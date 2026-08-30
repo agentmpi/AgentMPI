@@ -161,7 +161,10 @@ def main() -> int:
         problems.append(f"unbalanced environments: {bad_envs}")
 
     # ---- placeholders ----
-    placeholders = re.findall(r"\[RESULTS PENDING[^\]]*\]|\bTODO\b|\bXXX\b|\bTBD\b", tex)
+    # Strip \op{...} and verbatim-ish spans first: a view spec like `grep:TODO`
+    # is an example, not a leftover.
+    scan = re.sub(r"\\op\{[^}]*\}", "", tex)
+    placeholders = re.findall(r"\[RESULTS PENDING[^\]]*\]|\bTODO\b|\bXXX\b|\bTBD\b", scan)
     if placeholders:
         notes.append(f"{len(placeholders)} explicit placeholder(s) remaining "
                      "(expected while runs are in flight)")
