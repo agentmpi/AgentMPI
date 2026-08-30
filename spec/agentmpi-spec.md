@@ -118,7 +118,11 @@ AMPI_Type_contiguous(count, base) -> Datatype
 * A sender MUST validate a payload against its datatype's contract before
   sending, and MUST raise `AMPI_ERR_CONTRACT` on violation.
 * A receiver MUST re-check on arrival and MUST report violations in the
-  status. It MUST raise `AMPI_ERR_CONTRACT` if `ampi_strict_contracts` is
+  status, and a diagnostic MUST carry the violation list, which is the
+  actionable part.
+* For a collective that moves *blocks* of items (a tree scatter), the
+  contract describes an item and MUST be checked against the item each rank
+  keeps, not against the block an interior node forwards. It MUST raise `AMPI_ERR_CONTRACT` if `ampi_strict_contracts` is
   set.
 * If a payload exceeds `max_tokens`, an implementation MUST apply `digest`
   when the type is lossy, and MUST raise `AMPI_ERR_CONTEXT_OVERFLOW`

@@ -29,8 +29,14 @@ where you would design them differently.
 ### Step 2 — receive your assignment
 
 ```
-ampi scatter --root 0 --type json --out /workspace/runs/scratch-tinyq/rank-{{RANK}}/assignment.json
+ampi scatter --root 0 --type json --expect rank={{RANK}} \
+  --out /workspace/runs/scratch-tinyq/rank-{{RANK}}/assignment.json
 ```
+
+The `--expect rank={{RANK}}` clause asserts that the assignment you receive
+really is addressed to you. If it is not, the command fails with
+`AMPI_ERR_CONTRACT` rather than handing you another rank's work; stop and
+report rather than implementing whatever arrived.
 
 `assignment.json` tells you the file you own (`module`), any extra files you
 own (`also`), the modules you depend on (`depends_on`), and the package root

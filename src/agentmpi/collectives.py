@@ -47,8 +47,8 @@ from typing import Any, Sequence
 
 from .constants import TAG_UB, CollAlgorithm, InternalTag
 from .context import plan_reduction, safe_fanout
-from .datatypes import JSON_, TEXT, TypeDescriptor
-from .errors import ArgError, OpError, RootError
+from .datatypes import JSON_, TEXT, TypeDescriptor, lookup
+from .errors import ArgError, ContractError, OpError, RootError
 from .ops import Op, check_op_for_tree, lookup_op
 from .tokens import count_tokens
 from .trace import Event
@@ -580,6 +580,25 @@ def _scatter_impl(comm, values, root, datatype, algorithm, timeout, variable):
         else:
             mine, _st = comm.recv(root, _tag(cid, 0), datatype, timeout=timeout)
             steps = 1
+
+    # Check the contract on the *item*, not on the block.
+    #
+    # A tree scatter moves blocks: an interior node receives a slice of the
+    # vector and forwards the rest, so the datatype the caller declared
+    # describes an element and never gets applied to one. That is how a
+    # misdelivered work assignment reached four of our ranks unchallenged
+    # even though each payload carried the rank it was addressed to.
+    dt = lookup(datatype) if isinstance(datatype, str) else datatype
+    if mine is not None:
+        violations = dt.check(mine)
+        if violations:
+            comm.runtime.pvars.inc("contract_violations", len(violations))
+            if comm.runtime.cvars["ampi_strict_contracts"]:
+                raise ContractError(
+                    "scattered item does not satisfy its declared contract",
+                    violations=violations, rank=rank, root=root)
+            comm.runtime.profiler.note("scattered item violates its contract",
+                                       violations=list(violations))
 
     _emit(comm, "scatterv" if variable else "scatter", sel.algorithm.value, steps, t0,
           root=root, rationale=sel.rationale)

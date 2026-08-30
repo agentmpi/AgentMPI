@@ -108,6 +108,50 @@ def _require_run(root: str) -> None:
         }))
 
 
+def _expected_type(args: argparse.Namespace, rank: int):
+    """Build the receive datatype, attaching any ``--expect`` assertions.
+
+    The motivating case is a self-identifying payload. A work assignment that
+    carries its own ``rank`` field can be checked against the rank that
+    received it, and four of our agents did that check by hand after noticing
+    the numbers disagreed. One of them then reasoned its way to the right
+    action and the others did not, which is the usual outcome when a
+    correctness check lives in an agent's judgement rather than in the type.
+    Declaring it turns a silent misdelivery into ``AMPI_ERR_CONTRACT`` at the
+    point of receipt, naming both values.
+    """
+    from .datatypes import lookup, type_contract
+
+    base = lookup(getattr(args, "type", "text"))
+    clauses = getattr(args, "expect", None)
+    if not clauses:
+        return base
+
+    wanted: dict[str, str] = {}
+    for clause in clauses:
+        key, _, value = clause.partition("=")
+        if not key or not _:
+            raise SystemExit(f"error: --expect needs KEY=VALUE, got {clause!r}")
+        wanted[key.strip()] = value.strip().replace("{rank}", str(rank))
+
+    def validate(value):
+        problems = []
+        if not isinstance(value, dict):
+            return (f"expected a JSON object to check {sorted(wanted)} against, "
+                    f"got {type(value).__name__}",)
+        for key, expected in wanted.items():
+            if key not in value:
+                problems.append(f"payload has no field {key!r}")
+            elif str(value[key]) != expected:
+                problems.append(
+                    f"field {key!r} is {value[key]!r}, expected {expected!r} "
+                    f"-- this payload was not addressed to rank {rank}")
+        return tuple(problems)
+
+    return type_contract(base, validators=[validate],
+                         name=f"{base.name}/expect")
+
+
 def _open(args: argparse.Namespace) -> Runtime:
     root = getattr(args, "run_root", None) or os.environ.get("AMPI_ROOT")
     if not root:
@@ -121,6 +165,12 @@ def _open(args: argparse.Namespace) -> Runtime:
         cvars["ampi_context_capacity"] = args.capacity
     if getattr(args, "no_admission", False):
         cvars["ampi_admission_control"] = False
+    if getattr(args, "expect", None):
+        # An explicit assertion is meant to fail, not to be noted. The
+        # default is lenient because most contract violations are a quality
+        # signal a harness may want to see and continue past; --expect is the
+        # caller saying this one is not.
+        cvars["ampi_strict_contracts"] = True
     return init(root=str(root), rank=int(rank), device="journal", cvars=cvars)
 
 
@@ -258,7 +308,8 @@ def cmd_send(args: argparse.Namespace) -> int:
 def cmd_recv(args: argparse.Namespace) -> int:
     rt = _open(args)
     comm = _comm(rt, args)
-    value, status = comm.recv(args.source, args.tag, args.type, timeout=args.timeout)
+    value, status = comm.recv(args.source, args.tag, _expected_type(args, comm.rank),
+                              timeout=args.timeout)
     _emit(args, value, {"source": status.source, "tag": status.tag,
                         "tokens": status.tokens, "waited_s": round(status.wait_time_s, 2),
                         "contract_ok": status.contract_ok,
@@ -282,7 +333,7 @@ def cmd_bcast(args: argparse.Namespace) -> int:
     rt = _open(args)
     comm = _comm(rt, args)
     value = _read_value(args) if comm.rank == args.root else None
-    got = comm.bcast(value, args.root, datatype=args.type,
+    got = comm.bcast(value, args.root, datatype=_expected_type(args, comm.rank),
                      algorithm=CollAlgorithm(args.algorithm), timeout=args.timeout)
     _emit(args, got, {"root": args.root})
     _finish(rt)
@@ -297,7 +348,8 @@ def cmd_scatter(args: argparse.Namespace) -> int:
         values = _read_value(args)
         if not isinstance(values, list):
             raise SystemExit("error: the root of a scatter must supply a JSON list")
-    mine = comm.scatterv(values, args.root, datatype=args.type, timeout=args.timeout)
+    mine = comm.scatterv(values, args.root, datatype=_expected_type(args, comm.rank),
+                         timeout=args.timeout)
     _emit(args, mine, {"root": args.root})
     _finish(rt)
     return 0
@@ -679,6 +731,11 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--tag", type=int, default=ANY_TAG, help="-1 = any tag")
     sp.add_argument("--type", default="text",
                     choices=["text", "json", "patch", "artifact", "toolcall", "digest"])
+    sp.add_argument(
+        "--expect", action="append",
+        help="assert a top-level field of the received JSON, as KEY=VALUE; "
+             "{rank} expands to this rank. A mismatch raises "
+             "AMPI_ERR_CONTRACT rather than being silently accepted.")
     sp.set_defaults(func=cmd_recv)
 
     sp = sub.add_parser("barrier", help="wait for every rank to arrive")
@@ -693,6 +750,11 @@ def build_parser() -> argparse.ArgumentParser:
     timeout(sp)
     sp.add_argument("--root", type=int, default=0)
     sp.add_argument("--algorithm", default="auto", choices=[a.value for a in CollAlgorithm])
+    sp.add_argument(
+        "--expect", action="append",
+        help="assert a top-level field of the received JSON, as KEY=VALUE; "
+             "{rank} expands to this rank. A mismatch raises "
+             "AMPI_ERR_CONTRACT rather than being silently accepted.")
     sp.set_defaults(func=cmd_bcast)
 
     sp = sub.add_parser("scatter", help="deal one piece of a list to each rank")
@@ -701,6 +763,11 @@ def build_parser() -> argparse.ArgumentParser:
     output(sp)
     timeout(sp)
     sp.add_argument("--root", type=int, default=0)
+    sp.add_argument(
+        "--expect", action="append",
+        help="assert a top-level field of the received JSON, as KEY=VALUE; "
+             "{rank} expands to this rank. A mismatch raises "
+             "AMPI_ERR_CONTRACT rather than being silently accepted.")
     sp.set_defaults(func=cmd_scatter)
 
     sp = sub.add_parser("gather", help="collect one contribution per rank at a root")
@@ -839,11 +906,17 @@ def main(argv: list[str] | None = None) -> int:
     except AmpiError as exc:
         # Structured errors so that an agent reading stderr can branch on the
         # error class rather than on a prose message.
-        print(json.dumps({"error": exc.error_class.name,
-                          "code": int(exc.error_class),
-                          "message": exc.message,
-                          "context": {k: str(v) for k, v in exc.context.items()}}),
-              file=sys.stderr)
+        payload = {"error": exc.error_class.name,
+                   "code": int(exc.error_class),
+                   "message": exc.message,
+                   "context": {k: str(v) for k, v in exc.context.items()}}
+        # The violation list is the diagnosis, not decoration: it is the
+        # difference between "the payload was wrong" and "field 'rank' is 2,
+        # expected 1". Dropping it leaves the reader with the useless half.
+        violations = getattr(exc, "violations", ())
+        if violations:
+            payload["violations"] = list(violations)
+        print(json.dumps(payload), file=sys.stderr)
         return 1 + int(exc.error_class) % 100
     except KeyboardInterrupt:
         return 130

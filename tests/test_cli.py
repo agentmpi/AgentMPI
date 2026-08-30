@@ -290,3 +290,58 @@ def test_scatter_routes_correctly_across_nine_processes(tmp_path):
     for rank in range(1, 9):
         got = json.loads(results[rank])
         assert got["rank"] == rank, f"rank {rank} received {got}"
+
+
+def test_expect_rejects_a_payload_addressed_to_another_rank(tmp_path):
+    """A self-identifying payload should be checked by the type, not by luck.
+
+    Four agents in our software build noticed that the work assignment they
+    received carried a `rank` field disagreeing with their own, and each
+    decided independently what to do about it. Declaring the check makes it
+    the runtime's job: a misdelivered assignment fails at receipt with
+    AMPI_ERR_CONTRACT naming both values, instead of being implemented.
+    """
+    root = tmp_path / "run"
+    subprocess.run(AMPI + ["init", "--root", str(root), "--ranks", "3"],
+                   check=True, capture_output=True, env=clean_env(), timeout=60)
+
+    # Rank 0 scatters assignments that are deliberately rotated by one, the
+    # symptom our ranks reported.
+    rotated = [None, {"rank": 2, "module": "b.py"}, {"rank": 1, "module": "a.py"}]
+
+    def worker(rank: int):
+        args = ["scatter", "--root", "0", "--type", "json",
+                "--expect", "rank={rank}", "--timeout", "60"]
+        if rank == 0:
+            args += ["--json", json.dumps(rotated)]
+        return rank, run_ampi(root, rank, *args, timeout=120, check=False)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = dict(pool.map(worker, range(3)))
+
+    for rank in (1, 2):
+        proc = results[rank]
+        assert proc.returncode != 0, (
+            f"rank {rank} accepted an assignment addressed to another rank")
+        err = json.loads(proc.stderr)
+        assert err["error"] == "ERR_CONTRACT"
+        assert "not addressed to rank" in json.dumps(err)
+
+
+def test_expect_accepts_a_correctly_addressed_payload(tmp_path):
+    root = tmp_path / "run"
+    subprocess.run(AMPI + ["init", "--root", str(root), "--ranks", "3"],
+                   check=True, capture_output=True, env=clean_env(), timeout=60)
+    correct = [None, {"rank": 1, "module": "a.py"}, {"rank": 2, "module": "b.py"}]
+
+    def worker(rank: int):
+        args = ["scatter", "--root", "0", "--type", "json",
+                "--expect", "rank={rank}", "--timeout", "60"]
+        if rank == 0:
+            args += ["--json", json.dumps(correct)]
+        return rank, run_ampi(root, rank, *args, timeout=120)
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results = dict(pool.map(worker, range(3)))
+    for rank in (1, 2):
+        assert json.loads(results[rank].stdout)["rank"] == rank
