@@ -256,7 +256,7 @@ def select_algorithm(
     if coll == COLL_SCAN:
         return ALGO_CHAIN, considered
     if coll == COLL_REDUCE_SCATTER:
-        return ALGO_RING, considered
+        return (ALGO_RECURSIVE_DOUBLING if p & (p - 1) == 0 else ALGO_RING), considered
     if coll in (COLL_REDUCE, COLL_ALLREDUCE):
         if op is None:
             raise AmpiArgError(f"{coll} requires an operator")
@@ -392,6 +392,7 @@ STEP_KINDS = {
     "gatherparts",  # slots[dst] = {i: parts[i] for i in meta['indices']}
     "combineparts",  # parts[i] = op(parts[i], slots[src][i]) for i in indices
     "mergeparts",   # parts.update(slots[src])
+    "drop",         # parts[i] = None for i in meta['indices'] (block is dead)
     "assemble",     # slots['acc'] = assemble(parts)
     "setacc",       # slots['acc'] = parts[meta['index']]
 }
@@ -419,9 +420,27 @@ class CollectiveState:
     coll_id: str
     pc: int
     slots: dict[str, Any]
+    peak: int = 0
 
     def to_dict(self) -> dict[str, Any]:
-        return {"coll_id": self.coll_id, "pc": self.pc, "slots": self.slots}
+        return {"coll_id": self.coll_id, "pc": self.pc, "slots": self.slots, "peak": self.peak}
+
+
+def _resident_tokens(slots: dict[str, Any]) -> int:
+    """Tokens a rank is holding at this instant of the schedule.
+
+    This is the quantity the context bound applies to, and the reason the
+    reduce-scatter family is admissible where recursive doubling is not: it
+    counts what the rank must have materialised simultaneously, not the total
+    it will move over the whole collective.  Bookkeeping slots that exist only
+    to name a step are excluded; the payload-carrying ones are not.
+    """
+    total = 0
+    for key, value in slots.items():
+        if key.startswith("_") or key in ("tok", "tok_in"):
+            continue
+        total += util.count_tokens(util.dumps(value))
+    return total
 
 
 # ===========================================================================
@@ -584,6 +603,7 @@ def sched_allreduce_ring(p: int, me: int) -> list[Step]:
         recv_idx = (me - k - 1) % p
         steps.append(Step("gatherparts", dst="out", meta={"indices": [send_idx]}))
         steps.append(Step("send", peer=right, src="out"))
+        steps.append(Step("drop", meta={"indices": [send_idx]}))
         steps.append(Step("recv", peer=left, dst="inc"))
         steps.append(Step("combineparts", src="inc", meta={"indices": [recv_idx]},
                           order="left"))
@@ -616,6 +636,7 @@ def sched_allreduce_rabenseifner(p: int, me: int) -> list[Step]:
         give = [i for i in owned if (i & mask) != (me & mask)]
         steps.append(Step("gatherparts", dst="out", meta={"indices": give}))
         steps.append(Step("send", peer=partner, src="out"))
+        steps.append(Step("drop", meta={"indices": give}))
         steps.append(Step("recv", peer=partner, dst="inc"))
         steps.append(Step("combineparts", src="inc", meta={"indices": keep},
                           order="left" if me < partner else "right"))
@@ -637,6 +658,74 @@ def sched_allreduce_rabenseifner(p: int, me: int) -> list[Step]:
 
 def _mirror(indices: list[int], mask: int) -> list[int]:
     return [i ^ mask for i in indices]
+
+
+def sched_reduce_scatter_ring(p: int, me: int) -> list[Step]:
+    """Ring reduce-scatter: rank *me* ends holding the reduced block (me+1) mod p.
+
+    p-1 steps, each moving one block, and --- because a block is dropped as
+    soon as it has been forwarded --- a rank never holds more than a couple of
+    blocks at once.  This is the operation the context-bound feasibility
+    argument is about: the reduction of an n-token vector across p agents
+    completes with O(n/p) resident per agent, so it runs at payload sizes where
+    no algorithm that materialises the whole vector can run at all.
+    """
+    steps: list[Step] = [Step("partition")]
+    left, right = (me - 1) % p, (me + 1) % p
+    for k in range(p - 1):
+        send_idx = (me - k) % p
+        recv_idx = (me - k - 1) % p
+        steps.append(Step("gatherparts", dst="out", meta={"indices": [send_idx]}))
+        steps.append(Step("send", peer=right, src="out"))
+        steps.append(Step("drop", meta={"indices": [send_idx]}))
+        steps.append(Step("recv", peer=left, dst="inc"))
+        steps.append(Step("combineparts", src="inc", meta={"indices": [recv_idx]},
+                          order="left"))
+    steps.append(Step("setacc", meta={"index": (me + 1) % p}))
+    return steps
+
+
+def sched_reduce_scatter_halving(p: int, me: int) -> list[Step]:
+    """Recursive-halving reduce-scatter: lg p steps, rank *me* ends owning block me."""
+    if p & (p - 1) != 0:
+        return sched_reduce_scatter_ring(p, me)
+    steps: list[Step] = [Step("partition")]
+    owned = list(range(p))
+    mask = p >> 1
+    while mask >= 1:
+        partner = me ^ mask
+        keep = [i for i in owned if (i & mask) == (me & mask)]
+        give = [i for i in owned if (i & mask) != (me & mask)]
+        steps.append(Step("gatherparts", dst="out", meta={"indices": give}))
+        steps.append(Step("send", peer=partner, src="out"))
+        steps.append(Step("drop", meta={"indices": give}))
+        steps.append(Step("recv", peer=partner, dst="inc"))
+        steps.append(Step("combineparts", src="inc", meta={"indices": keep},
+                          order="left" if me < partner else "right"))
+        owned = keep
+        mask >>= 1
+    steps.append(Step("setacc", meta={"index": me}))
+    return steps
+
+
+def sched_allreduce_linear(p: int, me: int) -> list[Step]:
+    """Canonical-order reduce to rank 0 followed by a flat broadcast.
+
+    Depth p, and every operator evaluation is on the critical path.  This is
+    the only admissible allreduce schedule for an operator that is not declared
+    associative, and measuring how much it costs relative to the tree is the
+    point of making the declaration part of the interface.
+    """
+    return sched_reduce_linear(p, me, 0) + sched_bcast_linear(p, me, 0)
+
+
+def sched_allreduce_binomial(p: int, me: int) -> list[Step]:
+    """Binomial reduce to rank 0 followed by a binomial broadcast.
+
+    Still p-1 operator evaluations in total, but only lg p of them lie on the
+    root's critical path, which is what associativity buys.
+    """
+    return sched_reduce_binomial(p, me, 0) + sched_bcast_binomial(p, me, 0)
 
 
 def sched_allgather_ring(p: int, me: int) -> list[Step]:
@@ -662,7 +751,7 @@ def sched_alltoall_pairwise(p: int, me: int) -> list[Step]:
     a rank forward a block it received instead of the one it owns --- the
     in-place hazard that MPI handles with MPI_IN_PLACE and a separate recvbuf.
     """
-    steps: list[Step] = [Step("partition")]
+    steps: list[Step] = [Step("partition", meta={"keep_send": True})]
     for k in range(1, p):
         dst = (me + k) % p
         src = (me - k) % p
@@ -702,9 +791,13 @@ SCHEDULES: dict[tuple[str, str], Callable[..., list[Step]]] = {
     (COLL_ALLREDUCE, ALGO_RECURSIVE_DOUBLING): sched_allreduce_recursive_doubling,
     (COLL_ALLREDUCE, ALGO_RING): sched_allreduce_ring,
     (COLL_ALLREDUCE, ALGO_RABENSEIFNER): sched_allreduce_rabenseifner,
+    (COLL_ALLREDUCE, ALGO_LINEAR): sched_allreduce_linear,
+    (COLL_ALLREDUCE, ALGO_BINOMIAL): sched_allreduce_binomial,
     (COLL_ALLGATHER, ALGO_RING): sched_allgather_ring,
     (COLL_ALLTOALL, ALGO_LINEAR): sched_alltoall_pairwise,
     (COLL_SCAN, ALGO_CHAIN): sched_scan_chain,
+    (COLL_REDUCE_SCATTER, ALGO_RING): sched_reduce_scatter_ring,
+    (COLL_REDUCE_SCATTER, ALGO_RECURSIVE_DOUBLING): sched_reduce_scatter_halving,
 }
 
 
@@ -736,6 +829,7 @@ class CollectiveEngine:
         self.coll_id = ""
         self.algo = algo
         self.considered: list[dict[str, Any]] = []
+        self.peak_resident = 0
 
     # -- registration and the collective-ordering check --------------------
     def register(self, payload_tokens: int, algo: str) -> dict[str, Any]:
@@ -851,7 +945,8 @@ class CollectiveEngine:
         raw = self.rt.device.kv_get(self.rt.job_id, self._state_key(), None)
         if raw is None:
             return CollectiveState(self.coll_id, 0, {})
-        return CollectiveState(self.coll_id, int(raw["pc"]), raw["slots"])
+        return CollectiveState(self.coll_id, int(raw["pc"]), raw["slots"],
+                               int(raw.get("peak", 0)))
 
     def save_state(self, state: CollectiveState) -> None:
         with self.rt.device.write_tx():
@@ -914,9 +1009,12 @@ class CollectiveEngine:
                     self.save_state(state)
                     raise
                 state.pc += 1
+                state.peak = max(state.peak, _resident_tokens(state.slots))
                 self.save_state(state)
-            span["meta"] = {"algo": self.algo, "steps": len(steps), "p": self.p}
+            span["meta"] = {"algo": self.algo, "steps": len(steps), "p": self.p,
+                            "peak_resident": state.peak}
         result = state.slots.get("acc")
+        self.peak_resident = state.peak
         self._record_result(result, len(steps))
         self.clear_marker()
         return result
@@ -929,6 +1027,8 @@ class CollectiveEngine:
         if step.kind == "send":
             rt.send(self.comm_name, step.peer, tag, {"v": slots.get(step.src)},
                     meta={"coll": self.coll_id, "step": state.pc})
+            if step.src != "acc":
+                slots[step.src] = None  # the staging buffer is dead once sent
         elif step.kind == "recv":
             remaining = max(2.0, deadline - time.time())
             got = rt.recv(self.comm_name, step.peer, tag, timeout=remaining, deref=True,
@@ -945,7 +1045,13 @@ class CollectiveEngine:
             slots[step.dst] = slots.get(step.src)
         elif step.kind == "partition":
             slots["parts"] = partition(slots.get("acc"), self.p)
-            slots["sendparts"] = partition(slots.get("acc"), self.p)
+            if step.meta.get("keep_send"):
+                slots["sendparts"] = partition(slots.get("acc"), self.p)
+            # The whole-vector accumulator is dead once it has been split;
+            # keeping it would make every block-decomposed algorithm hold the
+            # full payload for the entire schedule, which is precisely the
+            # residency the decomposition exists to avoid.
+            slots["acc"] = None
         elif step.kind == "gatherparts":
             source = slots.setdefault(step.meta.get("from", "parts"), [None] * self.p)
             indices = step.meta.get("indices", [])
@@ -973,6 +1079,11 @@ class CollectiveEngine:
                 # index, but the receiver must file it under the *source*.
                 for value in incoming.values():
                     parts[int(relabel)] = value
+            slots["parts"] = parts
+        elif step.kind == "drop":
+            parts = slots.setdefault("parts", [None] * self.p)
+            for i in step.meta.get("indices", []):
+                parts[i] = None
             slots["parts"] = parts
         elif step.kind == "assemble":
             slots["acc"] = assemble(slots.get("parts") or [])
@@ -1006,10 +1117,16 @@ class CollectiveEngine:
 
 
 def _prepare(rt: Any, comm_name: str, coll: str, op_name: str | None, root: int | None,
-             algo: str, payload: Any, timeout: float) -> tuple[CollectiveEngine, Op | None, bool]:
+             algo: str, payload: Any, timeout: float,
+             datatype: str = "auto") -> tuple[CollectiveEngine, Op | None, bool]:
     op = get_op(op_name) if op_name else None
     engine = CollectiveEngine(rt, comm_name, coll, op=op, root=root, algo=algo, timeout=timeout)
-    vector = is_vector(payload)
+    # The datatype declaration is MPI's count-and-datatype argument: it says
+    # whether the operator applies to the payload as a whole (scalar) or
+    # element-wise to a keyed collection (vector).  Only vector payloads can be
+    # partitioned, so this declaration decides whether the reduce-scatter
+    # family is available at all.
+    vector = is_vector(payload) if datatype == "auto" else (datatype == "vector")
     n = util.count_tokens(util.dumps(payload)) if payload is not None else 0
     if algo == ALGO_AUTO:
         ctx_limit = int(rt.rank_row()["ctx_limit"])
@@ -1061,9 +1178,10 @@ def bcast(rt: Any, comm_name: str, root: int, payload: Any = None, *, algo: str 
 
 
 def reduce_(rt: Any, comm_name: str, root: int, payload: Any, op_name: str, *,
-            algo: str = ALGO_AUTO, timeout: float = 1800.0) -> dict[str, Any]:
+            algo: str = ALGO_AUTO, timeout: float = 1800.0,
+            datatype: str = "auto") -> dict[str, Any]:
     engine, op, vector = _prepare(rt, comm_name, COLL_REDUCE, op_name, root, algo, payload,
-                                  timeout)
+                                  timeout, datatype)
     if engine.p == 1:
         return {"result": payload, "algo": engine.algo, "p": 1, "steps": 0}
     steps = _schedule(COLL_REDUCE, engine.algo, engine.p, engine.me, root)
@@ -1072,13 +1190,34 @@ def reduce_(rt: Any, comm_name: str, root: int, payload: Any, op_name: str, *,
         result = op.finalize(result)
     return {"result": result if engine.me == root else None, "algo": engine.algo,
             "p": engine.p, "steps": len(steps), "seq": engine.seq,
-            "considered": engine.considered}
+            "peak_resident_tokens": engine.peak_resident, "considered": engine.considered}
+
+
+def reduce_scatter(rt: Any, comm_name: str, payload: Any, op_name: str, *,
+                   algo: str = ALGO_AUTO, timeout: float = 1800.0,
+                   datatype: str = "vector") -> dict[str, Any]:
+    """AMPI_Reduce_scatter_block.
+
+    Reduce a keyed vector element-wise across the communicator and leave each
+    rank holding exactly the block of the key space it owns.  Ownership is by
+    stable hash of the key, so every rank agrees on the partition without
+    exchanging it.
+    """
+    engine, op, vector = _prepare(rt, comm_name, COLL_REDUCE_SCATTER, op_name, None, algo,
+                                  payload, timeout, datatype)
+    if engine.p == 1:
+        return {"result": payload, "algo": engine.algo, "p": 1, "steps": 0}
+    steps = _schedule(COLL_REDUCE_SCATTER, engine.algo, engine.p, engine.me, None)
+    result = engine.run(steps, {"acc": payload}, vector=vector)
+    return {"result": result, "algo": engine.algo, "p": engine.p, "steps": len(steps),
+            "seq": engine.seq, "peak_resident_tokens": engine.peak_resident,
+            "owns_block": (engine.me + 1) % engine.p if engine.algo == ALGO_RING else engine.me}
 
 
 def allreduce(rt: Any, comm_name: str, payload: Any, op_name: str, *, algo: str = ALGO_AUTO,
-              timeout: float = 1800.0) -> dict[str, Any]:
+              timeout: float = 1800.0, datatype: str = "auto") -> dict[str, Any]:
     engine, op, vector = _prepare(rt, comm_name, COLL_ALLREDUCE, op_name, None, algo, payload,
-                                  timeout)
+                                  timeout, datatype)
     if engine.p == 1:
         result = op.finalize(payload) if op and op.finalize else payload
         return {"result": result, "algo": engine.algo, "p": 1, "steps": 0}
@@ -1087,7 +1226,8 @@ def allreduce(rt: Any, comm_name: str, payload: Any, op_name: str, *, algo: str 
     if op is not None and op.finalize:
         result = op.finalize(result)
     return {"result": result, "algo": engine.algo, "p": engine.p, "steps": len(steps),
-            "seq": engine.seq, "considered": engine.considered}
+            "seq": engine.seq, "peak_resident_tokens": engine.peak_resident,
+            "considered": engine.considered}
 
 
 def allgather(rt: Any, comm_name: str, payload: Any, *, algo: str = ALGO_AUTO,
@@ -1127,8 +1267,9 @@ def alltoall(rt: Any, comm_name: str, payload: Any, *, algo: str = ALGO_AUTO,
 
 
 def scan(rt: Any, comm_name: str, payload: Any, op_name: str, *, algo: str = ALGO_AUTO,
-         timeout: float = 1800.0) -> dict[str, Any]:
-    engine, op, vector = _prepare(rt, comm_name, COLL_SCAN, op_name, None, algo, payload, timeout)
+         timeout: float = 1800.0, datatype: str = "auto") -> dict[str, Any]:
+    engine, op, vector = _prepare(rt, comm_name, COLL_SCAN, op_name, None, algo, payload,
+                                  timeout, datatype)
     if engine.p == 1:
         return {"result": payload, "algo": engine.algo, "p": 1, "steps": 0}
     steps = _schedule(COLL_SCAN, engine.algo, engine.p, engine.me, None)

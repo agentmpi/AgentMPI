@@ -279,7 +279,11 @@ def _collective(args: argparse.Namespace, fn: Any, *fnargs: Any, **fnkw: Any) ->
 
 def _render_collective(result: dict[str, Any], args: argparse.Namespace, job_dir: str,
                        rt: Runtime) -> dict[str, Any]:
-    out = {k: v for k, v in result.items() if k != "result"}
+    # The decision function's reasoning is valuable to a human reading a trace
+    # and pure noise in an agent's context, so it is opt-in.  The full record is
+    # persisted in the coll table either way.
+    skip = {"result"} if getattr(args, "explain", False) else {"result", "considered"}
+    out = {k: v for k, v in result.items() if k not in skip}
     out["status"] = "ok"
     if "result" in result:
         text = result["result"] if isinstance(result["result"], str) \
@@ -300,12 +304,12 @@ def cmd_bcast(args: argparse.Namespace) -> int:
 
 def cmd_reduce(args: argparse.Namespace) -> int:
     return _collective(args, coll.reduce_, args.root, read_payload(args), args.op,
-                       algo=args.algo, timeout=args.timeout)
+                       algo=args.algo, timeout=args.timeout, datatype=args.datatype)
 
 
 def cmd_allreduce(args: argparse.Namespace) -> int:
     return _collective(args, coll.allreduce, read_payload(args), args.op, algo=args.algo,
-                       timeout=args.timeout)
+                       timeout=args.timeout, datatype=args.datatype)
 
 
 def cmd_allgather(args: argparse.Namespace) -> int:
@@ -326,9 +330,14 @@ def cmd_scatter(args: argparse.Namespace) -> int:
     return _collective(args, coll.scatter, args.root, read_payload(args), timeout=args.timeout)
 
 
+def cmd_reduce_scatter(args: argparse.Namespace) -> int:
+    return _collective(args, coll.reduce_scatter, read_payload(args), args.op, algo=args.algo,
+                       timeout=args.timeout, datatype=args.datatype)
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
     return _collective(args, coll.scan, read_payload(args), args.op, algo=args.algo,
-                       timeout=args.timeout)
+                       timeout=args.timeout, datatype=args.datatype)
 
 
 def cmd_op_submit(args: argparse.Namespace) -> int:
@@ -766,16 +775,23 @@ def build_parser() -> argparse.ArgumentParser:
         ("gather", cmd_gather, "AMPI_Gather"),
         ("scatter", cmd_scatter, "AMPI_Scatter"),
         ("scan", cmd_scan, "AMPI_Scan"),
+        ("reduce-scatter", cmd_reduce_scatter,
+         "AMPI_Reduce_scatter_block: reduce, then keep only your block"),
     ]:
         p = add(name, fn, help_text)
         p.add_argument("--timeout", type=float, default=1800.0)
         p.add_argument("--algo", default=ALGO_AUTO,
                        help="force a collective algorithm instead of using the decision function")
+        p.add_argument("--explain", action="store_true",
+                       help="also report which algorithms were considered and why")
         out_args(p)
         if name in ("bcast", "reduce", "gather", "scatter"):
             p.add_argument("--root", type=int, default=0)
-        if name in ("reduce", "allreduce", "scan"):
+        if name in ("reduce", "allreduce", "scan", "reduce-scatter"):
             p.add_argument("--op", required=True, help="reduction operator (see `ampi ops`)")
+            p.add_argument("--datatype", default="auto", choices=["auto", "scalar", "vector"],
+                           help="apply the operator to the payload as a whole (scalar) or "
+                                "element-wise to a keyed collection (vector)")
         if name != "barrier":
             payload_args(p)
 

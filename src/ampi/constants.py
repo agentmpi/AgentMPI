@@ -144,5 +144,12 @@ ERROR_NAMES = {
 DEFAULT_CTX_LIMIT = 120_000
 DEFAULT_EAGER_LIMIT = 2_000
 DEFAULT_HEARTBEAT_PERIOD = 20.0
-DEFAULT_FAILURE_TIMEOUT = 180.0
+# Long, and deliberately so.  A rank's heartbeat only advances when it calls
+# the library, and an LLM rank can spend many minutes inside a single turn
+# without doing so.  Turn latency is heavy tailed, so any fixed timeout tight
+# enough to detect a crash quickly will also condemn healthy agents; we
+# therefore set the fixed bound loosely and rely on AMPI_Heartbeat's declared
+# deadline for ranks that know they are about to be slow.  Section
+# core/ft.py in the specification discusses the trade-off.
+DEFAULT_FAILURE_TIMEOUT = 900.0
 DEFAULT_POLL_INTERVAL = 0.35
