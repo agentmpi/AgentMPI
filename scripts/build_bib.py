@@ -18,6 +18,24 @@ from typing import Dict, List, Tuple
 
 ENTRY_RE = re.compile(r"@(\w+)\s*\{\s*([^,\s]+)\s*,", re.MULTILINE)
 
+#: Works that arrived under two keys because they were surveyed independently.
+#: The value is the key we keep; the alias is dropped and any citation of it is
+#: rewritten by `canonical_key`. Resolving these by hand is correct: an automatic
+#: title match would also merge genuinely distinct editions of the same standard.
+ALIASES = {
+    "carriero1989linda": "carriero1989lindaincontext",
+    "mpi22": "mpiforum2009mpi22",
+    "mpi31": "mpiforum2015mpi31",
+    "mpi41": "mpiforum2023mpi41",
+    "mpi50": "mpiforum2025mpi50",
+    "flp1985impossibility": "fischer1985impossibility",
+    "kleppmann2016locks": "kleppmann2016locking",
+}
+
+
+def canonical_key(key: str) -> str:
+    return ALIASES.get(key, key)
+
 
 def split_entries(text: str) -> List[Tuple[str, str, str]]:
     """Return (kind, key, source) for each BibTeX entry, brace-balanced."""
@@ -71,6 +89,8 @@ def main() -> int:
         entries = split_entries(block)
         per_file[path.name] = len(entries)
         for kind, key, src in entries:
+            key = canonical_key(key)
+            src = re.sub(r"(@\w+\s*\{\s*)[^,\s]+(\s*,)", r"\g<1>" + key + r"\g<2>", src, count=1)
             prev = best.get(key)
             if prev is None or field_count(src) > field_count(prev[2]):
                 best[key] = (kind, key, src)
