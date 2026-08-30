@@ -482,11 +482,20 @@ def cmd_win_get(args: argparse.Namespace) -> int:
     result = rt.win_get(args.win, args.key, charge_context=args.charge)
     if not result["found"]:
         return emit(result)
-    text = result["value"] if isinstance(result["value"], str) else util.dumps(result["value"])
+    value = result["value"]
+    text = value if isinstance(value, str) else util.dumps(value)
     body = spill(text, job_dir, rt.rank, f"win-{args.key.replace('/', '_')}.txt",
                  args.inline_limit, args.out)
-    return emit({"key": args.key, "found": True, "version": result["version"],
-                 "updated_by": result["updated_by"], **body})
+    out = {"key": args.key, "found": True, "version": result["version"],
+           "updated_by": result["updated_by"], **body}
+    # Also hand back a scalar under the obvious name. Counters are the common
+    # case for a window read -- a rank polling for "have all six finished?" --
+    # and two agents wrote poll loops against `value` or `current`, read
+    # nothing, and never took their early exit. Returning only `payload` was
+    # technically complete and practically a trap.
+    if isinstance(value, (int, float, bool)) or (isinstance(value, str) and len(value) <= 200):
+        out["value"] = value
+    return emit(out)
 
 
 def cmd_win_list(args: argparse.Namespace) -> int:

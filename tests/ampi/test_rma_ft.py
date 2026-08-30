@@ -525,3 +525,24 @@ def test_concurrent_shrinks_converge_on_one_communicator(make_job):
     assert len(names) == 1, f"survivors fragmented across {names}"
     comm = setup.comms.get(next(iter(names)))
     assert comm.members == [0, 1, 3, 5]
+
+
+def test_a_killed_rank_stays_failed_after_it_finalizes(make_job):
+    """A confirmed death is a fact, not a state a later call can overwrite.
+
+    Keying the failed set on current state alone made it transient: a killed
+    rank that went on to finalize dropped out, so two survivors calling shrink
+    moments apart computed different survivor sets and one got a collision.
+    """
+    job = make_job(4)
+    rt = job.runtime(0)
+    rt.init(0)
+    victim = job.runtime(2)
+    victim.init(2)
+
+    rt.declare_failed(2, "injected", confirmed=True)
+    assert rt.failed_ranks() == {2}
+
+    victim.finalize("clean exit after being killed")
+    assert rt.failed_ranks() == {2}, "the kill must survive the rank's own finalize"
+    assert rt.comm_shrink("world")["members"] == [0, 1, 3]
