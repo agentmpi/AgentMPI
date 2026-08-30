@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import importlib
 import sys
 from pathlib import Path
 
@@ -221,7 +222,7 @@ def main() -> int:
     # Execute the produced tests in-process.
     testdir = Path(args.workdir)
     sys.path.insert(0, str(testdir))
-    import tests.test_kvstore as produced_tests  # type: ignore
+    produced_tests = importlib.import_module("tests.test_kvstore")
 
     produced_tests.test_put_get()
     produced_tests.test_cas()

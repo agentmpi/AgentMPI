@@ -16,6 +16,7 @@ import time
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                 "..", "..", "..", "src"))
 
+from ampi import util  # noqa: E402
 from ampi.core import collectives as coll  # noqa: E402
 from ampi.core.runtime import Runtime  # noqa: E402
 from ampi.device import open_device  # noqa: E402
@@ -55,10 +56,9 @@ def kernel_pingpong(rt: Runtime, chars: int, iters: int) -> None:
             rtts.append(time.time() - started)
             modes.append(sent["mode"])
             payload_tokens = sent["tokens"]
-        from ampi import util as _u
         finish(rt, {"rank": RANK, "rtts": rtts, "modes": modes,
                     "payload_tokens": payload_tokens,
-                    "body_tokens": _u.count_tokens(body)})
+                    "body_tokens": util.count_tokens(body)})
     else:
         for _ in range(iters):
             rt.recv("world", 0, 1, timeout=300, deref=True, charge_context=False)
@@ -106,8 +106,6 @@ def kernel_allreduce(rt: Runtime, algo: str, entries: int, iters: int) -> None:
         correct = correct and result["result"] == expected
         coll.barrier(rt, "world", timeout=600)
     row = rt.rank_row()
-    from ampi import util
-
     finish(rt, {"rank": RANK, "durations": durations, "steps": steps, "correct": correct,
                 "ctx_peak": peak, "charged_ctx_peak": row["ctx_peak"],
                 "tokens_sent": row["tokens_sent"],
@@ -126,8 +124,6 @@ def kernel_residency(rt: Runtime, entries: int, iters: int) -> None:
     the reduce-scatter one, because it is the only family whose reduction phase
     residency falls with p.
     """
-    from ampi import util
-
     contribution = {f"k{RANK}-{i}": ("v" * 40) + f"{RANK}-{i}" for i in range(entries)}
     n_tokens = util.count_tokens(util.dumps(contribution))
     world = rt.comms.get("world").size

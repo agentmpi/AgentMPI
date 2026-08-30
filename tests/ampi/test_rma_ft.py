@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import threading
+import time
 
 import pytest
 
@@ -10,7 +12,6 @@ from ampi.constants import LOCK_EXCLUSIVE, LOCK_SHARED, RANK_FAILED
 from ampi.core import collectives as coll
 from ampi.core.collectives import SemanticUpcall
 from ampi.errors import AmpiProcFailed, AmpiRevoked, AmpiTimeout
-
 
 # ---------------------------------------------------------------------------
 # One-sided operations
@@ -130,8 +131,6 @@ def test_expired_lease_does_not_wedge_the_window(make_job):
     rt0.init(0)
     rt0.win_create("world", "w")
     rt0.win_lock("w", "k", mode=LOCK_EXCLUSIVE, ttl=0.2, timeout=5)
-    import time
-
     time.sleep(0.4)
     rt1 = job.runtime(1)
     rt1.init(1)
@@ -162,8 +161,6 @@ def test_revoke_unblocks_a_waiting_rank(make_job):
             return type(excinfo.value).__name__
         if rank == 0:
             ready.wait(10)
-            import time
-
             time.sleep(3)
             rt.comm_revoke("world")
             return "revoked"
@@ -248,8 +245,6 @@ def test_checkpoint_and_restore(make_job):
     rt.checkpoint({"done": ["a", "b"], "next": "c"}, label="phase1")
     restored = rt.restore(label="phase1")
     assert restored is not None
-    import json
-
     assert json.loads(restored["state"])["next"] == "c"
 
 
@@ -308,12 +303,10 @@ def test_semantic_tree_reduction_has_logarithmic_depth(make_job):
             except SemanticUpcall as upcall:
                 upcalls += 1
                 merged = [x for operand in upcall.operands for x in operand]
-                import json as _json
-
                 with rt.device.write_tx():
                     rt.device.execute(
                         "UPDATE pending_op SET state='done', result=? WHERE op_token=?",
-                        (_json.dumps(merged), upcall.op_token),
+                        (json.dumps(merged), upcall.op_token),
                     )
                 continue
             return {"result": result["result"], "upcalls": upcalls}
@@ -341,8 +334,6 @@ def test_failure_detector_widens_after_a_false_condemnation(make_job):
     victim = job.runtime(1)
     victim.init(1)
     victim.failure_timeout = 0.05
-
-    import time
 
     time.sleep(0.1)
     assert 1 in rt.suspected()

@@ -9,7 +9,8 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Callable
+from collections.abc import Callable
+from typing import Any
 
 import pytest
 

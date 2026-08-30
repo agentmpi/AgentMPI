@@ -14,6 +14,7 @@ The package layers exactly as MPICH does:
     ampi.launch                  process manager (the ``mpirun`` analogue)
 """
 
+from .api import Ampi as _Ampi
 from .constants import SPEC_VERSION
 from .errors import (
     AmpiCollectiveMismatch,
@@ -41,6 +42,4 @@ __all__ = [
 
 def Ampi(*args, **kwargs):  # noqa: N802 - matches the class it constructs
     """Lazily construct the Python binding, so importing the package is cheap."""
-    from .api import Ampi as _Ampi
-
     return _Ampi(*args, **kwargs)

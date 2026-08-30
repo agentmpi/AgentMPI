@@ -19,6 +19,7 @@ inspection.
 from __future__ import annotations
 
 import threading
+import time
 
 import pytest
 
@@ -177,8 +178,6 @@ def test_shared_leases_coexist_but_block_exclusive(device):
 
 
 def test_lease_expiry_releases_a_dead_holder(device):
-    import time
-
     assert device.lease("win1", "c", holder=0, mode="exclusive", ttl=0.15)
     time.sleep(0.3)
     assert device.lease("win1", "c", holder=1, mode="exclusive", ttl=5) is not None
