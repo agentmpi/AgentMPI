@@ -379,3 +379,47 @@ def test_point_to_point_on_a_split_communicator():
     r = sim.run(8, body, timeout=120)
     r.raise_errors()
     assert r.results[0] == "root-ok" and r.results[4] == "root-ok"
+
+
+def test_window_never_aliases_content_between_keys():
+    """Concurrent puts to distinct keys must not cross-contaminate.
+
+    A rank in our software build reported that the interface board had
+    aliased two entries: the key for one module held another module's
+    payload, with byte-identical previews. That would be a fatal window bug,
+    so it is pinned here. It was not the window -- the harness had given
+    every rank the same working directory and the same output filename, so
+    the ranks were overwriting one another's file before publishing it. The
+    protocol isolates the message plane; it cannot isolate a filesystem the
+    agents also share.
+    """
+
+    def body(comm):
+        win = win_create(comm, "interfaces")
+        win.put(f"iface/m{comm.rank}",
+                {"module": f"m{comm.rank}", "filler": "x" * (100 + comm.rank)})
+        comm.barrier(timeout=60)
+        if comm.rank == 0:
+            return {r: win.materialize_raw(win.get(f"iface/m{r}"))["module"]
+                    for r in range(comm.size)}
+        return None
+
+    r = sim.run(8, body, timeout=120, cvars={"ampi_context_capacity": 400_000})
+    r.raise_errors()
+    assert r.results[0] == {i: f"m{i}" for i in range(8)}
+
+
+def test_window_keys_with_identical_content_stay_distinct():
+    """Content addressing must not merge two keys that happen to agree."""
+
+    def body(comm):
+        win = win_create(comm, "same")
+        win.put(f"k{comm.rank}", {"identical": "payload"})
+        comm.barrier(timeout=60)
+        if comm.rank == 0:
+            return {r: win.get(f"k{r}").key for r in range(comm.size)}
+        return None
+
+    r = sim.run(6, body, timeout=120)
+    r.raise_errors()
+    assert r.results[0] == {i: f"k{i}" for i in range(6)}

@@ -261,3 +261,32 @@ def test_launchplan_emits_one_prompt_per_rank(run_dir: Path, tmp_path: Path):
     text = (out / "rank-002.md").read_text()
     assert "Rank 2 of 4" in text
     assert 'export AMPI_RANK="2"' in text
+
+
+def test_scatter_routes_correctly_across_nine_processes(tmp_path):
+    """Every rank receives exactly its own item, as separate processes.
+
+    Two ranks in the software build reported receiving another rank's work
+    assignment. The cause was a desynchronised collective counter from a
+    recycled run directory, not misrouting, but the distinction is only
+    credible if routing itself is pinned -- and pinned across processes, not
+    just in-process, at a size that is neither a power of two nor small.
+    """
+    root = tmp_path / "run"
+    subprocess.run(AMPI + ["init", "--root", str(root), "--ranks", "9"],
+                   check=True, capture_output=True, env=clean_env(), timeout=60)
+    assignment = [None] + [{"rank": i, "module": f"m{i}.py"} for i in range(1, 9)]
+
+    def worker(rank: int):
+        args = ["scatter", "--root", "0", "--type", "json", "--timeout", "90"]
+        if rank == 0:
+            args += ["--json", json.dumps(assignment)]
+        return rank, run_ampi(root, rank, *args, timeout=180).stdout.strip()
+
+    with ThreadPoolExecutor(max_workers=9) as pool:
+        results = dict(pool.map(worker, range(9)))
+
+    assert json.loads(results[0]) is None, "the coordinator takes no assignment"
+    for rank in range(1, 9):
+        got = json.loads(results[rank])
+        assert got["rank"] == rank, f"rank {rank} received {got}"
