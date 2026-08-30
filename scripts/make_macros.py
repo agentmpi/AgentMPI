@@ -84,7 +84,7 @@ def main() -> int:
             fit = s["latency"]["fit_eager"]
             m.add("alphaMs", (fit["alpha_s"] or 0) * 1e3, 1)
             m.add("betaUsPerTok", (fit["beta_s_per_token"] or 0) * 1e6, 2)
-            m.add("nHalfTokens", fit["n_half_tokens"])
+            m.add("nHalfTokens", int(round(fit["n_half_tokens"] or 0)))
             m.add("latencyReps", s["latency"]["reps"])
 
         if "collectives" in s:

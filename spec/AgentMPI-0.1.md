@@ -463,9 +463,13 @@ override the selection. The reference catalogue and selection rules:
 | bcast | `flat`, `binomial`, `chain`, `relay` | `flat` |
 | reduce | `flat`, `binomial`, `chain` | `flat` for runtime operators; `binomial` for agent operators |
 | allreduce | `flat`, `reduce_bcast`, `recursive_doubling` | `flat` for runtime operators; `reduce_bcast` for agent operators |
+| gather | `flat`, `binomial` | `flat` |
 | allgather | `flat`, `ring`, `recursive_doubling` | `flat` |
 | scatter | `flat`, `binomial` | `flat` |
-| scan/exscan | `chain`, `recursive_doubling` | journal prefix fold for runtime operators; `chain` for agent operators |
+| scan | `chain`, `recursive_doubling` | journal prefix fold for runtime operators; `chain` for agent operators |
+| exscan | `chain`, `recursive_doubling` | as `scan` |
+| alltoall | `flat`, `pairwise` | `flat` |
+| reduce_scatter | `flat` | `flat` (runtime operators only) |
 
 The two rules that differ from MPI, both derived from S2.2 and confirmed by
 measurement:
@@ -763,8 +767,18 @@ replacements per rank, then give up on that rank.
 | Class | Meaning | Retryable |
 |---|---|---|
 | `AMPI_SUCCESS` | — | — |
-| `AMPI_ERR_ARG`, `_RANK`, `_TAG`, `_COMM`, `_OP`, `_WIN`, `_REQUEST` | usage errors | no |
-| `AMPI_ERR_NOT_INIT`, `_ALREADY_INIT`, `_NO_JOB` | lifecycle errors | no |
+| `AMPI_ERR_ARG` | malformed or missing argument | no |
+| `AMPI_ERR_RANK` | rank out of range, or not a member of the communicator | no |
+| `AMPI_ERR_TAG` | tag out of range or in the reserved internal range | no |
+| `AMPI_ERR_COMM` | no such communicator, or wrong kind | no |
+| `AMPI_ERR_OP` | no such reduction operator | no |
+| `AMPI_ERR_WIN` | no such window | no |
+| `AMPI_ERR_REQUEST` | no such request, or it was cancelled | no |
+| `AMPI_ERR_TRUNCATE` | a payload did not fit the declared shape | no |
+| `AMPI_ERR_NOT_INIT` | the caller has not called `AMPI_Init` | no |
+| `AMPI_ERR_ALREADY_INIT` | duplicate initialisation at the same epoch | no |
+| `AMPI_ERR_NO_JOB` | no job state was found | no |
+| `AMPI_ERR_INTERN` | internal error in the implementation | no |
 | `AMPI_ERR_UNSUPPORTED` | optional operation absent | no |
 | `AMPI_ERR_TIMEOUT` | deadline reached; state preserved | **yes** |
 | `AMPI_ERR_PROC_FAILED` | a peer required to complete has failed | no |

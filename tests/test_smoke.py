@@ -606,3 +606,50 @@ def test_two_phase_failure_detection(job, tmp_path):
     _t.sleep(3.2)
     st = ampi(root, 0, "failed")
     assert 2 in [f["world"] for f in st["failed"]]
+
+
+def test_spec_and_implementation_agree_on_algorithms():
+    """The specification's algorithm table must match the implementation.
+
+    A specification that drifts from its reference implementation is worse than
+    no specification, and the table in S6.7 is the part most likely to drift
+    because it changes whenever a measurement moves a threshold.
+    """
+    import re
+
+    from ampi import collectives as C
+
+    spec = (REPO / "spec" / "AgentMPI-0.1.md").read_text(encoding="utf-8")
+    table = spec[spec.index("| Collective | Algorithms | Default rule |"):]
+    table = table[: table.index("\n\n")]
+    documented: dict[str, set[str]] = {}
+    for line in table.splitlines()[2:]:
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        names = [n.strip() for n in cells[0].split("/")]
+        algos = set(re.findall(r"`([a-z_]+)`", cells[1]))
+        for n in names:
+            documented[n] = algos
+    for op, algos in documented.items():
+        assert op in C.ALGORITHMS, f"spec documents {op!r}, implementation does not"
+        impl = set(C.ALGORITHMS[op])
+        assert algos == impl, (
+            f"{op}: spec says {sorted(algos)}, implementation offers {sorted(impl)}"
+        )
+    # Every implemented collective must appear in the spec table.
+    for op in C.ALGORITHMS:
+        assert op in documented, f"implementation offers {op!r}, spec does not document it"
+
+
+def test_error_classes_are_all_documented():
+    """Every error class the runtime can raise must be in the spec's table."""
+    from ampi.errors import ErrClass
+
+    spec = (REPO / "spec" / "AgentMPI-0.1.md").read_text(encoding="utf-8")
+    names = [
+        v for k, v in vars(ErrClass).items()
+        if not k.startswith("_") and isinstance(v, str) and v.startswith("AMPI_")
+    ]
+    missing = [n for n in names if n not in spec]
+    assert not missing, f"error classes absent from the specification: {missing}"

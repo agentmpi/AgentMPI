@@ -455,7 +455,12 @@ def suite_context(a: argparse.Namespace, workdir: Path) -> Dict[str, Any]:
                     )
                 out["charged"] = r.get("context_charged", 0)
 
-            res = _run_ranks(root, np, body, max_threads=min(np, 64))
+            # All P ranks must be concurrent: an allgather cannot complete with
+            # half of them held back. Capping concurrency below P here made our
+            # own harness reproduce the agent host's concurrency limit, and the
+            # resulting rows silently under-reported the totals because half the
+            # ranks timed out before charging their context.
+            res = _run_ranks(root, np, body, max_threads=np)
             j = Journal(root)
             total_ctx = int(j.scalar(
                 "SELECT COALESCE(SUM(value),0) FROM counter WHERE job=? AND name='ctx_tokens'",
