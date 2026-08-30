@@ -8,7 +8,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from agentmpi.runtime import estimate_tokens
+from agentmpi.util import estimate_tokens
 
 
 def read_json(path: Path) -> Any:
