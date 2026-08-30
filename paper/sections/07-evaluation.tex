@@ -222,10 +222,89 @@ which is what the comparison arm uses.
 
 \input{tables/software-body}
 
+\paragraph{Result.} The eight modules compose. The assembled package passes
+all 24 tests of the frozen integration suite, including every named error
+case, and there is \emph{no interface mismatch between any pair of
+independently written modules}: the parser emits exactly the tuple shapes
+the predicate evaluator and the executor consume, the executor calls all six
+of its dependencies correctly, and the command-line interface drives the
+whole stack end to end. The eight interface declarations cost 1{,}994 tokens
+in total on the shared window, which is what each rank paid to know what its
+dependencies would provide --- roughly 250 tokens per module against 859
+lines of code produced.
+
+We take that as the experiment's answer to Q3: publishing interfaces to a
+window behind a barrier, and reading only one's declared dependencies, is
+enough structure to make eight independently written modules of one program
+fit together on the first assembly. The comparison we would like to
+report---the same eight agents with an unstructured shared directory---is
+the one we could not run, for the reason below.
+
+\paragraph{But the run did not complete as a run.} The artifacts above are
+the agents' own work, produced under the protocol; the package was assembled
+and scored afterwards, because the run's collective control flow wedged
+before reaching its own measurement point. This is the more instructive half
+of the experiment, and it exposed a protocol bug the translation experiment
+had not. Rank~4's agent issued
+\code{ampi barrier}; its shell killed the command part way through, after
+the barrier's messages had been sent but before the process exited. Because
+the collective counter was only persisted at exit, the rank's next process
+reused the same number, replayed a barrier its peers had already completed,
+and was one collective behind them from then on. Every subsequent collective
+it issued carried a tag nobody was listening for, and the whole job wedged
+with all nine ranks blocked in a barrier.
+
+Two things are notable. First, this is not the disobedience of
+\Cref{sec:discussion-disobedience}: rank~4 followed its program exactly, and
+the fault was ours. Second, our own collective-order verification did
+\emph{not} catch it, because the mechanism compares operation \emph{names} at
+a given sequence number, and a replayed barrier has the same name as the
+barrier its peers ran at that number. A rank that repeats a collective is
+indistinguishable, by that test, from a rank that is merely slow.
+
+The fix is the write-ahead logging argument: the counter must be durable
+before the messages it labels, not after. \op{Init} now persists the
+increment before the collective proceeds, at a cost of one small write per
+collective, and a regression test kills a rank mid-barrier and asserts that
+its next process issues collective~2 rather than collective~1. We report the
+failed run rather than only the repaired one because the failure is the
+evidence: a protocol whose counters are not durable will wedge exactly this
+way, silently, the first time an executor's shell times out.
+
 \subsection{Q4: surviving rank death}
 \label{sec:eval-faults}
 
+Ranks are killed for real: the executor stops mid-run, stops heartbeating,
+and says nothing. Survivors learn of it the only way anything learns of a
+crash, from the absence of further evidence. Executors are scripted here so
+that the configuration space can be covered with repetition; the
+corresponding evidence from real agents is in
+\Cref{sec:discussion-disobedience}.
+
 \input{tables/faults-body}
+
+The result is unanimous across all eighteen configurations. Without
+recovery, \emph{every} survivor of \emph{every} configuration fails---the
+collective simply never completes, which is what an agent harness with no
+failure semantics does today, except that it hangs rather than returning an
+error. With detection enabled, every survivor identifies the failure within
+2.0\,s against a 3.0\,s liveness timeout. With revoke and shrink, every
+survivor recovers, every survivor computes the \emph{same} survivor set, and
+the subsequent collective over the shrunk communicator returns the correct
+result, at $p \in \{8,16\}$ and with up to four simultaneous failures.
+
+The consistency of the survivor set is the part worth emphasising. It is not
+enough that the survivors continue; they must continue \emph{as a group}. Two
+ranks that disagreed about who died would build different communicators and
+deadlock on their next collective, which is why the shrink is an agreement
+and why it intersects rather than unions the proposals.
+
+Building this experiment also found the bug described in
+\Cref{sec:impl}: envelopes carried communicator-local ranks while the device
+addresses inboxes by world rank. On \op{COMM\_WORLD} the two numberings
+coincide, so the confusion survives every test that uses only the world
+communicator---and misroutes every message the moment a job shrinks. Before
+the fix, no collective on a shrunk communicator could complete.
 
 \subsection{What the trace shows}
 

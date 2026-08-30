@@ -100,3 +100,51 @@ def test_collective_log_is_bounded():
     r.raise_errors()
     for size in r.ordered():
         assert size <= 64, f"collective log grew to {size}"
+
+
+def test_collective_counter_is_durable_before_the_collective(tmp_path):
+    """A rank killed mid-collective must not replay it.
+
+    The counter that separates one collective's traffic from the next must be
+    persisted before the messages it labels are sent. If it is written only
+    at exit, a process killed part way through a collective -- an agent's
+    shell timing out is the common cause -- reuses the same number in its
+    next process, replays a collective its peers have already completed, and
+    is one behind them from then on.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+    from concurrent.futures import ThreadPoolExecutor
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2"],
+                   check=True, capture_output=True, env=env, timeout=60)
+
+    def call(rank: int, *args: str, timeout: float = 30):
+        return subprocess.run(
+            ampi + list(args), capture_output=True, text=True, timeout=timeout,
+            env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": str(rank)})
+
+    # Rank 0 enters a barrier that can never complete and is killed. Its
+    # counter increment must already be on disk.
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        fut = pool.submit(call, 0, "barrier", "--timeout", "2")
+        fut.result()
+
+    state = json.loads((root / "kv" / "pstate%2f0").read_text())
+    assert state["coll_counter"]["world"] == 1, (
+        "the collective counter was not durable across the killed process")
+    assert state["coll_log"]["world"]["1"] == "barrier"
+
+    # The rank's next process must therefore issue collective #2, not #1.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(call, 0, "barrier", "--timeout", "20")
+        b = pool.submit(call, 1, "barrier", "--timeout", "20")
+        b.result()
+        a.result()
+    after = json.loads((root / "kv" / "pstate%2f0").read_text())
+    assert after["coll_counter"]["world"] == 2

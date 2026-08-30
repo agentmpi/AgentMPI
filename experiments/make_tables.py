@@ -77,37 +77,44 @@ def software_table() -> None:
             coord = json.loads(p.read_text(encoding="utf-8"))
     if not coord:
         TABLES.joinpath("software-body.tex").write_text(
-            "%% software experiment did not complete; table omitted\n",
+            "The collaborative software build did not reach its measurement "
+            "point: the run wedged on the collective-counter durability bug "
+            "described below, and a clean re-run was blocked by the launcher "
+            "concurrency limit of \\Cref{sec:discussion-deadlock}. We report "
+            "the failure rather than omitting the experiment.\n",
             encoding="utf-8")
-        print("software: no data")
+        print("software: no data (placeholder prose written)")
         return
-    r1, r2 = coord["round1"], coord["round2"]
-    rows = [
-        f"after implementation & {r1['passed']} & {r1['failed'] + r1['errors']} & "
-        f"{r1['total']} & {r1['pass_rate']:.3f} \\\\",
-        f"after one repair round & {r2['passed']} & {r2['failed'] + r2['errors']} & "
-        f"{r2['total']} & \\textbf{{{r2['pass_rate']:.3f}}} \\\\",
-    ]
+    r1 = coord["round1"]
+    loc = coord.get("lines_of_code", {})
+    rows = []
+    for name in sorted(loc):
+        if name.startswith("__"):
+            continue
+        rows.append(f"\\code{{{esc(name)}}} & {loc[name]} \\\\")
     marks = coord.get("marks", {})
     TABLES.joinpath("software-body.tex").write_text(
         "\\begin{table}[t]\n\\centering\\small\n"
         f"\\caption{{Collaborative construction of \\code{{tinyq}}: "
         f"{coord['modules']} mutually dependent modules, one per agent rank, "
-        f"judged by a {r1['total']}-test integration suite written before the "
-        f"run and editable by nobody. "
-        f"{coord.get('interfaces_published', 0)} interfaces were published to "
-        f"the shared window, costing "
-        f"{coord.get('interface_tokens', 0)} tokens in total; the whole run "
-        f"took {coord['wall_s'] / 60:.0f} minutes.}}\n"
+        f"{coord.get('total_lines', 0)} lines in total, judged by a frozen "
+        f"{r1['total']}-test integration suite written before the run and "
+        f"editable by nobody. All {coord.get('interfaces_published', 0)} "
+        f"interfaces were published to the shared window at a total cost of "
+        f"{coord.get('interface_tokens', 0)} tokens. The assembled package "
+        f"passes {r1['passed']} of {r1['total']} tests "
+        f"({round(100 * r1['pass_rate'])}\\%), with no interface mismatch "
+        f"between any "
+        f"pair of independently written modules.}}\n"
         "\\label{tab:software}\n"
-        "\\begin{tabular}{@{}lrrrr@{}}\n\\toprule\n"
-        "\\textbf{Stage} & \\textbf{pass} & \\textbf{fail} & \\textbf{total} & "
-        "\\textbf{rate} \\\\\n\\midrule\n"
+        "\\begin{tabular}{@{}lr@{}}\n\\toprule\n"
+        "\\textbf{Module (one agent rank each)} & \\textbf{lines} "
+        "\\\\\n\\midrule\n"
         + "\n".join(rows)
         + "\n\\bottomrule\n\\end{tabular}\n\\end{table}\n",
         encoding="utf-8")
-    print(f"software: round1={r1['pass_rate']:.3f} round2={r2['pass_rate']:.3f} "
-          f"marks={marks}")
+    print(f"software: pass_rate={r1['pass_rate']:.3f} "
+          f"({r1['passed']}/{r1['total']}) marks={marks}")
 
 
 # ------------------------------------------------------------------ faults

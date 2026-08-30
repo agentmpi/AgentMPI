@@ -80,6 +80,18 @@ def _next_coll_id(comm, name: str = "?") -> int:
     comm._coll_counter = nxt
     comm.runtime.record_collective(comm.context, nxt, name)
     comm._active_coll = (name, nxt)
+    # Persist the counter *before* the collective it labels, not after.
+    #
+    # This is the write-ahead logging argument, and skipping it cost us a
+    # live run. A rank whose process is killed part way through a collective
+    # -- an agent's shell timing out is the usual cause -- has already sent
+    # messages tagged with this counter. If the increment was only persisted
+    # at exit, the rank's next process reuses the same number, replays the
+    # collective its peers have already completed, and is thereafter one
+    # behind them forever. Nothing detects it, either: the replayed operation
+    # has the same *name* as the one the peers ran at that number, so it looks
+    # like an ordinary slow peer rather than a divergence.
+    comm.runtime.save_state()
     return nxt
 
 
