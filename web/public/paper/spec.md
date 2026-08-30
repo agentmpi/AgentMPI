@@ -79,8 +79,9 @@ destination mailbox.
 
 ## 4. Collectives
 
-All ranks in a communicator (or its live subset, for resilient variants)
-must invoke the same collective in the same order. Collectives are
+All ranks in a communicator's immutable generation must invoke the same strict
+collective in the same order. Quorum or repair operations use distinct names
+and return their actual participant set. Collectives are
 identified by a per-communicator call id `cid`, not by tags the user sees.
 
 | Call | MPI analog | Algorithm in this implementation | Agent reading |
@@ -90,7 +91,7 @@ identified by a per-communicator call id `cid`, not by tags the user sees.
 | `scatter` | `MPI_Scatter` | Binomial subtree slices | Partition work |
 | `gather` | `MPI_Gather` | Binomial subtree concat | Collect results |
 | `reduce` | `MPI_Reduce` | Binomial combine-on-path | Hierarchical synthesis |
-| `allreduce` | `MPI_Allreduce` | Recursive doubling (p=2^k); else reduce+bcast | Consensus / global counters |
+| `allreduce` | `MPI_Allreduce` | Recursive doubling (p=2^k); else reduce+bcast | Deterministic global aggregate or vote; not consensus |
 | `allgather` | `MPI_Allgather` | Bruck map-union | Everyone sees every partial |
 | `alltoall` | `MPI_Alltoall` | Pairwise exchange | Personalized exchange (reviews, diffs) |
 | `scan` | `MPI_Scan` | Gather + prefix + scatter | Rank-ordered accumulation |
