@@ -298,9 +298,16 @@ def test_drop_oldest_always_keeps_the_last_message_even_when_it_alone_overflows(
     assert kept == [messages[-1]]
     assert estimate.estimate_messages(kept) > 1
 
-    # Zero and a negative budget must still leave the final message standing.
+    # A zero budget must still leave the final message standing.
     assert compact.drop_oldest(messages, 0) == [messages[-1]]
-    assert compact.drop_oldest(messages, -5) == [messages[-1]]
+
+    # The contract does not say what a negative budget means, so either
+    # refusing it or treating it as "keep only the last message" is correct;
+    # what must not happen is losing the final message or returning nothing.
+    try:
+        assert compact.drop_oldest(messages, -5) == [messages[-1]]
+    except ValueError:
+        pass
 
 
 def test_drop_oldest_does_not_mutate_the_caller_s_list():

@@ -48,6 +48,8 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "src"))
 
+from ampi.core.runtime import Runtime  # noqa: E402
+from ampi.device import open_device  # noqa: E402
 from ampi.launch import create_job, write_rank_cards  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "e4_software"))
@@ -59,13 +61,14 @@ ARCHITECT_TASK = """
 You are the architect. Publish the contract, create the package skeleton, then
 help integrate. You never block waiting for anyone.
 
-**Step 1.** Set up and publish:
+**Step 1.** Join. The contract is already published in the window --- the
+harness seeded it so that nobody has to wait for you --- so read it and check it
+against `{contract_file}`:
 
 ```
 ampi init --role architect
 ampi win-create --name build
-ampi win-put --win build --key contract --json-file {contract_file}
-ampi win-put --win build --key modules --json '{module_list}'
+ampi win-get --win build --key contract --out {scratch}/contract.json
 ```
 
 **Step 2.** Create the package skeleton under `{pkg_dir}`:
@@ -99,6 +102,14 @@ ampi send --to <asker> --tag 11 --text "<your answer>"
 
 If you must amend the contract, take `ampi win-lock --win build --key contract`
 first, re-read the cell, apply your change, write it back, and unlock.
+
+**You do not implement modules.** The six modules belong to the implementers,
+who claim them by compare-and-swap. Writing one yourself, even an unclaimed
+one, is the duplicated-work failure this experiment exists to measure. The only
+exception: if `ampi win-get --win build --key done` has not increased for a
+full 25 minutes AND `ampi win-list --win build --prefix module/` shows a module
+with no claim, you may take it --- but you must `ampi win-claim` it first, like
+everyone else, and you must say so in your report.
 
 **Step 4.** When `done` reaches 6, run the full suite yourself:
 
@@ -296,6 +307,18 @@ def prepare(root: str, world_size: int = 8) -> dict:
         else:
             roles[rank] = "integrator"
             tasks[rank] = INTEGRATOR_TASK.format(**common)
+    # Seed the shared state the harness owns, so that no rank has to be
+    # present for another rank to make progress. This is the point of the
+    # idiom: the contract is durable state, not a message that must be caught.
+    device = open_device(os.path.join(job_dir, "job.db"))
+    seeder = Runtime(device, os.path.basename(job_dir.rstrip("/")), None)
+    with device.write_tx():
+        seeder.win_create("world", "build")
+        seeder.win_put("build", "contract", CONTRACT)
+        seeder.win_put("build", "modules", MODULES)
+        seeder.win_put("build", "done", 0)
+    device.close()
+
     cards = write_rank_cards(job_dir, world_size, tasks, roles)
     return {**info, "cards": cards, "artifact": pkg_dir, "roles": roles,
             "modules": MODULES}
