@@ -248,3 +248,48 @@ def test_review_excerpt_never_cuts_mid_line():
 
     # A file with no newline at all still truncates without crashing.
     assert _excerpt("x" * 500, 100).startswith("x")
+
+
+def test_campaign_deactivate_does_not_clobber_another_campaign(tmp_path):
+    """Clearing the pointer must be a compare-and-swap, not a blind write.
+
+    Two campaigns sharing a campaign directory ran concurrently during our own
+    experiments: the second activated its job, then the first finished and cleared the
+    pointer, stranding the second's worker pool with nothing to poll. A reduction sat
+    waiting on a rank that could no longer find its work.
+
+    That is a lost update on a shared cell with two writers and no synchronisation --
+    the bug AgentMPI's own `Window.compare_and_swap` exists to prevent, committed in
+    the harness that runs the experiments.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
+    from campaign import Campaign  # noqa: PLC0415 - path set above
+
+    shared = tmp_path / "camp"
+    first = Campaign(shared)
+    second = Campaign(shared)
+
+    first.activate(tmp_path / "job-a")
+    assert (shared / "active").read_text().endswith("job-a")
+
+    # The second campaign takes over the pointer.
+    second.activate(tmp_path / "job-b")
+    assert (shared / "active").read_text().endswith("job-b")
+
+    # The first campaign finishing must not strand the second.
+    first.deactivate()
+    assert (shared / "active").read_text().endswith("job-b"), "first campaign clobbered the second"
+
+    # The owner may still clear its own pointer.
+    second.deactivate()
+    assert (shared / "active").read_text().strip() == ""
+
+    # A campaign that never activated anything clears unconditionally, which keeps
+    # `--stop`-style cleanup working.
+    third = Campaign(shared)
+    (shared / "active").write_text("/somewhere", encoding="utf-8")
+    third.deactivate()
+    assert (shared / "active").read_text().strip() == ""

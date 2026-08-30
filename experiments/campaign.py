@@ -58,15 +58,41 @@ class Campaign:
         self.dir = directory
         self.dir.mkdir(parents=True, exist_ok=True)
         self.log_path = self.dir / "campaign.log"
+        #: Last value this campaign wrote to the pointer, so `deactivate` can tell
+        #: whether it is still ours to clear.
+        self._last_activated: str | None = None
 
     # ---- pointer management ----
 
     def activate(self, root: Path) -> None:
-        (self.dir / "active").write_text(str(Path(root).resolve()), encoding="utf-8")
+        resolved = str(Path(root).resolve())
+        (self.dir / "active").write_text(resolved, encoding="utf-8")
+        self._last_activated = resolved
         self.log(f"activate {root}")
 
     def deactivate(self) -> None:
-        (self.dir / "active").write_text("", encoding="utf-8")
+        """Clear the pointer only if it still names *our* job.
+
+        A compare-and-swap, not a blind write, and the reason is embarrassing enough
+        to record. Two campaigns sharing a campaign directory ran concurrently: the
+        second activated its job, and then the first finished and cleared the pointer,
+        stranding the second's worker pool with nothing to poll. The population sat
+        idle while a reduction waited on a rank that could no longer find its work.
+
+        That is a lost update on a shared cell with two writers and no synchronisation
+        -- precisely the bug that AgentMPI's own ``Window.compare_and_swap`` exists to
+        prevent, committed in the harness that runs the experiments. It is a fair
+        illustration of the paper's argument arriving as a self-inflicted wound: the
+        discipline is easy to state and easy to skip, and skipping it fails silently
+        rather than loudly.
+        """
+        active = self.dir / "active"
+        current = active.read_text(encoding="utf-8").strip() if active.exists() else ""
+        expected = getattr(self, "_last_activated", None)
+        if expected is not None and current != expected:
+            self.log(f"not clearing pointer: now held by {current or '(empty)'}, not ours ({expected})")
+            return
+        active.write_text("", encoding="utf-8")
 
     def stop(self) -> None:
         (self.dir / "stop").write_text("1", encoding="utf-8")
