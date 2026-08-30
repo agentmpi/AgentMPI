@@ -60,12 +60,12 @@ def collect(job_dir: str) -> dict:
                 claims[key.split("/", 1)[1]] = {
                     "owner": value.get("owner"), "version": cell["version"]}
 
-        refused = [e for e in dev.query(
-            "SELECT rank, meta FROM event WHERE job_id=? AND op='AMPI_Claim'", (job_id,))
-            if util.loads(e["meta"], {}).get("ok") is False]
-        granted = [e for e in dev.query(
-            "SELECT rank, meta FROM event WHERE job_id=? AND op='AMPI_Claim'", (job_id,))
-            if util.loads(e["meta"], {}).get("ok") is True]
+        # The claim outcome rides in the event's own ok column, not in meta.
+        attempts = dev.query(
+            "SELECT rank, ok FROM event WHERE job_id=? AND op='AMPI_Claim' AND phase='exit'",
+            (job_id,))
+        granted = [e for e in attempts if e["ok"]]
+        refused = [e for e in attempts if not e["ok"]]
 
         locks = dev.query("SELECT * FROM win_lock ORDER BY acquired_at", ())
         initpy_locks = [lk for lk in locks if lk["key"] == "initpy"]
