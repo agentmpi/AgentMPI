@@ -192,3 +192,147 @@ suite ran eight claimants against it concurrently.  We mention it because the
 lesson generalises: the coordination guarantees an agent protocol advertises
 are exactly the ones that will be quietly wrong unless something tests them
 under real concurrency.
+
+\subsection{Does the declared algebra buy anything, with real agents?}
+\label{sec:eval-semantic}
+
+Everything above is checkable in simulation.  The claim that is not is whether
+the *answer* survives re-association when the operator is a language model
+rather than integer addition.  We therefore ran the same reduction twice with
+eight Cursor subagents, one per rank, changing only the schedule.
+
+Each agent held one chapter's partial style guide for a book translation,
+seeded so that several rules genuinely conflict --- most sharply, four chapters
+disagree about how to render the German \emph{Rechner}, and one of them says
+the distinction is load-bearing.  The agents reduced their guides under
+\code{AMPI\_SYNTHESIZE}, a semantic operator declared neither associative nor
+commutative, once with \code{--algo linear} and once with
+\code{--algo binomial}.  The tree is forced: the decision function would refuse
+it for this operator, and the point of the comparison is to measure what the
+declaration is worth and what overriding it costs.  Both runs used identical
+inputs and identical instructions, and every number below is recomputed from
+the two job traces.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Semantic reduction over eight Cursor subagents, $p=8$, operator
+\code{AMPI\_SYNTHESIZE}. The schedule is the only difference between the two
+columns.}
+\label{tab:semantic}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & linear & binomial tree \\
+\midrule
+operator evaluations, total      & 7      & 7 \\
+\quad on the critical path       & 7      & \textbf{3} \\
+\quad distribution over ranks    & $\{0{:}7\}$ & $\{0{:}3, 2{:}1, 4{:}2, 6{:}1\}$ \\
+median evaluation turnaround (s) & 30.2   & 24.3 \\
+model time on the path (s)       & 324.7  & 194.8 \\
+wall clock to the result (s)     & 2450.6 & \textbf{550.9} \\
+protocol messages                & 10     & 7 \\
+tokens moved                     & 1014   & 1314 \\
+spurious failure suspicions      & 0      & 0 \\
+payload conformance              & 8/8    & 8/8 \\
+contribution retention           & 8/8    & 8/8 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Table~\ref{tab:semantic} and Figure~\ref{fig:semantic} report the outcome.
+Three things are worth separating.
+
+\textbf{The depth prediction holds exactly.}  Both schedules performed
+$p-1 = 7$ operator evaluations, and the tree put $\lg p = 3$ of them on the
+root's critical path while distributing the rest over ranks 2, 4 and 6 --- the
+internal nodes of the binomial tree, in exactly the multiplicities the schedule
+specifies.  End to end the tree took 550.9\,s against 2450.6\,s, a
+$4.4\times$ reduction, and the ratio of model time on the critical path
+(194.8\,s against 324.7\,s) accounts for part of it while the removal of six
+sequential agent hand-offs accounts for the rest.
+
+\textbf{Nothing measurable was lost.}  Both runs retained all eight
+contributions: every chapter's distinctive marker survives into the final
+guide, both results name all eight chapters, and both resolve the seeded
+\emph{Rechner} conflict explicitly rather than by silent overwrite.  On this
+task, re-associating a non-associative operator cost nothing in coverage.
+
+\textbf{But the two answers are different documents.}  At almost identical
+length --- 1470 and 1484 tokens --- the two merged guides have a character-level
+similarity of 0.07.  They agree on every substantive rule and share almost no
+sentences.  This is the agent form of the reproducibility trade MPI makes with
+floating point, and it is worth stating precisely: re-association changed the
+artifact without changing its content, so a harness that needs a byte-stable
+result must declare its operator non-associative and pay the $O(p)$ depth,
+while a harness that needs the answer fast may re-associate and must not
+promise its users a stable document.  The protocol's contribution is that this
+is a declaration the author makes once, in the operator, rather than a property
+that emerges from however the harness happened to be wired.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{figures/semantic.pdf}
+\caption{Semantic reduction over eight Cursor subagents. The two schedules
+perform the same number of model evaluations of the operator; only the tree
+takes them off the root's critical path, and it finishes $4.4\times$ sooner
+with the same coverage.}
+\label{fig:semantic}
+\end{figure}
+
+\subsection{What the agents got wrong, and what that implies}
+\label{sec:eval-conformance}
+
+The runs above are the second attempt.  The first exposed three defects that no
+simulation would have, and they are more informative than the timings.
+
+\emph{A fixed heartbeat timeout is unusable against model ranks.}  The first
+run recorded 1091 condemnations across eight ranks in twenty minutes,
+essentially all withdrawn moments later when the ``dead'' rank made its next
+call.  Worse, a rank that used \code{AMPI\_Heartbeat} to declare a five-minute
+quiet period and then blocked for forty was condemned at minute five and stayed
+condemned however often it called the library, because the declaration
+overrode its own heartbeats --- declaring a short idle period was strictly worse
+than declaring none.  Making a declaration extend rather than replace the
+lease, and doubling a rank's timeout on each withdrawn condemnation, took the
+suspicion count in the runs reported above to zero.
+
+\emph{A suspicion must not fail a peer's operation.}  In the first run one slow
+agent was condemned while the root was broadcasting to it; the send raised
+\code{AMPI\_ERR\_PROC\_FAILED}, the root revoked the communicator, and the job
+was lost.  Nothing had actually died.  AgentMPI now distinguishes a suspected
+from a confirmed failure and lets only the latter fail another rank's call,
+which is the honest encoding of the fact that the detector is eventually
+perfect rather than perfect.
+
+\emph{Detection of a collective mismatch is not recovery.}  A collective slot's
+operation is fixed by whichever rank arrives first.  In one run a single agent
+issued \code{reduce} where the other seven issued \code{allreduce}; the seven
+conforming ranks received \code{AMPI\_ERR\_COLLECTIVE\_MISMATCH} indefinitely,
+five of them then conformed to the mistake rather than to their instructions,
+and the only recoveries available were to abandon the job or to shrink the
+communicator --- which discards live ranks and their work for something that was
+not a failure at all.  This motivated \code{AMPI\_Comm\_resync}
+(\S\ref{sec:algebra}), which abandons the in-flight collectives and restarts
+the sequence.
+
+Two further observations bear on how agent experiments should be run at all.
+Agents that exported their rank into the shell environment overwrote one
+another, because the harness shared shell state between them; one rank spent an
+entire run acting as another.  The remedy --- requiring rank identity as an
+explicit argument on every call, and refusing to act when it is absent rather
+than defaulting to a sentinel --- is unglamorous and load-bearing, and a
+protocol whose participants are agents should assume ambient configuration is
+not to be trusted.  Separately, agents sometimes re-issued a collective that
+had already completed, which under MPI semantics correctly starts a second
+one; harnesses should expect this and either make the call idempotent at the
+application layer or check the returned sequence number.
+
+Payload conformance is the number we would most want a future standard to
+address.  In the first run one of eight agents contributed a payload that was
+not the input it had been assigned, and the protocol delivered it faithfully
+because it had no basis on which to object.  In the runs reported above
+conformance was 8/8 in both arms after the instructions were tightened, but a
+mechanism --- binding a rank's contribution to a declared input digest --- would
+convert a property that currently depends on prompt wording into one the
+runtime can check.  We name it as an open question in the specification rather
+than adding it speculatively.

@@ -229,25 +229,55 @@ def fig_semantic(path: str) -> None:
     if not configs:
         print("  (skipping semantic figure: no completed configurations)")
         return
-    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(6.6, 2.4))
-    labels = [c["algo"] for c in configs]
-    x = range(len(labels))
-    ax.bar([i - 0.2 for i in x], [c["upcalls_total"] for c in configs], width=0.4,
-           color=COLORS[0], label="operator evaluations, total")
-    ax.bar([i + 0.2 for i in x], [c["upcalls_critical_path"] for c in configs], width=0.4,
-           color=COLORS[1], label="on the critical path")
-    ax.set_xticks(list(x))
-    ax.set_xticklabels(labels)
-    ax.set_ylabel("model evaluations")
-    ax.set_title(f"(a) semantic reduction, $p={configs[0].get('p', '?')}$")
-    ax.legend(frameon=False)
+    order = {"linear": 0, "binomial": 1}
+    configs = sorted(configs, key=lambda c: order.get(c["algo"], 9))
+    pretty = {"linear": "linear", "binomial": "binomial\ntree"}
+    labels = [pretty.get(c["algo"], c["algo"]) for c in configs]
+    x = list(range(len(labels)))
 
-    ax2.bar([i for i in x], [c.get("wall_seconds") or 0 for c in configs], width=0.5,
-            color=COLORS[2])
-    ax2.set_xticks(list(x))
+    fig, (ax, ax2, ax3) = plt.subplots(1, 3, figsize=(7.0, 2.5))
+    fig.subplots_adjust(wspace=0.42)
+
+    ax.bar([i - 0.19 for i in x], [c["upcalls_total"] for c in configs], width=0.38,
+           color=COLORS[0], label="total")
+    ax.bar([i + 0.19 for i in x], [c["upcalls_critical_path"] for c in configs], width=0.38,
+           color=COLORS[1], label="on critical path")
+    for i, c in enumerate(configs):
+        ax.text(i + 0.19, c["upcalls_critical_path"] + 0.15,
+                str(c["upcalls_critical_path"]), ha="center", fontsize=7)
+    ax.set_xticks(x)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel("operator evaluations")
+    ax.set_ylim(0, max(c["upcalls_total"] for c in configs) * 1.28)
+    ax.set_title(f"(a) evaluations, $p={configs[0].get('p', '?')}$", pad=6)
+    ax.legend(frameon=False, fontsize=6.5, loc="upper center", ncol=2)
+
+    model = [(c["operator_turnaround_s"] or {}).get("total") or 0 for c in configs]
+    wall = [c.get("wall_seconds") or 0 for c in configs]
+    ax2.bar([i - 0.19 for i in x], wall, width=0.38, color=COLORS[2], label="wall clock")
+    ax2.bar([i + 0.19 for i in x], model, width=0.38, color=COLORS[4],
+            label="model time on path")
+    for i, v in enumerate(wall):
+        ax2.text(i - 0.19, v * 1.03, f"{v:.0f}", ha="center", fontsize=7)
+    ax2.set_xticks(x)
     ax2.set_xticklabels(labels)
-    ax2.set_ylabel("wall clock (s)")
-    ax2.set_title("(b) end-to-end time with real agents")
+    ax2.set_ylabel("seconds")
+    ax2.set_ylim(0, max(wall) * 1.22)
+    ax2.set_title("(b) time to the merged artifact", pad=6)
+    ax2.legend(frameon=False, fontsize=6.5, loc="upper right")
+
+    ax3.bar([i - 0.19 for i in x],
+            [c["conformance"]["conformance_rate"] for c in configs], width=0.38,
+            color=COLORS[3], label="payload conformance")
+    ax3.bar([i + 0.19 for i in x],
+            [c["retention"]["retention_fraction"] for c in configs], width=0.38,
+            color=COLORS[5], label="contribution retention")
+    ax3.set_xticks(x)
+    ax3.set_xticklabels(labels)
+    ax3.set_ylim(0, 1.32)
+    ax3.set_ylabel("fraction of ranks")
+    ax3.set_title("(c) fidelity", pad=6)
+    ax3.legend(frameon=False, fontsize=6.5, loc="upper center")
     _save(fig, "semantic.pdf")
 
 
