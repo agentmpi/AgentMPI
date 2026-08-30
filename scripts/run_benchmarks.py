@@ -20,7 +20,7 @@ from agentmpi_sql.runtime import estimate_tokens
 
 def summarize(samples_ns: list[int]) -> dict[str, float | int]:
     ordered = sorted(samples_ns)
-    p95 = ordered[min(len(ordered) - 1, int(0.95 * len(ordered)))]
+    p95 = ordered[int(0.95 * (len(ordered) - 1))]
     return {
         "n": len(samples_ns),
         "median_us": statistics.median(samples_ns) / 1_000,
@@ -90,6 +90,9 @@ def ping_pong(iterations: int, payload_bytes: int) -> dict[str, Any]:
             "payload_bytes": payload_bytes,
             "estimated_tokens": estimate_tokens(payload),
             "artifact_spills": artifact_spills,
+            "artifact_mode": (
+                "descriptor-round-trip" if artifact_spills else "inline-round-trip"
+            ),
             "summary": summarize(samples),
             "samples_ns": samples,
             "database_bytes": db.stat().st_size,
