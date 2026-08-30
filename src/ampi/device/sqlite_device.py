@@ -69,6 +69,11 @@ CREATE TABLE IF NOT EXISTS rank (
     -- stops a slow-but-healthy agent oscillating between alive and failed.
     suspicions     INTEGER NOT NULL DEFAULT 0,
     retractions    INTEGER NOT NULL DEFAULT 0,
+    -- 0 when a timeout merely suspects this rank, 1 when its death is known
+    -- (administratively killed, or finalized and then addressed).  Only a
+    -- confirmed death may fail a peer's operation; a suspicion must not,
+    -- because suspicions are routinely wrong.
+    failure_confirmed INTEGER NOT NULL DEFAULT 0,
     tokens_sent    INTEGER NOT NULL DEFAULT 0,
     tokens_recvd   INTEGER NOT NULL DEFAULT 0,
     exit_note      TEXT,
@@ -336,6 +341,8 @@ class SqliteDevice(Device):
         for column, ddl in (
             ("suspicions", "ALTER TABLE rank ADD COLUMN suspicions INTEGER NOT NULL DEFAULT 0"),
             ("retractions", "ALTER TABLE rank ADD COLUMN retractions INTEGER NOT NULL DEFAULT 0"),
+            ("failure_confirmed",
+             "ALTER TABLE rank ADD COLUMN failure_confirmed INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in have:
                 try:

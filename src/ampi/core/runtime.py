@@ -212,7 +212,7 @@ class Runtime:
         if row is not None and row["state"] == RANK_FAILED:
             self.device.execute(
                 "UPDATE rank SET state=?, last_heartbeat=?, finished_at=NULL, "
-                "suspicions=suspicions+1, retractions=retractions+1 "
+                "failure_confirmed=0, suspicions=suspicions+1, retractions=retractions+1 "
                 "WHERE job_id=? AND rank=?",
                 (RANK_ALIVE, util.now(), self.job_id, self.rank),
             )
@@ -223,8 +223,9 @@ class Runtime:
             )
             return
         self.device.execute(
-            "UPDATE rank SET last_heartbeat=? WHERE job_id=? AND rank=?",
-            (util.now(), self.job_id, self.rank),
+            "UPDATE rank SET last_heartbeat=?, hb_deadline=CASE WHEN hb_deadline < ? "
+            "THEN NULL ELSE hb_deadline END WHERE job_id=? AND rank=?",
+            (util.now(), util.now(), self.job_id, self.rank),
         )
 
     def rank_row(self, rank: int | None = None) -> dict[str, Any]:
@@ -269,11 +270,18 @@ class Runtime:
                 continue
             if row["last_heartbeat"] is None:
                 continue
+            widened = self.failure_timeout * (2 ** min(6, int(row["suspicions"] or 0)))
+            deadline = row["last_heartbeat"] + min(widened, self.max_failure_timeout)
+            # A declared idle period may only *extend* the lease.  Honouring it
+            # verbatim was a bug with a nasty shape: a rank that announced a
+            # five-minute quiet period and then blocked for forty minutes was
+            # condemned at minute five and stayed condemned however often it
+            # called the library, because the declaration overrode its own
+            # heartbeats.  Declaring a short idle period was strictly worse
+            # than declaring none, which is the opposite of what the call is
+            # for.
             if row["hb_deadline"]:
-                deadline = row["hb_deadline"]
-            else:
-                widened = self.failure_timeout * (2 ** min(6, int(row["suspicions"] or 0)))
-                deadline = row["last_heartbeat"] + min(widened, self.max_failure_timeout)
+                deadline = max(deadline, row["hb_deadline"])
             if now_ts > deadline:
                 out.append(int(row["rank"]))
         return out
@@ -284,17 +292,39 @@ class Runtime:
         )
         return {int(r["rank"]) for r in rows}
 
-    def declare_failed(self, rank: int, reason: str, detected_by: int | None = None) -> None:
-        """Move a rank to FAILED and record the detection event."""
+    def declare_failed(self, rank: int, reason: str, detected_by: int | None = None,
+                       confirmed: bool = False) -> None:
+        """Move a rank to FAILED and record the detection event.
+
+        ``confirmed`` separates the two things a fixed-timeout detector
+        conflates.  A timeout is a *suspicion*: the rank may simply be inside a
+        long model turn, and suspicions here are wrong far more often than they
+        are right.  An administrative kill, or a rank that finalized, is
+        *confirmed*.  Only a confirmed death is allowed to fail a peer's
+        operation; letting a suspicion do it is what turned one slow agent into
+        a revoked communicator and a lost job in our first run.
+        """
         with self.device.write_tx():
             row = self.device.query_one(
                 "SELECT * FROM rank WHERE job_id=? AND rank=?", (self.job_id, rank)
             )
-            if row is None or row["state"] == RANK_FAILED:
+            if row is None:
+                return
+            if row["state"] == RANK_FAILED:
+                # A suspicion may later be upgraded to a confirmation; the
+                # reverse never happens, because evidence of death does not
+                # decay. Only a retraction (the rank speaking) clears it.
+                if confirmed and not row["failure_confirmed"]:
+                    self.device.execute(
+                        "UPDATE rank SET failure_confirmed=1 WHERE job_id=? AND rank=?",
+                        (self.job_id, rank),
+                    )
+                    self.tracer.emit("AMPI_Failure_confirmed", "exit", peer=rank, reason=reason)
                 return
             self.device.execute(
-                "UPDATE rank SET state=?, finished_at=? WHERE job_id=? AND rank=?",
-                (RANK_FAILED, util.now(), self.job_id, rank),
+                "UPDATE rank SET state=?, finished_at=?, failure_confirmed=? "
+                "WHERE job_id=? AND rank=?",
+                (RANK_FAILED, util.now(), 1 if confirmed else 0, self.job_id, rank),
             )
             self.device.execute(
                 "INSERT INTO failure (job_id, rank, generation, detected_at, detected_by, reason) "
@@ -308,7 +338,8 @@ class Runtime:
                     reason,
                 ),
             )
-            self.tracer.emit("AMPI_Failure_detected", "exit", peer=rank, reason=reason)
+            self.tracer.emit("AMPI_Failure_detected", "exit", peer=rank, reason=reason,
+                             confirmed=confirmed)
 
     # =====================================================================
     # Object store  (the substrate for rendezvous payloads and window cells)
@@ -394,10 +425,15 @@ class Runtime:
                 self._touch()
                 dst_world = comm.world_of(dst)
                 receiver = self.ctx.get(dst_world)
-                if receiver["state"] == RANK_FAILED:
+                if receiver["state"] == RANK_FAILED and receiver["failure_confirmed"]:
                     raise AmpiProcFailed(
-                        f"destination rank {dst} (world {dst_world}) has failed", peer=dst
+                        f"destination rank {dst} (world {dst_world}) is confirmed dead; "
+                        "respawn it or shrink the communicator", peer=dst
                     )
+                # A merely suspected peer is still sent to.  The message is
+                # durable, so it survives until the peer returns or a
+                # replacement replays the inbox; refusing to send would discard
+                # work on the strength of a guess.
 
                 projected = project(text, projection, digest_budget)
                 obj = self.put_object(text) if projection != PROJ_DIGEST else None
@@ -676,7 +712,8 @@ class Runtime:
                               comm=comm.name)
         if src != AMPI_ANY_SOURCE:
             src_world = comm.world_of(src)
-            if self.rank_row(src_world)["state"] == RANK_FAILED:
+            src_row = self.rank_row(src_world)
+            if src_row["state"] == RANK_FAILED and src_row["failure_confirmed"]:
                 # A dead sender only matters if it died still owing us data.
                 # If the message is already in the store the transfer can
                 # complete, and failing here would discard work that survived

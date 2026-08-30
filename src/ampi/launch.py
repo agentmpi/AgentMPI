@@ -43,23 +43,26 @@ message-passing protocol: you coordinate with the other ranks *only* through the
 and do not try to contact another rank by any other means. Everything you need
 arrives through the protocol.
 
-## Your environment
+## How to invoke `ampi`
 
-Run this once at the start of your shell session, then every `ampi` command
-picks up its identity automatically:
-
-```
-export PATH={bindir}:$PATH
-export AMPI_JOB_DIR={job_dir}
-export AMPI_RANK={rank}
-export AMPI_COMM=world
-```
-
-If your shell does not persist between commands, prefix each call instead:
+**Always pass `--job` and `--rank` explicitly, on every single call.** Do not
+rely on environment variables: shell state may not survive between your tool
+invocations, and a call that silently picks up the wrong rank will corrupt the
+run in ways that are hard to see. Every command looks like this:
 
 ```
-PATH={bindir}:$PATH AMPI_JOB_DIR={job_dir} AMPI_RANK={rank} ampi status
+{bindir}/ampi --job {job_dir} --rank {rank} <subcommand> ...
 ```
+
+To keep that short, define a shell function at the start of every command you
+run (not once at the beginning --- every time):
+
+```
+A="{bindir}/ampi --job {job_dir} --rank {rank}"
+$A status
+```
+
+Whenever this card writes `ampi ...` below, run `$A ...` instead.
 
 Your scratch directory is `{scratch}`. Write intermediate files there.
 
@@ -111,7 +114,10 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
    context is a budget; `ampi ctx` shows it.
 3. **Heartbeat before long work.** Before any step that will take more than a
    couple of minutes without an `ampi` call, run `ampi hb --expect-idle
-   SECONDS`. Otherwise the failure detector may declare you dead.
+   SECONDS`, and over-estimate rather than under-estimate. A declared period
+   can only lengthen your lease, never shorten it, so guessing high is free.
+   A blocking call such as `recv` or a collective heartbeats for you while it
+   waits, so you do not need to declare anything before one of those.
 4. **Claim before you work.** When picking up a shared work item, use `ampi
    win-claim`. If it returns `"claimed": false` somebody else already has it;
    take a different item. Never assume an item is yours.

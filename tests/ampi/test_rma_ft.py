@@ -9,7 +9,7 @@ import pytest
 from ampi.constants import LOCK_EXCLUSIVE, LOCK_SHARED, RANK_FAILED
 from ampi.core import collectives as coll
 from ampi.core.collectives import SemanticUpcall
-from ampi.errors import AmpiRevoked, AmpiTimeout
+from ampi.errors import AmpiProcFailed, AmpiRevoked, AmpiTimeout
 
 
 # ---------------------------------------------------------------------------
@@ -359,3 +359,64 @@ def test_failure_detector_widens_after_a_false_condemnation(make_job):
     # that condemned it before no longer does.
     time.sleep(0.06)
     assert 1 not in rt.suspected()
+
+
+def test_declared_idle_period_only_extends_the_lease(make_job):
+    """Declaring a quiet period must never make a rank easier to condemn.
+
+    The first version honoured the declaration verbatim, so a rank that
+    announced five minutes and then blocked for forty was condemned at minute
+    five and stayed condemned however often it called the library. Declaring a
+    short idle period was strictly worse than declaring none.
+    """
+    job = make_job(2)
+    rt = job.runtime(0)
+    rt.init(0)
+    rt.failure_timeout = 30.0
+
+    victim = job.runtime(1)
+    victim.init(1)
+    victim.heartbeat(expect_idle=0.05)  # a deliberately too-short declaration
+
+    import time
+
+    time.sleep(0.15)
+    assert 1 not in rt.suspected(), (
+        "a lapsed declaration must fall back to the heartbeat lease, not override it"
+    )
+
+
+def test_a_suspicion_does_not_fail_a_peers_send(make_job):
+    """Only a confirmed death may fail another rank's operation.
+
+    A timeout is a guess, and guesses about LLM ranks are usually wrong. If a
+    guess could fail a send, one slow agent would be enough to revoke a
+    communicator and lose the job -- which is exactly what happened before this
+    distinction existed.
+    """
+    job = make_job(2)
+    sender = job.runtime(0)
+    sender.init(0)
+    other = job.runtime(1)
+    other.init(1)
+
+    sender.declare_failed(1, "timed out", confirmed=False)
+    result = sender.send("world", 1, 1, "this must still be accepted")
+    assert result["msg_id"]
+
+    sender.declare_failed(1, "administratively killed", confirmed=True)
+    with pytest.raises(AmpiProcFailed):
+        sender.send("world", 1, 1, "this must not be")
+
+
+def test_a_returning_rank_clears_its_confirmation(make_job):
+    job = make_job(2)
+    rt = job.runtime(0)
+    rt.init(0)
+    victim = job.runtime(1)
+    victim.init(1)
+    rt.declare_failed(1, "timed out", confirmed=True)
+    victim._touch()
+    row = rt.rank_row(1)
+    assert row["state"] == "alive"
+    assert row["failure_confirmed"] == 0
