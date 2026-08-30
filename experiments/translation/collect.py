@@ -9,9 +9,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agentmpi import Runtime
-
 from prepare import GLOSSARY, SESSION
+
+from agentmpi import Runtime
 
 
 def evaluate(final: dict[str, Any], trace: list[dict[str, Any]]) -> dict[str, Any]:
