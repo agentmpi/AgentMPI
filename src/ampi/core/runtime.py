@@ -1045,6 +1045,24 @@ class Runtime:
     # Failure mitigation  (the ULFM triad, plus respawn)
     # =====================================================================
 
+    def _assert_not_terminated(self) -> None:
+        """Refuse a state-changing call from a rank that has been killed.
+
+        ``_touch`` already enforces this for anything that sends, receives or
+        touches a window, but communicator surgery does not touch, and a
+        terminated rank was still able to revoke and shrink. A dead rank must
+        not be able to reshape the communicator the survivors are repairing.
+        """
+        if self.rank is None:
+            return
+        row = self.device.query_one(
+            "SELECT state, failure_confirmed FROM rank WHERE job_id=? AND rank=?",
+            (self.job_id, self.rank))
+        if row is not None and row["state"] == RANK_FAILED and row["failure_confirmed"]:
+            raise AmpiProcFailed(
+                f"rank {self.rank} has been terminated and may not alter the job; "
+                "a replacement must be started with AMPI_Respawn", rank=self.rank)
+
     def comm_revoke(self, comm_name: str) -> dict[str, Any]:
         """AMPI_Comm_revoke.
 
@@ -1055,6 +1073,7 @@ class Runtime:
         which is the only way to get all survivors to the same place at the
         same time so that recovery can be collective.
         """
+        self._assert_not_terminated()
         comm = self.comms.revoke(comm_name, self.actor())
         with self.device.write_tx():
             self.tracer.emit("AMPI_Comm_revoke", "exit", comm_id=comm.comm_id)
@@ -1123,6 +1142,7 @@ class Runtime:
         want to survive failures must not hard-code rank identities into
         durable state --- the same discipline ULFM demands.
         """
+        self._assert_not_terminated()
         comm = self.comms.get(comm_name)
         failed = self.failed_ranks()
         survivors = [w for w in comm.members if w not in failed]
