@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -22,8 +23,6 @@ def run_spmd(
     failure_timeout_s: float = 8.0,
     context_budget: int = 200_000,
 ) -> tuple[list[Any], dict[str, Any]]:
-    import shutil
-
     home = Path(home)
     if home.exists():
         shutil.rmtree(home)

@@ -62,8 +62,10 @@ from ..errors import (
     AmpiRevoked,
     AmpiTimeout,
 )
+from .collectives import allreduce_structural, barrier
 from .comm import CommRegistry, Communicator
 from .context import ContextAccount, choose_mode, project
+from .ops import get_op
 from .trace import Tracer
 
 
@@ -874,8 +876,6 @@ class Runtime:
 
     def win_accumulate(self, win_name: str, key: str, value: Any, op_name: str) -> dict[str, Any]:
         """AMPI_Accumulate: atomic read-modify-write with a reduction operator."""
-        from .ops import get_op
-
         op = get_op(op_name)
         if op.is_semantic:
             raise AmpiArgError(
@@ -984,8 +984,6 @@ class Runtime:
         exactly what makes it useful for reasoning: a harness author can say
         "phase 2 reads only what phase 1 published" and have it be true.
         """
-        from .collectives import barrier
-
         result = barrier(self, comm_name, timeout=timeout)
         with self.device.write_tx():
             epoch = self.device.counter_next(self.job_id, f"epoch:{win_name}")
@@ -1050,8 +1048,6 @@ class Runtime:
         it is the right one --- agreement here is used to answer "shall we all
         continue?", which must be cheap enough to ask after every phase.
         """
-        from .collectives import allreduce_structural
-
         result = allreduce_structural(
             self, comm_name, bool(value), "AMPI_LAND", timeout=timeout, tolerate_failures=True
         )

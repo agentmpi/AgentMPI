@@ -10,6 +10,7 @@ the OTF2 trace.
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import statistics
@@ -265,8 +266,6 @@ def timeline(job_dir: str) -> list[dict[str, Any]]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    import argparse
-
     parser = argparse.ArgumentParser(prog="ampi-analyse",
                                      description="Summarise an AgentMPI job from its trace")
     parser.add_argument("job_dir")

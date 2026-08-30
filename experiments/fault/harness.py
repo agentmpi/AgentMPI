@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -43,8 +44,6 @@ def death_and_shrink(n: int, victims: list[int], home: Path) -> dict:
         # Continue the job on the repaired communicator: allreduce a 1.
         total = new.allreduce(1, op=Op.SUM, timeout_s=15)
         return {"rank": comm.rank, "fate": "survived", "new_rank": new.rank, "new_size": new.size, "allreduce": total}
-
-    from concurrent.futures import ThreadPoolExecutor
 
     def worker(rank: int):
         comm = Communicator(home, rank=rank, size=n, failure_timeout_s=1.5, poll_s=0.02, context_budget=200_000)
@@ -129,8 +128,6 @@ def recv_unblocks_on_death(home: Path) -> dict:
             return {"status": "unexpected-success", "dt": time.time() - t0}
         except DeadRankError as exc:
             return {"status": "unblocked", "dead": exc.ranks, "dt": time.time() - t0}
-
-    from concurrent.futures import ThreadPoolExecutor
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         f1 = pool.submit(victim)
