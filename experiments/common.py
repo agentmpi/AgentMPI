@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import random
 import re
 import subprocess
 import sys
@@ -392,7 +393,9 @@ def score_translation(
 FACT_ID = re.compile(r"\bF-(\d+)-(\d+)\b")
 
 
-def make_fact_report(rank: int, n_facts: int, *, topic: str = "system") -> dict[str, Any]:
+def make_fact_report(
+    rank: int, n_facts: int, *, topic: str = "system", incompressible: bool = False
+) -> dict[str, Any]:
     """Build a report containing ``n_facts`` uniquely identified factual items.
 
     The identifiers are the trick that makes reduction fidelity *objectively*
@@ -400,18 +403,80 @@ def make_fact_report(rank: int, n_facts: int, *, topic: str = "system") -> dict[
     and no judgement is required to tell.  Each item is phrased as a real
     sentence so that a summarising operator behaves as it would on real content
     rather than treating the input as a list to be copied.
+
+    ``incompressible`` exists because the compressible version cannot be saturated,
+    and finding that out was the most surprising result of the reduction experiments.
+    We assumed an operator asked to fit more content than its budget allows must
+    either overflow or discard items.  It does neither: it *re-encodes*.  Given 96
+    identified sentences and a 450-token budget, the population invented a packed
+    notation --- ``[F-0-0]100n`` with a legend in the title --- and preserved every
+    single identifier.  Retention stayed at 1.0 no matter how tight the budget,
+    because identifiers are precisely what a compressing operator protects.
+
+    So a budget cannot force loss while the payload is compressible.  With
+    ``incompressible=True`` each item carries a random six-digit value and a random
+    token that carry no redundancy and cannot be paraphrased shorter, and the item's
+    value is measured as well as its identifier.  Fitting *n* items into *B* tokens is
+    then arithmetically impossible beyond ``n ~ B/k``, and an operator has no option
+    but to drop.  This is the design that can actually test whether fold depth costs
+    fidelity; the compressible one measures only item survival.
     """
     facts = []
+    rng = random.Random(1000 * rank + n_facts)
     for i in range(n_facts):
         fid = f"F-{rank}-{i}"
-        facts.append(
-            f"[{fid}] Component {topic}-{rank}.{i} reported a measured throughput of "
-            f"{100 + 7 * rank + i} units per second under the {['nominal', 'degraded', 'saturated'][i % 3]} workload."
-        )
+        if incompressible:
+            # A high-entropy value and tag: no shorter equivalent exists, so the only
+            # way to fit fewer tokens is to carry fewer items.
+            value = rng.randrange(100000, 999999)
+            tag = "".join(rng.choice("BCDFGHJKLMNPQRSTVWXZ") for _ in range(4))
+            facts.append(f"[{fid}] serial {value} checksum {tag}")
+        else:
+            facts.append(
+                f"[{fid}] Component {topic}-{rank}.{i} reported a measured throughput of "
+                f"{100 + 7 * rank + i} units per second under the "
+                f"{['nominal', 'degraded', 'saturated'][i % 3]} workload."
+            )
     return {
         "source_rank": rank,
         "title": f"Report from component group {rank}",
         "findings": facts,
+    }
+
+
+VALUE_RE = re.compile(r"\[F-(\d+)-(\d+)\]\s*serial\s*(\d{6})\s*checksum\s*([A-Z]{4})")
+
+
+def value_retention(result: Any, n_ranks: int, n_facts: int) -> dict[str, Any]:
+    """Retention of *incompressible* items, keyed on identifier AND payload.
+
+    Distinguishes three outcomes an identifier-only metric conflates: an item carried
+    through intact, an item whose identifier survived while its payload was mangled
+    (the reduction kept the label and lost the content), and an item dropped entirely.
+    The middle case is the interesting one, and it is invisible to
+    :func:`fact_retention`.
+    """
+    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, default=str)
+    found: dict[str, tuple[str, str]] = {
+        f"F-{a}-{b}": (v, t) for a, b, v, t in VALUE_RE.findall(text)
+    }
+    ids_present = fact_ids(result)
+    expected: dict[str, tuple[str, str]] = {}
+    for r in range(n_ranks):
+        report = make_fact_report(r, n_facts, incompressible=True)
+        for line in report["findings"]:
+            m = VALUE_RE.search(line)
+            if m:
+                expected[f"F-{m.group(1)}-{m.group(2)}"] = (m.group(3), m.group(4))
+    intact = sum(1 for k, v in expected.items() if found.get(k) == v)
+    label_only = sum(1 for k in expected if k in ids_present and found.get(k) != expected[k])
+    return {
+        "n_expected": len(expected),
+        "n_intact": intact,
+        "n_label_only": label_only,
+        "n_dropped": len(expected) - intact - label_only,
+        "value_retention": round(intact / len(expected), 4) if expected else 0.0,
+        "id_retention": round(len(ids_present & set(expected)) / len(expected), 4) if expected else 0.0,
     }
 
 

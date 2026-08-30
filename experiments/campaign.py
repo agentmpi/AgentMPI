@@ -235,6 +235,13 @@ def microbench_steps(*, ranks: int, prefix: str) -> list[Step]:
         # retains everything and the depth effect is unobservable.
         ("fidelity", ["--bench", "fidelity", "--facts", "12", "--merge-budget", "450",
                       "--algorithms", "chain,flat,binomial,kary", "--fanin", "4"], ranks),
+        # The configuration that can actually force loss. A token budget cannot
+        # saturate a compressible payload -- the operator re-encodes rather than
+        # discards -- so each item carries a high-entropy value with no shorter
+        # equivalent, making 96 items in 450 tokens arithmetically impossible.
+        ("fidelity-inc", ["--bench", "fidelity", "--facts", "12", "--merge-budget", "450",
+                          "--algorithms", "chain,flat,binomial,kary", "--fanin", "4",
+                          "--incompressible"], ranks),
         ("faults", ["--bench", "faults"], ranks),
     ):
         root = REPO / "runs" / f"{prefix}-{name}"

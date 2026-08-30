@@ -57,6 +57,7 @@ from common import (  # noqa: E402
     make_executor_factory,
     make_fact_report,
     provenance,
+    value_retention,
     write_result,
 )
 
@@ -386,7 +387,7 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
             )
 
         def rank_main(comm: ampi.Communicator, op: ampi.Op = op, alg: str = alg) -> Any:
-            report = make_fact_report(comm.rank, n_facts)
+            report = make_fact_report(comm.rank, n_facts, incompressible=cfg.incompressible)
             t0 = time.perf_counter()
             # For the k-ary tree the fan-in is derived from the context budget if the
             # caller did not fix it, which is the policy the spec recommends.
@@ -404,7 +405,10 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
                 "tokens_out": comm.rt.cost.tokens_out,
             }
 
-        root = Path(cfg.root) / f"fidelity-{alg}-{'w' if cfg.weighted else 'f'}-k{cfg.fanin or 0}"
+        root = Path(cfg.root) / (
+            f"fidelity-{alg}-{'w' if cfg.weighted else 'f'}-k{cfg.fanin or 0}"
+            f"{'-inc' if cfg.incompressible else ''}"
+        )
         factory = (
             make_executor_factory("broker", fabric_root=_ensure(root, cfg.ranks), timeout=cfg.timeout)
             if cfg.executor == "broker"
@@ -423,6 +427,10 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
         )
         head = job.value(0) or {}
         retention = fact_retention(head.get("result"), cfg.ranks, n_facts)
+        if cfg.incompressible:
+            # Identifier retention alone cannot distinguish "carried through" from
+            # "label kept, payload lost", and the second is the failure that matters.
+            retention |= value_retention(head.get("result"), cfg.ranks, n_facts)
         rows.append(
             {
                 "algorithm": alg,
@@ -430,6 +438,7 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
                 "p": cfg.ranks,
                 "facts_per_rank": n_facts,
                 "_budget": cfg.merge_budget,
+                "incompressible": cfg.incompressible,
                 "ok": job.ok,
                 "fold_depth": head.get("fold_depth"),
                 "rounds": head.get("rounds"),
@@ -757,6 +766,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--merge-budget", type=int, default=900)
     ap.add_argument("--algorithms", default="binomial,chain,flat")
     ap.add_argument("--fanin", type=int, default=None, help="k for the kary reduce; default from the context budget")
+    ap.add_argument(
+        "--incompressible",
+        action="store_true",
+        help="give each item a high-entropy payload so a token budget genuinely forces loss",
+    )
     ap.add_argument("--weighted", action="store_true", help="give the merge operator a subtree-proportional budget")
     ap.add_argument("--drop-rate", type=float, default=0.15, help="surrogate merge loss per application")
     ap.add_argument("--victims", default="3")

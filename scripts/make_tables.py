@@ -570,6 +570,34 @@ def table_software() -> None:
         _MACROS["NSwLinesNoshared"] = fmt(dn.get("n_lines"))
         _MACROS["NSwLinesRatio"] = f"{100 * ((dn.get('n_lines') or 0) / max(dp.get('n_lines') or 1, 1) - 1):.0f}"
 
+    # The vague-specification pair: the comparison that actually isolates interface
+    # publication, since with a precise specification the window is redundant.
+    vshared = next((d for d in res if d["config"].get("vague_spec") and d["config"].get("shared_interfaces")), None)
+    vnos = next((d for d in res if d["config"].get("vague_spec") and not d["config"].get("shared_interfaces")), None)
+    if vshared and vnos:
+        av, an = acc(vshared), acc(vnos)
+        dv, dn = (av.get("defensiveness") or {}), (an.get("defensiveness") or {})
+        _MACROS["NVagueSharedWall"] = f"{vshared['job']['wall_s']:.0f}"
+        _MACROS["NVagueNosWall"] = f"{vnos['job']['wall_s']:.0f}"
+        _MACROS["NVagueWallRatio"] = f"{vnos['job']['wall_s'] / max(vshared['job']['wall_s'], 1e-9):.1f}"
+        _MACROS["NVagueSharedCalls"] = str(vshared["job"]["agent_calls"])
+        _MACROS["NVagueNosCalls"] = str(vnos["job"]["agent_calls"])
+        _MACROS["NVagueSharedUsd"] = f"{vshared['job']['usd']:.3f}"
+        _MACROS["NVagueNosUsd"] = f"{vnos['job']['usd']:.3f}"
+        _MACROS["NVaguePriceRatio"] = f"{vnos['job']['usd'] / max(vshared['job']['usd'], 1e-9):.1f}"
+        _MACROS["NVagueSharedDef"] = fmt(dv.get("per_kloc"), 2)
+        _MACROS["NVagueNosDef"] = fmt(dn.get("per_kloc"), 2)
+        _MACROS["NVagueDefRatio"] = f"{(dn.get('per_kloc') or 0) / max(dv.get('per_kloc') or 1e-9, 1e-9):.1f}"
+        _MACROS["NVagueSharedLines"] = fmt(dv.get("n_lines"))
+        _MACROS["NVagueNosLines"] = fmt(dn.get("n_lines"))
+        _MACROS["NVagueLinesRatio"] = f"{(dn.get('n_lines') or 0) / max(dv.get('n_lines') or 1, 1):.2f}"
+        rs = (av.get("per_round") or [{}])[0]
+        rn = (an.get("per_round") or [{}])[0]
+        _MACROS["NVagueSharedRound1"] = f"{rs.get('n_passed')}/{rs.get('n_total')}"
+        _MACROS["NVagueNosRound1"] = f"{rn.get('n_passed')}/{rn.get('n_total')}"
+        _MACROS["NVagueSharedRounds"] = str(len(av.get("per_round") or []))
+        _MACROS["NVagueNosRounds"] = str(len(an.get("per_round") or []))
+
     lines = []
     for d in res:
         c, k = d["config"], d.get("contention") or {}
@@ -735,7 +763,12 @@ def summary_macros() -> None:
                  "NSwParPassed", "NSwSoloPassed", "NSwSoloCalls", "NSwParCalls",
                  "NSwSoloDef", "NSwDefShared", "NSwDefNoshared", "NSwDefRatio",
                  "NSwLinesShared", "NSwLinesNoshared", "NSwLinesRatio",
-                 "NGrowthTotalPrecise", "NGrowthTotalVague"):
+                 "NGrowthTotalPrecise", "NGrowthTotalVague",
+                 "NVagueSharedWall", "NVagueNosWall", "NVagueWallRatio", "NVagueSharedCalls",
+                 "NVagueNosCalls", "NVagueSharedUsd", "NVagueNosUsd", "NVaguePriceRatio",
+                 "NVagueSharedDef", "NVagueNosDef", "NVagueDefRatio", "NVagueSharedLines",
+                 "NVagueNosLines", "NVagueLinesRatio", "NVagueSharedRound1", "NVagueNosRound1",
+                 "NVagueSharedRounds", "NVagueNosRounds"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
