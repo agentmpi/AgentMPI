@@ -120,7 +120,12 @@ TASKS: dict[int, dict[str, Any]] = {
 }
 
 
-def prepare(db: Path, workspace: Path, manifest_path: Path) -> dict[str, Any]:
+def prepare(
+    db: Path,
+    workspace: Path,
+    manifest_path: Path,
+    interface_path: Path,
+) -> dict[str, Any]:
     if db.exists():
         db.unlink()
     for suffix in ("-shm", "-wal"):
@@ -196,6 +201,11 @@ minidag = "minidag.cli:main"
         json.dumps(manifest, indent=2) + "\n",
         encoding="utf-8",
     )
+    interface_path.parent.mkdir(parents=True, exist_ok=True)
+    interface_path.write_text(
+        json.dumps(INTERFACE, indent=2) + "\n",
+        encoding="utf-8",
+    )
     return manifest
 
 
@@ -212,8 +222,13 @@ def main() -> None:
         type=Path,
         default=Path("experiments/results/software_manifest.json"),
     )
+    parser.add_argument(
+        "--interface",
+        type=Path,
+        default=Path("experiments/results/software_interface.json"),
+    )
     args = parser.parse_args()
-    manifest = prepare(args.db, args.workspace, args.manifest)
+    manifest = prepare(args.db, args.workspace, args.manifest, args.interface)
     print(json.dumps({"session": manifest["session"], "tasks": 12}, indent=2))
 
 
