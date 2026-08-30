@@ -1,0 +1,137 @@
+\section{Related work}
+\label{sec:related}
+
+\subsection{Multi-agent LLM frameworks}
+
+The frameworks differ mainly in their concurrency model.
+AutoGen's v0.4 rewrite moved to an actor model with typed messages and a
+runtime that can be embedded or distributed, which is the closest of the
+major frameworks to a systems substrate~\cite{microsoft2025autogen04,autogencoredocs2025}.
+LangGraph compiles a graph over a shared, checkpointed state object;
+communication is by state mutation, and its \code{Send} API allows dynamic
+fan-out~\cite{langchaindocs2026persistence}. CrewAI and MetaGPT organise agents by role
+and pass work along a fixed
+pipeline~\cite{crewaidocs2026,hong2024metagpt}. The OpenAI Agents SDK
+formalises the handoff: control, and the conversation, transfer
+wholesale~\cite{openaiagentsdocs2026handoffs}. AgentScope is unusual in explicitly
+adopting distributed-systems machinery (actors, an
+RPC layer)~\cite{agentscope2docs2026}.
+
+What none of them provides is a group abstraction with collective
+operations, a consistency model for shared state, or defined semantics under
+partial failure. Where a framework has a shared state object it is a
+blackboard without epochs; where it has fan-out it is a scatter without a
+matching gather contract; where it has retries it has no notion of what a
+peer already observed. Our claim is not that these frameworks are wrong, but
+that they are \emph{applications} of a layer that does not exist, and
+therefore each rebuilds part of it incompatibly. That is the pre-MPI
+situation exactly.
+
+\subsection{Agent interoperability protocols}
+
+MCP standardises the client--server relationship between a model and its
+tools, resources and prompts, with a defined transport and lifecycle;
+A2A standardises agent-to-agent delegation with agent cards, tasks and
+artifacts; ACP and ANP occupy neighbouring
+positions~\cite{mcpblog2026,a2adocs2026v1,ibm2026acp,ehtesham2025survey,ehtesham2025survey}.
+All are valuable and all are orthogonal to this work: they specify how
+\emph{two} parties exchange a request and a response, and \ampi{} specifies
+how \emph{$p$} parties behave as a group. Nothing in MCP or A2A defines a
+barrier, a reduction, group membership, an epoch, or what happens to the
+other $p-1$ participants when one dies. \Cref{tab:protocols} makes the
+comparison explicit.
+
+\begin{table}[t]
+\centering\small
+\caption{Agent protocols by layer. \ampi{} is complementary to, not a
+replacement for, MCP and A2A: a rank may well use MCP to reach its tools.}
+\label{tab:protocols}
+\begin{tabular}{@{}llll@{}}
+\toprule
+ & \textbf{MCP} & \textbf{A2A} & \textbf{\ampi{}}\\
+\midrule
+Relationship & client--server & peer--peer & group\\
+Unit         & tool call & task & message, collective\\
+Naming       & server URI & agent card & rank in a communicator\\
+Collectives  & no & no & yes\\
+Group membership & no & no & yes\\
+Barrier / epochs & no & no & yes\\
+Shared state model & resources & artifacts & window, defined epochs\\
+Failure semantics & transport error & task state & failure lattice, ULFM\\
+Context budget & no & no & first class\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{Classical parallel and distributed models}
+
+The actor model~\cite{agha1986actors} and its descendants---Erlang/OTP,
+Akka, Orleans~\cite{Armstrong2003,Akka2025,bernstein2014orleans}---supply
+asynchronous message passing, location transparency, and supervision. We
+take Erlang's supervision strategies directly, and its ``let it crash''
+argument is the right default for agents for the reason Armstrong gave:
+defensive code for every failure mode is larger, buggier and less complete
+than a clean restart. What actors do not supply is collective operations or
+a group-scoped consistency model, which is precisely the gap MPI filled
+relative to the message-passing libraries of its own day.
+
+PGAS languages (UPC, Coarray Fortran, OpenSHMEM, Chapel,
+X10)~\cite{alvanos2013pgas} and task-based runtimes (Charm++, Legion,
+HPX)~\cite{Charm2025} offer a global address space or overdecomposition with
+dynamic load balancing. Charm++'s measurement-based load balancing is
+directly applicable to agents, whose per-task costs vary by an order of
+magnitude and are not predictable in advance; we do not implement it and
+regard it as clear future work.
+
+Tuple spaces and the blackboard architecture are the intellectual ancestors
+of every agent scratchpad. Linda's tuple space is an associative shared
+memory with atomic \code{in}/\code{out}; Hearsay-II's blackboard is a shared
+structure that independent knowledge sources
+read and write~\cite{erman1980hearsay}. Our \op{Win\_query} is closer to the
+Linda \code{rd} operation than to \mpiop{Get}, and the resemblance is not
+accidental: an associative read is what a reader smaller than the memory
+needs.
+
+KQML and FIPA-ACL are the historical precedent that should give the current
+protocol efforts pause. Both standardised agent communication in terms of
+speech acts and interaction protocols, both were technically careful, and
+neither achieved broad adoption~\cite{ehtesham2025survey}. Our reading is
+that they standardised the \emph{semantics of intent}, which is the hardest
+thing to agree on and the least useful thing to fix, while leaving the
+mechanics to implementations. MPI did the opposite and succeeded. \ampi{}
+follows MPI: it says nothing about what a message means.
+
+\subsection{Empirical studies of multi-agent failure}
+
+Cemri et al.\ analyse 200+ traces across seven multi-agent frameworks and
+derive the MAST taxonomy, in which the majority of failures are
+specification and inter-agent misalignment rather than reasoning
+errors~\cite{cemri2025mast}. Their categories map onto protocol features
+with uncomfortable directness: ``disobey task specification'' is a contract
+violation; ``step repetition'' and ``loss of conversation history'' are
+context management; ``no or incomplete verification'' is a missing
+validation contract; ``premature termination'' is a missing barrier. We
+regard that mapping as the strongest available evidence for this paper's
+thesis, and also as a caution: a protocol can make these failures
+\emph{detectable}, and cannot make them impossible.
+
+The practitioner literature is split, usefully. Cognition argues against
+multi-agent architectures on the grounds that context does not propagate
+reliably and implicit decisions conflict~\cite{yan2025dontbuild};
+Anthropic reports a production multi-agent research system whose engineering
+difficulties were coordination, state and
+recovery~\cite{anthropic2025multiagent}. Both diagnoses are the same. They
+differ on whether the problems are inherent. We think they are the ordinary
+problems of distributed systems, and that the field's tools for them are
+forty years old.
+
+\subsection{Serving and scheduling}
+
+The inference-serving layer is \ampi{}'s network fabric, and its properties
+matter. Continuous batching, paged attention and prefix
+caching~\cite{yu2022orca,kwon2023vllm,zheng2024sglang} determine whether two
+ranks that share a prompt prefix share work, which is the agent analogue of
+two MPI ranks sharing a cache line. Our \op{Comm\_split\_type} by model or
+provider exposes exactly this locality to the harness, and exploiting it
+properly---scheduling a reduction tree so that siblings share a
+prefix---is future work we find promising.

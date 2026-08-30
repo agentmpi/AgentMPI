@@ -1,0 +1,133 @@
+\section{Discussion}
+\label{sec:discussion}
+
+\subsection{A coordination failure we caused ourselves}
+\label{sec:discussion-deadlock}
+
+The most instructive event in this work was not planned. Our launcher---the
+subagent API we used to start ranks---turned out to have a concurrency limit
+of ten. We asked for twelve translator ranks; nine started, three were
+refused, and the nine that started blocked in the exclusive scan waiting for
+peers that did not exist. Because every one of the nine held a launcher
+slot while blocked, no slot ever freed, and the three missing ranks could
+never start. The job was deadlocked by a resource limit two layers below
+the protocol, and no rank could observe the cause: each was correctly
+waiting for a message that a peer would have sent had it been allowed to
+run.
+
+This is a textbook resource deadlock, and it is worth reporting for three
+reasons. First, it is exactly the class of failure a harness author does not
+anticipate, because the launcher's capacity is not part of the program.
+Second, it is invisible without a global view: \code{ampi peers} showed
+three ranks that had never checked in, which is the whole diagnosis, and
+nothing in any rank's local state would have revealed it. Third, the
+protocol already contains the correct response---\op{Comm\_shrink} over the
+ranks that did arrive, or a launch-time check that the launcher can supply
+$p$ executors before the job starts---and we had implemented neither as a
+default. We now emit the second as a warning at \op{Init} when the rank
+table is incomplete after the failure timeout.
+
+The general lesson is that a collective's all-participants requirement makes
+the launcher's capacity a correctness property, not a performance one. MPI
+gets this for free because \code{mpiexec} either allocates $p$ slots or
+fails. An agent launcher that partially fulfils a request produces a job
+that starts, looks healthy, and never finishes.
+
+\subsection{Agents disobey the protocol, and the protocol must survive it}
+\label{sec:discussion-disobedience}
+
+We observed two protocol violations by agent ranks in a single run, and
+neither was a model quality problem in the usual sense.
+
+Rank 1 decided that receiving its work assignment through \code{ampi
+scatter} was unnecessary. It read the corpus from disk instead and inferred
+which chunk was its own. It inferred wrongly---the scatter had assigned it
+chapter~1, and it took chapter~2---and it translated the wrong chapter
+competently and at length. Worse, skipping the collective left its
+collective counter one behind every peer's, so from then on it would have
+labelled every message with a tag nobody was listening for. This is the
+failure that motivated collective-order verification
+(\Cref{sec:design}); with that mechanism the run would have reported
+\emph{``collective \#2 was issued as `scatterv' here and as `exscan' by
+ranks [2,4]; this rank skipped a collective''} within seconds instead of
+hanging.
+
+Rank 3 reordered its program, translating before running the scan it was
+supposed to run first, and then stopped without completing its remaining
+collectives. Its translation was good. Its participation was not.
+
+Both are instances of what the MAST taxonomy calls disobeying the task
+specification~\cite{cemri2025mast}, and both were locally reasonable: an
+agent that can see the corpus has no obvious reason to wait for a message
+containing part of it. The design conclusion we draw is that a protocol for
+agents cannot rely on participants following it, and must therefore make
+deviation \emph{detectable} rather than merely forbidden. Contract checking
+does this for message content; collective-order verification does it for
+control flow; the failure lattice does it for liveness. We do not claim the
+set is complete.
+
+There is a second, more uncomfortable conclusion. An agent that can reach
+the shared state by a path the protocol does not mediate will sometimes take
+it, and the protocol's guarantees evaporate silently when it does. MPI does
+not have this problem because a rank physically cannot read another
+address space. The nearest available remedy is to remove the side channel:
+run ranks in sandboxes whose only view of the job is the run directory. We
+did not do this, and we think a serious deployment should.
+
+\subsection{Operator algebra deserves more attention than it gets}
+
+The result we would most like other designers to take away is the one about
+commutativity (\Cref{sec:ops}). Every framework that merges contributions
+from several agents is applying a reduction operator, and almost none of
+them ask whether the operator is associative or commutative. The
+consequences are not subtle: our own first implementation of a
+shared-terminology scan used a union, which is commutative, and it left the
+participants disagreeing about a decision the scan existed to make. The
+error was invisible in small runs and appeared as an 18-point quality drop
+at twelve ranks.
+
+Commutativity is the wrong default for consensus, and precedence is
+inexpressible without a rank order. We suspect this generalises well beyond
+terminology to any convention an agent team must settle---schema shapes,
+naming, file layout, API contracts---and that a good deal of reported
+multi-agent inconsistency is this bug.
+
+\subsection{Limitations}
+
+\paragraph{Scale.} Our agent runs are at 12 ranks and our software build at
+8. The microbenchmarks reach 128 ranks, but with scripted executors: they
+measure the protocol, not the agents. We cannot claim from this data that
+agent \emph{quality} holds at 128 ranks, and we would expect it not to for
+allgather-shaped workloads for the reasons in \Cref{sec:cost}.
+
+\paragraph{One model family.} All agent ranks were the same class of coding
+agent. \ampi{}'s heterogeneity machinery---\code{RankSpec},
+\op{Comm\_split\_type} by model, cost-aware selection---is implemented and
+tested but not exercised against genuinely different models.
+
+\paragraph{Statistical power.} We report single runs of each configuration.
+Agent runs are expensive and slow, and turn durations are heavy-tailed, so
+the wall-clock numbers in particular should be read as one draw rather than
+as an estimate of a mean. The round counts are exact and deterministic; the
+consistency metrics are deterministic given the outputs; only the timings
+are noisy.
+
+\paragraph{Operator intervention.} Two ranks in the glossary run required
+manual completion of protocol steps they had skipped
+(\Cref{sec:discussion-disobedience}). The translations they contributed are
+their own work, but the run is not a clean unattended execution, and we
+report it as such.
+
+\paragraph{The failure detector is weak for shell-mode ranks.} A rank
+implemented as a sequence of short-lived commands cannot heartbeat while it
+thinks, so its liveness timeout must exceed its longest turn. In our runs
+that meant a 30-minute timeout, which is a long time to wait to discover
+that an agent has died. A supervisor process per rank would fix this and is
+the obvious next step.
+
+\paragraph{Not evaluated against alternative frameworks.} We compare against
+an unstructured baseline, not against LangGraph or AutoGen. A fair
+comparison would require reimplementing the same workload in each, and the
+result would largely measure how much of the protocol those frameworks
+oblige the author to rebuild by hand---which is our claim, but not one this
+paper's data establishes.
