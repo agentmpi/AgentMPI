@@ -39,8 +39,8 @@ def collect_one(job_dir: str, algo: str) -> dict:
             by_rank[int(u["assignee"])] = by_rank.get(int(u["assignee"]), 0) + 1
 
         coll = dev.query_one(
-            "SELECT * FROM coll WHERE job_id=? AND op='allreduce' ORDER BY created_at LIMIT 1",
-            (job_id,))
+            "SELECT * FROM coll WHERE job_id=? AND op IN ('reduce','allreduce') "
+            "ORDER BY created_at LIMIT 1", (job_id,))
         contribs = dev.query(
             "SELECT rank, body, arrived_at FROM coll_contrib WHERE coll_id=? ORDER BY rank",
             (coll["coll_id"],)) if coll else []
@@ -283,8 +283,9 @@ def main() -> int:
         configurations.append(entry)
 
     payload = {
-        "experiment": "e2-semantic-allreduce",
+        "experiment": "e2-semantic-reduction",
         "ranks": "Cursor subagents, one per rank",
+        "collective": "AMPI_Reduce to root 0",
         "operator": "AMPI_SYNTHESIZE (semantic, declared neither associative nor commutative)",
         "note": "The binomial schedule is forced with --algo; the decision function would "
                 "refuse it for this operator, and the point of the comparison is to measure "

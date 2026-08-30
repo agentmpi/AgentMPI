@@ -103,14 +103,21 @@ follow.
 **Step 3.** Take part in the reduction:
 
 ```
-ampi allreduce --op AMPI_SYNTHESIZE --algo binomial --datatype scalar --json-file /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-binomial/ranks/6/notes.json --timeout 2400
+ampi reduce --root 0 --op AMPI_SYNTHESIZE --algo binomial --datatype scalar --json-file /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-binomial/ranks/6/notes.json --timeout 2400
 ```
 
-This will do one of two things.
+Under this schedule most ranks are leaves: you send your contribution once and
+the call returns immediately with `"status": "ok"` and a null payload. That is
+success, not a failure --- only the ranks that sit above you in the reduction
+tree are asked to evaluate the operator. If that is you, go to step 3a. If not,
+go straight to step 4.
 
-* It may print `"status": "op_required"`. That means the runtime has reached a
-  step of the reduction that *you* have to evaluate: it is handing you two
-  partial style guides and asking for their merge. When this happens:
+**Step 3a.** If your call printed `"status": "op_required"` instead:
+
+The runtime has reached a step of the reduction that *you* have to evaluate:
+it is handing you two partial style guides and asking for their merge.
+
+* When this happens:
   - read the operands (they are in the JSON under `operands`, or in the file
     named by `operands_file` if they were too large to inline);
   - produce the merged style guide yourself. Merge means: keep every rule that
@@ -123,23 +130,21 @@ This will do one of two things.
     comma-separated list of the chapters covered), to a file in your scratch
     directory;
   - run `ampi op-submit --op-token <the op_token you were given> --json-file <that file>`;
-  - then run the **identical** `ampi allreduce` command again to resume. Do not
+  - then run the **identical** `ampi reduce` command again to resume. Do not
     change any of its arguments.
-  - Repeat as many times as you are asked. You may be asked several times.
+  - Repeat until it prints `"status": "ok"`. You may be asked several times.
 
-* Or it prints `"status": "ok"`, with either a `payload` or a `payload_file`.
-  That is the final reduced style guide and the reduction is over for you.
-
-**Step 4.** Once you have the final result, write it to
-`/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-binomial/ranks/6/result.json` as a JSON object with keys:
+**Step 4.** Write your report to `/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-binomial/ranks/6/result.json` as a JSON object with keys:
 `{"rank": 6, "algo": "binomial", "upcalls": <how many times you were asked to
-evaluate the operator>, "final": <the final merged guide>}`.
+evaluate the operator, which may be 0>, "final": <the payload the reduce
+returned, or null if it returned null because you are not the root>}`.
 
-**Step 5.** Run `ampi barrier --timeout 1200`, then
-`ampi finalize --note "e2 binomial done"`.
+**Step 5.** Run `ampi finalize --note "e2 binomial done"`. Do **not** call
+`ampi barrier` --- there is no barrier in this experiment, and calling one
+would be a collective the other ranks are not making.
 
-Before any step where you expect to think for more than about two minutes, run
-`ampi hb --expect-idle 300` first so the failure detector does not condemn you.
+If you are asked to evaluate the operator, run `ampi hb --expect-idle 900`
+before you start thinking about the merge. Over-estimating is free.
 
 Do not edit any file outside your scratch directory and the one output file
 named above. Do not run git.
