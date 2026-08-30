@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import Enum
+from enum import StrEnum
 from typing import Any
-
 
 ANY_SOURCE = -1
 ANY_TAG = "*"
 
 
-class AgentState(str, Enum):
+class AgentState(StrEnum):
     JOINING = "joining"
     ACTIVE = "active"
     SUSPECT = "suspect"
@@ -19,28 +18,28 @@ class AgentState(str, Enum):
     FINALIZED = "finalized"
 
 
-class DeliveryMode(str, Enum):
+class DeliveryMode(StrEnum):
     STANDARD = "standard"
     SYNCHRONOUS = "synchronous"
     BUFFERED = "buffered"
     READY = "ready"
 
 
-class MessageState(str, Enum):
+class MessageState(StrEnum):
     PENDING = "pending"
     MATCHED = "matched"
     ACKED = "acked"
     CANCELLED = "cancelled"
 
 
-class RequestState(str, Enum):
+class RequestState(StrEnum):
     PENDING = "pending"
     COMPLETE = "complete"
     CANCELLED = "cancelled"
     FAILED = "failed"
 
 
-class CollectiveOp(str, Enum):
+class CollectiveOp(StrEnum):
     BARRIER = "barrier"
     BCAST = "bcast"
     SCATTER = "scatter"
@@ -51,7 +50,7 @@ class CollectiveOp(str, Enum):
     AGREE = "agree"
 
 
-class ReduceOp(str, Enum):
+class ReduceOp(StrEnum):
     SUM = "sum"
     PRODUCT = "product"
     MIN = "min"

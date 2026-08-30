@@ -94,7 +94,17 @@ def build_parser() -> argparse.ArgumentParser:
     sub.choices["recv"].add_argument("--timeout", type=float)
     sub.choices["recv"].add_argument("--no-context-charge", action="store_true")
 
-    for name in ("barrier", "bcast", "scatter", "gather", "allgather", "reduce", "allreduce", "agree"):
+    collective_names = (
+        "barrier",
+        "bcast",
+        "scatter",
+        "gather",
+        "allgather",
+        "reduce",
+        "allreduce",
+        "agree",
+    )
+    for name in collective_names:
         sub.choices[name].add_argument("--timeout", type=float, default=120.0)
 
     for name in ("bcast", "scatter", "gather", "allgather", "reduce", "allreduce", "agree"):

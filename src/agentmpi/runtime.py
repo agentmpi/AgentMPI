@@ -15,10 +15,10 @@ import sqlite3
 import threading
 import time
 import uuid
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
-from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Callable, Iterator, Sequence
+from typing import Any, cast
 
 from .model import (
     ANY_SOURCE,
@@ -39,7 +39,6 @@ from .model import (
     Timeout,
     WouldBlock,
 )
-
 
 SCHEMA_VERSION = 1
 
@@ -150,7 +149,7 @@ class Runtime:
         *,
         context_budget: int | None = None,
         heartbeat_ttl: float = 30.0,
-    ) -> "Runtime":
+    ) -> Runtime:
         runtime = cls(
             db_path,
             session_id,
@@ -169,9 +168,7 @@ class Runtime:
                 raise ProtocolViolation(f"rank {rank} is already active")
             if row["state"] == AgentState.FINALIZED.value:
                 raise ProtocolViolation(f"rank {rank} was finalized")
-            budget_sql = (
-                ", context_budget=?" if context_budget is not None else ""
-            )
+            budget_sql = ", context_budget=?" if context_budget is not None else ""
             params: list[Any] = [
                 AgentState.ACTIVE.value,
                 now,
@@ -296,7 +293,9 @@ class Runtime:
         artifact_ref: str | None = None
         session = self._session_row()
         if token_count > int(session["inline_token_limit"]):
-            artifact_ref = self.put_artifact(encoded.encode("utf-8"), media_type="application/json")
+            artifact_ref = self.put_artifact(
+                encoded.encode("utf-8"), media_type="application/json"
+            )
             encoded = json.dumps(
                 {
                     "_agentmpi_artifact": artifact_ref,
@@ -314,9 +313,7 @@ class Runtime:
                     if mode is DeliveryMode.READY and not self._has_posted_receive(
                         communicator.id, self.rank, dest, tag
                     ):
-                        raise ProtocolViolation(
-                            "ready send has no matching posted receive"
-                        )
+                        raise ProtocolViolation("ready send has no matching posted receive")
                     queued = self._conn.execute(
                         """SELECT COALESCE(SUM(payload_bytes), 0) AS total
                            FROM messages
@@ -429,7 +426,7 @@ class Runtime:
                     if row is not None:
                         payload = json.loads(row["payload_json"])
                         if charge_context:
-                            self._charge_context(int(row["payload_tokens"]))
+                            self._charge_context(estimate_tokens(payload))
                         now = time.time()
                         self._conn.execute(
                             """UPDATE messages
@@ -467,9 +464,7 @@ class Runtime:
                 time.sleep(self.poll_interval)
         finally:
             with self._transaction():
-                self._conn.execute(
-                    "DELETE FROM posted_receives WHERE id=?", (request_id,)
-                )
+                self._conn.execute("DELETE FROM posted_receives WHERE id=?", (request_id,))
 
     def probe(
         self,
@@ -561,9 +556,10 @@ class Runtime:
         comm: Communicator | None = None,
         timeout: float | None = None,
     ) -> list[Any]:
-        return self._collective(
-            CollectiveOp.ALLGATHER, value, comm=comm, timeout=timeout
-        )
+        result = self._collective(CollectiveOp.ALLGATHER, value, comm=comm, timeout=timeout)
+        if not isinstance(result, list):
+            raise ProtocolViolation("allgather produced a non-list result")
+        return result
 
     def reduce(
         self,
@@ -625,9 +621,7 @@ class Runtime:
             self._conn.execute(
                 "UPDATE communicators SET revoked=1 WHERE id=?", (communicator.id,)
             )
-            self._event(
-                "comm.revoke", {"comm_id": communicator.id, "reason": reason}
-            )
+            self._event("comm.revoke", {"comm_id": communicator.id, "reason": reason})
 
     def detect_failures(self, *, now: float | None = None) -> list[int]:
         timestamp = now or time.time()
@@ -646,7 +640,8 @@ class Runtime:
                 self._event("agent.failed", {"rank": rank, "cause": "lease_expired"})
             if failed:
                 affected = self._conn.execute(
-                    "SELECT id, members_json FROM communicators WHERE session_id=? AND revoked=0",
+                    """SELECT id, members_json FROM communicators
+                       WHERE session_id=? AND revoked=0""",
                     (self.session_id,),
                 ).fetchall()
                 for row in affected:
@@ -721,9 +716,7 @@ class Runtime:
             )
         return self.communicator(comm_id)
 
-    def acquire_lock(
-        self, name: str, *, lease_seconds: float = 30.0
-    ) -> int:
+    def acquire_lock(self, name: str, *, lease_seconds: float = 30.0) -> int:
         """Acquire a lease lock and return its monotonic fencing token."""
         now = time.time()
         with self._transaction():
@@ -736,9 +729,7 @@ class Runtime:
                 and float(row["lease_until"]) >= now
                 and int(row["owner"]) != self.rank
             ):
-                raise LockUnavailable(
-                    f"lock {name!r} is held by rank {row['owner']}"
-                )
+                raise LockUnavailable(f"lock {name!r} is held by rank {row['owner']}")
             token = 1 if row is None else int(row["fencing_token"]) + 1
             self._conn.execute(
                 """INSERT INTO locks(
@@ -1017,7 +1008,7 @@ class Runtime:
             conditions.append("tag=?")
             params.append(tag)
         row = self._conn.execute(
-            f"""SELECT * FROM messages WHERE {' AND '.join(conditions)}
+            f"""SELECT * FROM messages WHERE {" AND ".join(conditions)}
                 ORDER BY created_at, src, sequence LIMIT 1""",
             params,
         ).fetchone()
@@ -1026,11 +1017,9 @@ class Runtime:
                 "UPDATE messages SET state='matched', matched_at=? WHERE id=?",
                 (time.time(), row["id"]),
             )
-        return row
+        return cast("sqlite3.Row | None", row)
 
-    def _has_posted_receive(
-        self, comm_id: str, source: int, dest: int, tag: str
-    ) -> bool:
+    def _has_posted_receive(self, comm_id: str, source: int, dest: int, tag: str) -> bool:
         row = self._conn.execute(
             """SELECT 1 FROM posted_receives
                WHERE comm_id=? AND dst=?
@@ -1041,9 +1030,7 @@ class Runtime:
         ).fetchone()
         return row is not None
 
-    def _wait_for_ack(
-        self, message_id: str, timeout: float | None, started: float
-    ) -> None:
+    def _wait_for_ack(self, message_id: str, timeout: float | None, started: float) -> None:
         while True:
             row = self._conn.execute(
                 "SELECT state FROM messages WHERE id=?", (message_id,)
@@ -1072,9 +1059,7 @@ class Runtime:
             (tokens, self.session_id, self.rank),
         )
 
-    def _validate_comm(
-        self, comm: Communicator, *, allow_revoked: bool = False
-    ) -> None:
+    def _validate_comm(self, comm: Communicator, *, allow_revoked: bool = False) -> None:
         if comm.session_id != self.session_id:
             raise ProtocolViolation("communicator belongs to another session")
         current = self.communicator(comm.id)
@@ -1098,9 +1083,7 @@ class Runtime:
             (self.session_id, self.rank),
         ).fetchone()
         if row is None:
-            raise ProtocolViolation(
-                f"rank {self.rank} is not in session {self.session_id}"
-            )
+            raise ProtocolViolation(f"rank {self.rank} is not in session {self.session_id}")
 
     def _session_row(self) -> sqlite3.Row:
         row = self._conn.execute(
@@ -1108,7 +1091,7 @@ class Runtime:
         ).fetchone()
         if row is None:
             raise ProtocolViolation(f"unknown session {self.session_id}")
-        return row
+        return cast("sqlite3.Row", row)
 
     def _event(self, kind: str, data: dict[str, Any]) -> None:
         self._conn.execute(
