@@ -81,7 +81,7 @@ graph.add(
 )
 graph.validate()
 
-assert graph.topological_order() == ["compile", "test"]
+assert graph.topological_order() == ("compile", "test")
 ready = graph.ready(completed=set(), running=set())
 ```
 
@@ -89,7 +89,7 @@ ready = graph.ready(completed=set(), running=set())
 `deps: tuple[str, ...]`. `Graph.add(task)` adds one task and rejects duplicate
 names. `Graph.validate()` rejects unknown dependencies and cycles.
 `Graph.topological_order()` returns a deterministic dependency-first
-`list[str]`. `Graph.ready(completed, running)` returns a lexicographically
+`tuple[str, ...]`. `Graph.ready(completed, running)` returns a lexicographically
 ordered `list[Task]` whose dependencies are complete and which are neither
 complete nor currently running. The read-only `Graph.tasks` mapping and the
 usual `len`, iteration, membership, and name lookup operations expose the
