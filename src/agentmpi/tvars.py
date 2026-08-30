@@ -70,6 +70,12 @@ CVARS: dict[str, Cvar] = {
              "filesystem traffic."),
         Cvar("ampi_failure_timeout_s", 90.0, float,
              "A rank with no heartbeat for this long is declared failed."),
+        Cvar("ampi_roll_call_s", 300.0, float,
+             "How long to wait, from the run's creation, for a rank that has "
+             "never registered.  Separate from the failure timeout because "
+             "the conditions differ: a rank that registered and went quiet "
+             "may return, while a rank that never registered was never "
+             "launched and no amount of waiting will produce it."),
         Cvar("ampi_stall_timeout_s", 600.0, float,
              "A rank that heartbeats but does not advance its turn counter for "
              "this long is declared stalled.  Separating these two timeouts is "

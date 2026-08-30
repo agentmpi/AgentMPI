@@ -132,6 +132,7 @@ class Runtime:
         self.pvars = Pvars()
         self.turn = 0
         self.started_at = time.time()
+        self.run_started_at = self.started_at
         self.finalized = False
         self.killed = False
         self.state = RankState.INIT
@@ -164,6 +165,7 @@ class Runtime:
         self.persist_state = device.name != "inproc"
         if self.persist_state:
             self.run_id = self._read_run_id()
+            self.run_started_at = self._read_run_started_at()
             self._load_state()
 
         self.world = self._make_world()
@@ -172,6 +174,16 @@ class Runtime:
     # -- durable protocol state -------------------------------------------
     def _state_key(self) -> str:
         return f"pstate/{self.world_rank}"
+
+    def _read_run_started_at(self) -> float:
+        """When the run was created, not when this rank joined it."""
+        if not self.root:
+            return self.started_at
+        try:
+            with open(os.path.join(self.root, RUN_MANIFEST), encoding="utf-8") as fh:
+                return float(json.load(fh).get("created_at", self.started_at))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return self.started_at
 
     def _read_run_id(self) -> str:
         """The identity of the run this rank is joining.
@@ -302,6 +314,21 @@ class Runtime:
             json.dumps({"state": self.state.value, "ts": time.time(), "turn": self.turn}),
         )
 
+    def registered_ranks(self) -> set[int]:
+        """World ranks that have ever called ``AMPI_Init`` in this run.
+
+        Distinct from "ranks that are currently alive": registration is a
+        durable fact about whether a rank was ever launched at all, which is
+        what separates a launcher shortfall from a crash.
+        """
+        out: set[int] = set()
+        for key in self.device.kv_list("rank/"):
+            try:
+                out.add(int(key.split("/", 1)[1]))
+            except (IndexError, ValueError):
+                continue
+        return out
+
     def _refresh_rank_table(self) -> None:
         specs = []
         for key in self.device.kv_list("rank/"):
@@ -394,6 +421,8 @@ class Runtime:
             return cached[1]
         fail_after = float(self.cvars["ampi_failure_timeout_s"])
         stall_after = float(self.cvars["ampi_stall_timeout_s"])
+        roll_call = float(self.cvars["ampi_roll_call_s"])
+        registered = self.registered_ranks()
         failed: set[int] = set()
         for local in range(comm.size):
             wr = comm.world(local)
@@ -401,11 +430,32 @@ class Runtime:
                 continue
             hb = self.peer_health(wr)
             if hb is None:
-                # Never heartbeated.  Only suspect it once the run is old
-                # enough that a healthy rank would certainly have checked in;
-                # otherwise every run would begin by declaring its own peers
-                # dead before they had started.
-                if now - self.started_at > fail_after:
+                # Two different conditions wear the same disguise here, and
+                # conflating them is expensive.
+                #
+                # A rank that *registered* and then went quiet may come back,
+                # so it gets the full failure timeout, which is generous
+                # because an agent's turn is long.
+                #
+                # A rank that has *never registered* was never launched. No
+                # amount of waiting will produce it, and waiting the failure
+                # timeout for it is pure loss: we have watched eight ranks
+                # block for twenty minutes on a broadcast whose root had not
+                # started, and a launcher that silently fulfils only part of
+                # a request produces exactly this. It gets the much shorter
+                # roll-call deadline instead, measured from the *run's* start
+                # rather than this rank's, so that a late joiner does not
+                # restart everyone's clock.
+                if wr not in registered:
+                    if now - self.run_started_at > roll_call:
+                        failed.add(local)
+                        self.profiler.note(
+                            "peer never joined the run", peer=local, world=wr,
+                            waited_s=round(now - self.run_started_at, 1),
+                            hint="the launcher did not start this rank; a "
+                                 "collective requires every member, so the "
+                                 "job cannot complete without a shrink")
+                elif now - self.started_at > fail_after:
                     failed.add(local)
                 continue
             state = hb.get("state")

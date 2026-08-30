@@ -227,3 +227,75 @@ def test_lock_lease_is_stolen_from_a_dead_holder(tmp_path):
     second.acquire()
     assert second.stolen_from == "rank0"
     second.release()
+
+
+def test_a_rank_that_never_joined_is_detected_on_the_roll_call_deadline(tmp_path):
+    """A launcher shortfall must not cost a full failure timeout.
+
+    Two distinct conditions look identical from a peer's view: a rank that
+    registered and went quiet, and a rank that was never launched. The first
+    may come back and deserves the generous failure timeout an agent's long
+    turn requires. The second never will, and waiting for it is pure loss --
+    we watched eight ranks block for twenty minutes on a broadcast whose root
+    had not started, because a launcher silently fulfilled only part of a
+    request. The roll-call deadline is short, separate, and measured from the
+    run's creation so a late joiner does not restart everyone's clock.
+
+    This is set up the way it actually happens: a manifest declaring four
+    ranks, and a launcher that starts only one of them.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+    subprocess.run(
+        ampi + ["init", "--root", str(root), "--ranks", "4",
+                "--cvar", "ampi_roll_call_s=1",
+                "--cvar", "ampi_failure_timeout_s=600"],
+        check=True, capture_output=True, env=env, timeout=60)
+
+    time.sleep(1.5)   # only rank 0 is ever launched
+    proc = subprocess.run(
+        ampi + ["ft", "detect"], capture_output=True, text=True, timeout=60,
+        env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": "0"})
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["failed"] == [1, 2, 3], (
+        f"ranks that were never launched went unnoticed: {report}")
+
+
+def test_a_registered_rank_that_goes_quiet_still_gets_the_failure_timeout(tmp_path):
+    """The roll call must not shorten the deadline for a rank that did join."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+    subprocess.run(
+        ampi + ["init", "--root", str(root), "--ranks", "4",
+                "--cvar", "ampi_roll_call_s=0.1",
+                "--cvar", "ampi_failure_timeout_s=600"],
+        check=True, capture_output=True, env=env, timeout=60)
+
+    # Every rank joins once and exits, so all four are registered and none
+    # is heartbeating any more.
+    for rank in range(4):
+        subprocess.run(ampi + ["rank"], capture_output=True, timeout=60,
+                       env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": str(rank)})
+    time.sleep(1.5)
+
+    proc = subprocess.run(
+        ampi + ["ft", "detect"], capture_output=True, text=True, timeout=60,
+        env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": "0"})
+    assert proc.returncode == 0, proc.stderr
+    report = json.loads(proc.stdout)
+    assert report["failed"] == [], (
+        "a registered rank was declared dead on the roll-call deadline "
+        f"instead of the failure timeout: {report}")
