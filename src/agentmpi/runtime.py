@@ -862,6 +862,7 @@ class Runtime:
         epoch = self._next_collective_epoch(communicator.id, op)
         started = time.monotonic()
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        signature_error: str | None = None
         with self._transaction():
             self._conn.execute(
                 """INSERT OR IGNORE INTO collective_instances(
@@ -916,33 +917,36 @@ class Runtime:
                         "received": expected,
                     },
                 )
-                raise ProtocolViolation(message)
-            if instance["error"] is not None:
-                raise ProtocolViolation(str(instance["error"]))
-            self._conn.execute(
-                """INSERT INTO collective_contributions(
-                       comm_id, generation, operation, epoch, rank,
-                       value_json, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    communicator.id,
-                    communicator.generation,
-                    op.value,
-                    epoch,
-                    self.rank,
-                    encoded,
-                    time.time(),
-                ),
-            )
-            self._event(
-                "collective.enter",
-                {
-                    "comm_id": communicator.id,
-                    "op": op.value,
-                    "epoch": epoch,
-                    "ordinal": ordinal,
-                },
-            )
+                signature_error = message
+            elif instance["error"] is not None:
+                signature_error = str(instance["error"])
+            else:
+                self._conn.execute(
+                    """INSERT INTO collective_contributions(
+                           comm_id, generation, operation, epoch, rank,
+                           value_json, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        communicator.id,
+                        communicator.generation,
+                        op.value,
+                        epoch,
+                        self.rank,
+                        encoded,
+                        time.time(),
+                    ),
+                )
+                self._event(
+                    "collective.enter",
+                    {
+                        "comm_id": communicator.id,
+                        "op": op.value,
+                        "epoch": epoch,
+                        "ordinal": ordinal,
+                    },
+                )
+        if signature_error is not None:
+            raise ProtocolViolation(signature_error)
         while True:
             with self._transaction():
                 if not tolerate_failures:
