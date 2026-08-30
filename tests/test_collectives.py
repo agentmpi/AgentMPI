@@ -305,3 +305,27 @@ def test_collectives_in_sequence_do_not_interfere(p):
         assert a == "one" and d == "two"
         assert b == sum(range(p))
         assert c == list(range(p))
+
+
+@pytest.mark.parametrize("p", list(range(2, 18)))
+def test_binomial_scatter_delivers_exactly_one_item_per_rank(p):
+    """Every size, not just the usual suspects.
+
+    A rank in our 13-rank translation run reported that its scatter slice
+    held two chunks rather than one, which looked like a distribution bug.
+    It was not: recursive halving has interior nodes hold their subtree's
+    block and forward the remainder, so a mid-tree rank transiently holds
+    more than its own item and keeps the first. This test pins the invariant
+    that matters -- every rank ends with exactly its own item -- at every
+    size from 2 to 17, since the tree's shape is most irregular at sizes that
+    are neither powers of two nor small.
+    """
+
+    def body(comm):
+        values = [f"c{i}" for i in range(comm.size)] if comm.rank == 0 else None
+        return comm.scatterv(values, 0, datatype="json",
+                             algorithm=CollAlgorithm.BINOMIAL, timeout=60)
+
+    r = sim.run(p, body, timeout=120)
+    r.raise_errors()
+    assert [r.results.get(i) for i in range(p)] == [f"c{i}" for i in range(p)]
