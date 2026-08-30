@@ -141,11 +141,24 @@ def resolve_rank(args: argparse.Namespace) -> int | None:
     return int(env) if env not in (None, "") else None
 
 
+RANKLESS_COMMANDS = {"new", "status", "doctor", "trace", "ops", "plan", "comm-list",
+                     "failures"}
+
+
 def make_runtime(args: argparse.Namespace) -> tuple[Runtime, str]:
     job_dir = resolve_job_dir(args)
     device = open_device(os.path.join(job_dir, "job.db"))
     job_id = os.path.basename(job_dir.rstrip("/"))
-    rt = Runtime(device, job_id, resolve_rank(args))
+    rank = resolve_rank(args)
+    if rank is None and getattr(args, "command", None) not in RANKLESS_COMMANDS:
+        raise AmpiArgError(
+            f"`ampi {getattr(args, 'command', '?')}` acts on behalf of a rank, but no rank "
+            "was given: pass --rank N or set AMPI_RANK. Refusing rather than acting "
+            "anonymously, because an operation attributed to no rank is unauditable "
+            "and, in the case of revoke, unrecoverable.",
+            command=getattr(args, "command", None),
+        )
+    rt = Runtime(device, job_id, rank)
     if getattr(args, "failure_timeout", None):
         rt.failure_timeout = float(args.failure_timeout)
     return rt, job_dir
@@ -540,6 +553,11 @@ def cmd_ctx_release(args: argparse.Namespace) -> int:
 # -- fault tolerance --------------------------------------------------------
 
 
+def cmd_comm_resync(args: argparse.Namespace) -> int:
+    rt, _ = make_runtime(args)
+    return emit(rt.comm_resync(default_comm(args)))
+
+
 def cmd_revoke(args: argparse.Namespace) -> int:
     rt, _ = make_runtime(args)
     return emit(rt.comm_revoke(default_comm(args)))
@@ -905,6 +923,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("kill", cmd_kill, "Fault injection: declare a rank failed")
     p.add_argument("--target", type=int, required=True)
     p.add_argument("--reason")
+    add("comm-resync", cmd_comm_resync,
+        "Abandon the in-flight collectives on a communicator and realign sequence numbers")
     add("failures", cmd_failures, "Failure detector state")
     p = add("inbox", cmd_inbox, "Replay everything ever addressed to a rank")
     p.add_argument("--target", type=int)

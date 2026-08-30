@@ -883,8 +883,12 @@ class CollectiveEngine:
                         f"rank {self.me} issued {self.coll} as collective #{seq} on "
                         f"{self.comm_name!r}, but rank "
                         f"{util.loads(row['meta'], {}).get('initiator')} issued {row['op']} "
-                        "there: " + "; ".join(mismatch),
+                        "there: " + "; ".join(mismatch) + ". Either re-issue the "
+                        f"collective the slot already holds ({row['op']}), or, once the "
+                        "ranks have agreed which was intended, run `ampi comm-resync` to "
+                        "abandon the in-flight collectives and restart the sequence.",
                         seq=seq, expected=row["op"], got=self.coll,
+                        remedy="ampi comm-resync",
                     )
         self.seq = seq
         self.coll_id = row["coll_id"]

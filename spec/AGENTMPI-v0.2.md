@@ -227,6 +227,23 @@ same order. Unlike MPI, an implementation MUST detect a violation and raise
 sequence counter per communicator; the first rank to reach sequence *k* records
 which collective it is and every later arrival at *k* must agree.
 
+**Recovering from a mismatch.** Detection is necessary but not sufficient. A
+slot's operation is fixed by whichever rank arrives first, so one rank issuing
+the wrong collective makes that slot permanently unusable for every other rank,
+and the conforming ranks are the ones penalised. An implementation MUST
+therefore provide `AMPI_Comm_resync(comm)`, which abandons the in-flight
+collectives on a communicator and restarts every rank's sequence counter above
+every slot ever used. It is administrative rather than collective, deliberately:
+requiring agreement to escape a state that blocks agreement is not a recovery
+path. Callers SHOULD agree out of band on which collective was intended before
+using it, and MUST then re-issue that collective.
+
+This is not a hypothetical. In a measured eight-rank run one agent issued
+`reduce` where the other seven issued `allreduce`; five subsequent ranks
+conformed to the mistake rather than to their instructions, and the job had no
+way forward. Shrinking would have discarded live ranks and their work for what
+was not a failure at all.
+
 **Datatype.** A reduction declares whether its operator applies to the payload
 as a whole (`scalar`) or element-wise to a keyed collection (`vector`). This is
 MPI's count-and-datatype argument. Only vector payloads may be partitioned, so

@@ -1009,6 +1009,60 @@ class Runtime:
             self.tracer.emit("AMPI_Comm_revoke", "exit", comm_id=comm.comm_id)
         return comm.to_dict()
 
+    def comm_resync(self, comm_name: str) -> dict[str, Any]:
+        """Discard the in-flight collectives on a communicator and realign the
+        per-rank collective sequence counters.
+
+        Detecting a collective mismatch is necessary but not sufficient.  A
+        collective slot is keyed by (communicator, sequence number) and its
+        operation is fixed by whichever rank arrives first, so one rank issuing
+        the wrong collective poisons that slot for everybody: the conforming
+        ranks get ``AMPI_ERR_COLLECTIVE_MISMATCH`` forever, and the only
+        recoveries MPI would offer are to abandon the job or to shrink the
+        communicator, which discards live participants and their work for what
+        is not a failure at all.
+
+        This operation is the missing third option.  It is deliberately
+        administrative and deliberately not collective: the ranks that need it
+        most are the ones already stuck.  Callers SHOULD agree first with
+        ``AMPI_Comm_agree`` on a healthy communicator, but the protocol cannot
+        require it, because requiring agreement to escape a state that blocks
+        agreement is not a recovery path.
+        """
+        comm = self.comms.get(comm_name)
+        with self.device.write_tx():
+            open_colls = self.device.query(
+                "SELECT coll_id, seq, op FROM coll WHERE comm_id=? AND state='open'",
+                (comm.comm_id,))
+            for row in open_colls:
+                self.device.execute(
+                    "UPDATE coll SET state='abandoned', completed_at=? WHERE coll_id=?",
+                    (util.now(), row["coll_id"]))
+                self.device.execute(
+                    "DELETE FROM coll_contrib WHERE coll_id=?", (row["coll_id"],))
+            highest = self.device.query_one(
+                "SELECT MAX(seq) AS s FROM coll WHERE comm_id=?", (comm.comm_id,))
+            base = int(highest["s"] or 0) + 1
+            # Every rank restarts numbering above every slot ever used, so a
+            # rank that had already advanced past the poisoned one cannot
+            # collide with a rank that had not.
+            for world_rank in comm.members:
+                local = comm.rank_of(world_rank)
+                self.device.execute(
+                    "INSERT INTO counter (job_id, name, value) VALUES (?,?,?) "
+                    "ON CONFLICT(job_id, name) DO UPDATE SET value=excluded.value",
+                    (self.job_id, f"collseq:{comm.comm_id}:{local}", base))
+                self.device.kv_set(self.job_id, f"inflight:{comm.comm_id}:{local}", None)
+            self.tracer.emit("AMPI_Comm_resync", "exit", comm_id=comm.comm_id,
+                             abandoned=len(open_colls), base=base)
+        return {
+            "comm": comm.name,
+            "abandoned": [{"seq": r["seq"], "op": r["op"]} for r in open_colls],
+            "next_sequence": base,
+            "note": "every rank must now re-issue the collective it intended; "
+                    "sequence numbers restart above every slot ever used",
+        }
+
     def comm_shrink(self, comm_name: str, new_name: str | None = None) -> dict[str, Any]:
         """AMPI_Comm_shrink: derive a communicator over the survivors.
 
