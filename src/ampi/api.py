@@ -41,7 +41,7 @@ class Ampi:
     # -- lifecycle ---------------------------------------------------------
     @classmethod
     def create(cls, job_dir: str, world_size: int, *, ctx_limit: int = DEFAULT_CTX_LIMIT,
-               meta: dict[str, Any] | None = None) -> "Ampi":
+               meta: dict[str, Any] | None = None) -> Ampi:
         os.makedirs(job_dir, exist_ok=True)
         device = open_device(os.path.join(job_dir, "job.db"))
         Runtime.create_job(device, os.path.basename(os.path.abspath(job_dir)), world_size,

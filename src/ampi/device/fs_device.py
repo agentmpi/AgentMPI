@@ -28,7 +28,7 @@ import errno
 import json
 import os
 import time
-from typing import Any, Iterable
+from typing import Any
 
 from .. import util
 from .base import Device
@@ -274,7 +274,7 @@ class _FsLock:
         self.path = path
         self.timeout = timeout
 
-    def __enter__(self) -> "_FsLock":
+    def __enter__(self) -> _FsLock:
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         deadline = time.time() + self.timeout
         while True:
@@ -290,7 +290,9 @@ class _FsLock:
                 except OSError:
                     pass
                 if time.time() > deadline:
-                    raise TimeoutError(f"could not acquire filesystem lock {self.path}")
+                    raise TimeoutError(
+                        f"could not acquire filesystem lock {self.path}"
+                    ) from None
                 time.sleep(0.005)
 
     def __exit__(self, *exc: Any) -> None:

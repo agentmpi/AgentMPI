@@ -29,7 +29,8 @@ have:
 from __future__ import annotations
 
 import time
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 from .. import util
 from ..constants import (
@@ -107,7 +108,7 @@ class Runtime:
         *,
         ctx_limit: int = DEFAULT_CTX_LIMIT,
         meta: dict[str, Any] | None = None,
-    ) -> "Runtime":
+    ) -> Runtime:
         with device.write_tx():
             existing = device.query_one("SELECT * FROM job WHERE job_id=?", (job_id,))
             if existing is None:

@@ -212,7 +212,7 @@ def retention(dev: SqliteDevice, job_id: str, final: object) -> dict:
         dev.query("SELECT operands FROM pending_op WHERE job_id=?", (job_id,)))
     final_text = final if isinstance(final, str) else util.dumps(final)
     delivered, survived = [], []
-    for rank, (chapter, probes) in sorted(RETENTION_PROBES.items()):
+    for rank, (_chapter, probes) in sorted(RETENTION_PROBES.items()):
         if any(pr.lower() in operand_text.lower() for pr in probes):
             delivered.append(rank)
         if final_text and any(pr.lower() in final_text.lower() for pr in probes):
