@@ -483,13 +483,17 @@ class Communicator:
             lookup(datatype) if isinstance(datatype, str)
             else (datatype if datatype is not None else self.runtime.types_by_name(env.datatype))
         )
+        # Admission control runs *before* the payload is materialised, and may
+        # rewrite the envelope to a digested form.  Reading the text first
+        # would hand the receiver the oversized version the runtime just
+        # decided it could not afford.
+        if admit:
+            self.runtime.admit(env.tokens, datatype=dt, env=env)
+
         text = env.inline
         if text is None and env.blob is not None:
             text = self.runtime.device.get_blob(env.blob)
         text = text or ""
-
-        if admit:
-            self.runtime.admit(env.tokens, datatype=dt, env=env)
 
         value = dt.parse(text) if dt.base is not Datatype.TEXT else text
         violations = dt.check(value)

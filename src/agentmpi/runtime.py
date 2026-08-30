@@ -293,6 +293,46 @@ class Runtime:
             }),
         )
 
+    def start_heartbeat(self, period_s: float | None = None) -> None:
+        """Emit heartbeats from a background thread.
+
+        Without this, a rank only heartbeats inside protocol calls, and a
+        rank that is *working* -- which for an agent means a turn lasting
+        minutes -- looks exactly like a rank that has died.  Separating
+        liveness from progress is only useful if liveness can be observed
+        while the rank is busy, which requires a thread.
+
+        Ranks that cannot run one (an agent whose only interface is a shell,
+        invoking ``ampi`` once per operation) fall back to inferring liveness
+        from activity: their last ``ampi`` invocation is their last
+        heartbeat, so their failure timeout must exceed their turn length.
+        The runtime reports which mode a rank is in so that a harness can set
+        the timeout accordingly rather than guessing.
+        """
+        import threading
+
+        if getattr(self, "_hb_thread", None) is not None:
+            return
+        period = period_s or float(self.cvars["ampi_heartbeat_s"])
+        self._hb_stop = threading.Event()
+
+        def loop() -> None:
+            while not self._hb_stop.wait(period):
+                try:
+                    self.heartbeat(force=True)
+                except Exception:  # pragma: no cover - never kill the rank
+                    return
+
+        self._hb_thread = threading.Thread(target=loop, daemon=True,
+                                           name=f"ampi-hb-{self.world_rank}")
+        self._hb_thread.start()
+
+    def stop_heartbeat(self) -> None:
+        stop = getattr(self, "_hb_stop", None)
+        if stop is not None:
+            stop.set()
+        self._hb_thread = None
+
     def peer_health(self, world_rank: int) -> dict[str, Any] | None:
         raw = self.device.kv_get(f"hb/{world_rank}")
         if raw is None:
@@ -343,8 +383,19 @@ class Runtime:
         return failed
 
     def check_failures(self, comm: Communicator) -> None:
-        """Called from inside blocking operations to drive failure detection."""
+        """Called from inside blocking operations to drive failure detection.
+
+        Also picks up a revocation issued by another rank.  This is the hook
+        that makes ``AMPI_Comm_revoke`` able to interrupt a blocked receive:
+        the revoker writes a durable record and every blocked peer notices it
+        on its next poll, which is what turns an unbreakable wait into a
+        recoverable ``AMPI_ERR_REVOKED``.
+        """
         self.heartbeat()
+        from .ft import is_revoked
+
+        if is_revoked(comm):
+            return
         newly = self.detect_failures(comm) - comm.failed
         if not newly:
             return
@@ -419,6 +470,7 @@ class Runtime:
     def finalize(self) -> None:
         if self.finalized:
             return
+        self.stop_heartbeat()
         self.state = RankState.FINALIZED
         self.save_state()
         self.publish_spec()

@@ -125,6 +125,10 @@ def run(
         runtimes[rank] = rt
         rt.publish_spec()
         rt.heartbeat(force=True)
+        # Ranks in the simulator are threads, so they can heartbeat while
+        # they work; that is what lets the detector distinguish a long turn
+        # from a dead rank.
+        rt.start_heartbeat()
         try:
             barrier_started.wait(timeout=timeout)
         except threading.BrokenBarrierError:
@@ -166,8 +170,10 @@ def _die(rt: Runtime) -> None:
     look like from the outside, and the only thing the failure detector can
     actually observe.
     """
+    rt.stop_heartbeat()
     rt.state = RankState.FAILED
     rt.heartbeat = lambda force=False: None  # type: ignore[assignment]
+    rt.start_heartbeat = lambda period_s=None: None  # type: ignore[assignment]
     rt.device.kv_delete(f"hb/{rt.world_rank}")
 
 

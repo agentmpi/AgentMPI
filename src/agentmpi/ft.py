@@ -118,10 +118,18 @@ def comm_agree(
     decision is durable so that the decider's own death after writing it does
     not lose it.
     """
+    from .collectives import _next_coll_id
+
     rt = comm.runtime
     t0 = time.time()
-    round_id = int(rt.device.kv_get(f"agree/{comm.context}/round") or 0) + 1
-    rt.device.kv_put(f"agree/{comm.context}/round", str(round_id))
+    # The round identifier must be *agreed without agreeing*, which sounds
+    # circular but is not: agreement is a collective, and collectives are
+    # required to be issued in the same order on every rank, so the
+    # communicator's collective counter is already a replicated value.
+    # Deriving the round from a shared counter in the key-value store instead
+    # would be a read-then-write race, and two ranks landing on different
+    # rounds would each wait forever for votes the other posted elsewhere.
+    round_id = _next_coll_id(comm)
     base = f"agree/{comm.context}/{round_id}"
     rt.device.kv_put(f"{base}/vote/{comm.rank}", json.dumps(
         {"value": value, "ts": time.time()}))
@@ -156,7 +164,11 @@ def comm_agree(
 
         if comm.rank == decider and len(votes) == len(survivors):
             reduced = operation.apply([votes[r] for r in sorted(votes)])
-            rt.device.kv_put(decision_key, json.dumps({
+            # Compare-and-swap, not put: two ranks can briefly disagree about
+            # who is dead and therefore about who decides, and a second
+            # decision overwriting the first would let ranks that already read
+            # the first one diverge.  First writer wins, permanently.
+            rt.device.kv_cas(decision_key, None, json.dumps({
                 "value": reduced, "by": comm.rank, "ts": time.time(),
                 "survivors": survivors, "failed": sorted(comm.failed),
                 "round": round_id,
@@ -186,9 +198,7 @@ def comm_shrink(comm, *, timeout: float | None = 180.0):
     rt = comm.runtime
     rt.check_failures(comm)
     alive = sorted(r for r in range(comm.size) if r not in comm.failed)
-    agreed = comm_agree(comm, alive, op="ampi_union" if False else "ampi_min_list",
-                        timeout=timeout) if False else _agree_on_survivors(
-        comm, alive, timeout)
+    agreed = _agree_on_survivors(comm, alive, timeout)
     members = tuple(comm.world(r) for r in agreed)
     specs = tuple(s for s in comm.group.specs if s.rank in members) if comm.group.specs else ()
     new_epoch = comm.epoch + 1

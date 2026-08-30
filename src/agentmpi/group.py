@@ -43,7 +43,11 @@ class RankSpec:
     provider: str = "unknown"
     host: str = "local"
     store: str = "default"
-    context_capacity: int = 128_000
+    context_capacity: int = 0
+    """Context window in tokens.  Zero means "inherit the run's default"
+    (the ``ampi_context_capacity`` control variable), so that a harness can
+    set one capacity for the whole job and override it only for the ranks
+    that differ."""
     price_in_per_mtok: float = 0.0
     price_out_per_mtok: float = 0.0
     tools: tuple[str, ...] = ()
