@@ -107,7 +107,7 @@ def test_compaction_against_the_budget_left_after_the_ledger_is_charged():
     remaining = budget.remaining(book.total())
     assert remaining == 4_000 - 500 - 1_200
 
-    text = "sentence number one. " * 400
+    text = "sentence number one. " * 1200
     assert estimate.count_tokens(text) > remaining
 
     shortened = compact.head_tail(text, remaining)
