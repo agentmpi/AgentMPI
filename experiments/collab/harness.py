@@ -200,7 +200,7 @@ def fn(comm):
 def materialize(artifacts: dict, dest: Path) -> list[str]:
     dest.mkdir(parents=True, exist_ok=True)
     written = []
-    for rel, art in artifacts.items():
+    for art in artifacts.values():
         path = dest / art["path"]
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(art["content"])

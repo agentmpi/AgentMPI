@@ -10,7 +10,7 @@ Independent / systems note
 
 The last decade of multi-agent software has repeated a mistake the parallel-computing community made—and then corrected—between 1989 and 1994. Every vendor and research group shipped a *system*: a crew, a graph, a conversation manager, a “society of mind.” None of those systems is wrong, but none of them is what a person writing a new system actually needs. What they need is what Jack Dongarra, Al Geist, William Gropp, Ewing Lusk, and the MPI Forum eventually gave HPC: a small, boring, portable *interface* for moving information among unreliable workers, with matching rules, collectives, one-sided data, and a failure model.
 
-This paper introduces **AgentMPI**, a message-passing interface for multi-agent harnesses. AgentMPI is not a multi-agent system. It is a protocol people use to write multi-agent systems, the way MPI is a protocol people use to write parallel programs. We reconstruct the history and design philosophy of MPI at the level expected of an HPC systems paper—Williamsburg 1992 through MPI-4 sessions and ULFM—and we give every major MPI idea an agent analog that is grounded in a working implementation, not a metaphor. Point-to-point matching, eager versus rendezvous, binomial-tree broadcast, Bruck barrier and allgather, recursive-doubling allreduce, passive-target windows and locks, communicator split, spawn, and User-Level Failure Mitigation (revoke / agree / shrink) are all present as callable operations.
+This paper introduces **AgentMPI**, a message-passing interface for multi-agent harnesses. AgentMPI is not a multi-agent system. It is a protocol people use to write multi-agent systems, the way MPI is a protocol people use to write parallel programs. We reconstruct the history and design philosophy of MPI at the level expected of an HPC systems paper—Williamsburg 1992 through MPI-4 sessions, MPI-5's ABI, and ULFM research—and we give every major MPI idea an agent analog that is grounded in a working implementation, not a metaphor. Point-to-point matching, eager versus rendezvous, binomial-tree broadcast, Bruck barrier and allgather, recursive-doubling allreduce, passive-target windows and locks, communicator split, spawn, and User-Level Failure Mitigation (revoke / agree / shrink) are all present as callable operations.
 
 The implementation is a Python library plus a language-neutral CLI and a POSIX filesystem transport. We evaluate it with four jobs written *against the protocol*, not against a framework: (E1) data-parallel translation of a public-domain book; (E2) coupled collaborative development of a small software package; (E3) a fault, lock, lifecycle, and context-OOM study; (E4) a 100-rank corpus map-reduce. On the filesystem binding, a 16-rank Bruck barrier is 92 ms median; a 100-rank scatter–allreduce–gather over 285 Aesop fables finishes in 7.86 s with all-rank agreement on the word count; killing two of eight ranks, shrinking, and allreducing on the survivors succeeds; a dead source unblocks a posted receive in 0.21 s instead of hanging; a 20-token context budget refuses an oversized inbound message.
 
@@ -82,6 +82,11 @@ AgentMPI keeps 1–4 and 6–9. It *rejects* 5 as a statement about executors. T
 **MPI-3 (2012)** added non-blocking collectives, neighborhood collectives, and a usable shared-memory window. Non-blocking collectives are the right shape for “start a reduce of reviews, keep writing code, wait later.”
 
 **MPI-4 (2021)** added large-count support, persistent and partitioned communication, and the **Sessions** model: an application can build communicators from groups without a world-sized `MPI_Init`. Sessions are how an agent should join a job. The standard still does not specify behaviour after process failure.
+
+**MPI-5 (2025)** added a standard ABI and targeted refinements. The released
+standard still does not contain ULFM's revoke, agree, shrink, or failure error
+classes; AgentMPI borrows those from the research extension, not from normative
+MPI-5.
 
 **ULFM** (User-Level Failure Mitigation; Bland, Bouteiller, Herault, Hursey, Dongarra, and others) is the extension that does. A communicator can be *revoked*; survivors can *agree* on a value; they can *shrink* to a new communicator whose ranks are remapped to `0..p'−1`. ULFM refuses to pick a recovery policy. Checkpoint/restart, replication, and algorithmic inversion are the application’s problem. That refusal is the most important sentence in the fault-tolerance literature for anyone building agent systems. The protocol makes failure *visible*. The harness decides what to do.
 
@@ -262,17 +267,19 @@ These are the five failure modes named in the introduction, each turned into a c
 A parallel campaign in this repository already ran **true** multi-agent jobs
 through AgentMPI, not mocks:
 
-- **Alice in Wonderland → French.** Eight draft ranks plus four reviewers
-  produced a glossary-compliant French text (`experiments/results/translation/`).
-  Mechanical checks: all review contracts followed, glossary exact-hit rate 1.0,
-  estimated input-token reduction 0.73 from artifact-not-transcript sharing.
+- **Alice in Wonderland → French.** Eight draft ranks, four reviewers, one
+  synthesizer, and one blinded single-agent baseline produced auditable outputs
+  (`experiments/results/translation/`). Mechanical checks: all review contracts
+  followed, glossary exact-hit rate 1.0, 16 review findings, and estimated
+  translator-input reduction 0.723 from sharding rather than full replication.
 - **Collaborative `minidag`.** Twelve software ranks wrote a small DAG
   scheduler (`experiments/results/software_artifact/`) with parser, executor,
-  tests, and a 1,732-event protocol trace.
-- **100-rank Aesop wave.** Work packets for ranks 0–99 live under
-  `experiments/results/.ampi/cursor-scale/`. Each Cursor subagent is a rank:
-  it reads its shard, writes a Spanish title and moral, and heartbeats
-  `finalized`. That is `mpirun` with language models as the processes.
+  25 passing tests, and a 143-event protocol trace.
+
+The live campaign therefore used 26 Cursor subagent executors. The separate
+100-rank Aesop and SQLite scaling runs used independent deterministic OS
+processes, not 100 language-model agents. A prepared Cursor-scale collector is
+included, but no 100-subagent quality result is claimed.
 
 ### 7.7 Threats to validity
 
@@ -282,7 +289,7 @@ Process-mode executors are threads, not language models. They validate the proto
 
 ## 8. Related work
 
-**Message passing.** MPI Forum reports 1.0–4.1; Gropp, Lusk, Skjellum, *Using MPI*; Snir et al., *MPI: The Complete Reference*; Geist et al. on PVM; Thakur, Rabenseifner, Gropp 2005 on collectives; Bruck 1997; Van de Geijn broadcast; ULFM papers; MPI Sessions (MPI-4) and the 2023 work on fault-aware sessions.
+**Message passing.** MPI Forum reports 1.0–5.0; Gropp, Lusk, Skjellum, *Using MPI*; Snir et al., *MPI: The Complete Reference*; Geist et al. on PVM; Thakur, Rabenseifner, Gropp 2005 on collectives; Bruck 1997; Van de Geijn broadcast; ULFM papers; MPI Sessions (MPI-4) and the 2023 work on fault-aware sessions.
 
 **Classical concurrency.** CSP (Hoare 1978); actors (Hewitt; Agha 1986); Linda tuple spaces (Gelernter); the barrier/reduction literature in PRAM and BSP (Valiant).
 
