@@ -57,7 +57,7 @@ SECTIONS = [
 ]
 
 TASK = """
-You own one section of a short technical report that the eight of you are
+You own one section of a short technical report that {world_size} of you are
 writing together. Some of you will be killed part way through. The report must
 be finished anyway.
 
@@ -81,24 +81,40 @@ ampi win-put --win report --key section/{name} --file {draft_file}
 ampi win-put --win report --key status/{name} --json '{{"author": {rank}, "state": "drafted"}}'
 ```
 
-**Phase 2 --- synchronise, and cope with whatever has happened.**
+Then count yourself done, and wait for the others by polling a counter rather
+than by calling a collective --- some of them are about to be killed, and a
+barrier would simply hang:
 
-Run `ampi barrier --timeout 900`.
+```
+ampi win-fetch-add --win report --key drafted
+```
 
-That barrier may fail, and if it does it is not your fault. Handle it like
-this:
+Now poll, every 30 seconds, for up to 10 minutes, running
+`ampi hb --expect-idle 120` between polls:
 
-1. If it reports `AMPI_ERR_PROC_FAILED`, `AMPI_ERR_REVOKED`, or times out, run
-   `ampi failures` and `ampi doctor` to see what the runtime knows.
-2. If any rank is listed as failed and the communicator is not yet revoked, run
-   `ampi revoke`. It is safe and expected for several survivors to do this; the
-   operation is idempotent.
-3. Every survivor then runs `ampi shrink --name survivors`. This builds a new
-   communicator over the ranks that are still alive, renumbered densely. Note
-   what your new rank is --- `ampi --comm survivors status` and the shrink
-   output will tell you.
-4. Every survivor then runs `ampi --comm survivors agree --value true` to
-   confirm that the survivors are all in the same place and intend to continue.
+```
+ampi win-get --win report --key drafted
+ampi failures
+```
+
+Stop polling as soon as **either** the counter reaches {world_size} **or**
+`ampi failures` reports one or more ranks in its `failed` list. If some ranks
+have failed, the counter will never reach {world_size}, which is exactly why
+you must watch both.
+
+**Phase 2 --- repair the communicator.**
+
+If `ampi failures` lists any failed rank, the world communicator is no longer
+usable for collectives and the survivors have to rebuild it. Do this:
+
+1. Run `ampi revoke`. Several survivors will do this; it is idempotent and
+   safe.
+2. Run `ampi shrink --name survivors`. This builds a communicator over the
+   ranks still alive, renumbered densely. The output tells you your new rank.
+3. Run `ampi --comm survivors agree --value true`. This is the one collective
+   in this experiment, and it is deliberately over the survivors only: it
+   confirms that everyone still standing is in the same place and intends to
+   continue. It tolerates further failures while it runs.
 
 From this point on, **use `--comm survivors` on every collective**.
 
@@ -122,15 +138,12 @@ returns `"claimed": true` it is yours: write it, then
 
 **Phase 4 --- finish.**
 
-```
-ampi --comm survivors barrier --timeout 900
-```
-
-Then write a JSON summary to `{out_file}`:
+Write a JSON summary to `{out_file}`:
 
 ```
 {{"rank": {rank}, "survived": true, "new_rank": <your rank in survivors>,
   "sections_present": <how many section/* keys exist>,
+  "failed_ranks": [<what ampi failures reported>],
   "adopted": [<names of sections you found already published by others>],
   "wrote_extra": [<names of sections you wrote to cover for a dead peer>]}}
 ```
@@ -145,7 +158,7 @@ killed, you simply stop; that is the experiment working.
 """
 
 
-def prepare(root: str, world_size: int = 8, words: int = 160) -> dict:
+def prepare(root: str, world_size: int = 6, words: int = 130) -> dict:
     job_dir = os.path.join(os.path.abspath(root), "job")
     info = create_job(job_dir, world_size, ctx_limit=120_000,
                       meta={"experiment": "e3-fault-tolerance"})
@@ -156,6 +169,7 @@ def prepare(root: str, world_size: int = 8, words: int = 160) -> dict:
         os.makedirs(scratch, exist_ok=True)
         tasks[rank] = TASK.format(
             rank=rank, name=name, topic=topic, words=words,
+            world_size=world_size,
             draft_file=os.path.join(scratch, f"{name}.md"),
             out_file=os.path.join(scratch, "result.json"))
     cards = write_rank_cards(job_dir, world_size, tasks,
@@ -168,7 +182,7 @@ def prepare(root: str, world_size: int = 8, words: int = 160) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.path.join(os.path.dirname(__file__), "runs"))
-    parser.add_argument("-n", type=int, default=8)
+    parser.add_argument("-n", type=int, default=6)
     args = parser.parse_args()
     print(json.dumps(prepare(args.root, args.n), indent=2))
     return 0
