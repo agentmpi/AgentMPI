@@ -230,3 +230,73 @@ def test_decision_function_reports_no_admissible_algorithm():
     op = get_op("AMPI_MERGE_JSON")
     with pytest.raises(AmpiArgError):
         coll.select_algorithm(COLL_ALLREDUCE, 8, 10_000_000, op, 1_000, vector=True)
+
+
+@pytest.mark.parametrize("p,algo", [(8, ALGO_RECURSIVE_DOUBLING), (8, ALGO_RING),
+                                    (6, ALGO_RING)])
+def test_reduce_scatter_partitions_the_key_space(make_job, p, algo):
+    """Every key ends up owned by exactly one rank, fully reduced.
+
+    Reduce-scatter is the operation the context-bound feasibility argument
+    rests on, so its correctness matters more than its speed: the union of what
+    the ranks hold afterwards must equal what an allreduce would have produced,
+    and the blocks must be disjoint.
+    """
+    job = make_job(p)
+
+    def body(rt, r):
+        contribution = {f"term{(r * 3 + i) % 15}": f"g{(r * 3 + i) % 15}" for i in range(5)}
+        contribution[f"own{r}"] = f"only{r}"
+        return coll.reduce_scatter(rt, "world", contribution, "AMPI_MERGE_JSON", algo=algo,
+                                   timeout=120, datatype="vector")["result"]
+
+    out = job.run_ranks(body, timeout=180)
+    expected: dict[str, str] = {}
+    for r in range(p):
+        for i in range(5):
+            k = (r * 3 + i) % 15
+            expected[f"term{k}"] = f"g{k}"
+        expected[f"own{r}"] = f"only{r}"
+
+    union: dict[str, str] = {}
+    for rank, block in out.items():
+        assert isinstance(block, dict), f"rank {rank} got {block!r}"
+        for key in block:
+            assert key not in union, f"key {key} is owned by two ranks"
+        union.update(block)
+    assert union == expected
+
+
+def test_reduce_scatter_holds_less_than_allreduce(make_job):
+    """The residency separation, asserted rather than only measured.
+
+    An allreduce that materialises the vector everywhere must hold more than a
+    reduce-scatter of the same data, and the gap must widen with p. This is the
+    property that decides whether a reduction larger than one context window
+    can run at all.
+    """
+    p = 8
+    payload_keys = 60
+
+    ar_job = make_job(p)
+    rs_job = make_job(p)
+
+    def contribution(r):
+        return {f"k{r}-{i}": "v" * 60 for i in range(payload_keys)}
+
+    def allreduce_body(rt, r):
+        return coll.allreduce(rt, "world", contribution(r), "AMPI_MERGE_JSON",
+                              algo=ALGO_RECURSIVE_DOUBLING, timeout=180,
+                              datatype="vector")["peak_resident_tokens"]
+
+    def scatter_body(rt, r):
+        return coll.reduce_scatter(rt, "world", contribution(r), "AMPI_MERGE_JSON",
+                                   algo=ALGO_RECURSIVE_DOUBLING, timeout=180,
+                                   datatype="vector")["peak_resident_tokens"]
+
+    allreduce_peak = max(ar_job.run_ranks(allreduce_body, timeout=300).values())
+    scatter_peak = max(rs_job.run_ranks(scatter_body, timeout=300).values())
+    assert scatter_peak * 2 < allreduce_peak, (
+        f"reduce-scatter held {scatter_peak} tokens, allreduce held {allreduce_peak}; "
+        "the reduce-scatter family must hold substantially less"
+    )
