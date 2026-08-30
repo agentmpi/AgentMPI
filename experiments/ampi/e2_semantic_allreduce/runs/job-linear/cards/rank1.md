@@ -6,23 +6,26 @@ message-passing protocol: you coordinate with the other ranks *only* through the
 and do not try to contact another rank by any other means. Everything you need
 arrives through the protocol.
 
-## Your environment
+## How to invoke `ampi`
 
-Run this once at the start of your shell session, then every `ampi` command
-picks up its identity automatically:
-
-```
-export PATH=/workspace/.venv/bin:$PATH
-export AMPI_JOB_DIR=/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear
-export AMPI_RANK=1
-export AMPI_COMM=world
-```
-
-If your shell does not persist between commands, prefix each call instead:
+**Always pass `--job` and `--rank` explicitly, on every single call.** Do not
+rely on environment variables: shell state may not survive between your tool
+invocations, and a call that silently picks up the wrong rank will corrupt the
+run in ways that are hard to see. Every command looks like this:
 
 ```
-PATH=/workspace/.venv/bin:$PATH AMPI_JOB_DIR=/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear AMPI_RANK=1 ampi status
+/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear --rank 1 <subcommand> ...
 ```
+
+To keep that short, define a shell function at the start of every command you
+run (not once at the beginning --- every time):
+
+```
+A="/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear --rank 1"
+$A status
+```
+
+Whenever this card writes `ampi ...` below, run `$A ...` instead.
 
 Your scratch directory is `/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear/ranks/1`. Write intermediate files there.
 
@@ -74,7 +77,10 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
    context is a budget; `ampi ctx` shows it.
 3. **Heartbeat before long work.** Before any step that will take more than a
    couple of minutes without an `ampi` call, run `ampi hb --expect-idle
-   SECONDS`. Otherwise the failure detector may declare you dead.
+   SECONDS`, and over-estimate rather than under-estimate. A declared period
+   can only lengthen your lease, never shorten it, so guessing high is free.
+   A blocking call such as `recv` or a collective heartbeats for you while it
+   waits, so you do not need to declare anything before one of those.
 4. **Claim before you work.** When picking up a shared work item, use `ampi
    win-claim`. If it returns `"claimed": false` somebody else already has it;
    take a different item. Never assume an item is yours.
@@ -97,14 +103,21 @@ follow.
 **Step 3.** Take part in the reduction:
 
 ```
-ampi allreduce --op AMPI_SYNTHESIZE --algo linear --datatype scalar --json-file /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear/ranks/1/notes.json --timeout 2400
+ampi reduce --root 0 --op AMPI_SYNTHESIZE --algo linear --datatype scalar --json-file /workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear/ranks/1/notes.json --timeout 2400
 ```
 
-This will do one of two things.
+Under this schedule most ranks are leaves: you send your contribution once and
+the call returns immediately with `"status": "ok"` and a null payload. That is
+success, not a failure --- only the ranks that sit above you in the reduction
+tree are asked to evaluate the operator. If that is you, go to step 3a. If not,
+go straight to step 4.
 
-* It may print `"status": "op_required"`. That means the runtime has reached a
-  step of the reduction that *you* have to evaluate: it is handing you two
-  partial style guides and asking for their merge. When this happens:
+**Step 3a.** If your call printed `"status": "op_required"` instead:
+
+The runtime has reached a step of the reduction that *you* have to evaluate:
+it is handing you two partial style guides and asking for their merge.
+
+* When this happens:
   - read the operands (they are in the JSON under `operands`, or in the file
     named by `operands_file` if they were too large to inline);
   - produce the merged style guide yourself. Merge means: keep every rule that
@@ -117,23 +130,21 @@ This will do one of two things.
     comma-separated list of the chapters covered), to a file in your scratch
     directory;
   - run `ampi op-submit --op-token <the op_token you were given> --json-file <that file>`;
-  - then run the **identical** `ampi allreduce` command again to resume. Do not
+  - then run the **identical** `ampi reduce` command again to resume. Do not
     change any of its arguments.
-  - Repeat as many times as you are asked. You may be asked several times.
+  - Repeat until it prints `"status": "ok"`. You may be asked several times.
 
-* Or it prints `"status": "ok"`, with either a `payload` or a `payload_file`.
-  That is the final reduced style guide and the reduction is over for you.
-
-**Step 4.** Once you have the final result, write it to
-`/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear/ranks/1/result.json` as a JSON object with keys:
+**Step 4.** Write your report to `/workspace/experiments/ampi/e2_semantic_allreduce/runs/job-linear/ranks/1/result.json` as a JSON object with keys:
 `{"rank": 1, "algo": "linear", "upcalls": <how many times you were asked to
-evaluate the operator>, "final": <the final merged guide>}`.
+evaluate the operator, which may be 0>, "final": <the payload the reduce
+returned, or null if it returned null because you are not the root>}`.
 
-**Step 5.** Run `ampi barrier --timeout 1200`, then
-`ampi finalize --note "e2 linear done"`.
+**Step 5.** Run `ampi finalize --note "e2 linear done"`. Do **not** call
+`ampi barrier` --- there is no barrier in this experiment, and calling one
+would be a collective the other ranks are not making.
 
-Before any step where you expect to think for more than about two minutes, run
-`ampi hb --expect-idle 300` first so the failure detector does not condemn you.
+If you are asked to evaluate the operator, run `ampi hb --expect-idle 900`
+before you start thinking about the merge. Over-estimating is free.
 
 Do not edit any file outside your scratch directory and the one output file
 named above. Do not run git.
