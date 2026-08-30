@@ -593,8 +593,8 @@ def table_software() -> None:
         _MACROS["NVagueLinesRatio"] = f"{(dn.get('n_lines') or 0) / max(dv.get('n_lines') or 1, 1):.2f}"
         rs = (av.get("per_round") or [{}])[0]
         rn = (an.get("per_round") or [{}])[0]
-        _MACROS["NVagueSharedRound1"] = f"{rs.get('n_passed')}/{rs.get('n_total')}"
-        _MACROS["NVagueNosRound1"] = f"{rn.get('n_passed')}/{rn.get('n_total')}"
+        _MACROS["NVagueSharedRoundOne"] = f"{rs.get('n_passed')}/{rs.get('n_total')}"
+        _MACROS["NVagueNosRoundOne"] = f"{rn.get('n_passed')}/{rn.get('n_total')}"
         _MACROS["NVagueSharedRounds"] = str(len(av.get("per_round") or []))
         _MACROS["NVagueNosRounds"] = str(len(an.get("per_round") or []))
 
@@ -754,6 +754,12 @@ def summary_macros() -> None:
     macros.append(rf"\newcommand{{\NAgentCallsMicro}}{{{mb_calls:,}}}")
     macros.append(rf"\newcommand{{\NAgentCallsTotal}}{{{n_calls + sw_calls + mb_calls:,}}}")
     macros.append(rf"\newcommand{{\NTranslationConfigs}}{{{len(tr)}}}")
+    bad = sorted(n for n in _MACROS if not n.isalpha())
+    if bad:
+        raise ValueError(
+            "LaTeX macro names may contain only letters; these would silently truncate "
+            f"and typeset their remainder: {bad}"
+        )
     for name, value in sorted(_MACROS.items()):
         macros.append(rf"\newcommand{{\{name}}}{{{value}}}")
     for name in ("NModelConfigs", "NModelAgreement", "NModelDepthAgreement", "NEagerLimit", "NUslFit",
@@ -767,7 +773,7 @@ def summary_macros() -> None:
                  "NVagueSharedWall", "NVagueNosWall", "NVagueWallRatio", "NVagueSharedCalls",
                  "NVagueNosCalls", "NVagueSharedUsd", "NVagueNosUsd", "NVaguePriceRatio",
                  "NVagueSharedDef", "NVagueNosDef", "NVagueDefRatio", "NVagueSharedLines",
-                 "NVagueNosLines", "NVagueLinesRatio", "NVagueSharedRound1", "NVagueNosRound1",
+                 "NVagueNosLines", "NVagueLinesRatio", "NVagueSharedRoundOne", "NVagueNosRoundOne",
                  "NVagueSharedRounds", "NVagueNosRounds"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
