@@ -13,7 +13,7 @@ export function SiteHeader() {
       <div className="mx-auto flex max-w-6xl items-center justify-between gap-4 px-4 py-3 md:px-6">
         <Link href="/" className="text-ink no-underline">
           <span className="font-semibold tracking-tight">AgentMPI</span>
-          <span className="ml-2 hidden text-sm text-muted sm:inline">1.0</span>
+          <span className="ml-2 hidden text-sm text-muted sm:inline">0.1 draft</span>
         </Link>
         <nav className="flex flex-wrap items-center gap-3 text-sm md:gap-5">
           {links.map((l) => (
