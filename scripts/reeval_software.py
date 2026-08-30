@@ -38,6 +38,81 @@ RESULTS = REPO / "results" / "software"
 RUNS = REPO / "runs"
 
 
+#: Exception types an agent catches when it is guessing at another module's shape.
+_ADAPTIVE_EXCEPTIONS = {"AttributeError", "KeyError", "TypeError", "IndexError"}
+
+
+def defensiveness(tree: Path) -> dict[str, Any]:
+    """Count the defensive-adaptation constructs in a generated tree.
+
+    This metric exists because the interface-publication ablation came back nearly
+    null on pass rate, and two agent ranks explained why in their own reports: with
+    no published interfaces they did not fail, they *adapted*. One re-classified
+    tokens by value when it could not know the token-kind vocabulary; another
+    constructed AST nodes by matching values onto whatever field names the class
+    actually declared; a third reached for ``getattr`` fallbacks throughout.
+
+    So the cost of withholding interface information is not correctness. It is
+    **defensive coupling**: code that introspects its collaborators at runtime
+    instead of calling them. That is invisible to an acceptance suite and obvious in
+    the source, and it is the thing worth measuring. Counted precisely with the AST
+    rather than by regular expression, because a comment mentioning ``getattr`` is
+    not defensive code.
+
+    Three constructs are counted:
+
+    ``getattr_default``
+        Three-argument ``getattr``: reading an attribute the author is not certain
+        exists.
+    ``hasattr``
+        Probing for shape before use.
+    ``adaptive_except``
+        Handlers for ``AttributeError``/``KeyError``/``TypeError``/``IndexError``,
+        which are what a wrong guess about an interface raises. Handlers for the
+        project's own ``QueryError`` are deliberately excluded: catching a declared
+        error is correct design, not adaptation.
+    """
+    counts = {"getattr_default": 0, "hasattr": 0, "adaptive_except": 0, "n_files": 0, "n_lines": 0}
+    per_file: dict[str, int] = {}
+    import ast
+
+    for path in sorted((tree / "minidb").glob("*.py")):
+        if path.name == "__init__.py":
+            continue
+        source = path.read_text(encoding="utf-8", errors="replace")
+        counts["n_files"] += 1
+        counts["n_lines"] += source.count("\n") + 1
+        try:
+            module = ast.parse(source)
+        except SyntaxError:
+            continue
+        local = 0
+        for node in ast.walk(module):
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                if node.func.id == "getattr" and len(node.args) >= 3:
+                    counts["getattr_default"] += 1
+                    local += 1
+                elif node.func.id == "hasattr":
+                    counts["hasattr"] += 1
+                    local += 1
+            elif isinstance(node, ast.ExceptHandler) and node.type is not None:
+                names = {
+                    n.id
+                    for n in ast.walk(node.type)
+                    if isinstance(n, ast.Name)
+                }
+                if names & _ADAPTIVE_EXCEPTIONS:
+                    counts["adaptive_except"] += 1
+                    local += 1
+        per_file[path.name] = local
+
+    total = counts["getattr_default"] + counts["hasattr"] + counts["adaptive_except"]
+    counts["total"] = total
+    counts["per_kloc"] = round(1000.0 * total / max(1, counts["n_lines"]), 2)
+    counts["per_file"] = per_file
+    return counts
+
+
 def score(tree: Path, timeout: float = 240.0) -> dict[str, Any]:
     """Run the current suite against one generated tree, out of process."""
     shutil.copy(SUITE, tree / "acceptance.py")
@@ -108,9 +183,11 @@ def main() -> int:
             if not (rd / "minidb").exists():
                 continue
             rep = score(rd)
+            defence = defensiveness(rd)
             per_round.append(
                 {
                     "round": int(rd.name.removeprefix("round")),
+                    "defensiveness": defence,
                     "importable": rep.get("importable"),
                     "n_passed": rep.get("n_passed"),
                     "n_total": rep.get("n_total"),
@@ -139,12 +216,17 @@ def main() -> int:
             "by_module": best["by_module"],
             "blame": best["blame"],
             "failures": best["failures"],
+            "defensiveness": best.get("defensiveness"),
         }
         if not cfg.dry_run:
             result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         n += 1
         traj = " / ".join(f"r{r['round']}:{r['n_passed']}" for r in per_round)
-        print(f"  {result_path.name}: best {best['n_passed']}/{best['n_total']}  ({traj})")
+        dfc = best.get("defensiveness") or {}
+        print(
+            f"  {result_path.name}: best {best['n_passed']}/{best['n_total']}  ({traj})"
+            f"  defensive={dfc.get('total', 0)} ({dfc.get('per_kloc', 0)}/kloc, {dfc.get('n_lines', 0)} lines)"
+        )
     print(f"re-scored {n} runs against the current suite")
     return 0
 

@@ -241,9 +241,45 @@ Return ONLY a JSON object:
 --- END SPECIFICATION ---"""
 
 
+def _excerpt(code: str, max_chars: int = 9000) -> str:
+    """Truncate source at a line boundary and say so.
+
+    Two reviewers reported that the code they were asked to review stopped mid-function
+    --- inside ``_and_expression`` in one case --- because an earlier version sliced the
+    source at a fixed character count. A reviewer handed a syntactically incomplete file
+    cannot tell a real defect from the cut, and both of them correctly flagged the
+    problem instead of the code, which is a review round wasted.
+
+    Truncating at a line boundary and marking the elision costs nothing and makes the
+    omission legible. The protocol has a first-class facility for this
+    (:class:`agentmpi.View`), and the right long-term fix is to send the source by
+    handle and let the reviewer fetch the projection it wants rather than have the
+    sender guess.
+    """
+    if len(code) <= max_chars:
+        return code
+    # Counted in lines, not characters. Character arithmetic around the boundary
+    # newline is off by one in a way that is easy to get wrong and hard to notice,
+    # and the number is stated to a reader who will rely on it.
+    lines = code.splitlines()
+    kept_lines: list[str] = []
+    used = 0
+    for line in lines:
+        if used + len(line) + 1 > max_chars and kept_lines:
+            break
+        kept_lines.append(line)
+        used += len(line) + 1
+    omitted = len(lines) - len(kept_lines)
+    if omitted <= 0:
+        return code
+    kept = "\n".join(kept_lines)
+    return f"{kept}\n# ... {omitted} further lines of this file were not included in this review excerpt ...\n"
+
+
 def prompt_review(mod: dict[str, Any], targets: list[dict[str, Any]]) -> str:
     bodies = "\n\n".join(
-        f"### {t['path']} (published exports: {json.dumps(t.get('exports', []))})\n```python\n{t.get('code', '')[:9000]}\n```"
+        f"### {t['path']} (published exports: {json.dumps(t.get('exports', []))})\n"
+        f"```python\n{_excerpt(t.get('code', ''))}\n```"
         for t in targets
     )
     return f"""You own `{mod['path']}`. Review the peer modules below for problems that would
@@ -508,7 +544,7 @@ def build_harness(cfg: argparse.Namespace, spec: str, workdir: Path) -> Any:
                 topo = ampi.dist_graph_create(comm, edges)
                 transpose = ampi.dist_graph_create(comm, [(b, a) for a, b in edges])
                 mine_payload = [
-                    {"path": m["path"], "code": code.get(m["path"], "")[:9000], "exports": exports.get(m["name"], [])}
+                    {"path": m["path"], "code": _excerpt(code.get(m["path"], "")), "exports": exports.get(m["name"], [])}
                     for m in mine
                 ]
                 incoming = ampi.neighbor_allgather(topo, mine_payload, admit=False, label=f"review-r{round_no}")

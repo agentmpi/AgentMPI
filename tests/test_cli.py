@@ -212,3 +212,39 @@ def test_acceptance_report_parsing():
     assert parse_report("")["importable"] is False
     assert parse_report("", "Traceback ...")["import_error"] == "Traceback ..."
     assert parse_report("total garbage")["importable"] is False
+
+
+def test_review_excerpt_never_cuts_mid_line():
+    """Source sent for review must be truncated at a line boundary, and say so.
+
+    Two reviewer ranks reported that the code they were given stopped mid-function,
+    because an earlier version sliced at a fixed character count. A reviewer handed a
+    syntactically incomplete file cannot distinguish a real defect from the cut, and
+    both of them correctly flagged the truncation instead of the code -- a wasted
+    review round. Marking the elision costs nothing.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
+    from software import _excerpt  # noqa: PLC0415 - path set above
+
+    short = "def f():\n    return 1\n"
+    assert _excerpt(short, 9000) == short, "short files must pass through untouched"
+
+    code = "".join(f"def f{i}():\n    return {i}\n" for i in range(500))
+    out = _excerpt(code, 200)
+    assert len(out) < len(code)
+    body = out.split("# ...")[0]
+    # Every retained line must be whole: no line of the excerpt may be a prefix of a
+    # source line without being the whole line.
+    source_lines = set(code.splitlines())
+    assert all(line in source_lines for line in body.splitlines() if line), body
+    assert "further lines of this file were not included" in out
+    # The stated count must be right, counted in lines.
+    stated = int(out.split("# ... ")[1].split(" further")[0])
+    kept_lines = [line for line in body.splitlines() if line]
+    assert stated == len(code.splitlines()) - len(kept_lines), out[-140:]
+
+    # A file with no newline at all still truncates without crashing.
+    assert _excerpt("x" * 500, 100).startswith("x")

@@ -519,15 +519,17 @@ def table_software() -> None:
         j, c = d["job"], d["config"]
         rounds = (d.get("acceptance_reeval") or {}).get("per_round") or d.get("per_round") or []
         traj = " / ".join(str(r.get("n_passed") or 0) for r in rounds)
+        dfc = a.get("defensiveness") or {}
         lines.append(
-            rf"{label(c)} & {c.get('ranks')} & {fmt(a.get('importable'))} & "
-            rf"{a.get('n_passed') or 0}/{a.get('n_total') or 0} & {fmt(a.get('pass_rate'), 3)} & "
-            rf"{tex_escape(traj)} & {fmt(j['wall_s'], 0)} & {j['agent_calls']} & "
+            rf"{label(c)} & {c.get('ranks')} & "
+            rf"{a.get('n_passed') or 0}/{a.get('n_total') or 0} & "
+            rf"{fmt(dfc.get('n_lines'))} & {dfc.get('total', 0)} & {fmt(dfc.get('per_kloc'), 2)} & "
+            rf"{fmt(j['wall_s'], 0)} & {j['agent_calls']} & "
             rf"{fmt(j['tokens_in'] + j['tokens_out'])} & {fmt(j['usd'], 3)} \\"
         )
     body = (
-        "\\begin{tabular}{lrccrlrrrr}\n\\toprule\n"
-        "configuration & $p$ & imports & passed & rate & per round & wall (s) & calls & tokens & USD \\\\\n\\midrule\n"
+        "\\begin{tabular}{lrcrrrrrrr}\n\\toprule\n"
+        "configuration & $p$ & passed & lines & defensive & /kloc & wall (s) & calls & tokens & USD \\\\\n\\midrule\n"
         + "\n".join(lines)
         + "\n\\bottomrule\n\\end{tabular}"
     )
@@ -554,6 +556,19 @@ def table_software() -> None:
         _MACROS["NSwSoloPassed"] = f"{acc(solo).get('n_passed')}/{acc(solo).get('n_total')}"
         _MACROS["NSwSoloCalls"] = str(solo["job"]["agent_calls"])
         _MACROS["NSwParCalls"] = str(par["job"]["agent_calls"])
+        _MACROS["NSwSoloDef"] = fmt((acc(solo).get("defensiveness") or {}).get("per_kloc"), 2)
+    noshared = next((d for d in res if d["config"].get("ranks", 0) > 1
+                     and not d["config"].get("shared_interfaces")
+                     and not d["config"].get("vague_spec")), None)
+    if par and noshared:
+        dp = (acc(par).get("defensiveness") or {})
+        dn = (acc(noshared).get("defensiveness") or {})
+        _MACROS["NSwDefShared"] = fmt(dp.get("per_kloc"), 2)
+        _MACROS["NSwDefNoshared"] = fmt(dn.get("per_kloc"), 2)
+        _MACROS["NSwDefRatio"] = f"{(dn.get('per_kloc') or 0) / max(dp.get('per_kloc') or 1e-9, 1e-9):.1f}"
+        _MACROS["NSwLinesShared"] = fmt(dp.get("n_lines"))
+        _MACROS["NSwLinesNoshared"] = fmt(dn.get("n_lines"))
+        _MACROS["NSwLinesRatio"] = f"{100 * ((dn.get('n_lines') or 0) / max(dp.get('n_lines') or 1, 1) - 1):.0f}"
 
     lines = []
     for d in res:
@@ -654,7 +669,9 @@ def summary_macros() -> None:
                  "NSemTime", "NSemTokens", "NSemPrice", "NSemCalls", "NCoordTime", "NCoordTokens",
                  "NFidTree", "NFidChain", "NFidFlat", "NFidSpeedup",
                  "NSwSpeedup", "NSwEff", "NSwPrice", "NSwTokens", "NSwParWall", "NSwSoloWall",
-                 "NSwParPassed", "NSwSoloPassed", "NSwSoloCalls", "NSwParCalls"):
+                 "NSwParPassed", "NSwSoloPassed", "NSwSoloCalls", "NSwParCalls",
+                 "NSwSoloDef", "NSwDefShared", "NSwDefNoshared", "NSwDefRatio",
+                 "NSwLinesShared", "NSwLinesNoshared", "NSwLinesRatio"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
