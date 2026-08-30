@@ -172,6 +172,8 @@ python3 experiments/e2_codev/prepare.py --arm naive --np 8 --out runs/e2_naive
 # ... launch one agent per rank ...
 python3 experiments/e2_codev/grade.py runs/e2_ampi runs/e2_naive \
     --out results/e2_grade.json     # 174-case held-out suite
+python3 experiments/e2_codev/differential.py runs/e2_ampi runs/e2_naive \
+    --n 2500 --seed 11 --out results/e2_differential.json
 ```
 
 Both experiments run an ablated `naive` arm: the same agents, the same task, the
@@ -181,6 +183,57 @@ Comparing against a baseline that also lacked instrumentation would produce
 numbers nobody could interpret.
 
 ---
+
+## What the experiments found
+
+**E1, parallel book translation** (5 agent ranks per arm, *Flatland* into Chinese).
+Identical wall time and output volume; the difference is the artefact and the
+context. Of 10 probe terms reported by two or more ranks, the unprotocolled arm
+diverged on two (*Equilateral* rendered two ways in a 2–2 split, *Priest* two ways
+by two ranks); the AgentMPI arm diverged on none. The glossary was agreed by 4
+agent-evaluated merges with 3 on the critical path — exactly `ceil(log2 5)` — and
+adherence to it, checked against the collective's own result object rather than
+against agent self-report, was 1.00. Four of five ranks revised and republished
+their opening after the halo exchange (durable window-cell versions, not
+self-report); none did without it. Peak context in one rank: 8,661 tokens versus
+897, because the unprotocolled coordinator materialised every translation.
+
+**E2, eight agents building a Scheme interpreter.** Both arms passed **174/174**
+held-out cases, so that instrument measured neither. The ablated arm also
+*spontaneously recreated the protocol's mechanisms* — unprompted, its agents built
+`contract` and `decisions` windows with cells named `interface` and
+`eval-protocol` — and reached the same score for a third of the wall time and a
+fifth of the context. We take that as evidence the abstraction matches the problem
+and as a caution against selling it as a capability.
+
+To separate the arms we used **differential testing**: 2500 programs generated
+from a grammar written against the spec, run under both interpreters and compared
+— symmetric between arms by construction, since no program is chosen after seeing
+a failure. The arms agree on 92.4%. Of 190 disagreements, **111 are attributable
+to a specification clause and every one favours the protocol arm**; none favours
+the ablated arm. Stated honestly, those 111 observations trace to *one* root cause
+(float exponent formatting). What makes that one defect interesting is that it
+arose in **both** arms and only one arm's process removed it: in the protocol arm
+the integrator raised it in a synchronised integration round, a third rank
+seconded it in the shared fix log, and the printer's owner adopted it. In the
+ablated arm a rank diagnosed it *more precisely than anyone in the protocol arm
+did*, messaged the owner and the integrator twice with a one-line fix, and was
+never answered. So the mechanism that paid off was not the negotiated contract —
+which the ablated arm reinvented — but the scheduled point at which "what does the
+spec say" got adjudicated once and written down.
+
+**E3, mass launch failure.** A job requested at P=22 started only 6 ranks. It ran
+to completion: all 6 survivors finalised, 5 of 5 collectives closed, 6 dead
+subtrees dropped from the agent-evaluated reduction tree, 6 translated sections
+produced.
+
+**Microbenchmarks.** α = 5.74 ms, β = 1.22 µs/token, n½ = 4,720 tokens. Rendezvous
+delivery charges a flat ~75 tokens whether the payload is 8 tokens or 32,768.
+At P=128 an inlining allgather charges one rank 501,888 context tokens against
+3,200 handle-based (157×). Recursive-doubling allreduce moves 36× the payload of
+reduce-then-broadcast. A binomial agent-operator reduction beats a linear chain
+11.6× at P=64 at identical total work. Receive latency is flat in unexpected-queue
+depth out to 2048.
 
 ## What running it with real agents taught us
 

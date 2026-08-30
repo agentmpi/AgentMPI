@@ -270,6 +270,57 @@ def fig_e1(e1: Optional[Dict[str, Any]], out: Path) -> None:
     _save(fig, out, "fig_e1")
 
 
+def fig_e2_differential(diff: Optional[Dict[str, Any]], out: Path) -> None:
+    """Where the held-out suite tied, differential testing separated the arms.
+
+    Left: the outcome of every generated program. Right: how the disagreements
+    attribute. The point of the right panel is the asymmetry -- every
+    specification-attributable disagreement falls on one side -- and the honesty
+    of it, which is that they trace to a single root cause.
+    """
+    if not diff:
+        return
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.0, 2.5),
+                                   gridspec_kw={"width_ratios": [1.25, 1]})
+    labels = {
+        "agree_value": "agree\n(value)",
+        "agree_error": "agree\n(error)",
+        "disagree_value": "disagree\n(value)",
+        "disagree_error_vs_value": "disagree\n(error vs value)",
+    }
+    order = ["agree_value", "agree_error", "disagree_value", "disagree_error_vs_value"]
+    vals = [diff["outcomes"].get(k, 0) for k in order]
+    shades = ["0.55", "0.75", "0.25", "0.4"]
+    ax1.bar(range(len(order)), vals, 0.6, color=shades,
+            edgecolor="black", linewidth=0.4)
+    ax1.set_xticks(range(len(order)))
+    ax1.set_xticklabels([labels[k] for k in order], fontsize=7)
+    ax1.set_yscale("log")
+    ax1.set_ylabel("generated programs")
+    ax1.set_title(f"(a) {diff['programs']} programs, {100*diff['agreement_rate']:.1f}% agree")
+    for i, v in enumerate(vals):
+        if v:
+            ax1.text(i, v * 1.25, str(v), ha="center", fontsize=7.5)
+
+    att = diff["attributable_disagreements"]
+    n_ampi = att.get("ampi", 0)
+    n_naive = att.get("naive", 0)
+    n_under = diff["disagreement_count"] - n_ampi - n_naive
+    bars = [("AgentMPI\nconforms", n_ampi, "0.35"),
+            ("no protocol\nconforms", n_naive, "0.75"),
+            ("spec is\nsilent", n_under, "0.9")]
+    ax2.bar(range(len(bars)), [b[1] for b in bars], 0.6,
+            color=[b[2] for b in bars], edgecolor="black", linewidth=0.4)
+    ax2.set_xticks(range(len(bars)))
+    ax2.set_xticklabels([b[0] for b in bars], fontsize=7)
+    ax2.set_ylabel("disagreeing programs")
+    ax2.set_title(f"(b) attribution ({len(diff['attribution_kinds'])} root cause)")
+    for i, b in enumerate(bars):
+        ax2.text(i, b[1] + max(1, 0.03 * max(x[1] for x in bars)), str(b[1]),
+                 ha="center", fontsize=7.5)
+    _save(fig, out, "fig_e2_differential")
+
+
 def fig_e2(e2: Optional[Dict[str, Any]], out: Path,
            behaviour: Optional[Dict[str, Any]] = None) -> None:
     """E2: identical quality, very different cost.
@@ -357,6 +408,7 @@ def main() -> int:
     ap.add_argument("--e1", default="results/e1_metrics.json")
     ap.add_argument("--e2", default="results/e2_grade.json")
     ap.add_argument("--e2b", default="results/e2_behaviour.json")
+    ap.add_argument("--e2d", default="results/e2_differential.json")
     ap.add_argument("--out", default="paper/figures")
     args = ap.parse_args()
     out = Path(args.out)
@@ -388,6 +440,10 @@ def main() -> int:
         fig_e2(json.loads(Path(args.e2).read_text()), out, beh)
     else:
         print(f"  (no {args.e2})")
+    if Path(args.e2d).exists():
+        fig_e2_differential(json.loads(Path(args.e2d).read_text()), out)
+    else:
+        print(f"  (no {args.e2d})")
     return 0
 
 

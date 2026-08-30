@@ -74,6 +74,14 @@ elif [[ -d runs/e2_ampi/project ]]; then
 else
   echo "  no E2 agent runs found; skipping"
 fi
+if [[ -d runs/e2_ampi/project && -d runs/e2_naive/project ]]; then
+  # Differential testing: the held-out suite saturated (both arms 174/174), so the
+  # arms are separated by generating programs from a grammar written against the
+  # spec and comparing. Symmetric in the arms by construction; seeded.
+  N=$([[ $QUICK -eq 1 ]] && echo 300 || echo 2500)
+  python3 experiments/e2_codev/differential.py runs/e2_ampi runs/e2_naive \
+    --n "$N" --seed 11 --out results/e2_differential.json | tail -12
+fi
 
 say "8. Paper artefacts"
 python3 scripts/build_bib.py

@@ -72,6 +72,7 @@ def main() -> int:
     ap.add_argument("--e2", default="results/e2_grade.json")
     ap.add_argument("--e3", default="results/e3_metrics.json")
     ap.add_argument("--e2b", default="results/e2_behaviour.json")
+    ap.add_argument("--e2d", default="results/e2_differential.json")
     ap.add_argument("--out", default="paper/results.tex")
     args = ap.parse_args()
     m = Macros()
@@ -251,6 +252,28 @@ def main() -> int:
     if e2b.exists():
         for k, v in (json.loads(e2b.read_text()).get("macros") or {}).items():
             m.add(k, v)
+
+    # ---- experiment 2, differential testing --------------------------------
+    e2d = Path(args.e2d)
+    if e2d.exists():
+        d = json.loads(e2d.read_text())
+        m.add("diffPrograms", d["programs"])
+        m.add("diffSeed", d["seed"])
+        m.add("diffAgreement", d["agreement_rate"], 3)
+        m.add("diffAgreementPct", round(100 * d["agreement_rate"], 1), 1)
+        m.add("diffDisagree", d["disagreement_count"])
+        m.add("diffAttributable", sum(d["attributable_disagreements"].values()))
+        m.add("diffAttributableTo", ", ".join(sorted(d["attributable_disagreements"])))
+        m.add("diffRootCauses", len(d["attribution_kinds"]))
+        m.add("diffFingerprints", d["distinct_fingerprints"])
+        m.add("diffUnderspecified", d["disagreement_count"]
+              - sum(d["attributable_disagreements"].values()))
+        agree_v = d["outcomes"].get("agree_value", 0)
+        agree_e = d["outcomes"].get("agree_error", 0)
+        m.add("diffAgreeValue", agree_v)
+        m.add("diffAgreeError", agree_e)
+        m.add("diffDisagreeValue", d["outcomes"].get("disagree_value", 0))
+        m.add("diffDisagreeStatus", d["outcomes"].get("disagree_error_vs_value", 0))
 
     # ---- experiment 3 -----------------------------------------------------
     e3p = Path(args.e3)
