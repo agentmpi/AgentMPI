@@ -40,7 +40,7 @@ from .model import (
     WouldBlock,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def estimate_tokens(value: Any) -> int:
@@ -75,7 +75,8 @@ class Runtime:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.execute("PRAGMA busy_timeout=30000")
         self._ensure_schema()
-        self._assert_member()
+        member = self._member_row()
+        self._incarnation = int(member["incarnation"])
 
     @classmethod
     def initialize(
@@ -169,11 +170,17 @@ class Runtime:
             if row["state"] == AgentState.FINALIZED.value:
                 raise ProtocolViolation(f"rank {rank} was finalized")
             budget_sql = ", context_budget=?" if context_budget is not None else ""
+            current_incarnation = int(row["incarnation"])
+            incarnation = (
+                current_incarnation
+                if row["state"] == AgentState.JOINING.value
+                else current_incarnation + 1
+            )
             params: list[Any] = [
                 AgentState.ACTIVE.value,
                 now,
                 now + heartbeat_ttl,
-                int(row["incarnation"]) + 1,
+                incarnation,
             ]
             if context_budget is not None:
                 params.append(context_budget)
@@ -184,13 +191,26 @@ class Runtime:
                     WHERE session_id=? AND rank=?""",
                 params,
             )
-            runtime._event("agent.join", {"rank": rank})
+            runtime._conn.execute(
+                """UPDATE messages SET state='cancelled'
+                   WHERE session_id=? AND state='pending'
+                     AND ((src=? AND source_incarnation<>?)
+                       OR (dst=? AND destination_incarnation<>?))""",
+                (session_id, rank, incarnation, rank, incarnation),
+            )
+            runtime._conn.execute(
+                "DELETE FROM posted_receives WHERE session_id=? AND dst=?",
+                (session_id, rank),
+            )
+            runtime._incarnation = incarnation
+            runtime._event("agent.join", {"rank": rank, "incarnation": incarnation})
         return runtime
 
     def close(self) -> None:
         self._conn.close()
 
     def finalize(self) -> None:
+        self._assert_active()
         with self._transaction():
             self._conn.execute(
                 """UPDATE agents SET state=?, lease_until=?
@@ -200,6 +220,7 @@ class Runtime:
             self._event("agent.finalize", {"rank": self.rank})
 
     def heartbeat(self) -> None:
+        self._assert_active()
         now = time.time()
         with self._transaction():
             self._conn.execute(
@@ -238,6 +259,7 @@ class Runtime:
     def create_communicator(
         self, members: Sequence[int], *, name: str | None = None
     ) -> Communicator:
+        self._assert_active()
         normalized = tuple(dict.fromkeys(int(rank) for rank in members))
         if not normalized:
             raise ValueError("communicator must have at least one member")
@@ -282,10 +304,21 @@ class Runtime:
         sends complete after the destination acknowledges receipt. Ready sends
         require a posted matching receive.
         """
+        self._assert_active()
         communicator = comm or self.world
         self._validate_comm(communicator)
-        if self.rank not in communicator.members or dest not in communicator.members:
-            raise ProtocolViolation("source and destination must belong to communicator")
+        if self.rank not in communicator.members:
+            raise ProtocolViolation("source must belong to communicator")
+        destination = communicator.world_rank(dest)
+        if tag == ANY_TAG:
+            raise ProtocolViolation("ANY_TAG is a receive selector, not a legal send tag")
+        destination_member = self._member_row(destination)
+        if destination_member["state"] in {
+            AgentState.FAILED.value,
+            AgentState.FINALIZED.value,
+        }:
+            raise ProcessFailed(f"destination rank {dest} is not available")
+        destination_incarnation = int(destination_member["incarnation"])
         started = time.monotonic()
         token_count = estimate_tokens(payload)
         encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -311,14 +344,14 @@ class Runtime:
                 with self._transaction():
                     self._assert_communicator_live(communicator.id)
                     if mode is DeliveryMode.READY and not self._has_posted_receive(
-                        communicator.id, self.rank, dest, tag
+                        communicator.id, self.rank, destination, tag
                     ):
                         raise ProtocolViolation("ready send has no matching posted receive")
                     queued = self._conn.execute(
                         """SELECT COALESCE(SUM(payload_bytes), 0) AS total
                            FROM messages
                            WHERE session_id=? AND dst=? AND state='pending'""",
-                        (self.session_id, dest),
+                        (self.session_id, destination),
                     ).fetchone()["total"]
                     if int(queued) + payload_bytes > int(session["mailbox_bytes"]):
                         raise ResourceExhausted(
@@ -328,17 +361,18 @@ class Runtime:
                         self._conn.execute(
                             """SELECT COALESCE(MAX(sequence), -1) + 1 AS next
                                FROM messages
-                               WHERE comm_id=? AND src=? AND dst=? AND tag=?""",
-                            (communicator.id, self.rank, dest, tag),
+                               WHERE comm_id=? AND src=? AND dst=?""",
+                            (communicator.id, self.rank, destination),
                         ).fetchone()["next"]
                     )
                     now = time.time()
                     self._conn.execute(
                         """INSERT INTO messages(
-                               id, session_id, comm_id, generation, src, dst, tag,
-                               sequence, mode, payload_json, payload_bytes,
+                               id, session_id, comm_id, generation, src,
+                               source_incarnation, dst, destination_incarnation,
+                               tag, sequence, mode, payload_json, payload_bytes,
                                payload_tokens, artifact_ref, state, created_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
                                      'pending', ?)""",
                         (
                             message_id,
@@ -346,7 +380,9 @@ class Runtime:
                             communicator.id,
                             communicator.generation,
                             self.rank,
-                            dest,
+                            self._incarnation,
+                            destination,
+                            destination_incarnation,
                             tag,
                             sequence,
                             mode.value,
@@ -361,8 +397,10 @@ class Runtime:
                         "message.send",
                         {
                             "message_id": message_id,
-                            "src": self.rank,
+                            "src": communicator.rank(self.rank),
+                            "src_incarnation": self._incarnation,
                             "dst": dest,
+                            "dst_incarnation": destination_incarnation,
                             "tag": tag,
                             "sequence": sequence,
                             "tokens": token_count,
@@ -370,7 +408,7 @@ class Runtime:
                         },
                     )
                 status = Status(
-                    source=self.rank,
+                    source=communicator.rank(self.rank),
                     tag=tag,
                     count=payload_bytes,
                     message_id=message_id,
@@ -397,24 +435,37 @@ class Runtime:
         timeout: float | None = None,
         charge_context: bool = True,
     ) -> Received:
+        self._assert_active()
         communicator = comm or self.world
         self._validate_comm(communicator)
         if self.rank not in communicator.members:
             raise ProtocolViolation("receiver does not belong to communicator")
+        source_world = (
+            ANY_SOURCE if source == ANY_SOURCE else communicator.world_rank(source)
+        )
         request_id = uuid.uuid4().hex
         started = time.monotonic()
         with self._transaction():
+            post_sequence = int(
+                self._conn.execute(
+                    """SELECT COALESCE(MAX(post_sequence), -1) + 1 AS next
+                       FROM posted_receives WHERE comm_id=? AND dst=?""",
+                    (communicator.id, self.rank),
+                ).fetchone()["next"]
+            )
             self._conn.execute(
                 """INSERT INTO posted_receives(
-                       id, session_id, comm_id, dst, source, tag, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                       id, session_id, comm_id, dst, source, tag,
+                       post_sequence, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     request_id,
                     self.session_id,
                     communicator.id,
                     self.rank,
-                    source,
+                    source_world,
                     tag,
+                    post_sequence,
                     time.time(),
                 ),
             )
@@ -422,7 +473,13 @@ class Runtime:
             while True:
                 with self._transaction():
                     self._assert_communicator_live(communicator.id)
-                    row = self._match_message(communicator.id, source, tag)
+                    self._assert_active()
+                    row = self._match_message(
+                        communicator.id,
+                        source_world,
+                        tag,
+                        request_id=request_id,
+                    )
                     if row is not None:
                         payload = json.loads(row["payload_json"])
                         if charge_context:
@@ -441,8 +498,9 @@ class Runtime:
                             "message.recv",
                             {
                                 "message_id": row["id"],
-                                "src": row["src"],
-                                "dst": self.rank,
+                                "src": communicator.rank(int(row["src"])),
+                                "src_incarnation": row["source_incarnation"],
+                                "dst": communicator.rank(self.rank),
                                 "tag": row["tag"],
                                 "sequence": row["sequence"],
                             },
@@ -450,7 +508,7 @@ class Runtime:
                         return Received(
                             payload=payload,
                             status=Status(
-                                source=int(row["src"]),
+                                source=communicator.rank(int(row["src"])),
                                 tag=str(row["tag"]),
                                 count=int(row["payload_bytes"]),
                                 message_id=str(row["id"]),
@@ -473,12 +531,24 @@ class Runtime:
         tag: str = ANY_TAG,
         comm: Communicator | None = None,
     ) -> Status:
+        self._assert_active()
         communicator = comm or self.world
-        row = self._match_message(communicator.id, source, tag, mutate=False)
+        self._validate_comm(communicator)
+        if self.rank not in communicator.members:
+            raise ProtocolViolation("receiver does not belong to communicator")
+        source_world = (
+            ANY_SOURCE if source == ANY_SOURCE else communicator.world_rank(source)
+        )
+        row = self._match_message(
+            communicator.id,
+            source_world,
+            tag,
+            mutate=False,
+        )
         if row is None:
             raise WouldBlock("no matching message")
         return Status(
-            source=int(row["src"]),
+            source=communicator.rank(int(row["src"])),
             tag=str(row["tag"]),
             count=int(row["payload_bytes"]),
             message_id=str(row["id"]),
@@ -501,7 +571,8 @@ class Runtime:
         timeout: float | None = None,
     ) -> Any:
         communicator = comm or self.world
-        contribution = value if self.rank == root else None
+        root_world = communicator.world_rank(root)
+        contribution = value if self.rank == root_world else None
         return self._collective(
             CollectiveOp.BCAST,
             contribution,
@@ -519,9 +590,14 @@ class Runtime:
         timeout: float | None = None,
     ) -> Any:
         communicator = comm or self.world
-        if self.rank == root and (values is None or len(values) != communicator.size):
+        root_world = communicator.world_rank(root)
+        if self.rank == root_world and (
+            values is None or len(values) != communicator.size
+        ):
             raise ProtocolViolation("scatter root must provide one value per member")
-        contribution = list(values) if self.rank == root and values is not None else None
+        contribution = (
+            list(values) if self.rank == root_world and values is not None else None
+        )
         result = self._collective(
             CollectiveOp.SCATTER,
             contribution,
@@ -547,7 +623,7 @@ class Runtime:
             root=root,
             timeout=timeout,
         )
-        return result if self.rank == root else None
+        return result if self.rank == communicator.world_rank(root) else None
 
     def allgather(
         self,
@@ -579,7 +655,7 @@ class Runtime:
             reduce_op=op,
             timeout=timeout,
         )
-        return result if self.rank == root else None
+        return result if self.rank == communicator.world_rank(root) else None
 
     def allreduce(
         self,
@@ -616,14 +692,19 @@ class Runtime:
         )
 
     def revoke(self, comm: Communicator | None = None, reason: str = "user") -> None:
+        self._assert_active()
         communicator = comm or self.world
+        self._validate_comm(communicator, allow_revoked=True)
         with self._transaction():
             self._conn.execute(
-                "UPDATE communicators SET revoked=1 WHERE id=?", (communicator.id,)
+                """UPDATE communicators SET revoked=1
+                   WHERE id=? AND session_id=?""",
+                (communicator.id, self.session_id),
             )
             self._event("comm.revoke", {"comm_id": communicator.id, "reason": reason})
 
     def detect_failures(self, *, now: float | None = None) -> list[int]:
+        self._assert_active()
         timestamp = now or time.time()
         with self._transaction():
             rows = self._conn.execute(
@@ -658,6 +739,7 @@ class Runtime:
 
     def fail_rank(self, rank: int, *, reason: str = "injected") -> None:
         """Mark a rank failed. This explicit hook supports fault-injection studies."""
+        self._assert_active()
         with self._transaction():
             self._conn.execute(
                 "UPDATE agents SET state='failed', lease_until=? WHERE session_id=? AND rank=?",
@@ -673,9 +755,16 @@ class Runtime:
                     self._conn.execute(
                         "UPDATE communicators SET revoked=1 WHERE id=?", (row["id"],)
                     )
+                    self._event(
+                        "comm.revoke",
+                        {"comm_id": row["id"], "reason": "member_failed"},
+                    )
 
     def shrink(self, comm: Communicator | None = None) -> Communicator:
+        self._assert_active()
         communicator = comm or self.world
+        self._validate_comm(communicator, allow_revoked=True)
+        communicator = self.communicator(communicator.id)
         states = {
             int(row["rank"]): str(row["state"])
             for row in self._conn.execute(
@@ -689,8 +778,10 @@ class Runtime:
         )
         if self.rank not in survivors:
             raise ProcessFailed(f"rank {self.rank} is not a survivor")
+        if not communicator.revoked and survivors == communicator.members:
+            return communicator
         generation = communicator.generation + 1
-        comm_id = f"{communicator.id.rsplit(':', 1)[0]}:{generation}"
+        comm_id = f"{communicator.id}:shrink:{generation}"
         with self._transaction():
             self._conn.execute(
                 """INSERT OR IGNORE INTO communicators(
@@ -706,6 +797,13 @@ class Runtime:
                     time.time(),
                 ),
             )
+            existing = self._conn.execute(
+                """SELECT members_json FROM communicators
+                   WHERE id=? AND session_id=?""",
+                (comm_id, self.session_id),
+            ).fetchone()
+            if existing is None or tuple(json.loads(existing["members_json"])) != survivors:
+                raise ProtocolViolation("shrink produced inconsistent survivor membership")
             self._event(
                 "comm.shrink",
                 {
@@ -718,6 +816,9 @@ class Runtime:
 
     def acquire_lock(self, name: str, *, lease_seconds: float = 30.0) -> int:
         """Acquire a lease lock and return its monotonic fencing token."""
+        self._assert_active()
+        if lease_seconds <= 0:
+            raise ValueError("lease_seconds must be positive")
         now = time.time()
         with self._transaction():
             row = self._conn.execute(
@@ -730,7 +831,19 @@ class Runtime:
                 and int(row["owner"]) != self.rank
             ):
                 raise LockUnavailable(f"lock {name!r} is held by rank {row['owner']}")
-            token = 1 if row is None else int(row["fencing_token"]) + 1
+            fence = self._conn.execute(
+                """SELECT last_token FROM lock_fences
+                   WHERE session_id=? AND name=?""",
+                (self.session_id, name),
+            ).fetchone()
+            token = 1 if fence is None else int(fence["last_token"]) + 1
+            self._conn.execute(
+                """INSERT INTO lock_fences(session_id, name, last_token)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(session_id, name) DO UPDATE SET
+                       last_token=excluded.last_token""",
+                (self.session_id, name, token),
+            )
             self._conn.execute(
                 """INSERT INTO locks(
                        session_id, name, owner, lease_until, fencing_token
@@ -748,6 +861,7 @@ class Runtime:
             return token
 
     def release_lock(self, name: str, fencing_token: int) -> None:
+        self._assert_active()
         with self._transaction():
             cursor = self._conn.execute(
                 """DELETE FROM locks
@@ -762,6 +876,7 @@ class Runtime:
             )
 
     def put_artifact(self, data: bytes, *, media_type: str) -> str:
+        self._assert_active()
         digest = hashlib.sha256(data).hexdigest()
         artifact_dir = self.db_path.with_suffix(self.db_path.suffix + ".artifacts")
         artifact_dir.mkdir(parents=True, exist_ok=True)
@@ -787,6 +902,7 @@ class Runtime:
         return f"sha256:{digest}"
 
     def get_artifact(self, ref: str, *, charge_context: bool = True) -> bytes:
+        self._assert_active()
         digest = ref.removeprefix("sha256:")
         row = self._conn.execute(
             "SELECT * FROM artifacts WHERE digest=? AND session_id=?",
@@ -803,6 +919,10 @@ class Runtime:
         return data
 
     def reset_context(self, *, used: int = 0) -> None:
+        self._assert_active()
+        member = self._member_row()
+        if used < 0 or used > int(member["context_budget"]):
+            raise ValueError("context usage must be within the configured budget")
         with self._transaction():
             self._conn.execute(
                 "UPDATE agents SET context_used=? WHERE session_id=? AND rank=?",
@@ -854,16 +974,27 @@ class Runtime:
         timeout: float | None = None,
         tolerate_failures: bool = False,
     ) -> Any:
+        self._assert_active()
         communicator = comm or self.world
         self._validate_comm(communicator, allow_revoked=tolerate_failures)
-        if root not in communicator.members:
-            raise ProtocolViolation("collective root is not in communicator")
-        ordinal = self._next_collective_ordinal(communicator.id)
-        epoch = self._next_collective_epoch(communicator.id, op)
+        if self.rank not in communicator.members:
+            raise ProtocolViolation("caller does not belong to communicator")
+        rooted = op in {
+            CollectiveOp.BCAST,
+            CollectiveOp.SCATTER,
+            CollectiveOp.GATHER,
+            CollectiveOp.REDUCE,
+        }
+        descriptor_root = root if rooted else -1
+        root_world = (
+            communicator.world_rank(root) if rooted else communicator.members[0]
+        )
         started = time.monotonic()
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         signature_error: str | None = None
         with self._transaction():
+            ordinal = self._next_collective_ordinal(communicator.id)
+            epoch = self._next_collective_epoch(communicator.id, op)
             self._conn.execute(
                 """INSERT OR IGNORE INTO collective_instances(
                        comm_id, generation, ordinal, operation, root,
@@ -874,7 +1005,7 @@ class Runtime:
                     communicator.generation,
                     ordinal,
                     op.value,
-                    root,
+                    descriptor_root,
                     reduce_op.value,
                     time.time(),
                 ),
@@ -887,7 +1018,7 @@ class Runtime:
             ).fetchone()
             if instance is None:
                 raise ProtocolViolation("collective signature disappeared")
-            expected = (op.value, root, reduce_op.value)
+            expected = (op.value, descriptor_root, reduce_op.value)
             actual = (
                 str(instance["operation"]),
                 int(instance["root"]),
@@ -994,7 +1125,7 @@ class Runtime:
                     ).fetchone()
                     if result_row is None:
                         result = self._compute_collective(
-                            op, submitted, members, root, reduce_op
+                            op, submitted, members, root_world, reduce_op
                         )
                         self._conn.execute(
                             """INSERT OR IGNORE INTO collective_results(
@@ -1053,68 +1184,91 @@ class Runtime:
         raise ProtocolViolation(f"unimplemented collective {op.value}")
 
     def _next_collective_epoch(self, comm_id: str, op: CollectiveOp) -> int:
-        with self._transaction():
-            row = self._conn.execute(
-                """SELECT next_epoch FROM collective_counters
-                   WHERE comm_id=? AND operation=? AND rank=?""",
-                (comm_id, op.value, self.rank),
-            ).fetchone()
-            epoch = 0 if row is None else int(row["next_epoch"])
-            self._conn.execute(
-                """INSERT INTO collective_counters(
-                       comm_id, operation, rank, next_epoch
-                   ) VALUES (?, ?, ?, ?)
-                   ON CONFLICT(comm_id, operation, rank) DO UPDATE SET
-                       next_epoch=excluded.next_epoch""",
-                (comm_id, op.value, self.rank, epoch + 1),
-            )
-            return epoch
+        row = self._conn.execute(
+            """SELECT next_epoch FROM collective_counters
+               WHERE comm_id=? AND operation=? AND rank=?""",
+            (comm_id, op.value, self.rank),
+        ).fetchone()
+        epoch = 0 if row is None else int(row["next_epoch"])
+        self._conn.execute(
+            """INSERT INTO collective_counters(
+                   comm_id, operation, rank, next_epoch
+               ) VALUES (?, ?, ?, ?)
+               ON CONFLICT(comm_id, operation, rank) DO UPDATE SET
+                   next_epoch=excluded.next_epoch""",
+            (comm_id, op.value, self.rank, epoch + 1),
+        )
+        return epoch
 
     def _next_collective_ordinal(self, comm_id: str) -> int:
         """Return this rank's next communicator-global collective ordinal."""
-        with self._transaction():
-            row = self._conn.execute(
-                """SELECT next_ordinal FROM collective_ordinals
+        row = self._conn.execute(
+            """SELECT next_ordinal FROM collective_ordinals
+               WHERE comm_id=? AND rank=?""",
+            (comm_id, self.rank),
+        ).fetchone()
+        if row is None:
+            legacy = self._conn.execute(
+                """SELECT COALESCE(SUM(next_epoch), 0) AS next_ordinal
+                   FROM collective_counters
                    WHERE comm_id=? AND rank=?""",
                 (comm_id, self.rank),
             ).fetchone()
-            if row is None:
-                legacy = self._conn.execute(
-                    """SELECT COALESCE(SUM(next_epoch), 0) AS next_ordinal
-                       FROM collective_counters
-                       WHERE comm_id=? AND rank=?""",
-                    (comm_id, self.rank),
-                ).fetchone()
-                ordinal = int(legacy["next_ordinal"])
-            else:
-                ordinal = int(row["next_ordinal"])
-            self._conn.execute(
-                """INSERT INTO collective_ordinals(comm_id, rank, next_ordinal)
-                   VALUES (?, ?, ?)
-                   ON CONFLICT(comm_id, rank) DO UPDATE SET
-                       next_ordinal=excluded.next_ordinal""",
-                (comm_id, self.rank, ordinal + 1),
-            )
-            return ordinal
+            ordinal = int(legacy["next_ordinal"])
+        else:
+            ordinal = int(row["next_ordinal"])
+        self._conn.execute(
+            """INSERT INTO collective_ordinals(comm_id, rank, next_ordinal)
+               VALUES (?, ?, ?)
+               ON CONFLICT(comm_id, rank) DO UPDATE SET
+                   next_ordinal=excluded.next_ordinal""",
+            (comm_id, self.rank, ordinal + 1),
+        )
+        return ordinal
 
     def _match_message(
-        self, comm_id: str, source: int, tag: str, *, mutate: bool = True
+        self,
+        comm_id: str,
+        source: int,
+        tag: str,
+        *,
+        mutate: bool = True,
+        request_id: str | None = None,
     ) -> sqlite3.Row | None:
         conditions = [
-            "comm_id=?",
-            "dst=?",
-            "state='pending'",
+            "m.comm_id=?",
+            "m.dst=?",
+            "m.destination_incarnation=?",
+            "m.state='pending'",
+            """m.source_incarnation=(
+                   SELECT incarnation FROM agents
+                   WHERE session_id=m.session_id AND rank=m.src
+               )""",
         ]
-        params: list[Any] = [comm_id, self.rank]
+        params: list[Any] = [comm_id, self.rank, self._incarnation]
         if source != ANY_SOURCE:
-            conditions.append("src=?")
+            conditions.append("m.src=?")
             params.append(source)
         if tag != ANY_TAG:
-            conditions.append("tag=?")
+            conditions.append("m.tag=?")
             params.append(tag)
+        if request_id is not None:
+            conditions.append(
+                """NOT EXISTS (
+                       SELECT 1
+                       FROM posted_receives earlier
+                       JOIN posted_receives current ON current.id=?
+                       WHERE earlier.comm_id=m.comm_id
+                         AND earlier.dst=m.dst
+                         AND earlier.post_sequence < current.post_sequence
+                         AND (earlier.source=? OR earlier.source=m.src)
+                         AND (earlier.tag=? OR earlier.tag=m.tag)
+                   )"""
+            )
+            params.extend([request_id, ANY_SOURCE, ANY_TAG])
         row = self._conn.execute(
-            f"""SELECT * FROM messages WHERE {" AND ".join(conditions)}
-                ORDER BY created_at, src, sequence LIMIT 1""",
+            f"""SELECT m.* FROM messages m WHERE {" AND ".join(conditions)}
+                ORDER BY m.src, m.sequence LIMIT 1""",
             params,
         ).fetchone()
         if row is not None and mutate:
@@ -1168,8 +1322,12 @@ class Runtime:
         if comm.session_id != self.session_id:
             raise ProtocolViolation("communicator belongs to another session")
         current = self.communicator(comm.id)
-        if current.generation != comm.generation:
-            raise ProtocolViolation("communicator generation mismatch")
+        if (
+            current.generation != comm.generation
+            or current.members != comm.members
+            or current.name != comm.name
+        ):
+            raise ProtocolViolation("communicator does not match canonical membership")
         if current.revoked and not allow_revoked:
             raise CommunicatorRevoked(comm.id)
 
@@ -1182,13 +1340,27 @@ class Runtime:
         if bool(row["revoked"]):
             raise CommunicatorRevoked(comm_id)
 
-    def _assert_member(self) -> None:
+    def _member_row(self, rank: int | None = None) -> sqlite3.Row:
+        selected_rank = self.rank if rank is None else rank
         row = self._conn.execute(
-            "SELECT 1 FROM agents WHERE session_id=? AND rank=?",
-            (self.session_id, self.rank),
+            "SELECT * FROM agents WHERE session_id=? AND rank=?",
+            (self.session_id, selected_rank),
         ).fetchone()
         if row is None:
-            raise ProtocolViolation(f"rank {self.rank} is not in session {self.session_id}")
+            raise ProtocolViolation(
+                f"rank {selected_rank} is not in session {self.session_id}"
+            )
+        return cast("sqlite3.Row", row)
+
+    def _assert_active(self) -> None:
+        row = self._member_row()
+        if (
+            row["state"] != AgentState.ACTIVE.value
+            or int(row["incarnation"]) != self._incarnation
+        ):
+            raise ProcessFailed(
+                f"rank {self.rank} incarnation {self._incarnation} is not active"
+            )
 
     def _session_row(self) -> sqlite3.Row:
         row = self._conn.execute(
@@ -1223,6 +1395,25 @@ class Runtime:
 
     def _ensure_schema(self) -> None:
         self._conn.executescript(_SCHEMA)
+        migrations = {
+            "messages": {
+                "source_incarnation": "INTEGER NOT NULL DEFAULT 0",
+                "destination_incarnation": "INTEGER NOT NULL DEFAULT 0",
+            },
+            "posted_receives": {
+                "post_sequence": "INTEGER NOT NULL DEFAULT 0",
+            },
+        }
+        for table, columns in migrations.items():
+            existing = {
+                str(row["name"])
+                for row in self._conn.execute(f"PRAGMA table_info({table})")
+            }
+            for column, declaration in columns.items():
+                if column not in existing:
+                    self._conn.execute(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+                    )
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -1316,7 +1507,9 @@ CREATE TABLE IF NOT EXISTS messages (
     comm_id TEXT NOT NULL,
     generation INTEGER NOT NULL,
     src INTEGER NOT NULL,
+    source_incarnation INTEGER NOT NULL,
     dst INTEGER NOT NULL,
+    destination_incarnation INTEGER NOT NULL,
     tag TEXT NOT NULL,
     sequence INTEGER NOT NULL,
     mode TEXT NOT NULL,
@@ -1333,6 +1526,8 @@ CREATE TABLE IF NOT EXISTS messages (
 );
 CREATE INDEX IF NOT EXISTS idx_messages_match
     ON messages(comm_id, dst, state, src, tag, created_at);
+CREATE INDEX IF NOT EXISTS idx_messages_order
+    ON messages(comm_id, dst, state, src, sequence);
 CREATE TABLE IF NOT EXISTS posted_receives (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL,
@@ -1340,6 +1535,7 @@ CREATE TABLE IF NOT EXISTS posted_receives (
     dst INTEGER NOT NULL,
     source INTEGER NOT NULL,
     tag TEXT NOT NULL,
+    post_sequence INTEGER NOT NULL,
     created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS collective_counters (
@@ -1391,6 +1587,12 @@ CREATE TABLE IF NOT EXISTS locks (
     owner INTEGER NOT NULL,
     lease_until REAL NOT NULL,
     fencing_token INTEGER NOT NULL,
+    PRIMARY KEY (session_id, name)
+);
+CREATE TABLE IF NOT EXISTS lock_fences (
+    session_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    last_token INTEGER NOT NULL,
     PRIMARY KEY (session_id, name)
 );
 CREATE TABLE IF NOT EXISTS artifacts (
