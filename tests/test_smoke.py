@@ -557,3 +557,51 @@ def test_internal_retry_covers_a_late_sender(job):
     got = ampi(root, 1, "recv", "--from", "0", "--tag", "9", "--timeout", "1", "--retries", "6")
     t.join(timeout=10)
     assert got["body"] == "eventually"
+
+
+def test_two_phase_failure_detection(job, tmp_path):
+    """Suspicion must not convict.
+
+    A rank that goes quiet becomes a suspect, which every rank can see, but it is
+    not written off until suspicion persists. Evidence of activity clears it. This
+    is the fix for a real incident: a translator agent doing 580 seconds of
+    legitimate work was declared dead because it had not volunteered a heartbeat,
+    and being declared dead is terminal.
+    """
+    root = tmp_path / "twophase"
+    root.mkdir()
+    # Lease 1s, confirmation window 3s: a rank is suspected after 1s of silence
+    # and convicted only after a further 3s.
+    ampi(root, None, "run", "--np", "3", "--label", "tp", "--job-root", str(root),
+         "--lease", "1")
+    import sqlite3
+
+    db = sqlite3.connect(str(root / ".ampi" / "journal.db"))
+    db.execute(
+        "UPDATE job SET config=json_set(config,'$.confirm_ns',3000000000)"
+    )
+    db.commit()
+    db.close()
+    for r in range(3):
+        ampi(root, r, "init")
+
+    import time as _t
+
+    _t.sleep(1.6)
+    # Rank 0 blocks, which is what runs the detector.
+    ampi(root, 0, "hb", "--extend", "600")
+    st = ampi(root, 0, "failed")
+    assert st["count"] == 0, "suspicion must not convict"
+    assert st["suspect_count"] >= 1
+    assert st["live"] == 3
+
+    # Rank 1 calls in: activity clears its suspicion.
+    ampi(root, 1, "hb", "--extend", "600")
+    ampi(root, 0, "failed")
+    st = ampi(root, 0, "failed")
+    assert 1 not in [s["world"] for s in st["suspected"]]
+
+    # Rank 2 stays silent past the confirmation window and is convicted.
+    _t.sleep(3.2)
+    st = ampi(root, 0, "failed")
+    assert 2 in [f["world"] for f in st["failed"]]

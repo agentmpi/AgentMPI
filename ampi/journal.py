@@ -77,6 +77,10 @@ CREATE TABLE IF NOT EXISTS rank(
     role             TEXT,
     agent_id         TEXT,
     lease_ns         INTEGER NOT NULL DEFAULT 0,   -- lease duration
+    -- When the failure detector first became suspicious. A rank is declared
+    -- *failed* only after suspicion has persisted for a confirmation window,
+    -- which keeps a slow executor from being killed merely for thinking.
+    suspect_ns       INTEGER NOT NULL DEFAULT 0,
     lease_expires_ns INTEGER NOT NULL DEFAULT 0,
     last_hb_ns       INTEGER NOT NULL DEFAULT 0,
     init_ns          INTEGER,

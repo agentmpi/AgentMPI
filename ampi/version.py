@@ -12,4 +12,4 @@ PROTOCOL_VERSION = "AgentMPI/0.1"
 
 #: On-disk journal schema version. Bumped whenever the SQLite schema changes in
 #: a way that older journals cannot be read with.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4

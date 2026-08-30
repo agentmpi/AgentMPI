@@ -373,7 +373,13 @@ def failure_get_acked(ctx: Ctx) -> Dict[str, Any]:
 
 
 def get_failed(ctx: Ctx) -> Dict[str, Any]:
-    """``AMPI_Comm_get_failed`` plus the diagnostic detail an agent needs."""
+    """``AMPI_Comm_get_failed`` plus the diagnostic detail an agent needs.
+
+    Reports convicted failures and current suspects separately. The distinction is
+    actionable: a failed peer will never answer, so its work must be taken over,
+    while a suspect is probably just slow and taking over its work duplicates
+    effort.
+    """
     j = ctx.j
     with j.tx() as c:
         detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
@@ -396,7 +402,30 @@ def get_failed(ctx: Ctx) -> Dict[str, Any]:
                 "ctx_used": int(r["ctx_used"]),
             }
         )
-    return {"failed": out, "count": len(out), "live": len(live_ranks(j, ctx.comm))}
+    from .core import suspect_ranks
+
+    suspects = []
+    for w in suspect_ranks(j, ctx.comm):
+        r = rank_row(j, w)
+        suspects.append({
+            "world": w,
+            "comm_rank": world_to_comm(j, ctx.comm, w),
+            "role": r["role"],
+            "silent_s": round((now_ns() - int(r["last_hb_ns"] or 0)) / 1e9, 1),
+        })
+    out_d: Dict[str, Any] = {
+        "failed": out,
+        "count": len(out),
+        "suspected": suspects,
+        "suspect_count": len(suspects),
+        "live": len(live_ranks(j, ctx.comm)),
+    }
+    if suspects and not out:
+        out_d["note"] = (
+            f"{len(suspects)} rank(s) are silent but not yet declared failed. Keep "
+            "waiting: suspicion alone is not grounds to take over their work."
+        )
+    return out_d
 
 
 def declare_failed(

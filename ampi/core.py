@@ -87,8 +87,17 @@ class Config:
     #: permitted to fill with message bodies.
     ctx_budget: int = 60_000
     #: Lease duration. A rank that has not called into the runtime for this long
-    #: is a failure-detector suspect.
+    #: becomes a failure-detector *suspect*.
     lease_ns: int = 900 * 1_000_000_000
+    #: How long suspicion must persist before a rank is declared failed. The
+    #: two-phase detector exists because a thinking executor and a dead one look
+    #: identical to a timeout, and the two errors have very different costs: in one
+    #: real run a translator was declared dead after 580s of legitimate work
+    #: because it did not volunteer a heartbeat it had been asked for, and being
+    #: declared dead is terminal. Suspicion is free; conviction needs
+    #: corroboration -- either persistence, or an explicit declaration from the
+    #: launcher, which unlike the protocol knows whether the process still exists.
+    confirm_ns: int = 900 * 1_000_000_000
     #: Default deadline for blocking calls.
     timeout_ns: int = 120 * 1_000_000_000
     #: Default fraction of live ranks required to close a quorum collective.
@@ -426,56 +435,115 @@ def detect_failures(
     by: Optional[int] = None,
     conn: Optional[sqlite3.Connection] = None,
 ) -> List[int]:
-    """Declare as failed any rank whose lease has expired.
+    """Run the two-phase failure detector; return ranks newly declared failed.
 
-    Returns the world ranks *newly* declared failed by this call. This is the
-    entire failure detector: an eventually-perfect (<>P) detector built from
-    leases. It is invoked opportunistically from blocking calls, so detection
-    happens exactly when someone cares, and never otherwise. That is the ULFM
-    "notification is local" principle taken to its conclusion.
+    Phase 1 (**suspect**): the lease deadline passed. Suspicion is recorded and is
+    visible to every rank, but it changes nothing -- collectives keep waiting and
+    no work is redistributed.
+
+    Phase 2 (**failed**): suspicion has persisted for a confirmation window. Only
+    now is the rank written off, its subtrees dropped from reduction trees and its
+    locks broken.
+
+    The split matters because a timeout cannot distinguish a thinking executor
+    from a dead one, and the two errors are not symmetric. Declaring a working
+    agent dead discards minutes of real work and then fences it, so it cannot even
+    finish what it had. Suspicion is cheap; conviction requires corroboration --
+    persistence, or an explicit declaration from the launcher, which unlike the
+    protocol actually knows whether the executor process still exists.
+
+    Detection remains lazy and local: it runs only when some rank blocks on an
+    operation a failure would prevent, so its failure-free cost is a timestamp
+    comparison, and two ranks may legitimately hold different views. That is
+    ULFM's "notification is local" principle.
     """
     ts = now_ns()
     scope: Optional[List[int]] = comm_members(j, comm) if comm else None
     c = conn or j.conn
+    confirm_ns = int(load_config(j).confirm_ns)
     rows = c.execute(
-        "SELECT rank, epoch, state, lease_expires_ns FROM rank WHERE job=?", (j.job_id,)
+        "SELECT rank, epoch, state, lease_expires_ns, suspect_ns FROM rank WHERE job=?",
+        (j.job_id,),
     ).fetchall()
     newly: List[int] = []
     for r in rows:
         wr = int(r["rank"])
         if scope is not None and wr not in scope:
             continue
-        if r["state"] not in ("running", "init", "spawned"):
+        state = str(r["state"])
+        if state not in ("running", "init", "spawned", "suspect"):
             continue
         exp = int(r["lease_expires_ns"] or 0)
-        if exp and ts > exp:
+        if not exp or ts <= exp:
+            # Evidence of activity clears suspicion: a rank that has called in is
+            # alive, whatever a pessimistic deadline implied a moment ago.
+            if state == "suspect":
+                c.execute(
+                    "UPDATE rank SET state='running', suspect_ns=0 WHERE job=? AND rank=?",
+                    (j.job_id, wr),
+                )
+                j.trace("suspicion_cleared", rank=wr, epoch=int(r["epoch"]), conn=c)
+            continue
+        suspect_since = int(r["suspect_ns"] or 0)
+        if suspect_since == 0:
             c.execute(
-                "UPDATE rank SET state='failed' WHERE job=? AND rank=? AND epoch=?",
-                (j.job_id, wr, int(r["epoch"])),
-            )
-            c.execute(
-                "INSERT INTO failure(job,rank,epoch,kind,detected_ns,detected_by,detail)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (
-                    j.job_id,
-                    wr,
-                    int(r["epoch"]),
-                    "lease_expired",
-                    ts,
-                    by,
-                    json.dumps({"lease_expired_ns_ago": ts - exp}),
-                ),
+                "UPDATE rank SET state='suspect', suspect_ns=? WHERE job=? AND rank=? AND epoch=?",
+                (ts, j.job_id, wr, int(r["epoch"])),
             )
             j.trace(
-                "failure",
+                "suspect",
                 rank=wr,
                 epoch=int(r["epoch"]),
                 status="lease_expired",
-                detail={"detected_by": by},
+                detail={"detected_by": by, "silent_s": round((ts - exp) / 1e9, 1)},
                 conn=c,
             )
-            newly.append(wr)
+            continue
+        if ts - suspect_since < confirm_ns:
+            continue
+        c.execute(
+            "UPDATE rank SET state='failed' WHERE job=? AND rank=? AND epoch=?",
+            (j.job_id, wr, int(r["epoch"])),
+        )
+        c.execute(
+            "INSERT INTO failure(job,rank,epoch,kind,detected_ns,detected_by,detail)"
+            " VALUES(?,?,?,?,?,?,?)",
+            (
+                j.job_id,
+                wr,
+                int(r["epoch"]),
+                "lease_expired",
+                ts,
+                by,
+                json.dumps({
+                    "silent_s": round((ts - exp) / 1e9, 1),
+                    "suspected_s": round((ts - suspect_since) / 1e9, 1),
+                }),
+            ),
+        )
+        j.trace(
+            "failure",
+            rank=wr,
+            epoch=int(r["epoch"]),
+            status="lease_expired",
+            detail={"detected_by": by, "suspected_s": round((ts - suspect_since) / 1e9, 1)},
+            conn=c,
+        )
+        newly.append(wr)
     return newly
+
+
+def suspect_ranks(j: Journal, comm: Optional[str] = None) -> List[int]:
+    """Ranks the detector currently suspects but has not convicted."""
+    scope = set(comm_members(j, comm)) if comm else None
+    out = []
+    for r in j.q(
+        "SELECT rank FROM rank WHERE job=? AND state='suspect' ORDER BY rank", (j.job_id,)
+    ):
+        wr = int(r["rank"])
+        if scope is None or wr in scope:
+            out.append(wr)
+    return out
 
 
 def failed_ranks(j: Journal, comm: Optional[str] = None) -> List[int]:
@@ -492,6 +560,9 @@ def failed_ranks(j: Journal, comm: Optional[str] = None) -> List[int]:
 
 
 def live_ranks(j: Journal, comm: Optional[str] = None) -> List[int]:
+    """Ranks not declared failed. Suspects count as live: suspicion alone must not
+    cause work to be redistributed, or a merely slow executor loses its
+    assignment to a duplicate."""
     scope = comm_members(j, comm) if comm else [int(r["rank"]) for r in j.q("SELECT rank FROM rank WHERE job=?", (j.job_id,))]
     dead = set(failed_ranks(j))
     return [r for r in scope if r not in dead]
