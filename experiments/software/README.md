@@ -28,11 +28,13 @@ before trace.
 python3 experiments/software/prepare.py
 ```
 
-Start rank 0's `Bcast` of the interface and start the 12 agents with the prompts
-recorded in `software_prompts.json`. Implementers run concurrently. Reviewers
-block on their expected producer ranks. The integrator waits for all completion
-messages, runs `unittest` and the example, fixes only integration defects under
-file locks, and sends a JSON report to rank 0.
+Start the 12 agents with the rank assignments in
+`software_manifest.json`. The versioned interface is embedded in each `TASK`
+message; this run uses point-to-point dissemination, while the translation run
+exercises `Bcast`/`Scatter`/`Gather`. Implementers run concurrently. Reviewers
+block on explicit `DONE` messages from expected producer ranks. The integrator
+waits for all completion messages, runs `unittest` and the example, fixes only
+integration defects under file locks, and sends a JSON report to rank 0.
 
 ```bash
 python3 experiments/software/collect.py

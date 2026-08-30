@@ -27,6 +27,7 @@ def analyze(
     source: dict[str, Any],
     drafts: dict[str, Any],
     reviews: dict[str, Any],
+    baseline: dict[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     passages = source["passages"]
     draft_values = drafts["rank_ordered_contributions"][1:]
@@ -42,6 +43,18 @@ def analyze(
                 glossary_checks += 1
                 if target_term.casefold() in target.casefold():
                     glossary_hits += 1
+    baseline_by_passage = {
+        item["id"]: item["translation"] for item in baseline["passages"]
+    }
+    baseline_glossary_checks = 0
+    baseline_glossary_hits = 0
+    for passage in passages:
+        target = baseline_by_passage[passage["id"]]
+        for source_term, target_term in source["style"]["glossary"].items():
+            if source_term.casefold() in passage["text"].casefold():
+                baseline_glossary_checks += 1
+                if target_term.casefold() in target.casefold():
+                    baseline_glossary_hits += 1
 
     issues = [issue for review in review_values for issue in review["issues"]]
     issue_categories = Counter(
@@ -70,6 +83,7 @@ def analyze(
         "experiment": "alice-french-pilot",
         "drafts_completed": len(draft_values),
         "reviews_completed": len(review_values),
+        "baseline_passages_completed": len(baseline_by_passage),
         "revised_passages": sum(len(review["revisions"]) for review in review_values),
         "all_self_checks_true": all(
             all(item["self_check"].values()) for item in draft_values
@@ -81,6 +95,11 @@ def analyze(
         "glossary_exact_hits": glossary_hits,
         "glossary_exact_compliance": (
             glossary_hits / glossary_checks if glossary_checks else 1.0
+        ),
+        "baseline_glossary_exact_compliance": (
+            baseline_glossary_hits / baseline_glossary_checks
+            if baseline_glossary_checks
+            else 1.0
         ),
         "review_issue_count": len(issues),
         "review_issue_categories": dict(sorted(issue_categories.items())),
@@ -138,6 +157,11 @@ def main() -> None:
         default=Path("experiments/results/translation/reviews.json"),
     )
     parser.add_argument(
+        "--baseline",
+        type=Path,
+        default=Path("experiments/results/translation/baseline.json"),
+    )
+    parser.add_argument(
         "--metrics",
         type=Path,
         default=Path("experiments/results/translation/metrics.json"),
@@ -152,6 +176,7 @@ def main() -> None:
         read_json(arguments.source),
         read_json(arguments.drafts),
         read_json(arguments.reviews),
+        read_json(arguments.baseline),
     )
     write_json(arguments.metrics, metrics)
     write_json(arguments.synthesis_task, synthesis_task)

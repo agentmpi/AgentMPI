@@ -66,16 +66,18 @@ are not treated as independent human judgments.
 
 ## Collaborative software workload
 
-Agents build a small event-sourced ledger library from a broadcast API contract.
-The work DAG separates model types, ledger state transitions, serialization,
-analytics, and tests into files with explicit owners. Implementers receive
-scattered module contracts. Integration agents gather status/artifact
-references, run tests, and return structured defects. One injected executor
-failure exercises revoke, shrink, fencing, and reassignment.
+Agents build `minidag`, a dependency-free deterministic DAG execution library,
+from a versioned API contract. The work DAG separates graph, parser, scheduler,
+executor, CLI, tests, documentation, staged review, and final integration into
+explicit owners. Dependencies are `DONE` messages; every mutation uses an
+AgentMPI lease lock and fencing token. The final integrator receives all eleven
+upstream reports, runs tests and the example, and returns a structured result.
+Executor death is exercised by the separate 16-process failure experiment,
+not this successful software run.
 
 Primary metrics are test pass rate, API-contract violations, integration
-defects, conflicting edits, recovery time, duplicate/stale commit rejection,
-messages, materialized tokens, and wall time. A naive condition gives agents
+defects, conflicting edits, messages, materialized tokens, and wall time. A
+future naive condition gives agents
 only prose goals; the AgentMPI condition broadcasts a versioned contract and
 uses explicit epochs. Because prompt information differs, the pilot reports the
 comparison descriptively; a publication experiment must equalize information
