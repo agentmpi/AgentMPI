@@ -113,6 +113,55 @@ def defensiveness(tree: Path) -> dict[str, Any]:
     return counts
 
 
+#: Naming axes on which the population had to converge, each a set of mutually
+#: exclusive spellings for the same idea. These are not chosen by us: they are the
+#: axes the agents themselves reported disagreeing about.
+CONVENTION_AXES: dict[str, tuple[str, ...]] = {
+    "order direction": ("ascending", "descending", "direction"),
+    "select statement": ("SelectStmt", "Select"),
+    "aggregate count": ("count_star", "COUNT_STAR"),
+}
+
+
+def convention_divergence(tree: Path) -> dict[str, Any]:
+    """How many spellings of the same idea the codebase ended up carrying.
+
+    The sharpest single observation in the software experiment came from the agents, not
+    from us: three ranks independently reported that the ORDER BY direction flag was lost
+    between modules, because one author published ``ascending`` and another
+    ``descending``. Both had published an interface --- the publication step ran in both
+    configurations --- so the failure was not that nobody declared a convention. It was
+    that the declarations were not mutually visible, and two reasonable authors chose
+    incompatible ones.
+
+    That distinction is what a shared communication context actually buys, and it is
+    measurable: count, per axis, how many alternative spellings survive in the delivered
+    source, and how many modules carry more than one. A population that converged uses
+    one spelling everywhere; a population that did not carries several plus the
+    translation code that bridges them, and the bridging code is pure overhead.
+    """
+    out: dict[str, Any] = {}
+    files = [p for p in sorted((tree / "minidb").glob("*.py")) if p.name != "__init__.py"]
+    sources = {p.name: p.read_text(encoding="utf-8", errors="replace") for p in files}
+    for axis, spellings in CONVENTION_AXES.items():
+        per_file: dict[str, list[str]] = {}
+        used: set[str] = set()
+        for name, src in sources.items():
+            present = [s for s in spellings if s in src]
+            if present:
+                per_file[name] = present
+                used.update(present)
+        out[axis] = {
+            "n_spellings": len(used),
+            "spellings": sorted(used),
+            "n_files_mixed": sum(1 for v in per_file.values() if len(v) > 1),
+            "n_files_touching": len(per_file),
+        }
+    out["total_spellings"] = sum(v["n_spellings"] for v in out.values() if isinstance(v, dict))
+    out["total_mixed_files"] = sum(v["n_files_mixed"] for v in out.values() if isinstance(v, dict))
+    return out
+
+
 def score(tree: Path, timeout: float = 240.0) -> dict[str, Any]:
     """Run the current suite against one generated tree, out of process."""
     shutil.copy(SUITE, tree / "acceptance.py")
@@ -188,6 +237,7 @@ def main() -> int:
                 {
                     "round": int(rd.name.removeprefix("round")),
                     "defensiveness": defence,
+                    "conventions": convention_divergence(rd),
                     "importable": rep.get("importable"),
                     "n_passed": rep.get("n_passed"),
                     "n_total": rep.get("n_total"),
@@ -217,15 +267,18 @@ def main() -> int:
             "blame": best["blame"],
             "failures": best["failures"],
             "defensiveness": best.get("defensiveness"),
+            "conventions": best.get("conventions"),
         }
         if not cfg.dry_run:
             result_path.write_text(json.dumps(payload, indent=2, ensure_ascii=False, default=str), encoding="utf-8")
         n += 1
         traj = " / ".join(f"r{r['round']}:{r['n_passed']}" for r in per_round)
         dfc = best.get("defensiveness") or {}
+        cvn = best.get("conventions") or {}
         print(
             f"  {result_path.name}: best {best['n_passed']}/{best['n_total']}  ({traj})"
             f"  defensive={dfc.get('total', 0)} ({dfc.get('per_kloc', 0)}/kloc, {dfc.get('n_lines', 0)} lines)"
+            f"  conventions={cvn.get('total_spellings', 0)} mixed_files={cvn.get('total_mixed_files', 0)}"
         )
     print(f"re-scored {n} runs against the current suite")
     return 0

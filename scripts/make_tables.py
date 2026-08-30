@@ -598,6 +598,32 @@ def table_software() -> None:
         _MACROS["NVagueSharedRounds"] = str(len(av.get("per_round") or []))
         _MACROS["NVagueNosRounds"] = str(len(an.get("per_round") or []))
 
+    # Convention divergence: how many spellings of the same idea survive. Monotone in
+    # coordination, and the cleanest mechanical signal in the experiment.
+    conv_rows = []
+    for d in sorted(res, key=lambda x: (bool(x["config"].get("vague_spec")), -(x["config"].get("ranks") or 0))):
+        cv = (acc(d).get("conventions") or {})
+        if not cv:
+            continue
+        conv_rows.append(
+            rf"{label(d['config'])} & {d['config'].get('ranks')} & "
+            rf"{cv.get('total_spellings', 0)} & {cv.get('total_mixed_files', 0)} \\"
+        )
+        if d["config"].get("vague_spec"):
+            key = "Shared" if d["config"].get("shared_interfaces") else "Noshared"
+            _MACROS["NConvVague" + key] = str(cv.get("total_spellings", 0))
+            _MACROS["NConvMixedVague" + key] = str(cv.get("total_mixed_files", 0))
+        elif d["config"].get("ranks") == 1:
+            _MACROS["NConvSolo"] = str(cv.get("total_spellings", 0))
+    if conv_rows:
+        emit(
+            "tab_conventions.tex",
+            "\\begin{tabular}{lrrr}\n\\toprule\n"
+            "configuration & $p$ & distinct spellings & files carrying $>$1 \\\\\n\\midrule\n"
+            + "\n".join(conv_rows)
+            + "\n\\bottomrule\n\\end{tabular}",
+        )
+
     lines = []
     for d in res:
         c, k = d["config"], d.get("contention") or {}
@@ -774,7 +800,9 @@ def summary_macros() -> None:
                  "NVagueNosCalls", "NVagueSharedUsd", "NVagueNosUsd", "NVaguePriceRatio",
                  "NVagueSharedDef", "NVagueNosDef", "NVagueDefRatio", "NVagueSharedLines",
                  "NVagueNosLines", "NVagueLinesRatio", "NVagueSharedRoundOne", "NVagueNosRoundOne",
-                 "NVagueSharedRounds", "NVagueNosRounds"):
+                 "NVagueSharedRounds", "NVagueNosRounds",
+                 "NConvVagueShared", "NConvVagueNoshared", "NConvMixedVagueShared",
+                 "NConvMixedVagueNoshared", "NConvSolo"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
