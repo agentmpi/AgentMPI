@@ -251,10 +251,18 @@ produced them:
   text they bought nothing measurable, because the entities were famous enough that
   models render them identically without coordination. We report that rather than
   swapping the metric.
-- **The depth penalty is conditional on capacity.** When a reduction is not
-  capacity-bound, every algorithm retains everything and fold depth is irrelevant —
-  but the tree is still 2.2× faster at identical quality. Ask whether your reduction
-  is saturated before optimising its shape.
+- **Fold depth costs latency, not fidelity.** We predicted a deep reduction tree would
+  lose more content than a shallow one. It does not: with an incompressible payload and a
+  contract-enforced output budget, retention is identical (0.385) at fold depths 2, 3 and
+  7, because the root's budget is the binding constraint and losses have no slack to
+  compound into. What depth does cost is time — the widest tree finished in 52 s where the
+  serial chain took 634 s, a 12× reduction at equal quality, emitting half the tokens.
+- **A budget stated in a prompt is not a budget.** Getting to that result took three
+  attempts. Asked to fit more than its budget allows, a semantic operator first
+  *re-encodes* (it invented a packed notation and preserved every item), and when that is
+  not enough it simply *overruns* an advisory limit — 8 of 10 merges exceeded the stated
+  budget by up to 55%. Only `Contract(max_tokens=...)`, which the runtime checks and
+  retries against, makes a budget real.
 - **Context safety has a sharp threshold**: an all-eager ring exchange fails above
   the unexpected-message budget with a reported `ERR_CONTEXT_OVERFLOW`, while
   rendezvous completes at every size.

@@ -62,11 +62,13 @@ the eager/rendezvous distinction that MPI hides as an implementation detail must
 become semantically visible; making it visible turns MPI's notion of an
 \emph{unsafe program} into a precise and checkable notion of \emph{context
 safety}. Second, reduction operators implemented by a language model are not
-associative and are \emph{lossy in proportion to the depth of the reduction},
-which makes collective-algorithm selection a quality decision rather than only a
-cost decision --- with the surprising consequence that the logarithmic-depth tree
-wins on fidelity as well as latency, provided broadcasts forward immutable
-content-addressed handles rather than regenerated text. Third, the dominant agent
+associative, so an operator must \emph{declare} its algebraic strength and the runtime
+must constrain algorithm selection accordingly; and because agent ranks are not
+single-ported, the optimal reduction tree is not the binary one MPI would choose but the
+widest the context budget admits, which we measure as a $12\times$ latency reduction at
+equal output quality. We predicted this would also be a \emph{fidelity} win and report
+that it is not: under a uniformly enforced output budget the root's budget binds and
+retention is invariant to fold depth. Third, the dominant agent
 failure is not the crash MPI's fault-tolerance work assumes but a well-formed,
 confident, wrong answer; this is the analogue of silent data corruption, for which
 the correct response is verification rather than checkpointing.
@@ -185,21 +187,31 @@ reduction rather than the number of applications. We make algebraic strength par
 of an operator's declaration, use it to constrain algorithm selection, and report
 fold depth from every reduction.
 
-Two consequences follow, and the second was not what we expected. First, a binomial
-tree at depth $\lceil\log_2 p\rceil$ beats a serial chain at depth $p-1$ on
-fidelity \emph{and} latency --- but only because broadcasts forward
-content-addressed handles, so relaying cannot corrupt. Second, and more
-interestingly: \textbf{binary is the wrong arity.} Every logarithmic collective in
-MPI descends from processes being \emph{single-ported} --- a process participates in
-one transfer at a time, so a wider tree node buys nothing. An agent rank has no
-port count. A prompt carries eight reports as easily as two, and merging eight in
-one call is one lossy re-encoding rather than seven. The binding constraint becomes
-the receiving rank's context budget, giving an optimal fan-in
+Two consequences follow. The first is that \textbf{binary is the wrong arity.} Every
+logarithmic collective in MPI descends from processes being \emph{single-ported} --- a
+process participates in one transfer at a time, so a wider tree node buys nothing. An
+agent rank has no port count. A prompt carries eight reports as easily as two, and
+merging eight in one call is one operator application rather than seven. The binding
+constraint becomes the receiving rank's context budget, giving an optimal fan-in
 $k^{*}=\lfloor C(1-h)/s\rfloor$ and a fold depth of $\lceil\log_{k^{*}} p\rceil$.
 At $p=64$, widening from $k{=}2$ to $k{=}8$ takes the fold depth from 6 to 2
 \emph{at an identical message count}, since every non-root rank sends exactly once
 whatever the arity. So the agent setting should prefer the \emph{widest} feasible
-tree where MPI prefers the narrowest (\cref{sec:coll}, \cref{tab:fanin}).
+tree where MPI prefers the narrowest (\cref{sec:coll}, \cref{tab:fanin}), and we measure
+a $12\times$ latency reduction from doing so at equal output quality.
+
+The second consequence is where we were wrong, and we report it because the correction is
+more useful than the claim. We predicted that fold depth would cost fidelity, so that
+algorithm selection for a semantic reduction would be a quality decision rather than a
+cost decision. It is not, at least under the natural policy: when every node's output
+obeys the same budget, the root's budget is the binding constraint and the surviving
+content is the same at depth 2 and at depth 7. Losses do not compound with depth because
+there is no slack for them to compound into. Getting to that conclusion required three
+experiments, because a semantic operator asked to fit more than its budget allows will
+first \emph{re-encode} and then simply \emph{overrun} an advisory limit; only an
+incompressible payload and a contract-enforced budget force it to choose
+(\cref{sec:eval}). What survives of the claim is the mechanism, not the direction: fold
+depth is the right quantity to expose and minimise, and the reason is cost.
 
 \paragraph{C3: the dominant failure is silent corruption, not crash.} A rank that
 returns a confident wrong answer is invisible to timeouts, retries and schema
@@ -1432,9 +1444,45 @@ items that survived --- a positional unfairness \code{MPI\_SUM} cannot exhibit.}
 \label{tab:fidelity}
 \end{table*}
 
-\Cref{tab:fidelity} tests the central prediction of \cref{sec:coll}: since all
-algorithms perform the same number of operator applications, retention differences
-must be attributable to fold depth.
+\Cref{tab:fidelity} tests the central prediction of \cref{sec:coll} --- that since all
+algorithms perform the same number of operator applications, retention differences must
+be attributable to fold depth --- and \textbf{refutes it}.
+
+\paragraph{Fidelity is set by the enforced budget, not by the tree.} With the payload made
+incompressible and the budget enforced by contract, so that neither re-encoding nor
+overflow is available and the operator must genuinely discard, loss finally appears: 37
+of 96 items survive to the root. It is \emph{the same 0.385 at every fold depth} --- at
+depth 2, at depth 3, and at depth 7 twice --- with zero mangled items, only clean drops.
+
+The reason is worth stating because it is a general fact about reductions rather than an
+artefact. When every node's output is bound by the same budget $B$, the last operation is
+the binding one: whatever the tree, the root emits at most $B$ tokens, so the surviving
+item count is $B$ divided by the per-item cost regardless of how the items arrived. A deep
+tree discards at intermediate levels and a shallow one discards at the root, and they
+arrive at the same place. Losses do not compound with depth, because there is no slack for
+them to compound into.
+
+This inverts the prediction and produces a cleaner rule. \textbf{For a semantic reduction
+under a uniform enforced output budget, collective-algorithm selection is a pure cost
+decision.} Fold depth would govern fidelity only if intermediate nodes were allowed to be
+larger than the root --- which is exactly what a subtree-proportional budget does, and is
+why \cref{sec:coll}'s operator interface exposes the leaf count. We did not run that
+variant, so the conditional remains untested; what is now established is that under the
+natural uniform-budget policy, depth costs nothing in quality.
+
+\paragraph{And the cost difference is enormous.} With quality pinned at 0.385 for all
+four, the shallowest tree took 52\,s where the serial chain took 634\,s ---
+$12\times$ --- and emitted half the output tokens (1{,}323 versus 2{,}623). Flat reduction
+is again slowest-but-one despite needing one round, for the reason the cost model gives:
+its applications serialise at the root. So the \code{kary} recommendation of
+\cref{sec:coll} survives, and survives on firmer ground than we proposed it on: not
+because a wide tree preserves more, but because it costs an order of magnitude less to
+preserve exactly as much.
+
+We think this is worth reporting at length because the failed prediction was the
+paper's most distinctive claim, and because arriving at it took three attempts --- a
+compressible payload, then a tighter budget, then an enforced one --- each of which
+failed for a different and instructive reason.
 
 \paragraph{A budget stated in a prompt is not a budget.} Before any of the fidelity
 numbers can be read, one methodological failure has to be reported, because it explains

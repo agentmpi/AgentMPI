@@ -403,15 +403,20 @@ def table_fidelity() -> None:
     # configuration per group, so algorithms within a group are comparable.
     groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
     for r in rows:
-        key = (r["_executor"], r.get("p"), r.get("facts_per_rank"), r.get("_budget"))
+        # The incompressible/enforced configuration must not share a group with the
+        # compressible/advisory one: they are different experiments that happen to have
+        # the same population, item count and nominal budget.
+        key = (r["_executor"], r.get("p"), r.get("facts_per_rank"), r.get("_budget"), bool(r.get("incompressible")))
         groups.setdefault(key, []).append(r)
 
     lines: list[str] = []
     for key in sorted(groups, key=lambda k: (k[0] != "broker", k[1] or 0, k[2] or 0)):
         block = groups[key]
-        executor, p, facts, budget = key
+        executor, p, facts, budget, incompressible = key
         lost = any((r.get("retention") or 0) < 1.0 for r in block)
         kind = "agent-executed" if executor == "broker" else f"surrogate operator ({executor})"
+        if incompressible:
+            kind += ", incompressible payload, budget enforced by contract"
         state = "capacity-bound" if lost else "not capacity-bound"
         budget_txt = f", {budget}-token merge budget" if budget else ""
         lines.append(
