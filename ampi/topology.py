@@ -30,7 +30,6 @@ working after a shrink renumbers everyone.
 from __future__ import annotations
 
 import json
-import math
 import uuid
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -39,11 +38,10 @@ from .core import (
     _create_comm,
     comm_members,
     comm_row,
-    comm_to_world,
     world_to_comm,
 )
 from .errors import ArgError, CommError, RankError
-from .journal import Journal, now_ns
+from .journal import now_ns
 
 
 def split(
@@ -69,7 +67,7 @@ def split(
     it is the difference between a split that survives a dead rank and one that
     hangs.
     """
-    from .core import detect_failures, failed_ranks
+    from .core import failed_ranks
 
     j = ctx.j
     parent = comm_row(j, ctx.comm)
@@ -264,7 +262,7 @@ def cart_rank(topo: Dict[str, Any], coords: Sequence[int]) -> Optional[int]:
     dims = topo["dims"]
     per = topo.get("periodic") or [False] * len(dims)
     r = 0
-    for i, (cd, d) in enumerate(zip(coords, dims)):
+    for i, (cd, d) in enumerate(zip(coords, dims, strict=False)):
         c = int(cd)
         if per[i]:
             c %= d
@@ -373,10 +371,9 @@ def neighbor_allgather(
     against, that is the difference between a harness that runs at P=12 and one
     that does not.
     """
-    from . import collectives, p2p
+    from . import p2p
     from .core import internal_tag
 
-    j = ctx.j
     nb = neighbors(ctx)["neighbors"]
     tg = internal_tag("allgather", 300)
     for n in nb:

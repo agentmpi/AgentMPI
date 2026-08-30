@@ -43,29 +43,24 @@ import math
 import sqlite3
 import time
 import uuid
-from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import p2p
 from .core import (
     Ctx,
+    _create_comm,
     comm_members,
     comm_row,
-    comm_to_world,
     detect_failures,
     failed_ranks,
     heartbeat,
     live_ranks,
     rank_row,
     world_to_comm,
-    _create_comm,
 )
 from .errors import (
-    AmpiError,
     ArgError,
     CommError,
-    ErrClass,
-    ProcFailedError,
-    RevokedError,
     TimeoutError_,
 )
 from .journal import Journal, now_ns
@@ -610,7 +605,8 @@ def recover(j: Journal, rank: int, comm: str = "world") -> Dict[str, Any]:
         "pending_reduction_steps": [
             {"step": str(s["id"]), "coll": str(s["coll"]), "round": int(s["round"])} for s in steps
         ],
-        "held_locks": [{"win": str(l["win"]), "key": str(l["key"]), "mode": str(l["mode"])} for l in locks],
+        "held_locks": [{"win": str(lk["win"]), "key": str(lk["key"]),
+                        "mode": str(lk["mode"])} for lk in locks],
         "memos": [{"key": str(m["key"]), "value": str(m["value"])} for m in memos],
     }
 

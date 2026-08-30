@@ -22,12 +22,12 @@ import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ampi import collectives, ft, p2p, rma  # noqa: E402
-from ampi.core import Config, Ctx, bind, init_rank  # noqa: E402
+from ampi.core import Config, bind, init_rank  # noqa: E402
 from ampi.errors import AmpiError, ErrClass  # noqa: E402
 from ampi.journal import Journal  # noqa: E402
 from ampi.launcher import create as launcher_create  # noqa: E402
@@ -210,9 +210,8 @@ def main() -> int:
         t.join(timeout=400)
     wall = time.perf_counter() - t0
     j = Journal(root)
-    from ampi.trace import summarize, text_timeline
+    from ampi.trace import text_timeline
 
-    s = summarize(j)
     print(text_timeline(j, width=100))
     print()
     print(f"wall {wall:.1f}s  killed rank {killed}")

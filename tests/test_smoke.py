@@ -403,8 +403,10 @@ def test_fetch_and_op_hands_out_tickets(job):
 
 def test_comm_split(job):
     root = job(6)
+    # Every rank must register a colour before the groups materialise, so all six
+    # calls are made for their effect; only the last rank's view is asserted.
     with ThreadPoolExecutor(max_workers=6) as ex:
-        res = list(ex.map(
+        list(ex.map(
             lambda r: ampi(root, r, "comm", "split", "--color", str(r % 2), "--key", str(r)),
             range(6),
         ))
@@ -473,7 +475,6 @@ def test_zombie_is_fenced(job):
     ampi(root, None, "respawn", "1")
     # The old agent (epoch 0) tries to keep working. Its environment still says
     # rank 1, but the journal has moved to epoch 1.
-    import sqlite3
 
     # Simulate the stale agent by driving a send while the rank is at epoch 1
     # but the caller believes epoch 0: the runtime rejects it via check_live.

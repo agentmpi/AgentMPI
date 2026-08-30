@@ -57,9 +57,6 @@ sys.path.insert(0, str(HERE.parent))
 
 from lib import PROTOCOL_DISCIPLINE, Rank, create_job, launch_plan, write_spec  # noqa: E402
 
-
-
-
 MODULES: List[Dict[str, object]] = [
     {
         "rank": 0,
@@ -403,7 +400,7 @@ Then assign the fixes: for each failure, work out which rank's file is responsib
 and tell them:
 ```
 ampi send --to <rank> --tag fix --in "round 1: <what is broken and the failing case>"
-```''' if integrator else f'''Then receive the failures and check for a fix assignment:
+```''' if integrator else '''Then receive the failures and check for a fix assignment:
 ```
 ampi bcast --root 0 --label failures-r1 --timeout 150 --materialize
 ampi recv --from 0 --tag fix --timeout 120 --materialize

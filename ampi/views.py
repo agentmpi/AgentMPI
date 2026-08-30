@@ -24,7 +24,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from . import tokens as tok
 from .errors import ArgError

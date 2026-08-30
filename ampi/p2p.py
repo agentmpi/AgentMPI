@@ -27,21 +27,19 @@ import json
 import sqlite3
 import time
 import uuid
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional
 
 from .core import (
     ANY_SOURCE,
     ANY_TAG,
     Ctx,
     check_comm_usable,
-    comm_members,
     comm_to_world,
     ctx_charge,
     detect_failures,
     failed_ranks,
     heartbeat,
     package,
-    world_to_comm,
 )
 from .errors import (
     AmpiError,

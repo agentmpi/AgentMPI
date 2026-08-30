@@ -32,7 +32,6 @@ from __future__ import annotations
 
 import json
 import math
-import os
 import sqlite3
 import time
 import uuid
@@ -41,27 +40,22 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from . import ops as ops_mod
 from . import p2p
-from . import tokens as tok
 from . import views as views_mod
 from .core import (
     ANY_SOURCE,
-    ANY_TAG,
     Ctx,
     check_comm_usable,
     comm_members,
     comm_to_world,
     ctx_charge,
-    detect_failures,
     failed_ranks,
     heartbeat,
     internal_tag,
     package,
-    world_to_comm,
 )
 from .errors import (
     AmpiError,
     ArgError,
-    CommError,
     ErrClass,
     LateError,
     OpError,

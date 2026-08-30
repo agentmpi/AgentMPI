@@ -12,16 +12,15 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from collections import Counter
 from pathlib import Path
-from typing import Dict, List, Set, Tuple
+from typing import List, Set
 
 
 def strip_comments(text: str) -> str:
     out = []
     for line in text.splitlines():
-        i, esc = 0, False
+        i = 0
         cut = len(line)
         while i < len(line):
             if line[i] == "\\":

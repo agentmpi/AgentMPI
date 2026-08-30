@@ -23,15 +23,13 @@ import os
 import sqlite3
 import uuid
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence
 
 from . import tokens as tok
 from .errors import (
-    AmpiError,
     ArgError,
     CommError,
     CtxExceededError,
-    ErrClass,
     FencedError,
     NotInitError,
     RankError,

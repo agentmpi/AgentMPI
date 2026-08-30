@@ -26,8 +26,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
-import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional

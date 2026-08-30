@@ -29,11 +29,11 @@ import argparse
 import json
 import os
 import sys
-import textwrap
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
-from . import collectives, ft, launcher, ops as ops_mod, p2p, rma, topology, trace, views
+from . import collectives, ft, launcher, p2p, rma, topology, trace, views
+from . import ops as ops_mod
 from .core import (
     ANY_SOURCE,
     ANY_TAG,
@@ -47,15 +47,12 @@ from .core import (
     failed_ranks,
     finalize_rank,
     init_rank,
-    live_ranks,
     resolve_peer,
     resolve_tag,
-    world_to_comm,
 )
-from .errors import AmpiError, ArgError, ErrClass, RETRYABLE, exit_code
-from .journal import Journal, find_root, now_ns, open_journal
+from .errors import RETRYABLE, AmpiError, ArgError, ErrClass, exit_code
+from .journal import find_root, now_ns, open_journal
 from .version import PROTOCOL_VERSION, __version__
-
 
 # --------------------------------------------------------------------------
 # Output rendering

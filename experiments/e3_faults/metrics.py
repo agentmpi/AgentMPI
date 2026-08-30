@@ -20,13 +20,13 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections import Counter, defaultdict
+from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from ampi.journal import Journal, now_ns  # noqa: E402
+from ampi.journal import Journal  # noqa: E402
 from ampi.trace import summarize  # noqa: E402
 
 

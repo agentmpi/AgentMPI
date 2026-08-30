@@ -20,7 +20,7 @@ import json
 import math
 import statistics
 from collections import defaultdict
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from .journal import Journal, now_ns
 

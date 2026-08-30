@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import re
-import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Dict, List, Tuple

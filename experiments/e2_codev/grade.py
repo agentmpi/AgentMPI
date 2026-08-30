@@ -19,7 +19,6 @@ import argparse
 import json
 import subprocess
 import sys
-import textwrap
 from collections import Counter
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple

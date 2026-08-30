@@ -31,7 +31,7 @@ import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))

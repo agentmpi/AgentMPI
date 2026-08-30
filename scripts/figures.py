@@ -12,7 +12,7 @@ import argparse
 import json
 import math
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 import matplotlib
 
@@ -105,7 +105,7 @@ def fig_collective_volume(mb: Dict[str, Any], out: Path) -> None:
     }
     op_of = {"(a) allreduce": "allreduce", "(b) allgather": "allgather", "(c) barrier": "barrier"}
     fig, axes = plt.subplots(1, 3, figsize=(7.2, 2.5))
-    for ax, (title, algos) in zip(axes, groups.items()):
+    for ax, (title, algos) in zip(axes, groups.items(), strict=False):
         op = op_of[title]
         for i, (algo, label) in enumerate(algos):
             pts = sorted(

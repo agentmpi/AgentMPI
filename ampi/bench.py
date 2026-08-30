@@ -49,13 +49,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from . import collectives, ops as ops_mod, p2p, rma
-from .core import Config, Ctx, bind, init_rank, load_config
-from .errors import AmpiError, ErrClass
-from .journal import Journal, now_ns
+from . import collectives, p2p
+from .core import Config, Ctx, bind, init_rank
+from .journal import Journal
 from .launcher import create as launcher_create
 from .trace import _dist, summarize
-
 
 # --------------------------------------------------------------------------
 # Stub executor plumbing
@@ -168,7 +166,8 @@ def suite_latency(a: argparse.Namespace, workdir: Path) -> Dict[str, Any]:
 
             take_body = mode == "eager"
 
-            def body(ctx: Ctx, out: Dict[str, Any], take_body=take_body) -> None:
+            def body(ctx: Ctx, out: Dict[str, Any], take_body=take_body,
+                     payload=payload) -> None:
                 lat: List[float] = []
                 for i in range(reps):
                     if ctx.crank == 0:
