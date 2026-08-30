@@ -94,5 +94,5 @@ standardization.
 
 ## License
 
-Apache-2.0. The short literary passages in the translation experiment are from
+MIT. The short literary passages in the translation experiment are from
 public-domain works and retain source attribution in their manifest.
