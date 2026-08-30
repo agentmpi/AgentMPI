@@ -54,11 +54,19 @@ class Contract:
     kind:
         ``"text"``, ``"json"``, ``"patch"`` or ``"none"``.
     required:
-        For ``kind="json"``, top-level keys that must be present.  This is a
+        For ``kind="json"``, top-level keys that must be *present*.  This is a
         deliberately weak structural language: experience with agent output is
         that presence-and-type checks catch nearly all mechanical breakage,
         while a full JSON Schema tempts harness authors into over-constraining
         an artifact whose interesting properties are semantic anyway.
+    nonempty:
+        Keys that must be present *and* carry a value.  Kept separate from
+        ``required`` because the two are genuinely different demands and
+        conflating them is a trap: a term sheet for a section that contains no
+        proper nouns legitimately has an empty term map, and a contract that
+        rejected it would make the harness retry, fail, and abandon its peers
+        mid-collective over a correct answer.  Only ``required`` participates in
+        type matching; ``nonempty`` is a value constraint.
     min_tokens / max_tokens:
         Volume bounds.  ``max_tokens`` is what lets a receiver reject an
         artifact that would blow its budget *before* reading it — the check
@@ -74,6 +82,7 @@ class Contract:
     name: str
     kind: str = "json"
     required: tuple[str, ...] = ()
+    nonempty: tuple[str, ...] = ()
     min_tokens: int = 0
     max_tokens: int | None = None
     must_match: tuple[str, ...] = ()
@@ -122,8 +131,11 @@ class Contract:
             for key in self.required:
                 if key not in payload:
                     problems.append(f"{where}: missing required key {key!r}")
-                elif payload[key] in (None, "", [], {}):
-                    problems.append(f"{where}: required key {key!r} is empty")
+            for key in self.nonempty:
+                if key not in payload:
+                    problems.append(f"{where}: missing required key {key!r}")
+                elif payload[key] in (None, "", [], {}, ()):
+                    problems.append(f"{where}: key {key!r} must not be empty")
         elif self.kind in ("text", "patch") and not isinstance(payload, str):
             problems.append(f"{where}: expected text, got {type(payload).__name__}")
         if self.kind == "patch" and isinstance(payload, str) and payload.strip():
@@ -154,6 +166,7 @@ class Contract:
             "name": self.name,
             "kind": self.kind,
             "required": list(self.required),
+            "nonempty": list(self.nonempty),
             "min_tokens": self.min_tokens,
             "max_tokens": self.max_tokens,
             "must_match": list(self.must_match),
@@ -171,6 +184,7 @@ class Contract:
             name=data["name"],
             kind=data.get("kind", "json"),
             required=tuple(data.get("required", ())),
+            nonempty=tuple(data.get("nonempty", ())),
             min_tokens=int(data.get("min_tokens", 0)),
             max_tokens=data.get("max_tokens"),
             must_match=tuple(data.get("must_match", ())),

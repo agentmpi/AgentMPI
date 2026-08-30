@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -386,97 +387,194 @@ def cmd_win(args: argparse.Namespace) -> int:
 # worker loop
 # ============================================================================
 
-WORKER_BANNER = """\
-AgentMPI worker: rank {rank} (incarnation {incarnation}) of job {job}
-Protocol: run `ampi worker next --rank {rank}` to receive the next task.
-          Do the work, write the result to a file, then run
-          `ampi worker done --rank {rank} --aid <AID> --file <RESULT>`.
-          If you cannot do the task, run
-          `ampi worker fail --rank {rank} --aid <AID> --error "<why>"`.
-"""
+#: The exact command string a worker should run to submit a result.  Handing the
+#: agent a ready-made command removes the largest source of protocol violations
+#: observed in practice: an agent that has to *construct* the submission command
+#: from remembered flags gets it wrong, and then its work is lost even though the
+#: work itself was fine.
+def _done_cmd(root: Path, rank: int, aid: int) -> str:
+    return f'ampi --root "{root}" worker done --rank {rank} --aid {aid} --file <RESULT_FILE>'
+
+
+def _fail_cmd(root: Path, rank: int, aid: int) -> str:
+    return f'ampi --root "{root}" worker fail --rank {rank} --aid {aid} --error "<REASON>"'
+
+
+def _campaign_root(campaign: Path) -> Path | None:
+    """Resolve the fabric a campaign is currently pointing at.
+
+    Campaign mode exists so that one pool of long-lived agent workers can serve a
+    *sequence* of jobs.  Without it, every experimental configuration needs its own
+    freshly launched population, and the launch cost -- which for real agents is
+    the dominant cost -- is paid again for every ablation.  This is the same reason
+    HPC sites run a persistent job with many phases rather than one job per phase.
+    """
+    active = campaign / "active"
+    if not active.exists():
+        return None
+    text = active.read_text(encoding="utf-8").strip()
+    return Path(text) if text else None
+
+
+def _lenient_json(text: str) -> Any:
+    """Parse an agent's result file, tolerating the ways models wrap JSON.
+
+    A worker that produced a perfectly good artifact should not lose it to a
+    markdown fence.  Tried in order: the text as JSON; the contents of a fenced
+    code block; the outermost brace-balanced span.  If none parse, the raw text is
+    returned and the *contract* decides whether it is acceptable — which is the
+    right place for that decision, since only the contract knows what was asked
+    for.
+    """
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    fence = re.search(r"```(?:json)?\s*(.*?)```", text, re.S)
+    if fence:
+        try:
+            return json.loads(fence.group(1).strip())
+        except Exception:
+            pass
+    start = text.find("{")
+    if start >= 0:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                if esc:
+                    esc = False
+                elif ch == "\\":
+                    esc = True
+                elif ch == '"':
+                    in_str = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start : i + 1])
+                    except Exception:
+                        break
+    return text
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
-    fabric = _fabric(args)
     rank = args.rank if args.rank is not None else int(os.environ.get("AMPI_RANK", "-1"))
     if rank < 0:
         raise SystemExit("no rank: pass --rank or set $AMPI_RANK")
+    campaign = Path(args.campaign) if getattr(args, "campaign", None) else None
+
+    def resolve() -> Fabric | None:
+        if campaign is None:
+            return _fabric(args)
+        root = _campaign_root(campaign)
+        if root is None or not (root / "fabric.sqlite").exists():
+            return None
+        return Fabric(root)
 
     if args.worker_cmd == "hello":
-        row = fabric.query_one("SELECT incarnation FROM ranks WHERE rank=?", (rank,))
-        inc = int(row["incarnation"]) if row else 0
+        fabric = resolve()
+        if fabric is None:
+            _out({"status": "waiting", "rank": rank, "detail": "campaign has no active job yet"})
+            return 0
         rt = RankRuntime(fabric, rank, strict_context=False)
         rt.register(executor_name="worker")
-        sys.stdout.write(WORKER_BANNER.format(rank=rank, incarnation=rt.incarnation, job=fabric.job_id))
-        _out({"rank": rank, "incarnation": rt.incarnation, "job_id": fabric.job_id, "root": str(fabric.root)})
+        _out(
+            {
+                "status": "ready",
+                "rank": rank,
+                "incarnation": rt.incarnation,
+                "job_id": fabric.job_id,
+                "root": str(fabric.root),
+            }
+        )
         return 0
 
     if args.worker_cmd == "next":
         deadline = time.time() + args.timeout
+        registered: set[str] = set()
         while True:
-            row = broker_mod.claim_next(fabric, rank, lease_s=args.lease)
-            if row is not None:
-                spool = fabric.root / "spool"
-                spool.mkdir(parents=True, exist_ok=True)
-                prompt = fabric.blobs.get_text(row["prompt_digest"])
-                pfile = spool / f"call-{row['aid']}.prompt.md"
-                pfile.write_text(prompt, encoding="utf-8")
-                meta = json.loads(row["meta"] or "{}")
-                _out(
-                    {
-                        "status": "task",
-                        "aid": int(row["aid"]),
-                        "rank": rank,
-                        "label": row["label"],
-                        "attempt": int(row["attempt"]),
-                        "prompt_tokens": int(row["prompt_tokens"]),
-                        "prompt_file": str(pfile),
-                        "result_file": str(spool / f"call-{row['aid']}.result"),
-                        "contract": json.loads(row["contract"]) if row["contract"] else None,
-                        "meta": meta,
-                        "prompt": prompt if args.inline else None,
-                    }
-                )
+            if campaign is not None and (campaign / "stop").exists():
+                _out({"status": "exit", "rank": rank, "reason": "campaign stopped"})
                 return 0
-            # Renew the lease while idle so the failure detector does not fire on
-            # a worker that is merely waiting for work.
-            with fabric.write() as cur:
-                cur.execute(
-                    "UPDATE ranks SET lease_expires=?, last_seen=? WHERE rank=?",
-                    (time.time() + args.lease, time.time(), rank),
-                )
-            if time.time() > deadline:
-                done = fabric.query_one(
+            fabric = resolve()
+            if fabric is not None:
+                key = str(fabric.root)
+                if key not in registered:
+                    registered.add(key)
+                    RankRuntime(fabric, rank, strict_context=False).register(executor_name="worker")
+                row = broker_mod.claim_next(fabric, rank, lease_s=args.lease)
+                if row is not None:
+                    spool = fabric.root / "spool"
+                    spool.mkdir(parents=True, exist_ok=True)
+                    prompt = fabric.blobs.get_text(row["prompt_digest"])
+                    pfile = spool / f"call-{row['aid']}.prompt.md"
+                    pfile.write_text(prompt, encoding="utf-8")
+                    rfile = spool / f"call-{row['aid']}.result"
+                    aid = int(row["aid"])
+                    _out(
+                        {
+                            "status": "task",
+                            "aid": aid,
+                            "rank": rank,
+                            "root": str(fabric.root),
+                            "label": row["label"],
+                            "attempt": int(row["attempt"]),
+                            "prompt_tokens": int(row["prompt_tokens"]),
+                            "prompt_file": str(pfile),
+                            "result_file": str(rfile),
+                            "contract": json.loads(row["contract"]) if row["contract"] else None,
+                            "meta": json.loads(row["meta"] or "{}"),
+                            "submit": _done_cmd(fabric.root, rank, aid).replace("<RESULT_FILE>", str(rfile)),
+                            "give_up": _fail_cmd(fabric.root, rank, aid),
+                            "prompt": prompt if args.inline else None,
+                        }
+                    )
+                    return 0
+                # Renew the lease while idle so the failure detector does not fire
+                # on a worker that is merely waiting for work.
+                with fabric.write() as cur:
+                    cur.execute(
+                        "UPDATE ranks SET lease_expires=?, last_seen=? WHERE rank=?",
+                        (time.time() + args.lease, time.time(), rank),
+                    )
+                stop = fabric.query_one(
                     "SELECT value FROM meta WHERE key=?", (f"worker_stop:{rank}",)
                 ) or fabric.query_one("SELECT value FROM meta WHERE key='worker_stop:all'")
-                _out({"status": "exit" if done else "idle", "rank": rank})
-                return 0 if done else 3
+                if stop and campaign is None:
+                    _out({"status": "exit", "rank": rank, "reason": "job stopped"})
+                    return 0
+            if time.time() > deadline:
+                _out({"status": "idle", "rank": rank})
+                return 3
             time.sleep(args.poll)
 
     if args.worker_cmd == "done":
-        payload: Any
-        if args.file:
-            text = Path(args.file).read_text(encoding="utf-8")
-            payload = json.loads(text) if args.json else text
-        else:
-            text = sys.stdin.read()
-            payload = json.loads(text) if args.json else text
+        fabric = _fabric(args)
+        text = Path(args.file).read_text(encoding="utf-8") if args.file else sys.stdin.read()
+        payload = _lenient_json(text) if not args.raw else text
         broker_mod.complete(fabric, args.aid, payload)
-        _out({"status": "done", "aid": args.aid})
+        _out({"status": "done", "aid": args.aid, "parsed": not isinstance(payload, str)})
         return 0
 
     if args.worker_cmd == "fail":
-        broker_mod.fail(fabric, args.aid, args.error or "unspecified")
+        broker_mod.fail(_fabric(args), args.aid, args.error or "unspecified")
         _out({"status": "failed", "aid": args.aid})
         return 0
 
     if args.worker_cmd == "stop":
-        fabric.set_meta(f"worker_stop:{rank}" if rank >= 0 else "worker_stop:all", "1")
+        _fabric(args).set_meta(f"worker_stop:{rank}" if rank >= 0 else "worker_stop:all", "1")
         _out({"status": "stop_requested", "rank": rank})
         return 0
 
     if args.worker_cmd == "stop-all":
-        fabric.set_meta("worker_stop:all", "1")
+        _fabric(args).set_meta("worker_stop:all", "1")
         _out({"status": "stop_requested", "rank": "all"})
         return 0
 
@@ -621,6 +719,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     q = sub.add_parser("worker", help="act as an agent rank")
     q.add_argument("--rank", type=int)
+    q.add_argument("--campaign", help="directory whose 'active' file names the current fabric")
     wsub2 = q.add_subparsers(dest="worker_cmd", required=True)
     wsub2.add_parser("hello")
     wn = wsub2.add_parser("next")
@@ -631,7 +730,7 @@ def build_parser() -> argparse.ArgumentParser:
     wd = wsub2.add_parser("done")
     wd.add_argument("--aid", type=int, required=True)
     wd.add_argument("--file")
-    wd.add_argument("--json", action="store_true")
+    wd.add_argument("--raw", action="store_true", help="store the result as text without JSON parsing")
     wfa = wsub2.add_parser("fail")
     wfa.add_argument("--aid", type=int, required=True)
     wfa.add_argument("--error")
