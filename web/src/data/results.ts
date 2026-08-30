@@ -4,8 +4,28 @@ import collab from "../../public/results/collab.json";
 import fault from "../../public/results/fault.json";
 import scale from "../../public/results/scale.json";
 import scale32 from "../../public/results/scale32.json";
+import cursorScale from "../../public/results/cursor_scale.json";
 
-export const results = { microbench, translation, collab, fault, scale, scale32 };
+export const results = {
+  microbench,
+  translation,
+  collab,
+  fault,
+  scale,
+  scale32,
+  cursorScale,
+};
+
+export function cursorScaleSummary() {
+  const fables = results.cursorScale.items.reduce((n, rank) => n + rank.items.length, 0);
+  return {
+    n: results.cursorScale.n,
+    completed: results.cursorScale.completed,
+    fables,
+    missing: results.cursorScale.missing_ranks.length,
+    sample: results.cursorScale.items[0]?.items ?? [],
+  };
+}
 
 export function ms(row: { timing?: { median_s: number } } | undefined): string {
   if (!row?.timing) return "—";

@@ -275,11 +275,16 @@ through AgentMPI, not mocks:
 - **Collaborative `minidag`.** Twelve software ranks wrote a small DAG
   scheduler (`experiments/results/software_artifact/`) with parser, executor,
   25 passing tests, and a 143-event protocol trace.
+- **100-rank Aesop → Spanish.** Every rank 0–99 was a Cursor subagent. Each
+  read a 2–3 fable shard, wrote Spanish titles and one-sentence morals, and
+  heartbeated `finalized`. Collector result: **100/100 ranks**, 200 items, no
+  missing ranks (`experiments/results/cursor_scale.json`). This measures
+  membership and gather completeness under 100 language-model executors; it
+  does not claim literary quality. Process-mode E4 remains the latency figure.
 
-The live campaign therefore used 26 Cursor subagent executors. The separate
-100-rank Aesop and SQLite scaling runs used independent deterministic OS
-processes, not 100 language-model agents. A prepared Cursor-scale collector is
-included, but no 100-subagent quality result is claimed.
+Alice and minidag used 26 Cursor executors. The Spanish wave adds 100 more.
+The separate process-mode 100-rank reduce and SQLite scaling runs stay
+deterministic OS processes.
 
 ### 7.7 Threats to validity
 

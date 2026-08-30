@@ -1,9 +1,10 @@
-import { findRow, ms, results } from "../../data/results";
+import { cursorScaleSummary, findRow, ms, results } from "../../data/results";
 
 const kernels = ["barrier", "bcast_small", "bcast_large", "allreduce_sum", "allgather", "pingpong_small"];
 const ns = [2, 4, 8, 16];
 
 export default function ExperimentsPage() {
+  const cursor = cursorScaleSummary();
   return (
     <main className="mx-auto w-full max-w-6xl flex-1 px-4 py-10 md:px-6">
       <p className="text-xs uppercase tracking-[0.2em] text-accent">Measured on this repository</p>
@@ -73,7 +74,9 @@ export default function ExperimentsPage() {
           <p className="mt-3 text-sm text-muted">
             Scatter of Vernon Jones’s 1912 Aesop (Gutenberg 11339), gather of
             translations, reduce of a table of contents. Six payloads crossed
-            the eager threshold and travelled as artifacts.
+            the eager threshold and travelled as artifacts. A live Cursor
+            campaign in this repo also translated Alice into French with eight
+            draft ranks and four reviewers (glossary exact-hit 1.0).
           </p>
         </article>
         <article className="rounded-xl border border-rule bg-card p-5">
@@ -131,6 +134,46 @@ export default function ExperimentsPage() {
             <dt className="text-muted">p=32 compare</dt>
             <dd>{results.scale32.elapsed_s.toFixed(2)} s</dd>
           </dl>
+          <p className="mt-3 text-sm text-muted">
+            Process-mode latency. The live Cursor wave below uses the same
+            scatter shape with language-model ranks.
+          </p>
+        </article>
+      </section>
+
+      <section className="mt-12">
+        <article className="rounded-xl border border-rule bg-card p-5">
+          <h3 className="text-lg font-semibold">Live Cursor · 100-rank Aesop → Spanish</h3>
+          <p className="mt-2 text-sm text-muted">
+            Each of 100 Cursor subagents was a COMM_WORLD rank: read a work
+            packet, write Spanish titles and one-sentence morals, heartbeat{" "}
+            <code>finalized</code>. No missing ranks; no cross-rank collisions.
+          </p>
+          <dl className="mt-3 grid grid-cols-2 gap-2 text-sm md:grid-cols-4">
+            <dt className="text-muted">Ranks completed</dt>
+            <dd>
+              {cursor.completed}/{cursor.n}
+            </dd>
+            <dt className="text-muted">Titles + morals</dt>
+            <dd>{cursor.fables}</dd>
+            <dt className="text-muted">Missing ranks</dt>
+            <dd>{cursor.missing}</dd>
+            <dt className="text-muted">Record</dt>
+            <dd>
+              <code>cursor_scale.json</code>
+            </dd>
+          </dl>
+          <ul className="mt-4 space-y-2 text-sm text-muted">
+            {cursor.sample.map((item) => (
+              <li key={item.title_en}>
+                <span className="text-ink">{item.title_en}</span>
+                {" → "}
+                <em>{item.title_es}</em>
+                {" — "}
+                {item.moral_es}
+              </li>
+            ))}
+          </ul>
         </article>
       </section>
     </main>
