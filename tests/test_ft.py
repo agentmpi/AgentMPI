@@ -227,3 +227,31 @@ def test_straggler_threshold_is_robust_to_the_tail():
     assert thr < 60.0, "a single outlier must not inflate the threshold"
     with_outlier = [*normal, 300.0]
     assert straggler_threshold(with_outlier, k=2.0) < 100.0
+
+
+def test_runtime_version_mismatch_is_traced(tmp_path, monkeypatch):
+    """A population split across two runtime builds must be visible in the trace.
+
+    The protocol keeps its *state* outside the agents and durable, and says nothing
+    about the runtime *code*, which is shared mutable state. Editing an editable
+    install while a live population executes against it puts half the ranks on a
+    different build, and the resulting failures look like heisenbugs. A mismatch is
+    traced rather than raised, because refusing to start would strand a population
+    mid-run over what is usually a benign upgrade -- but it must not be silent.
+    """
+    import agentmpi.rank as rank_mod
+
+    original = rank_mod.RUNTIME_VERSION
+    fabric = ampi.create_job(tmp_path / "v", 2)
+    s1 = ampi.init(tmp_path / "v", rank=0, size=2)
+    assert fabric.get_meta("runtime_version") == original
+    s1.finalize()
+    assert not fabric.events(kinds=["rank.version_mismatch"])
+
+    monkeypatch.setattr(rank_mod, "RUNTIME_VERSION", "9.9.9+schema99")
+    s2 = ampi.init(tmp_path / "v", rank=1, size=2)
+    s2.finalize()
+    events = fabric.events(kinds=["rank.version_mismatch"])
+    assert len(events) == 1, events
+    assert events[0]["payload"]["worker_version"] == "9.9.9+schema99"
+    assert events[0]["payload"]["job_version"] == original

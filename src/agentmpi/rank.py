@@ -39,6 +39,7 @@ import json
 import os
 import time
 import uuid
+from importlib.metadata import PackageNotFoundError, version
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -51,8 +52,20 @@ from .constants import (
     RankState,
 )
 from .errors import AmpiContextOverflow, AmpiTimeout, AmpiTruncateError, AmpiUsageError
-from .fabric import Fabric
+from .fabric import SCHEMA_VERSION, Fabric
 from .schema import Contract
+
+#: Version string recorded in the fabric at job creation and checked by every
+#: incarnation. Includes the schema version so that a runtime whose fabric layout
+#: changed is distinguishable from one whose behaviour merely changed.
+def _package_version() -> str:
+    try:
+        return version("agentmpi")
+    except PackageNotFoundError:
+        return "unknown"
+
+
+RUNTIME_VERSION = f"{_package_version()}+schema{SCHEMA_VERSION}"
 
 #: Signature of an executor: it receives a prompt and metadata and returns the
 #: agent's output.  See :mod:`agentmpi.executor`.
@@ -229,8 +242,18 @@ class RankRuntime:
     # ------------------------------------------------------------- lifecycle
 
     def register(self, *, executor_name: str = "local") -> None:
-        """Claim the rank, bumping the incarnation counter."""
+        """Claim the rank, bumping the incarnation counter.
+
+        Also records the runtime version this incarnation is running, and warns when
+        it differs from the version that created the job.  Protocol state lives
+        outside the agents and is durable; the runtime *code* is shared mutable state
+        that the protocol says nothing about, and a population half of which is
+        running a different build is a class of failure no amount of durable state
+        prevents.  We hit exactly this by editing an editable install while a live
+        population executed against it.
+        """
         now = time.time()
+        self._check_runtime_version()
         with self.fabric.write() as cur:
             row = cur.execute("SELECT incarnation FROM ranks WHERE rank=?", (self.wrank,)).fetchone()
             if row is None:
@@ -278,6 +301,26 @@ class RankRuntime:
                 executor=executor_name,
                 budget=self.context.budget,
                 eager_limit=self.eager_limit,
+            )
+
+    def _check_runtime_version(self) -> None:
+        """Compare this incarnation's runtime version against the job's.
+
+        A mismatch is emitted as a traced event rather than raised, because refusing
+        to start would strand a population mid-run for what is usually a benign
+        upgrade -- but it must be *visible*, since the alternative is debugging a
+        heisenbug caused by half the ranks running different code.
+        """
+        recorded = self.fabric.get_meta("runtime_version")
+        if recorded is None:
+            self.fabric.set_meta("runtime_version", RUNTIME_VERSION)
+            return
+        if recorded != RUNTIME_VERSION:
+            self.fabric.emit(
+                "rank.version_mismatch",
+                rank=self.wrank,
+                job_version=recorded,
+                worker_version=RUNTIME_VERSION,
             )
 
     def heartbeat(self) -> None:

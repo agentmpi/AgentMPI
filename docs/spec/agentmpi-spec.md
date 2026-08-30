@@ -446,6 +446,21 @@ glossary merged by an agent is not. Harnesses SHOULD use exact operators whereve
 combination is genuinely set-like, exactly as an MPI programmer prefers `MPI_SUM` to
 a user-defined operator.
 
+> **Advice to harness authors.** An exact merge over a keyed map presupposes that each
+> key has one correct value, and the resulting agreement is *binding on every rank*.
+> That presupposition is stronger than it looks. In our translation experiment a
+> glossary bound the English term *pounds* to the rendering for pounds sterling,
+> correct nearly everywhere; one section used the word for body weight, and the rank
+> — correctly obeying a glossary the harness had declared binding — produced a wrong
+> sentence. `UNION`'s conflict retention handles two ranks *disagreeing* about a key;
+> it cannot represent one key having two correct senses.
+>
+> The lesson generalises past glossaries. Whenever a collective imposes a decision
+> globally, choose the key so that a globally correct answer exists — here, key on
+> (term, sense) rather than on term — and be aware that a consistency metric will
+> score a uniformly wrong decision as a perfect one. Agreement is not correctness, and
+> a protocol that makes agreement cheap makes it cheap to agree on something false.
+
 ### 6.4 Allreduce and the divergence hazard
 
 `reduce_bcast` computes one result and broadcasts it, so every rank holds a
@@ -797,6 +812,31 @@ suffice to replay the protocol and to compute every cost and quality measure.
 > tracing is unconditional.
 
 ---
+
+## 13a. Operational requirements
+
+Two requirements sit outside the protocol proper but are necessary for a run to mean
+anything, and both were learned the hard way.
+
+**The runtime version MUST be pinned per job.** Protocol *state* lives outside the
+agents and is durable (§2.5), which is the design's central move. The runtime *code*
+is shared mutable state, and the specification says nothing about it. An
+implementation SHOULD record its version in the fabric at job creation and workers
+SHOULD refuse to serve a job whose recorded version differs from their own. During our
+own experiments a worker crashed inside the runtime because the package was edited
+while a live population executed against it; the honest description is that we
+hot-patched a running job, and no amount of durable protocol state protects against
+that.
+
+**The verifier MUST be versioned, and results MUST be re-scorable.** A
+verification-based fault-tolerance scheme (§8.6) inherits the reliability of its
+verifier, so an implementation MUST record which version of an acceptance oracle
+produced a result, and a harness SHOULD keep the artifacts needed to re-score a run
+offline. Our own oracle contained a case that contradicted the specification it
+tested, and the plumbing that carried its report back to the population parsed that
+report incorrectly — telling the population that a passing build had failed. Neither
+defect was visible from the population's behaviour; both were visible immediately once
+runs could be re-scored from stored artifacts.
 
 ## 14. Conformance checklist
 
