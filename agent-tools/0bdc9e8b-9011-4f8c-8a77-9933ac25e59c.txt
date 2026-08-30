@@ -1,0 +1,443 @@
+## Exploring Automatic, Online Failure Recovery for
+
+## Scientific Applications at Extreme Scales
+
+Marc Gamell∗, Daniel S. Katz†, Hemanth Kolla‡, Jacqueline Chen§, Scott Klasky¶ and Manish Parashar∗ ∗ NSF Cloud and Autonomic Computing Center & Rutgers Discovery Informatics Institute, Rutgers University, Piscataway, NJ, USA, { mgamell, parashar} @cac.rutgers.edu † Computation Institute, University of Chicago & Argonne National Laboratory, Chicago, IL, USA, d.katz@ieee.org ‡ Scalable Modeling and Analysis Department, Sandia National Laboratories, Livermore, CA, USA, hnkolla@sandia.gov § Combustion Research Facility, Sandia National Laboratories, Livermore, CA, USA, jhchen@sandia.gov ¶ Oak Ridge National Laboratories, Oak Ridge, TN, USA, klasky@ornl.gov
+
+Abstract—Application resilience is a key challenge that must be addressed in order to realize the exascale vision. Process/node failures, an important class of failures, are typically handled today by terminating the job and restarting it from the last stored checkpoint. This approach is not expected to scale to exascale. In this paper we present Fenix, a framework for enabling recovery from process/node/blade/cabinet failures for MPI-based parallel applications in an online (i.e., without disrupting the job) and transparent manner. Fenix provides mechanisms for transpar ently capturing failures, re-spawning new processes, fixing failed communicators, restoring application state, and returning execu tion control back to the application. To enable automatic data recovery, Fenix relies on application-driven, diskless, implicitly coordinated checkpointing. Using the S3D combustion simulation running on the Titan Cray-XK7 production system at ORNL, we experimentally demonstrate Fenix’s ability to tolerate high failure rates (e.g., more than one per minute) with low overhead while sustaining performance.
+
+I. INTRODUCTION
+
+The increasing demands of science and engineering appli cations continue to push the limits of current extreme-scale systems. As a result, the HPC community is working towards achieving exascale (10 18 FLOPS) by the end the decade [1], [2]. One of the key anticipated challenges at exascale will be the reliability of the system due to the very large number of cores and components. Current petascale systems have millions of cores (e.g., the top system on the Top500 list as of June 2014 achieves 33+ petaflops with 3,120,000 cores), and it is estimated that an exascale system will have an order of magni tude more cores, including individual nodes with thousands of cores [3]. The mean time between failures (MTBF) for current petascale systems is measured in days (e.g., the ORNL’s Jaguar Cray system had an average of 2.33 failures/day between August 2008 and February 2010 [4]), but it is estimated that the MTBF for an exascale system would be measured in minutes [5]. A dramatic improvement in component reliability would be required to neutralize this effect of higher component counts. However, architectural trends such as the predicted reduction of gate width and voltage levels [6] suggests that component reliability may in fact decrease. This significant reduction in MTBF will directly impact applications, since the typical run time of target scientific applications will be longer than the MTBF. As a result, resiliency will be a key design requirement for exascale systems and applications, and fault tolerance techniques will be essential. This has been well documented in reports such as [6]–[8]. Nevertheless, achieving resiliency at extreme scales remains a challenge, and current HPC systems do not provide fault tolerant runtimes out-of-the box. An important class of failures that must be addressed is process and node failures, including correlation effects. These process and node failures are often recovered by ter minating the job and restarting it from the last checkpoint found in stable storage. While coordinated, stable-storage based global checkpoint/restart (C/R) is currently the most widely accepted technique for addressing processor failures, it is unclear whether this approach will scale to exascale since the time to checkpoint will often be longer than the expected MTBF, and researchers continue to actively address this issue. As an alternate approach, several fault tolerant MPI runtimes have been developed, such as MPICH-V [9], rMPI [10], MR MPI [11], redMPI [12], or FEMPI [13]. These runtimes aim to support completely transparent failure recovery, i.e., they offer an abstraction of a fault-free system to the application. To do so, they use one or more of the existing application agnostic fault tolerance techniques. However, as suggested by recent studies [14], the abstraction of a failure-free machine will not be sustainable at extreme scales, and application-aware resilience techniques will likely be required at exascale. In this paper we present the design, prototype imple mentation, and evaluation of Fenix 1, a framework aimed at enabling online (i.e., without disrupting the job) and transpar ent recovery from process, node, blade, and cabinet failures for parallel applications in an efficient and scalable manner. Fenix provides mechanisms to transparently capture failures, re-spawn new processes on spare nodes when possible, fix failed communicators, restore application state, and return the execution control back to the application. As MPI is envisioned to continue being at least one of the de-facto communication libraries on exascale systems [8], [15], this paper targets MPI based applications. Fenix can leverage existing checkpointing solutions to enable automatic data recovery. In this paper, we implement application-driven, diskless, implicitly-coordinated checkpointing, and we use this implementation to explore
+
+1Fenix is the old English noun for Phoenix, the mythological bird that, like our library, is reborn from its ashes.
+
+SC14: International Conference for High Performance Computing, Networking, Storage and Analysis
+
+978-1-4799-5500-8/14 $31.00 © 2014 IEEE DOI 10.1109/SC.2014.78
+
+how application-driven checkpointing can eliminate the cost of coordination (both explicit or implicit synchronization) under certain assumptions, and can reduce the size of the checkpoints by saving only the essential data. We have prototyped Fenix and have deployed it on the Titan Cray XK7 production system at ORNL, the world’s second fastest machine as of June 2014. Our prototype im plementation of Fenix leverages User Level Failure Mitigation (ULFM) [16]–[20], which has been proposed as a minimalist and lightweight MPI extension that allows applications to create policies for tolerating process failures. In this paper, we present an experimental evaluation of the effectiveness and scalability of Fenix using the S3D [21] combustion ap plication on Titan. S3D is a highly parallel method-of-lines solver for partial differential equations and is used to perform first-principles-based direct numerical simulations of turbulent combustion. It employs high order explicit finite difference numerical schemes for spatial and temporal derivatives, and realistic physics for thermodynamics, molecular transport, and chemical kinetics. S3D demonstrates good scalability up to nearly 200K cores and has been highlighted by [22] as one of five promising applications on the path to exascale. Our results demonstrate Fenix’s ability to tolerate high-frequency dynamically injected multi-node failures while maintaining sustained performance of S3D. Our evaluation also explores extreme execution scenarios that may exist at exascale, where node failures occur with high frequency (i.e., as often as every 47 seconds). For example, when injecting node failures every 90 seconds and checkpointing every 3 application iterations (∼ 5 seconds), performance is sustained with 15% overhead when compared with a failure-free and checkpoint-free execu tion. Our experiments also demonstrate that coordination-less checkpointing scales perfectly up to 250K cores in a failure free scenario, resulting in a sustained checkpoint bandwidth of ∼ 17 TB/s when checkpointing every 18 seconds, with an overhead of 0.41% with respect to a checkpoint-free execution. In this experiment S3D simulated 31+ billion grid points, resulting in 2+ TB per checkpoint. Finally, we show that the programming overhead of using Fenix is low, requiring less than 35 new, changed, or rearranged lines of code in S3D. Key contributions of this paper include: (1) An approach for online, transparent recovery from process, node, blade, and cabinet failures for MPI-based parallel applications, guided by application-specific checkpoints, (2) design and implemen tation of this approach within the Fenix framework and its deployment on the Titan Cray XK7 production system at ORNL, (3) an experimental evaluation of Fenix on Titan using the S3D combustion application demonstrating its ability to support sustained performance in spite of high frequency real node failures, and (4) an exploration of the advantages and scalability of application-aware checkpointing (i.e. implicit coordination) as a means for enabling automatic entire-node failure recovery.
+
+II. BACKGROUND AND RELATED WORK
+
+Different failure modes and their characteristics have been well documented in [6], [23]. Both process and node failures can be caused by different faults. In this paper we consider node failures to be a subset of the process failures.
+
+Checkpoint and restart (C/R) [24]–[26] is the most com monly used technique to provide fault tolerance in HPC systems and to achieve an application-agnostic solution. In a typical C/R implementation, the application state is peri odically saved (e.g. using BLCR [27]) so that, upon failure, execution can be resumed from the saved checkpoint. Global consistency of the local checkpoints [25], [26] is ensured using fully coordinated [28], non-blocking coordinated [29], [30], blocking coordinated [31], uncoordinated [32] proto cols, or using communication-induced [33] protocols. Some approaches mix uncoordinated checkpointing with message logging to avoid domino effect, while others assume send determinism to avoid it [34], [35] or use message logging to reduce the overall waiting time when failures occur [36]. In contrast, Fenix implements a checkpointing mechanism where selective checkpoints are created at specific points within the application, guaranteeing global consistency without requiring a coordination protocol. Typically, checkpoints are saved to a centralized parallel file system [26], assumed to be fault-free. Other research has explored storing the checkpoints in local memory [37], [38], in both local and peer-memory [4], in non-volatile memory [39], in the node-local storage (such as SSD) [40], [41], or at different storage layers [42]. Fenix stores checkpoints as in [4]. It stores them both in peer-memory, to allow entire node failures, and in local-memory, to reduce network usage on failure by only transferring checkpoints to re-spawned processes. Other strategies, such as storing in the parallel file system, incur added performance costs that makes them prohibitive for Fenix, despite their advantages. Checkpoint compression [18], aggregation [43], or both [44] are often used to reduce both space and network bandwidth consumed by the checkpoint. In some cases, encod ings such as XOR or Reed-Solomon [45] are used, mimicking RAID-like resilience [41]. Fenix does not use such encodings to avoid associated computation and synchronization require ments. Furthermore, since it uses double checkpointing on separate nodes, Fenix does not require encodings to repair data when a checkpoint is lost. Recent studies [37] present a highly scalable memcpy-like filesystem optimized to hold checkpoints in-memory, falling back to other levels of the memory hierarchy using SCR [42]. Furthermore, the authors offer an interface to access the checkpoint data in the local memory using RDMA, which can be used by third-party tools to store it in a peer-node’s memory. As we need to tolerate entire-node failures, the checkpoint implementation in Fenix builds on this idea, i.e., holding the checkpoint in-memory and in a peer-node’s memory [4]. This approach can then be further extended using multilevel checkpointing [42] (i.e., high frequency diskless checkpoints, low frequency stable-storage-based checkpoints) to tolerate entire-job failures. Aside from C/R, other application-aware resilience tech niques include Algorithm-Based Fault Tolerance (ABFT) [46] or Containment Domains (CD) [47]. ABFT is focused mainly on tolerating soft failures by operating on augmented data structures with redundant information. Complementing these approaches, the recovery mechanisms in Fenix are focused on process/node failures using checkpoint as a vehicle for data recovery. CD is a language extension which enables the spec
+
+ification of failure detection, data preservation and recovery schemes for different code blocks in a nested and hierarchical manner. While CD present a generic and abstract construct able to fit many kinds of applications and failure types, in this paper we focus on hiding the details of state preservation, failure detection and failure recovery by restricting to a specific kind of applications (i.e., those whose state can be specified by a set of data chunks and that contain strongly consistent states) and failures (i.e., process/node failures). Application-awareness has also been used to enable autonomic data management [48]. To enable algorithms to work in spite of fail-stop fail ures, the MPI standard should offer a set of fault tolerance mechanisms. Two key extensions proposed are HARNESS FT-MPI [49] (discontinued in 2003) and User Level Failure Mitigation (ULFM) [16], [17], [50]. Fenix uses the latter for failure detection and process recovery. To the best of our knowledge, no existing studies have tried to target transparent online multi-node failure recovery on HPC systems using application-specific checkpoints. Furthermore, there is no evaluation of application recovery when injecting real failures with high frequency at large scales.
+
+III. THE FENIX ARCHITECTURE FOR ONLINE FAILURE RECOVERY
+
+In current implementations of MPI on production systems, node or process failures cause the entire MPI job to fail. This forces applications to recover from such failures in a bulk synchronous manner even if the failure occurs in only one node. S3D recovers from failures by restarting from the last checkpoint, which involves reading the large checkpoint file from persistent storage. This incurs a significant IO overhead, and additional costs for repeating the computations since the last checkpoint. These costs can be non-trivial even at petas cale, but will certainly become prohibitive if MTBF reduces to minutes at exascale, since the time of checkpointing to disk is typically in the order of minutes for S3D. Emerging implementations of the MPI standard are expected to include mechanisms to tolerate these faults without incurring a job failure. Leveraging such MPI implementations, specifically ULFM [16], [17], this section presents the design of Fenix with the goal of transparently recovering from process failures in an online manner. To enable automatic data recovery, Fenix relies on a checkpoint mechanism that is able to tolerate full-node failures. While this can be any of the existing solutions, we im plement an application-driven, diskless, implicitly-coordinated checkpointing. This implementation is presented later in this section.
+
+A. Process Recovery in Fenix Process recovery in Fenix involves four key stages: (i) detecting the failure, (ii) recovering the environment, (iii) recovering the data, and (iv) restarting the execution. Failure detection is delegated to ULFM-enabled MPI. This standard guarantees that all MPI communications should return an ERR_PROC_FAILED error code if the runtime detects a process failure in the communicator. The error codes are detected in Fenix using MPI’s profiling interface. As a result, no changes in MPI runtime itself are required, which will allow portability of Fenix when interfaces such as ULFM become part of the MPI standard. The first step in environment recovery is to invalidate all the communicators and to scatter the failure notification to all the ranks, as shown in Figure 1. In the current Fenix prototype, this is done using the ULFM revoke operator for all communicators in the system – the user must register their own communicators as discussed in Section IV-A. After that, the world communicator has to be shrunk to remove failed processes, while the rest are freed. If this step succeeds, new processes are spawned and merged with the old world communicator using the dynamic features of MPI 2. As this may reassign rank numbers, Fenix uses the split operation to set them to their previous value. Note that this procedure allows N − 1 simultaneous process failures, N being the number of processes running. An alternative approach is to use processes from a previously prepared process pool instead of spawning new processes.
+
+!
+
+Fig. 1. Communicator recovery in Fenix by spawning new processes. The recovery process when using a process pool is similar.
+
+Once Fenix’s communicators are recovered, a long jump is used to return execution to Fenix_Init(), except in the case of newly spawned processes – or processes in the process pool – which are already inside Fenix_Init(). From there, all processes, both survivors and newly spawned, are merged in the same execution path to get ready to recover the data. Data recovery in Fenix is achieved using application driven, implicitly coordinated, neighbor-based diskless check points created as described in Section III-B. The first step towards a safe recovery is to calculate the latest set of check points that are present on all the cores (i.e., that form a strongly consistent global checkpoint) for every saved data element. As Fenix collectively 2 assigns an increasing natural identifier IC to every new checkpoint, this is done by finding the maximum IC that is common to all ranks. This number, IC,max, will correspond to the last checkpoint successfully completed by all ranks. To obtain the identifiers of the rest of the saved elements, no communication is required; it is only needed to find, for each saved element, the largest checkpoint identifier
+
+2But without any synchronization/communication.
+
+that is smaller than IC,max. Finally, as Fenix uses neighbor based checkpointing (see Section III-B) to store checkpoints in a neighbor node’s memory, the next step is to copy these checkpoints back to the new process. Once the checkpoints have been copied to the local memory of the newly created processes, the only remaining step is to replace the contents of the original element’s memory with the contents of the checkpoint. This is done using memcpy(). Resuming execution can occur once the communicators and the data have been recovered. Execution can return: (i) to the beginning (after Fenix_Init), or (ii) to the last checkpoint that completed successfully. Dynamic labeling features are used in Fenix in order to allow static transfer of execution control at checkpoints. The former technique has several design advantages for applications that require complex communicator layout. For example, leveraging initial ization code that already existing in applications for creating communicators, communicators can be recreated after process recovery without the need of writing new code. In S3D we chose to resume at the beginning of the execution where, as we will see in Section IV-B, we re-initialize some of the modules and transparently re-create lost communicators before going back to the main loop.
+
+B. Application-driven Data Checkpointing To enable automatic data recovery, Fenix relies on a checkpoint-centric mechanism that is able to tolerate multi process failures. While it can use any of the existing check pointing platforms in the community, Fenix offers an imple mentation featuring application-driven checkpointing, which enables implicit, unsynchronized, coordinated, selective check points. Fenix also guarantees that it results in a strongly con sistent global checkpoint that can be safely used for restarts. Furthermore, Fenix uses neighbor-based diskless checkpoint ing, which can achieve high efficiency while scaling to a large core count. Selective Checkpointing. Conventional, application-agnostic checkpointing typically saves the entire state of the application –including all its memory pages, the heap, and the stack– even if they contain more data than necessary for recovery. In contrast, application specific checkpoints do not have to store the entire state of each process; in Fenix, the applications can specify which data elements should be checkpointed. Implicitly coordinated checkpointing is a technique for creating checkpoints locally (i.e., without requiring any com munication) while the application is in a strongly consistent state (SCS). SCSs are states in which there are no messages sent after the state that have been received before it and there are no messages sent before the state that have been received after it [26]. In other words, SCSs are states in which no messages cross the point where the state is con sistent. Therefore, checkpointing the data locally while in an SCS guarantees a set of checkpoints from which a proper recovery can be achieved [26]. Application knowledge can be used to identify such SCSs and to create strongly consistent checkpoints without the need for any explicit or implicit communication and without assuming any synchronization (e.g., barrier). This is in contrast to creating checkpoints in an application-agnostic manner where coordination protocols among the distributed application processes are typically re quired, which can be expensive and lead to scalability chal lenges. Uncoordinated checkpointing typically requires support mechanisms such as message logging to avoid the so-called “domino effect”, which can occur in non-send-deterministic applications as described in [34]. Assuming that the application calls Fenix_Checkpoint (a collective operation that will perform a local checkpoint) while in an SCS, the set of local checkpoints will form a strongly consistent global checkpoint. In case of a failure, this checkpoint can be used for recov ery as if it was created using a coordination protocol. The main advantage of this technique is that it supports highly imbalanced applications without requiring synchronization or any coordination-induced communication, which can degrade performance. Other advantages of this approach include its ease of implementation and efficiency. Fenix simply assigns an increasing natural identifier (cost O(1)) to every local checkpoint, and, upon recovery, it calculates the maximum common identifier shared by all processes for every saved element. In many scientific applications there are naturally occurring patterns that can be used to identify an appropriate location for the Fenix checkpoint operator. For example, for iterative simulation codes such as S3D that contain an outer timestep loop, positioning the checkpoint operator at the end of a timestep would typically result in an implicitly coordinated checkpoint. For other application structures, SCSs must be identified to determine where to position the checkpoint op erator. Possible locations may be synchronization points, sub module finalizations, before/after a communication-intensive period, after or during a computation-intensive region, after updating key data, etc. We plan to catalogue such locations for key program structures for scientific codes as part of future work. Diskless Checkpointing. As many current high-end systems do not have local storage on the compute nodes (e.g., the Top 5 machines as of June 2014 do not have compute node local storage [51]), stable storage is typically provided through a centralized/semi-decentralized parallel filesystem (e.g., Lustre [52]). As diskless checkpointing typically offers faster check point performance [4], [42], and S3D does not require all the memory in the compute nodes, we decided to implement neighbor-based checkpointing [4] in Fenix in which, for every checkpoint, each node stores a copy of its local data plus a copy of the data from a peer node. In Fenix, to enable data to survive node, blade, or cabinet failures (or failures of any other subset of the machine), we consider a group of ranks, whose size sgroup spans across the desired subset of the machine. For example, with a peer-node size of 96 physical nodes (one Cray XK7 cabinet), the checkpoints of one cabinet will be stored in a neighbor cabinet and as a result, from a data perspective, correlated failures within a cabinet can be tolerated. Assuming stotal is the total number of ranks used in the execution, to determine which remote MPI rank rr will store a node rl checkpoint, Fenix uses rr = (rl + sgroup) mod stotal, which assumes that the application uses at least 2 entire peer-nodes, but can work on partial peer-nodes beyond that (e.g., 2.5 cabinets). The cost incurred from setting a larger peer-node size in torus-like networks (Gemini [53]) is that checkpoint data will have to traverse more nodes to reach its peer-node. Currently, only one group failure is tolerated in the worst case scenario, as checkpoints are saved in the ranks of a remote
+
+peer-node. In practice, however, assuming a non-correlated distribution of failures among the group of ranks (which is certainly not an unrealistic assumption, as the group size can be tuned to contain correlated failures), if two groups have to fail, the probability of the failure of a node and its peer-node is:
+
+N/2 N 2
+
+=
+
+N
+
+2 ×
+
+N! 2!(N− 2)!
+
+=
+
+(N − 2)! 
+(N − 1)! = 1 
+N − 1 (1) 
+
+which for Titan translates to 1/18687 assuming a group of 16 cores (a physical node) or 1/194 assuming a group of cabinet size (96 physical nodes). Therefore, it is highly unlikely that if two failures occur simultaneously, no recovery by the neighbor algorithm is possible.
+
+IV. FENIX PROGRAMMING INTERFACE
+
+The API provided by Fenix, for both C and Fortran, is comprised of five operators as described in Section IV-A. Section IV-B describes the integration of S3D with Fenix, and the changes required to the S3D code to tolerate process, node, blade, and cabinet failures using Fenix. A. Interface overview The following functions make up the Fenix API. We discuss their usage below. Fenix_Checkpoint_Allocate notifies Fenix about a data element (e.g., an array) that will be saved. Only two parameters are needed, specifying the memory location of the element to save and its size in bytes. It returns an identifier that can be used to uniquely refer to the element when actually performing a checkpoint. Fenix_Init is the basic operation to initialize the Fenix library. Three parameters are required to specify the check pointing algorithm, its parameters, and the resuming des tination. The function returns the status of the rank, specifying whether this is the first time the application is started (i.e., Fenix_st_new), it has survived a failure (i.e., Fenix_st_survivor), or has been respawned after a fail ure (i.e., Fenix_st_respawned; note that processes are considered respawned even if the spare process pool method is used). It also returns world, the new/repaired world com municator, which will include all processes except ones kept in a process pool to tolerate failures. Fenix_Comm_Add can be used to notify Fenix about the creation of user communicators. Fenix_Checkpoint performs a checkpoint of the specified element identifier, which has been previously initialized by Fenix_Checkpoint_Allocate. Fenix_Finalize is the basic operation to terminate Fenix. In terms of interface design, Fenix cannot take advantage of existing ideas about application-level checkpointing interfaces such SRS [54] or SCR [42]. The semantics of these are richer in aspects not needed by Fenix, such as (1) no need to provide SRS’s value restarting functionality because this is automatically done by Fenix upon failure, or (2) unlike SCR, Fenix creates checkpoints internally, and so operations such as SCR_Complete_checkpoint or SCR_Route_file are not needed. Furthermore, our interface provides additional features required by Fenix, such as the aforementioned regis tration of application communicators.
+
+B. Integrating S3D with Fenix 
+As previously mentioned, changes to S3D were required 
+in order to incorporate Fenix. We outline these changes in the 
+skeleton below. 
+1 allocate(yspc(nx,ny,nz,nslvs)) 
+2 allocate(other_arrays) 
+3 call MPI_Init() 
+4 [...] ! Initialize non-conflicting modules 
+5 call Fenix_Checkpoint_Allocate(C_LOC(yspc), 
+6 sizeof(yspc),ckpt_yspc) 
+7 call Fenix_Init(Fenix_Neighbors,PEER_NODE_SIZE, 
+8 Fenix_resume_to_init, status, C_LOC(world)) 
+9 
+10 if(status.eq.Fenix_st_survivor) then 
+11 [...] ! Finalize conflicting modules 
+12 endif 
+13 [...] ! Initialize conflicting modules 
+14 if(status.eq.Fenix_st_new) 
+15 call initialize_yspc() 
+16 endif 
+17 
+18 do ! Main loop 
+19 [...] ! Iterate and update yspc array 
+20 if(mod(step-1,CHECKPOINT_PERIOD).eq.0) then 
+21 call Fenix_Checkpoint(ckpt_yspc); 
+22 endif 
+23 enddo 
+24 
+25 call Fenix_Finalize() 
+26 call MPI_Finalize() 
+
+In the original S3D code, the array allocation (lines 1,2) was done after initializing modules (lines 10-13). It was moved to before line 5 to allow the proper invocation of Fenix_Checkpoint_Allocate (line 5) to allocate yspc as the element to be checkpointed. Note that conflicting modules assume a global state among all the cores to be maintained, or are modules that must be initialized collectively, for example. These modules are noteworthy because upon failure they must be re-initialized. One example is the S3D topology module, which is initialized by all ranks to re-create communicators. Some modules require finalization prior to re initialization (e.g., the S3D derivative module). This is done on line 11. Fenix_Init (line 7) is configured to resume to the beginning of execution instead of to the last checkpoint, as detailed in Section III-A. Therefore, after recovering from a node failure (which is automatically detected by Fenix at every MPI operation invocation), all ranks will return to line 7, line 10 being the first instruction executed. Survivor processes will then finalize conflicting modules (line 11). After that, all ranks will merge in line 13 to initialize the conflicting modules collectively and continue the simulation in the main loop. The yspc array is initialized in line 15 the first time the execution is started. As there is no collective synchronization in the main loop of S3D, its instructions might be executed at different wall clock times by the different ranks. However, before and after line 19, all ranks would have the same logical time/state (independent of the imbalance between the ranks). In other words, the element to be checkpointed (yspc array) will have a well-defined, globally strong-consistent value when all ranks finish, for example, line 19. The important point is that this statement still holds when all of the different cores reach that point, regardless of if they reach it at different wall times (i.e., independently of any imbalance in S3D). As a result, a checkpoint done at the end of iteration would generate
+
+a strongly consistent state. In addition, we only request a 
+checkpoint every CHECKPOINT_PERIOD iterations, as we 
+will show in Section V-D. 
+In the following code snippet we show the rest of changes 
+to S3D: the usage of Fenix_Comm_Add, which is called 
+inside the topology module, immediately after creating each 
+derived communicator. 
+1 call MPI_Comm_split(gcomm, py+1000*pz, r, xcomm) 
+2 call MPI_Comm_split(gcomm, px+1000*pz, r, ycomm) 
+3 call MPI_Comm_split(gcomm, px+1000*py, r, zcomm) 
+4 call Fenix_Comm_Add(xcomm); 
+5 call Fenix_Comm_Add(ycomm); 
+6 call Fenix_Comm_Add(zcomm); 
+7 [...] 
+8 call MPI_Comm_split(gcomm, xid, r, yz_comm) 
+9 call MPI_Comm_split(gcomm, yid, r, xz_comm) 
+10 call MPI_Comm_split(gcomm, zid, r, xy_comm) 
+11 call Fenix_Comm_Add(yz_comm); 
+12 call Fenix_Comm_Add(xz_comm); 
+13 call Fenix_Comm_Add(xy_comm); 
+
+The overall impact on programmability using Fenix is very low, requiring less than 35 new, changed, or rearranged lines throughout the S3D code. In containment domains [47] terminology, our integration of Fenix within S3D can be seen as a top-level domain that isolates multi-node failures from job crashes. The inclusion of more finely grained levels to further isolate multi-node failures is left as future work.
+
+V. EMPIRICAL EVALUATION
+
+If applications must tolerate high frequency failures (on the order of 30-300 seconds) that involve only a subset of the machine (e.g., a node, a blade, a cabinet...), we must reduce the sources of fault tolerance overhead. By leveraging the fact that the majority of the system will survive these failures, online recovery can be used to further contain the failure. To enable online recovery, data must survive multi-node failures. Data checkpointing is therefore used. Specifically, Fenix implements diskless [55] neighbor-based [4] checkpointing. In this section, we evaluate the capabilities and impact of a prototype implementation of Fenix on the Titan Cray XK7 system, using the S3D [21] combustion simulation. We also evaluate the correctness of implicitly-coordinated checkpoint ing as previously described, which further reduces overhead by not requiring any synchronization (either explicit or assumed) from the cores. We also present a study of a 125k-core, 24-hour production runs with S3D on Titan, highlighting the failures encountered and the fault tolerance actions taken. The ultimate aim of the experimentation is to run an execution mimicking a future extreme-scale scenario, in which node failures occur with extremely high frequency (i.e., every 47 seconds). A. Methodology In order to run this experiment, we need to determine (1) the checkpointing implementation overhead and scalability, both in terms of data size and total core count, (2) the optimal interval between checkpoints, calculated using the Young formula [56] and validated with empirical results, (3)
+
+0
+
+0.02
+
+0.04
+
+0.06
+
+0.08
+
+0.1
+
+0.12
+
+0.14
+
+0.16
+
+0.07 0.23 0.55 1.07 1.85 2.94 4.39 6.26 8.58 11.4 14.8
+
+garbage collection memcpy()
+
+communication
+
+0
+
+0.04
+
+0.08
+
+0.12
+
+0 2 4 6 8 10 12 14 16 S3D yspc array size per core (MB)
+
+Fig. 2. Checkpoint time for different data sizes (1000 cores).
+
+the scalability of recovery algorithms towards an increasing number of concurrent failures within a group of ranks, and (4) the weak scalability of the recovery algorithm. Finally, we are able to run the experiment surviving frequent node failures assuming different system MTBFs. Failures, or crashes, are injected by sending simultaneous SIGKILL signals to the involved application and runtime helper processes. As a result, both the processes and the MPI runtime become unavailable to other nodes (i.e., this is seen as a real failure in the vicinity). As our porting of the ULFM prototype from UTK (r4579379) on Titan only works up to ∼ 5000 cores, the experiments where no crash was injected were done using Cray MPICH (v6.3.0). In an effort to reduce the impact of performance variability, all of the experiments presented in this section have been repeated five times, at different days of the week and at different times of day. We use checkpointing as a vehicle for data resilience, but improving its overall performance was not the goal of this paper. As a result, the memcpy process was not optimized by the compiler. B. Benchmarking S3D production runs – A base line test Currently, S3D production runs create checkpoints every 600 iterations. Our 24-hour runs on Titan using state-of the-art IO technology (ADIOS [57]) over 125k cores are shown in the top part of Figure 7. The checkpoint process of 5.2 MB/core (aggregated size of 658 GB) takes ∼ 55 seconds, while loading it from the filesystem takes ∼ 44 seconds. In total, 1126 seconds were spent checkpointing (1.72% more time compared to a failure-free, checkpoint-free execution 3). Our records registered 9 process/node failures, incurring a total rollback cost of 14884 seconds (22.63% overhead) while the rest of the recovery process took 4638 seconds (7.05% overhead). Therefore, the total time spent in fault-tolerance related tasks represents 31.40% compared to a failure-free and checkpoint-free execution. C. Determining failure-free Checkpoint Cost Data size. Figure 2 shows the checkpoint time for different data sizes, ranging from 0.07 to 15 MB per core (1 to 240
+
+3Estimated by subtracting overheads from total time.
+
+0
+
+0.05
+
+0.1
+
+0.15
+
+0.2
+
+0.25
+
+0.3
+
+0.35
+
+1000 2197 4096 8000 15625 32768 64000 125000 250047
+
+Core count garbage collection memcpy()
+
+communication
+
+0.1TB/s
+
+0.2TB/s 0.7TB/s
+
+0.6TB/s 1.2TB/s
+
+2.4TB/s
+
+3.8TB/s
+
+9.6TB/s
+
+16.8TB/s
+
+Fig. 3. Checkpoint time for different core counts (8.6 MB/core). The numbers above each test show the aggregated bandwidth (the total checkpoint size over the average checkpoint time).
+
+MB per node). The bars represent the average among all checkpoints, all cores, throughout the five repetitions, while error bars indicate variability (including minimum, maximum, first, and third quartile). The three different sub-bars show the three different processes that the checkpoint algorithm requires. Clearly, the communication cost dominates the ex ecution. The lower plot in Figure 2 shows that the checkpoint time is linearly dependent on data size (for sizes greater than 1 MB/core), as expected. The overhead caused by each array size strongly influences the choice of the size to be used in the rest of the experiments of this paper – 50 grid points per core, which corresponds to 8.58 MB of the yspc array. Weak scalability. Figure 3 shows how checkpointing scales to 250k cores as we increase total the number of cores while achieving similar average checkpoint time, sustaining a bandwidth of 16.8 TB/s in the test with a higher number of cores. Again, the checkpoint procedure is dominated mostly by the transfer cost. As expected, the memcpy time remains constant throughout all executions, and the garbage collection cost is negligible. The lower communication time of the tests with less than 4k cores is due to the configured group size. In small tests it was set to 16 nodes, while in bigger ones was set to 96 nodes (the Cray XK7 cabinet size). As the group size is increased, messages must traverse more Gemini nodes [53] to reach the destination. The minimum of each test (the lower point on the error bars) is in all cases close to the third quartile. Furthermore, the median (the white line inside the error bar) is below 0.075 in all cases but in the 64k test. These observations indicate that 25% of cores finish the checkpoint process within a reasonably small time window and half of them take less than 0.075 s, while others take more time. As this paper is not focused on the checkpointing process, no further analysis of this behavior is provided. Assuming a linear relationship between checkpoint size and checkpoint writing time in ADIOS, we can extrapolate a production run’s checkpoint time assuming 8.58 MB/core. This would be translated to a 90-second checkpoint write overhead and a 72-second checkpoint read overhead, a 750fold increase in the checkpoint time, compared to 0.12 s with 250k ranks obtained with Fenix (Figure 3). Regarding data recovery time, our implementation only requires the transfer of the checkpoints to the failed nodes, a process whose overhead can be expected to be the same as checkpoint time. Compared to other studies, such as CRUISE [37] (an extension of SCR [42]), our implementation is slower. This is mainly due to the fact that we have to send the checkpoint remotely in order to tolerate entire-node failures, while tests done in [37] only store checkpoints in local main memory.
+
+D. Validating Optimal Checkpoint Rate Young’s formula [56], [58] can be used to determine TC , the optimal interval between two consecutive checkpoints, depending on the MTBF of the system (TF ) and the checkpoint time (TS). The checkpoint time has been determined in Section V-C. As in the previous weak scalability test, checkpoint size is 8.58 MB/core, which leads to TS = 0.0748 s in the case of 2197 cores (Figure 3). For a system with one million nodes, each with an MTBF of 3 years, the overall system MTBF will drop to TF = 94.608 seconds. Using second-order approximation for exponential distribution [56], [58], TC is expressed as follows:
+
+TC = 2TSTF = √2 · 0.0748s · 94.608s = 3.76s (2)
+
+As the average S3D iteration time is 1.182 s with 50 grid points per core (over five executions of a failure- and checkpoint-free experiment on 2197 cores), TC can be expressed as 3 S3D iterations rounded due to the fact that checkpoints are triggered by the application only at the end of iterations. Using the same procedure as in equation 2, we obtained the optimal number of iterations between checkpoints for system’ MTBFs of 47 seconds (TC = 2) and 189 seconds (TC = 4). As suggested in [58], we want to verify the proper usage of the formula, i.e. the correct parameter settings and the correct rounding of TC from seconds to application iterations. To do that, we evaluated the total cost induced by a set of uniformly distributed, independent failures, for several given checkpoint rates. Specifically, assuming an MTBF of 94 seconds we used a Poisson distribution 4 to obtain ten random possible failure timestamps within the 94-second time frame. We obtained the following timestamps: 12, 19, 24, 32, 41, 51, 61, 70, 78, 91. Next, we had to chose 10 different number of iterations between consecutive checkpoints. As the formula indicated frequent checkpoints, we concentrated on the smallest five (1-5). Also, to have an idea of the cost with lower frequency, we chose the other five to be disperse (10, 20, 30, 40, 50). For every checkpoint rate, we evaluated the total overhead of fault tolerance while injecting a failure to every chosen failure timestamp. The overheads induced in the resulting 100 experiments, each running 90 iterations, are represented in Figure 4. To determine which is the interval that offers the lowest overall overhead, Figure 5 shows the average of the overheads caused by the ten different failures, on each chosen checkpoint rate. Within the highlighted tests (2, 3, 4, and 5), checkpointing every three or four iterations offers the best overall solution, validating in turn the result from Young’s formula.
+
+4We used R v 3.0.2, rpois() with a seed of 10, λ = 10.
+
+Failure injection timestamp (s)
+
+| | | | | | 12 | 19 | | 24 | | | | 32 | 41 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | | 70 | | | rollback | | | | | | | | |
+| | | 60 | | | process recovery (other) | | | | | | | | |
+| | | 50 | | | process recovery (shrink) | | | | | | | | |
+| | | | | | checkpoint | | | | | | | | |
+| | | 40 | | | data recovery | | | | | | | | |
+| ) | | 30 | | | | | | | | | | | |
+
+20 ( s )
+
+10 c e n
+
+0 r a le
+
+1 2345 1020304050
+
+1 2 3 4 5 1020304050
+
+123 4 51020304050
+
+1 2 3 451020304050
+
+1234 51020304050
+
+o
+
+51
+
+61
+
+70
+
+78
+
+91
+
+F f o
+
+70 d a
+
+60 e r h
+
+50 v e
+
+40
+
+O
+
+30
+
+20
+
+10
+
+0
+
+1234 51020304050
+
+123451020304050
+
+1 23451020304050
+
+1 2 3451020304050
+
+123 451020304050 Application iterations between consecutive checkpoints
+
+Fig. 4. Overhead of Fault Tolerance for different checkpoint rates for several failure injection wall clock times (8.6 MB/core, 2197 cores, 90 iterations)
+
+25 ( s )
+
+60
+
+rollback
+
+process recovery (other)
+
+( s )
+
+process recovery (other)
+
+process recovery (shrink)
+
+20
+
+data recovery process recovery (shrink)
+
+checkpoint
+
+40 o
+
+data recovery
+
+30
+
+10 o f F
+
+5
+
+O
+
+0
+
+0
+
+O
+
+163264128 256 512 1024
+
+2 3 4 5
+
+1 10 20 30 40 50
+
+1331 2197 3375 4096 49130 49131 49132 Number of total cores
+
+Iterations between consecutive checkpoints
+
+Number of simultaneous core failures
+
+Fig. 5. Average overhead for different checkpoint rates. Same test as Figure 4.
+
+Fig. 6. Recovery overhead. (Left) Simultaneous failures on increasing number of cores, 2197 total cores. (Right) 256-core failure on increasing number of total cores. The subindex in the 4913-core tests indicates a different distribution of failures within the 512-core group.
+
+E. Evaluating Recovery Algorithm
+
+Increasing Failure Size. This tests aims at studying the impact of the number of simultaneous failures on the recovery process. Given the same total number of nodes (2197 ranks) and the same problem size, we inject failures to an increasing number of nodes, ranging from 16 to 1024 cores. In all the experiments, we set the group size to 1024, so that the failures are always injected inside the same group. Note that checkpoint times in all tests are between 95-104 ms, validating conclusion from Figure 3 about group size effect on checkpoint time. The results of the experiment are shown on the left side of Figure 6, where we can see similar total time (process recovery time TP and data recovery time TD) regardless failure size. We can conclude that all parts of the recovery algorithm are scalable upon increasing failure size. Also, this result shows how Fenix’s recovery algorithm enables tolerance to large sets of correlated failures with no extra cost. Weak scalability. After showing that the recovery al gorithm scales when an increasing number of simultaneous failures occur, we want to see how the process and data recovery scales when we increase the total number of cores.
+
+For this purpose, we propose the experiment shown on the right side of Figure 6. We set up three groups of ranks per cabinet, resulting in a group size of 512 cores (as the cabinet size on Cray XK7 is 96 processors). The experiment was performed inducing a failure of 16 nodes (256 cores) per test. Comparing the overheads in Figure 6 (right) we can see that (1) shrink algorithm does not scale (i.e. its overhead increase along with the number of cores), (2) the remaining parts of the process and data recovery algorithms scale perfectly. Impact of spacial failure distribution. We also wanted to see how the distribution of the failure within the group impacts the recovery time. The 4913-core test in Figure 6-right we show three different distributions of the 16-node failure: 49130 injects failures in the lower 256 ranks of the 512-core group, 49131 injects failures in the upper 256 ranks and 49132 injects 16 node failures randomly within the group. We observe no impact of the distribution of the failure within the group.
+
+187
+
+94
+
+47
+
+0 100 200 300 400 500 600 Execution wall time (s)
+
+M
+
+T B
+
+F ( s )
+
+Checkpoints
+
+Proc. recovery Data recovery
+
+Lost ckpt
+
+Lost ckpt
+
+Failures
+
+0 10000 20000 30000 40000 50000 60000 70000 80000 86400
+
+3901s 1617s 1612s Recovery+rollback overhead 4439s 1928s 6025s
+
+Fig. 7. Checkpoint and failure timestamps on: (Top) production runs using 125k cores on Titan and (Bottom) the first 600 seconds of the high frequency node failure tests (8.6 MB/core, 2197 cores, 500 iterations, 16-core failure injection). Only one of the 5 re-executions is shown per test. Each test include six rows, organized by pairs. The pair’s meaning is indicated in the zoomed area: from top to bottom, the first two indicate where the checkpoint occurred (in red, the non-finished checkpoints), the second two indicate the process recovery while the last two refer the data recovery. Within each pair, the top row shows the average time, while the bottom row shows the whole span througout the cores (i.e. the time between the first core begins until the last core ends).
+
+MTBF - Average failure injection period (s)
+
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+2 3 4
+
+47
+
+data recovery checkpoint
+
+process recovery (shrink)
+
+process recovery (other)
+
+rollback
+
+3 4 5 Application iterations between consecutive checkpoints
+
+94
+
+4 5 6
+
+189
+
+2 3 4
+
+No failure
+
+Fig. 8. Overhead of continuously injecting failures at different periods, using different checkpoint rates.
+
+F. Surviving highly frequent node failures
+
+Goal. The results from the above experiments enable an empirical imitation of a future large-scale scenario (exascale), in which node failures occur with high frequency, more than one per minute. The goal of this test is to show that online recovery as presented in this paper may be a solution for process/node failures towards exascale. Experimental set up. After determining the optimal check point interval for the three scenarios (system MTBF of 47, 94, and 189 seconds), we set up experiments to run on 2197 cores (problem size of 13x13x13 with 50 grid points per core), injecting entire-node failures (16 cores). As done in Section V-D, to determine the failure injection time, we used a Poisson distribution with λ = 47, λ = 94 and λ = 189 seconds respectively, with a seed of 10 on the same version of the R suite. We let the test run for 500 iterations and measured the different overheads caused by all faults, shown in Figure 8, along with the total time to solution. We also recorded the time stamp of all events related to fault tolerance, shown in the bottom side of Figure 7. The discussion below is focused only on the three optimal tests: checkpoint every 2 iterations for the 47-s MTBF test, every 3 for the 94-s MTBF test and every 4 for the 189-s MTBF test. Unless otherwise specified, the discussion focuses on the worst case scenario, 47-s MTBF. Results. Fault tolerance overhead come from three sources: (1) The recovery algorithm cost is split into (1.1) process recovery (OMPI Comm shrink and other costs) and (1.2) data recovery. Clearly, data recovery is negligible, as expected from the algorithm design. Furthermore, process recovery is again negligible, aside from communicator shrink, which is the largest cost (but is dependent on the MPI implementation). (2) The overhead from re-execution of lost iterations, or rollback cost, is the second highest cost, only exceeded by the aforementioned shrink cost. Note, however, that the measured absolute rollback cost, about five seconds per failure in the 47s MTBF test, is relatively small: ∼ 10% of 47. Its accumulated cost corresponds to below 9% over a failure-free, checkpoint free test. It is also clearly smaller than the measured rollback cost in current production runs: 22.63%. Note that this scenario is even worse than what is expected towards exascale [5], where MTBF is predicted to be measured in minutes. (3) The aggregated checkpoint cost is the least significant cost of the three processes. In the worst case test (47-s MTBF), data is checkpointed on average ∼ 15 times between two consecutive failures, incurring an average cost of 1.05 seconds (2.23% of 47 s). The second row in each test of Figure 7bottom shows the time between when the first core begins the checkpoint process and the last core finishes it. As this time is small for most checkpoints, and knowing that S3D does not have any synchronization directive within its regular execution path, we conclude that S3D is highly balanced. This conclusion applies for the great majority of iterations, but in some cases cores have started/finished the checkpointing process with a noticeable amount of imbalance, progressively resuming balanced behavior in subsequent iterations. These situations empirically demonstrate the real benefit offered by implicit coordination: no impact was produced by the check point process due to this temporal imbalance. By accumulating the times in the second row we can estimate a lower bound on the time to checkpoint for a blocking coordinated protocol. The conclusions for the 47-s, 94-s, and 189-s MTBF test indicate, respectively, a cumulative blocking coordinated checkpoint of 76, 39, and 48 s which represent 3.4x, 3.0x, and 4.1x
+
+times more compared to using implicit coordination, Figure 8. Note that in production runs shown in Section V-B, where I/O costs are on the order of 55 s, coordination cost is insignificant. However, to checkpoint frequently coordination must be implicit to significantly reduce the overhead. For a more finely grained perspective, we focus on specific events and analyze them individually. The bottom part of Fig ure 7 shows all events related to fault tolerance. Specifically, for each test, it includes (top to bottom): (rows 1 and 2) when checkpoints happened, (rows 3 and 4) when failures happened –and process recovery time– and (rows 5 and 6) how much time data recovery took. Rollback time can be deduced from the last correctly finished checkpoint (first/second rows in blue) to the beginning of each bar in row 4. Note that thanks to the well-balanced behavior of S3D, at most one checkpoint was lost per failure, which only happened in the 47-s MTBF test. The results also indicate how data recovery time is negligible in all cases; even in the recovery around second 560 of the 47-s MTBF test, in which data recovery took a slightly longer to finish. Also note that overall recovery time is very stable. The fact that lines in row 4 always begin before equivalent ones in row 3 indicate that the failure detection occurs at different times in every core of the system. From a higher perspective, we compare the tests using the time to solution metric (i.e. from the start of the execution until the last core has finished) with respect to a failure-free, checkpoint-free, execution. With failures injected every 189, 94, and 47 s, the total job run-time penalty is as low as 10%, 15%, and 31%, respectively. We have shown in Section V-B that in current production runs, with an MTBF of 9600 s, the overhead is 31%, the same as in the 47-s MTBF test. The algorithm for shrinking the communicator is expected to be dramatically improved as more research is conducted towards MPI Fault Tolerance. To estimate a lower bound on the total overhead we can assume that the shrink time is negligible and subtract it in Figure 8. The resulting overhead is reduced from 31% to 17%, from 15% to 8%, and from 10% to 6%. G. Effect of the checkpoint size Dongarra et al. [5] suggest exascale systems are likely to have orders of magnitude less memory per core than current systems, estimating them in the order of tens of MB (estimations suggest that cores may have as low as 32 MB [59] of DRAM, assuming 100M cores [5]). S3D, which uses relatively smaller amounts of memory per core, fits well with architectural assumption. However, in cases where the assumption does not hold, i.e., exascale systems have larger memory sizes per core, we can still estimate the overall overhead due to fault tolerance. For example, for an application using 100 times the size utilized in Sections V-D, V-E and V-F, i.e., 858 MB/core, the 94-s MTBF experiment would require a checkpoint time of TS = 3.74 s (experimentally evaluated on Titan), a checkpoint interval of TC = 26.61 s, and a total overhead due to fault tolerance of approximately TC /2 + TS · TF /TC + TP + TD = 13.30 + 13.31 + 8.06 + 3.74 = 38.41 s every 94.6 s. This corresponds to a 40.6% overhead, compared to the 15% for the S3D example assuming 8.58 MB/core. Similarly, using 85 MB/core (10 times the utilized size), the total overhead would be approximately 21%. Therefore, the conclusions above would still apply.
+
+VI. CONCLUSION AND FUTURE WORK
+
+In this paper we have explored an approach for online, transparent recovery from high-frequency process, node, blade, and cabinet failures for MPI-based parallel applications, us ing application-guided checkpointing as a means for data resilience. We also presented the design and implementation of this approach within the Fenix framework, and its deployment on the Titan Cray XK7 production system at ORNL. We have used Fenix to introduce resilience in the S3D combustion application, which is a key application for exascale [22] – the integration required less than 35 lines of S3D code to be added, changed, or rearranged. We also presented an extensive experimental evaluation of Fenix on Titan using S3D, while injecting real failures on processes, nodes, blades, and cabinets. Our experiments demonstrate that the combination of tech niques implemented in Fenix provide a viable solution for addressing process, node, blade, and cabinet failures at extreme scales. Our results show an overall performance overhead of 31% while tolerating node failures every 47 seconds (worst case scenario, as the MTBF for the exascale systems is expected in order of minutes [5]). We also show that this over head is the same as measured overhead on current S3D large scale production runs on Titan, experiencing 9 failures/day. We also evaluated the scalability of all the stages towards failure recovery in Fenix, and demonstrate that data check pointing, data recovery, and almost all the parts of process recovery scale well with increasing the number of cores. The only stage that does not scale well is the algorithm for shrinking the communicator, which requires further research. Finally, we explored of the advantages and scalability of application-aware checkpointing as a means for enabling automatic entire-node failure recovery and demonstrated it can eliminate the cost of coordination under certain assumptions. Implicit coordination allows diskless, peer-based checkpoint ing to scale up to 250k cores and shows 300%-400% benefit compared to blocking coordinated checkpointing, even with a highly balanced application like S3D. This reaffirms what recent studies suggest [14]: the vision of a failure-free ma chine will not be sustainable and application-aware resilience techniques will likely be required at exascale. Our ongoing and future work include: (1) studying the benefit to gradual degradation, when failure occurs with no spare resources; (2) creating compiler-based analysis to detect parts of code that guarantee a strongly consistent checkpoint, to exploit implicitly coordinated checkpointing in an application agnostic manner; and (3) further exploring scalability.
+
+ACKNOWLEDGMENT
+
+The research was conducted as part of the NSF CAC Center at Rutgers University and RDI 2. It was supported by the NSF via grant number ACI 1339036, by the DoE RSVP grant via subcontract number 4000126989 from UT Battelle, and used resources of the ORLCF at the ORNL. Work by Katz was supported by the NSF. Any opinion, finding, and conclusions or recommendations expressed in this material are those of the author(s) and do not necessarily reflect the views of the NSF. Support for this work was provided through ExaCT Center for Exascale Simulation of Combustion in Turbulence funded by US DoE. We would also like to acknowledge Josep Gamell, Jim Housell and Melissa Romanus for their help in this research.
+
+REFERENCES
+
+[1] J. Dongarra, P. Beckman, P. Aerts, F. Cappello, T. Lippert, S. Matsuoka, P. Messina, T. Moore, R. Stevens, A. Trefethen, and M. Valero, “The International Exascale Software Project: a Call To Cooperative Action By the Global High-Performance Community,” Int. J. High Perform. Comput. Appl., vol. 23, no. 4, pp. 309–322, Nov. 2009. [Online]. Available: http://dx.doi.org/10.1177/1094342009347714 [2] S. Amarasinghe, D. Campbell, W. Carlson, A. Chien, W. Dally, E. El nohazy, M. Hall, R. Harrison, W. Harrod, K. Hill, J. Hiller, S. Karp, C. Koelbel, D. Koester, P. Kogge, J. Levesque, D. Reed, V. Sarkar, R. Schreiber, M. Richards, A. Scarpelli, J. Shalf, A. Snavely, and T. Sterling, “ExaScale Software Study: Software Challenges in Extreme Scale Systems,” DARPA IPTO, Air Force Reserach Lab, Tech. Rep., Sep. 2009. [3] R. Thakur, P. Balaji, D. Buntinas, D. Goodell, W. Gropp, T. Hoefler, S. Kumar, E. Lusk, and J. L. Traff, “MPI at Exascale,” Procceedings of SciDAC, vol. 2, 2010. [4] G. Zheng, X. Ni, and L. V. Kale, “A scalable double in-memory ´ checkpoint and restart scheme towards exascale,” in IEEE/IFIP 42nd International Conference on Dependable Systems and Networks Work shops (DSN-W), 2012, pp. 1–6. [5] J. Dongarra, P. Beckman, T. Moore, P. Aerts, G. Aloisio, J.-C. Andre, D. Barkai, J.-Y. Berthou, T. Boku, B. Braunschweig, F. Cappello, B. Chapman, X. Chi, A. Choudhary, S. Dosanjh, T. Dunning, S. Fiore, A. Geist, B. Gropp, R. Harrison, M. Hereld, M. Heroux, A. Hoisie, K. Hotta, Z. Jin, Y. Ishikawa, F. Johnson, S. Kale, R. Kenway, D. Keyes, B. Kramer, J. Labarta, A. Lichnewsky, T. Lippert, B. Lucas, B. Maccabe, S. Matsuoka, P. Messina, P. Michielse, B. Mohr, M. S. Mueller, W. E. Nagel, H. Nakashima, M. E. Papka, D. Reed, M. Sato, E. Seidel, J. Shalf, D. Skinner, M. Snir, T. Sterling, R. Stevens, F. Streitz, B. Sugar, S. Sumimoto, W. Tang, J. Taylor, R. Thakur, A. Trefethen, M. Valero, A. van der Steen, J. Vetter, P. Williams, R. Wisniewski, and K. Yelick, “The International Exascale Software Project Roadmap,” International Journal of High Performance Computing Applications, vol. 25, no. 1, pp. 3–60, 2011. [Online]. Available: http://hpc.sagepub.com/content/25/1/3.abstract [6] M. Snir, R. W. Wisniewski, J. A. Abraham, S. V. Adve, S. Bagchi, P. Balaji, J. Belak, P. Bose, F. Cappello, B. Carlson, and et al., Addressing Failures in Exascale Computing. U.S. DoE, 2013. [Online]. Available: http://www.osti.gov/scitech/servlets/purl/1078029 [7] D. S. Katz, J. Daly, N. DeBardeleben, M. Elnozahy, B. Kramer, L. Lathrop, N. Nystrom, K. Milfeld, S. Sanielevici, S. Cott, and L. Votta, “Fault Tolerance for Extreme-Scale Computing Workshop, Albuquerque, NM - March 19-20, 2009,” Argonne National Laboratory, Tech. Rep. ANL/MCS-TM-312, December 2009. [8] P. Beckman, R. Brightwell, B. R. de Supinski, M. Gokhale, S. Hofmeyr, S. Krishnamoorthy, M. Lang, B. Maccabe, J. Shalf, and M. Snir, “Exascale Operating Systems and Runtime Software Report,” US Department of Energy, Technical Report, December 2012. [Online]. Available: http://science.energy.gov/∼/media/ascr/pdf/ research/cs/Exascale%20Workshop/ExaOSR-Report-Final.pdf [9] A. Bouteiller, T. Herault, G. Krawezik, P. Lemarinier, and F. Cappello, “MPICH-V Project: A Multiprotocol Automatic Fault-Tolerant MPI,” International Journal of High Performance Computing Applications, vol. 20, no. 3, pp. 319–333, 2006. [Online]. Available: http: //hpc.sagepub.com/content/20/3/319.abstract [10] K. Ferreira, R. Oldfield, J. Stearley, J. Laros, K. Pedretti, R. Brightwell, and R. Riesen, “rMPI: Increasing Fault Resiliency in a Message-Passing Environment,” Sandia National Laboratories, Albuquerque, NM, Tech. Rep. SAND2011-2488, April 2011. [11] C. Engelmann and S. Bohm, “Redundant Execution of HPC Applications with MR-MPI,” in Proceedings of the 10th IASTED International Conference on Parallel and Distributed Computing and Networks, ser. PDCN 2011. Innsbruck, Austria: ACTA Press, Calgary, AB, Canada, 2011, pp. 31–38. [Online]. Available: http:// www.christian-engelmann.info/publications/engelmann11redundant.pdf [12] D. Fiala, F. Mueller, C. Engelmann, R. Riesen, K. Ferreira, and R. Brightwell, “Detection and correction of silent data corruption for large-scale high-performance computing,” in Proceedings of the International Conference on High Performance Computing, Networking,
+
+Storage and Analysis, ser. SC 2012, 2012, pp. 78:1–78:12. [Online]. Available: http://dl.acm.org/citation.cfm?id=2388996.2389102 [13] R. Subramaniyan, V. Aggarwal, A. Jacobs, and A. George, “FEMPI: A Lightweight Fault-tolerant MPI for Embedded Cluster Systems.” in 14th Annual European Symposium on Algorithms, ser. ESA 2006, H. R. Arabnia, Ed. CSREA Press, 2006, pp. 3–9. [Online]. Available: http://dblp.uni-trier.de/db/conf/csreaESA/ csreaESA2006.html#SubramaniyanAJG06 [14] M. A. Heroux, “Toward Resilient Algorithms and Applications,” in Proceedings of the 3rd Workshop on Fault-tolerance for HPC at Extreme Scale, ser. FTXS 2013. New York, NY, USA: ACM, 2013, pp. 1–2. [Online]. Available: http://doi.acm.org/10.1145/2465813.2465814 [15] F. Cappello, A. Geist, B. Gropp, L. Kale, B. Kramer, and M. Snir, “Toward Exascale Resilience,” Int. J. High Perform. Comput. Appl., vol. 23, no. 4, pp. 374–388, Nov 2009. [Online]. Available: http://dx.doi.org/10.1177/1094342009347767 [16] W. Bland, A. Bouteiller, T. Herault, G. Bosilca, and J. J. Dongarra, “Post-failure recovery of MPI communication capability: Design and rationale,” International Journal of High Performance Computing Applications, 2013. [Online]. Available: http://hpc.sagepub. com/content/early/2013/06/02/1094342013488238.abstract [17] W. Bland, A. Bouteiller, T. Herault, J. Hursey, G. Bosilca, and J. J. Dongarra, “An evaluation of user-level failure mitigation support in MPI,” in Proceedings of the 19th European conference on Recent Advances in the Message Passing Interface, ser. EuroMPI 2012. Berlin, Heidelberg: Springer-Verlag, 2012, pp. 193–203. [Online]. Available: http://dx.doi.org/10.1007/978-3-642-33518-1 24 [18] D. Ibtesham, D. Arnold, P. Bridges, K. Ferreira, and R. Brightwell, “On the Viability of Compression for Reducing the Overheads of Checkpoint/Restart-Based Fault Tolerance,” in 41st International Con ference on Parallel Processing (ICPP), 2012, pp. 148–157. [19] W. Bland, G. Bosilca, A. Bouteiller, T. Herault, and J. Dongarra, “A Proposal for User-Level Failure Mitigation in the MPI-3 Standard,” Innovative Computing Laboratory, University of Tennessee, Tech. Rep., February 2012. [20] K. Ferreira, R. Riesen, R. Oldfield, J. Stearley, J. Laros, K. Pedretti, R. Brightwell, and T. Kordenbrock, “Increasing Fault Resiliency in a Message-Passing Environment,” Oct 2009. [21] J. H. Chen, A. Choudhary, B. de Supinski, M. DeVries, E. R. Hawkes, S. Klasky, W. K. Liao, K. L. Ma, J. Mellor-Crummey, N. Podhorszki, R. Sankaran, S. Shende, and C. S. Yoo, “Terascale direct numerical simulations of turbulent combustion using S3D,” Computational Science and Discovery, vol. 2, no. 1, p. 015001, Jan. 2009. [22] S. Amarasinghe, M. Hall, R. Lethin, K. Pingali, D. Quinlan, V. Sarkar, J. Shalf, R. Lucas, K. Yelick, P. Balanji, P. C. Diniz, A. Koniges, and M. Snir, “Exascale Programming Challenges,” in Proceedings of the Workshop on Exascale Programming Challenges, Marina del Rey, CA, USA. U.S Department of Energy, Office of Science, Office of Advanced Scientific Computing Research (ASCR), Jul 2011. [Online]. Available: http://science.energy.gov/∼/media/ascr/pdf/ program-documents/docs/ProgrammingChallengesWorkshopReport.pdf [23] M. Turmon, R. Granat, D. Katz, and J. Lou, “Tests and tolerances for high-performance software-implemented fault detection,” IEEE Trans actions on Computers, vol. 52, no. 5, pp. 579–591, 2003. [24] J. Hursey, J. Squyres, T. Mattox, and A. Lumsdaine, “The Design and Implementation of Checkpoint/Restart Process Fault Tolerance for Open MPI,” in IEEE International Parallel and Distributed Processing Symposium, 2007, pp. 1–8. [25] J. Hursey, T. I. Mattox, and A. Lumsdaine, “Interconnect agnostic checkpoint/restart in Open MPI,” in Proceedings of the 18th ACM international symposium on High Performance Distributed Computing, ser. HPDC 2009. New York, NY, USA: ACM, 2009, pp. 49–58. [26] J. Hursey, “Coordinated checkpoint/restart process fault tolerance for mpi applications on hpc systems,” Ph.D. dissertation, Indiana Univer sity, Indianapolis, IN, USA, 2010, aAI3423687. [27] P. H. Hargrove and J. C. Duell, “Berkeley lab checkpoint/restart (blcr) for linux clusters,” in Journal of Physics: Conference Series, vol. 46, no. 1. IOP Publishing, 2006, p. 494. [28] E. N. M. Elnozahy, L. Alvisi, Y.-M. Wang, and D. B. Johnson, “A survey of rollback-recovery protocols in message-passing systems,”
+
+ACM Comput. Surv., vol. 34, no. 3, pp. 375–408, Sep 2002. [Online]. Available: http://doi.acm.org/10.1145/568522.568525 [29] B. Bouteiller, P. Lemarinier, K. Krawezik, and F. Capello, “Coordinated checkpoint versus message log for fault tolerant MPI,” in Proceedings of the IEEE International Conference on Cluster Computing, 2003, pp. 242–250. [30] K. M. Chandy and L. Lamport, “Distributed snapshots: determining global states of distributed systems,” ACM Trans. Comput. Syst., vol. 3, no. 1, pp. 63–75, Feb. 1985. [Online]. Available: http: //doi.acm.org/10.1145/214451.214456 [31] C. Coti, T. Herault, P. Lemarinier, L. Pilard, A. Rezmerita, E. Ro driguez, and F. Cappello, “Blocking vs. Non-Blocking Coordinated Checkpointing for Large-Scale Fault Tolerant MPI,” in ACM/IEEE Proceedings of the International Conference on High Performance Computing, Networking, Storage and Analysis, Nov 2006, pp. 18–18. [32] A. Bouteiller, T. Ropars, G. Bosilca, C. Morin, and J. Dongarra, “Reasons for a pessimistic or optimistic message logging protocol in MPI uncoordinated failure, recovery,” in IEEE International Conference on Cluster Computing and Workshops, CLUSTER 2009, 2009, pp. 1–9. [33] L. Alvisi, E. Elnozahy, S. Rao, S. Husain, and A. de Mel, “An analysis of communication induced checkpointing,” in Twenty-Ninth Annual International Symposium on Fault-Tolerant Computing. Digest of Papers, ser. FTCS 1999 - DSN, 1999, pp. 242–249. [34] A. Guermouche, T. Ropars, E. Brunet, M. Snir, and F. Cappello, “Unco ordinated Checkpointing Without Domino Effect for Send-Deterministic MPI Applications,” in IEEE International Parallel and Distributed Processing Symposium (IPDPS), 2011, pp. 989–1000. [35] T. Ropars, T. V. Martsinkevich, A. Guermouche, A. Schiper, and F. Cappello, “SPBC: Leveraging the Characteristics of MPI HPC Applications for Scalable Checkpointing,” in Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, ser. SC 2013. New York, NY, USA: ACM, 2013, pp. 8:1–8:12. [Online]. Available: http: //doi.acm.org/10.1145/2503210.2503271 [36] R. Riesen, K. Ferreira, D. Da Silva, P. Lemarinier, D. Arnold, and P. G. Bridges, “Alleviating scalability issues of checkpointing protocols,” in Proceedings of the International Conference on High Performance Computing, Networking, Storage and Analysis, ser. SC 2012. Los Alamitos, CA, USA: IEEE Computer Society Press, 2012, pp. 18:1–18:11. [Online]. Available: http://dl.acm.org/citation.cfm?id= 2388996.2389021 [37] R. Rajachandrasekar, A. Moody, K. Mohror, and D. K. D. Panda, “A 1 PB/s file system to checkpoint three million MPI tasks,” in Proceedings of the 22nd international symposium on High performance parallel and distributed computing, ser. HPDC 2013. New York, NY, USA: ACM, 2013, pp. 143–154. [Online]. Available: http://doi.acm.org/10.1145/2462902.2462908 [38] G. Zheng, L. Shi, and L. Kale, “FTC-Charm++: an in-memory checkpoint-based fault tolerant runtime for Charm++ and MPI,” in IEEE International Conference on Cluster Computing, 2004, pp. 93–103. [39] S. Kannan, A. Gavrilovska, K. Schwan, and D. Milojicic, “Optimizing Checkpoints Using NVM as Virtual Memory,” in IEEE 27th Interna tional Symposium on Parallel Distributed Processing, May 2013, pp. 29–40. [40] X. Ouyang, S. Marcarelli, and D. K. Panda, “Enhancing Checkpoint Performance with Staging IO and SSD,” in Proceedings of the International Workshop on Storage Network Architecture and Parallel I/Os, ser. SNAPI 2010. Washington, DC, USA: IEEE Computer Society, 2010, pp. 13–20. [Online]. Available: http: //dx.doi.org/10.1109/SNAPI.2010.10 [41] L. Bautista-Gomez, S. Tsuboi, D. Komatitsch, F. Cappello, N. Maruyama, and S. Matsuoka, “FTI: High Performance Fault Tolerance Interface for Hybrid Systems,” in Proceedings of International Conference for High Performance Computing, Networking, Storage and Analysis, ser. SC 2011, 2011. [42] A. Moody, G. Bronevetsky, K. Mohror, and B. R. d. Supinski, “Design, Modeling, and Evaluation of a Scalable Multi-level Checkpointing System,” in Proceedings of the ACM/IEEE International Conference for High Performance Computing, Networking, Storage and Analysis, ser. SC 2010. Washington, DC, USA: IEEE Computer Society, 2010, pp. 1–11. [Online]. Available: http://dx.doi.org/10.1109/SC.2010.18
+
+[43] X. Ouyang, R. Rajachandrasekar, X. Besseron, H. Wang, J. Huang, and D. K. Panda, “CRFS: A lightweight user-level filesystem for generic checkpoint/restart,” in International Conference on Parallel Processing (ICPP). IEEE, 2011, pp. 375–384. [44] T. Islam, K. Mohror, S. Bagchi, A. Moody, B. De Supinski, and R. Eigenmann, “MCREngine: A scalable checkpointing system using data-aware aggregation and compression,” in International Conference for High Performance Computing, Networking, Storage and Analysis, ser. SC 2012, Nov 2012, pp. 1–11. [45] I. Reed and G. Solomon, “Polynomial Codes Over Certain Finite Fields,” Journal of the Society for Industrial and Applied Mathematics, vol. 8, no. 2, pp. 300–304, 1960. [Online]. Available: http://epubs.siam.org/doi/abs/10.1137/0108018 [46] K.-H. Huang and J. Abraham, “Algorithm-Based Fault Tolerance for Matrix Operations,” IEEE Transactions on Computers, vol. C-33, no. 6, pp. 518–528, 1984. [47] J. Chung, I. Lee, M. Sullivan, J. H. Ryoo, D. W. Kim, D. H. Yoon, L. Kaplan, and M. Erez, “Containment domains: a scalable, efficient, and flexible resilience scheme for exascale systems,” in Proceedings of the International Conference on High Performance Computing, Networking, Storage and Analysis, ser. SC 2012. Los Alamitos, CA, USA: IEEE Computer Society Press, 2012, pp. 58:1–58:11. [Online]. Available: http://dl.acm.org/citation.cfm?id=2388996.2389075 [48] T. Jin, F. Zhang, Q. Sun, H. Bui, M. Parashar, H. Yu, S. Klasky, N. Podhorszki, and H. Abbasi, “Using Cross-layer Adaptations for Dynamic Data Management in Large Scale Coupled Scientific Workflows,” in Proceedings of the International Conference on High Performance Computing, Networking, Storage and Analysis, ser. SC 2013. New York, NY, USA: ACM, 2013, pp. 74:1–74:12. [Online]. Available: http://doi.acm.org/10.1145/2503210.2503301 [49] G. E. Fagg and J. Dongarra, “FT-MPI: Fault Tolerant MPI, Supporting Dynamic Applications in a Dynamic World,” in Proceedings of the 7th European PVM/MPI Users’ Group Meeting on Recent Advances in Parallel Virtual Machine and Message Passing Interface. London, UK: Springer-Verlag, 2000, pp. 346–353. [Online]. Available: http://dl.acm.org/citation.cfm?id=648137.746632 [50] J. Hursey and R. Graham, “Building a Fault Tolerant MPI Application: A Ring Communication Example,” in IEEE International Symposium on Parallel and Distributed Processing Workshops and Phd Forum, ser. IPDPSW, 2011, pp. 1549–1556. [51] Top500.org, “The Top500 List.” http://www.top500.org/list/2013/11/, 2013, accessed: 2014-03-18. [52] P. J. Braam., “ Lustre: A Scalable, High Performance File System.” https://http://www.lustre.org/docs.html, 2004, accessed: 2014-03-15. [53] R. Alverson, D. Roweth, and L. Kaplan, “The Gemini System In terconnect,” in IEEE 18th Annual Symposium on High Performance Interconnects (HOTI), Aug 2010, pp. 83–87. [54] S. S. Vadhiyar and J. Dongarra, “SRS: A Framework for Developing Malleable and Migratable Parallel Applications for Distributed Sys tems,” Parallel Processing Letters, vol. 13, no. 2, pp. 291–312, 2003. [55] J. Plank, K. Li, and M. Puening, “Diskless checkpointing,” Parallel and Distributed Systems, IEEE Transactions on, vol. 9, no. 10, pp. 972–986, 1998. [56] J. W. Young, “A First Order Approximation to the Optimum Checkpoint Interval,” Commun. ACM, vol. 17, no. 9, pp. 530–531, Sep. 1974. [Online]. Available: http://doi.acm.org/10.1145/361147.361115 [57] C. Jin, S. Klasky, S. Hodson, W. Yu, J. Lofstead, H. Abbasi, K. Schwan, M. Wolf, W. Liao, A. Choudhary et al., “Adaptive io system (adios),” Cray Users Group, 2008. [58] P. Shastry and K. Venkatesh, “Selection of a Checkpoint Interval in Coordinated Checkpointing Protocol for Fault Tolerant Open MPI.” International Journal on Computer Science and Engineering, vol. 2, no. 6, pp. 2064–2070, 2010. [59] M. S. Bouguerra, A. Gainaru, L. B. Gomez, F. Cappello, S. Matsuoka, and N. Maruyam, “Improving the Computing Efficiency of HPC Sys tems Using a Combination of Proactive and Preventive Checkpointing,” International Parallel and Distributed Processing Symposium, vol. 0, pp. 501–512, 2013.
+

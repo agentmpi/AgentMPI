@@ -1,0 +1,382 @@
+---
+description: Learn how vLLM boosts LLM inference performance with PagedAttention and continuous batching. This guide covers KV cache optimization, GPU efficiency, and.
+title: vLLM Explained: PagedAttention and Continuous Batching
+image: https://cdn.prod.website-files.com/69ce570adca53340abab8376/69e08af826de248f8febd0dc_opengraph-cover-image.jpg
+---
+
+# vLLM Explained: PagedAttention and Continuous Batching
+
+Author
+
+The Team at Runpod
+
+Updated
+
+April 22, 2026
+
+Table of contents
+
+[Example H2](#)
+
+[Example H3](#)
+
+Share
+
+[Get started](https://console.runpod.io/signup)
+
+Two failure modes end most LLM serving projects before they reach production scale:[ KV cache fragmentation](https://huggingface.co/blog/not-lain/kv-caching) that wastes the majority of reserved GPU memory, and[ static batching](https://bentoml.com/llm/inference-optimization/static-dynamic-continuous-batching) that idles the GPU while the slowest request in a batch finishes. Together, they cap throughput well below what the hardware can deliver.
+
+[vLLM](https://github.com/vllm-project/vllm) resolves both. Its[ PagedAttention](https://docs.vllm.ai/en/latest/design/paged%5Fattention/) system pages[ KV cache](https://jax-ml.github.io/scaling-book/applied-inference/) blocks on demand, treating GPU memory the way an operating system treats RAM, while iteration-level continuous batching keeps the GPU saturated at every forward pass. This guide covers the mechanics of both, walks through a production Docker deployment, and gives you the data to evaluate whether vLLM or one of its competitors fits your workload.
+
+## **The KV cache problem: why naive LLM serving breaks under load**
+
+Every autoregressive transformer forward pass[ reads and writes key-value tensors](https://huggingface.co/blog/not-lain/kv-caching) for each attention layer across every token in the current sequence. The[ standard approach](https://arxiv.org/abs/2309.06180) is to pre-allocate a contiguous memory region per request sized to `max_sequence_length`, using a per-token cost that follows a simple formula:
+
+`KV bytes per token per layer = 2 × num_kv_heads × head_dim × dtype_bytes`
+
+`(the factor of 2 accounts for separate K and V tensors)`
+
+`Total KV bytes per token = per_layer_bytes × num_layers`
+
+`Total KV bytes per request = total_per_token × sequence_length`
+
+Models using[ grouped-query attention (GQA)](https://arxiv.org/abs/2305.13245), like Llama-3, use fewer KV heads than query heads, reducing the per-token cost compared to multi-head attention (MHA). For Llama-3-70B in FP16 (80 layers, 8 KV heads, 128 head dimension, 2 bytes per element), that works out to[ roughly 160 KB per token](https://jax-ml.github.io/scaling-book/applied-inference/) across all layers.
+
+### **Problem 1: memory fragmentation**
+
+Pre-allocating for `max_sequence_length` means a 2,048-token context reserves approximately 327 MB per request, whether or not those tokens are ever generated. A request that finishes in 200 tokens still locks the full 327 MB. On an 80 GB A100 ([with \~140 GB of weights spread across GPUs](https://blogs.novita.ai/how-much-ram-memory-does-llama-3-1-70b-use/) in a tensor-parallel setup),[ the original PagedAttention paper measured 60-80% of reserved KV memory going to waste](https://arxiv.org/abs/2309.06180): internal fragmentation from unused space within reservations, and external fragmentation from free blocks too scattered to satisfy new requests. Active tokens touch[ fewer than half](https://arxiv.org/abs/2309.06180) the VRAM bytes reserved for them.
+
+### **Problem 2: static batching**
+
+Static batching groups all requests into a fixed batch that must complete as a unit: every sequence, including the shortest, waits for the longest to finish before memory is released or new requests enter. A batch of 32 requests where 30 finish in 50 tokens and 2 run to 500 tokens means the GPU idles on the tail end of those 2 long sequences while 30 slots sit empty. GPU utilization at realistic mixed-length workloads[ can drop to the 20-40% range](https://bentoml.com/llm/inference-optimization/static-dynamic-continuous-batching) under static batching, which translates directly to wasted spend at any GPU cost per hour.
+
+### **How they compound**
+
+Heavy fragmentation limits how many concurrent requests fit in memory, and static batching ensures the GPU underutilizes whatever capacity you do manage to fit. Solving one without the other still leaves significant headroom on the table. vLLM tackles both: fragmentation at the memory management layer with PagedAttention, and batching at the scheduler layer with continuous batching.
+
+## **PagedAttention: virtual memory for KV caches**
+
+The PagedAttention system, introduced by the UC Berkeley Sky Computing Lab and published at SOSP 2023, applies the core idea of OS virtual memory to KV cache management. Just as a process addresses memory through a logical page table that maps to non-contiguous physical frames, each active sequence in vLLM addresses its KV cache through a logical block table that maps to non-contiguous physical blocks in GPU memory.
+
+A[ physical block](https://docs.vllm.ai/en/stable/design/paged%5Fattention/) in vLLM’s KV cache pool holds the key and value tensors for 16 contiguous tokens (the default block size, configurable via `--block-size`). Blocks are allocated on-demand as tokens are generated. When a sequence has generated 16 tokens, vLLM claims one physical block from the free pool and records the mapping in the sequence’s block table. When it generates 32 tokens, it claims a second block, which can reside anywhere in the free pool regardless of where the first block sits. Fragmentation shrinks to a maximum of 15 wasted token slots per sequence (the partially filled last block),[ dropping the measured memory waste to approximately 4%](https://developers.redhat.com/articles/2025/07/24/how-pagedattention-resolves-memory-waste-llm-systems), compared to the 60-80% waste under contiguous pre-allocation.
+
+The block table structure also[ enables copy-on-write](https://vllm.ai/blog/2023-06-20-vllm) for parallel sampling and beam search. When a sequence forks (e.g., `best_of=4`),[ vLLM shares the parent’s physical blocks by reference](https://vllm.ai/blog/vllm) and only allocates new blocks as each candidate generates new tokens. Pruned candidates release their references immediately, returning blocks to the free pool with zero copy overhead.
+
+The diagram below shows a 3-sequence batch where physical blocks scatter across GPU memory while each sequence maintains a coherent logical view through its block table. Only the last block per sequence carries any waste (partially filled slots), which is why measured per-pool waste stays around 4% at production traffic levels.
+
+Under the hood, vLLM ships a[ custom CUDA kernel](https://deepwiki.com/z0306c/flash-attention/6.1-vllm-integration) that gathers non-contiguous blocks via the block table at each attention step, selecting from[ FlashAttention-2 or FlashAttention-3](https://github.com/Dao-AILab/flash-attention) based on GPU capabilities. One nuance for latency-sensitive workloads: the gather overhead is non-trivial at batch size 1, where FlashAttention-2’s contiguous access pattern has an edge. At higher concurrency, the memory savings from paging outweigh the gather cost and throughput reaches parity.
+
+With fragmentation solved at the memory layer, the remaining bottleneck is scheduling. vLLM pairs PagedAttention with a set of optimizations that keep the GPU busy at every forward pass.
+
+## **vLLM’s optimization stack: continuous batching and beyond**
+
+Where static batching locks the GPU to a fixed batch until the slowest sequence finishes, iteration-level scheduling (the term used in the[ Anyscale continuous batching analysis](https://www.anyscale.com/blog/continuous-batching-llm-inference)) operates at a finer granularity. After each forward pass iteration,[ vLLM’s scheduler](https://vllm.ai/blog/2025-09-05-anatomy-of-vllm) evaluates three queues: waiting (requests that haven’t started prefill), running (requests actively decoding), and swapped (sequences whose KV blocks have been evicted to CPU memory to free GPU space for higher-priority work). When a running sequence finishes, its physical blocks return to the free pool immediately, and the scheduler can slot in a waiting request at the next iteration.
+
+The practical result is that GPU utilization tracks request arrival rate much more closely under continuous batching. A batch that starts with 10 sequences and sees 5 finish within 20 tokens can absorb 5 new requests by iteration 21 rather than waiting for the full batch to drain. At high concurrency with mixed-length outputs,[ the throughput difference against static batching](https://blog.vllm.ai/2024/09/05/perf-update.html) typically reaches 2-4x, and the tail latency distribution tightens because long sequences stop blocking short ones.
+
+### **Preemption and the swapped queue**
+
+The swapped queue is not a curiosity for big deployments; any vLLM server under load can hit it. vLLM’s scheduler preempts running sequences (oldest-first, by default) when the KV cache pool fills beyond its threshold. Two preemption modes are available via --preemption-mode:
+
+* `recompute` (default for many configurations): dropped sequences rerun prefill from scratch when re-admitted. Zero PCIe bandwidth cost, higher GPU compute on restore.
+* `swap:` preempted sequences have their physical blocks serialized to CPU DRAM and moved to the swapped queue. Re-admission copies blocks back over PCIe (host-to-device). On a PCIe 4.0 x16 link (\~32 GB/s), restoring a long-context sequence on Llama-3-70B can take hundreds of milliseconds.
+
+Sustained preemption is a degradation state, not a normal operating mode. If the Prometheus `vllm:num_preemptions_total` counter grows steadily under nominal load, you need to reduce `--max-model-len`, raise `--gpu-memory-utilization`, or add capacity.
+
+### **Prefix caching**
+
+vLLM’s[ prefix caching](https://docs.vllm.ai/en/stable/design/prefix%5Fcaching/) stores KV blocks for shared prompt prefixes (system prompts, chat templates, few-shot examples) across requests. When two requests share the first 512 tokens of a system prompt, vLLM re-uses the pre-computed KV blocks for those tokens rather than recomputing them. For workloads with a fixed system prompt and high request volume, this produces near-zero prefill cost for the shared prefix portion, which can represent a significant fraction of total compute depending on prompt structure. Reported savings range from[ 32% throughput improvement to up to 90% cost reduction](https://dzone.com/articles/ninety-cost-reduction-prefix-caching-llms) in high-repetition scenarios.
+
+### **Chunked prefill**
+
+Head-of-line blocking hits any mixed-workload server: a 32,768-token prefill request can occupy the GPU for one to several seconds of continuous computation on large models, blocking every decode request queued behind it. With chunked prefill enabled via `--enable-chunked-prefill` (on by default in vLLM V1), vLLM splits long prefills into configurable chunks and interleaves them with decode operations. The default chunk budget is[ 2048 tokens in recent releases (v0.8.x+)](https://docs.vllm.ai/en/v0.8.2/performance/optimization.html), up from the earlier 512-token default. Decode requests for short sequences proceed in parallel with chunks of the long prefill, keeping p50 latency stable even when long-context requests arrive.
+
+### **Speculative decoding**
+
+Per-token decode latency can be cut further with[ speculative decoding](https://docs.vllm.ai/en/latest/features/spec%5Fdecode/), which pairs a small draft model with the target model. The draft model generates N candidate tokens in a single forward pass, and the target model verifies all N tokens simultaneously. When the draft model’s predictions align with the target model’s distribution, you get N tokens out of one target model forward pass. When a draft token is rejected, the target model discards all subsequent draft tokens and samples a correction token from its own distribution (one output from the verification pass).
+
+Acceptance rate is workload-dependent. Code completion and templated outputs with low entropy often achieve 70-90% acceptance; open-ended creative generation can fall to 20-40%. At low acceptance rates, the extra draft model forward pass adds overhead without reducing target model forward pass count, and net throughput can regress. vLLM exposes `vllm:spec_decode_draft_acceptance_rate` in its Prometheus metrics for empirical tuning, and enables the feature with `--speculative-model` and `--num-speculative-tokens`.
+
+### **Quantization**
+
+vLLM[ supports AWQ, GPTQ, FP8, and INT8 weight quantization](https://docs.vllm.ai/en/latest/features/quantization/).[ KV cache quantization](https://docs.vllm.ai/en/latest/features/quantization/quantized%5Fkvcache/) is currently available for FP8 only (INT8 KV cache quantization is[ a pending feature request](https://github.com/vllm-project/vllm/issues/33480), not yet supported). The choice between formats depends on your hardware and quality tolerance. FP8 is the natural fit for H100 and H200 GPUs, which have native FP8 tensor cores, and preserves model quality with minimal calibration. AWQ and GPTQ compress weights to 4-bit precision, cutting VRAM requirements by roughly 4x at the cost of a calibration step and a small quality regression that varies by model; AWQ is the more commonly used of the two for vLLM deployments. INT8 sits between FP8 and 4-bit in both compression and quality tradeoff, and runs well on A100s that lack FP8 hardware support.
+
+Quantization directly affects how many concurrent sequences fit in GPU memory.[ Llama-3-8B in FP16](https://localai.computer/models/meta-llama-llama-3.1-8b/requirements/fp16) requires approximately 16 GB for weights, fitting comfortably on a single A100 40 GB with room for a large KV cache pool. Llama-3-70B in FP16 demands at minimum two A100 80 GB GPUs with `--tensor-parallel-size 2`, and most production deployments targeting meaningful KV cache headroom use four with `--tensor-parallel-size 4`.[ AWQ-quantized Llama-3-70B](https://arxiv.org/abs/2306.00978) at 4-bit precision fits the weights into approximately 35 GB, making a single A100 80 GB viable for low-to-medium concurrency.
+
+With the optimization stack covered, the next question is whether vLLM is the right framework for your workload, or whether TGI or TensorRT-LLM fits better.
+
+## **vLLM vs TGI vs TensorRT-LLM: choosing the right framework**
+
+The three production-grade LLM serving frameworks each optimize for a different point in the tradeoff space between throughput, deployment simplicity, hardware flexibility, and operational cost. Pin down which framework fits before investing in deployment work.
+
+| Axis | vLLM | TGI (HuggingFace) | TensorRT-LLM (NVIDIA) |
+| ---------------------------------- | --------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------- |
+| Throughput at 100 concurrent users | High. PagedAttention plus continuous batching yields 2–4x over static batching at high concurrency | Medium. Continuous batching with less memory-efficient KV management | Highest on Hopper. Best raw tok/s on H100 with compiled engines |
+| Memory efficiency | \~4% KV waste via PagedAttention | Higher KV waste than vLLM from contiguous allocation | Blocked KV cache, lower waste than contiguous allocation |
+| Model support breadth | [200+ architectures](https://docs.vllm.ai/en/latest/models/supported%5Fmodels/) via HuggingFace Hub | [Popular architectures](https://huggingface.co/docs/text-generation-inference/supported%5Fmodels), tight HuggingFace integration | [Per-model engine compilation](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html), limited to NVIDIA-supported architectures |
+| Deployment complexity | Single docker run command, OpenAI-compatible server | Single docker run command, similar flags | Engine compilation pipeline, then serving |
+| Quantization support | AWQ, GPTQ, FP8, INT8, INT4 | AWQ, GPTQ, BitsAndBytes | FP8, INT8, INT4, SmoothQuant |
+| Hardware portability | NVIDIA (CUDA) and AMD (ROCm) | NVIDIA (CUDA) and AMD (ROCm) | NVIDIA only |
+
+For most production LLM serving workloads targeting 10-500 concurrent users, with a need to iterate on models without recompilation overhead and across multiple GPU vendors, vLLM covers the combination of memory efficiency, model breadth, and deployment speed that no other framework currently matches. The[ PagedAttention paper benchmarks](https://arxiv.org/abs/2309.06180) confirm this advantage at equivalent concurrency, driven primarily by memory efficiency enabling more sequences per GPU.
+
+[TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM) is the right choice when you’re deploying a single well-defined model at maximum scale on NVIDIA Hopper hardware (H100 or H200) and you can absorb the engine compilation investment.[ Compilation optimizes the inference graph](https://www.spheron.network/blog/vllm-vs-tensorrt-llm-vs-sglang-benchmarks/) specifically for the target GPU architecture and sequence length distribution, extracting 20-40% additional throughput above what vLLM achieves in typical FP8 configurations. The tradeoff is that every model update or hardware change requires a new compilation run (typically 30 minutes to several hours for large models), and managing compiled engine artifacts across GPU generations adds significant operational overhead. TensorRT-LLM makes sense when you’ve fixed your model version, own your hardware, and need maximum tokens per second per GPU dollar.
+
+[TGI](https://huggingface.co/docs/text-generation-inference/index) targets teams already deeply integrated with the HuggingFace ecosystem who want the simplest possible path to a production endpoint. Its deployment model mirrors vLLM’s, its model coverage is solid for the most popular architectures, and its throughput is competitive at modest concurrency (under 20 concurrent users). At higher concurrency, TGI’s[ throughput saturates earlier than vLLM](https://arxiv.org/abs/2511.17593) due to less efficient KV cache management.
+
+For single-developer tooling and local experimentation, purpose-built tools outperform all three production frameworks on ease of use. For edge inference or CPU-only deployments, runtimes like[ llama.cpp](https://github.com/ggml-org/llama.cpp) optimized for quantized CPU execution cover that workload. vLLM focuses on multi-user GPU inference, and that focus is both its strength and its appropriate scope.
+
+## **Docker deployment: from zero to serving endpoint**
+
+Having established why vLLM fits most multi-user GPU inference workloads, here is a production-grade deployment. The[ official vLLM Docker image](https://docs.vllm.ai/en/latest/getting%5Fstarted/quickstart.html) (`vllm/vllm-openai`) ships the vLLM runtime, CUDA dependencies, and an OpenAI-compatible HTTP server. The prerequisites on the host are NVIDIA GPU drivers and the[ NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html) (nvidia-docker), which enables GPU passthrough to containers via `--runtime nvidia`.
+
+### **Hardware sizing**
+
+Hardware scales directly with model size and precision. Use this table as a decision lead-in before picking a command below.
+
+| Model | Precision | Minimum GPU config | Aggregate VRAM | \--tensor-parallel-size |
+| ------------------------------------ | --------- | ------------------------------- | -------------- | ----------------------- |
+| Llama-3-8B / Mistral-7B / Phi-3-mini | FP16 | 1x A100 40 GB or L40S 48 GB | 40–48 GB | 1 |
+| Llama-3-70B | FP16 | 4x A100 80 GB | 320 GB | 4 |
+| Llama-3-70B | AWQ 4-bit | 1x A100 80 GB (low concurrency) | 80 GB | 1 |
+| Llama-3-405B | FP8 | 8x H100 80 GB | 640 GB | 8 |
+
+The key constraint in each case is how much VRAM remains for the KV cache pool after weights are loaded. For the 405B row, FP8 reduces the[ weight footprint to approximately 486 GB](https://developer.nvidia.com/blog/supercharging-llama-3-1-across-nvidia-platforms/), fitting within 640 GB aggregate VRAM with room for the KV cache pool.
+
+### **Deploying Llama-3-8B on a single GPU**
+
+Set an API key in your shell first, then run:
+
+A single L40S or A100 40 GB hosting Llama-3-8B at `--max-model-len 8192` supports approximately 50-100 concurrent users at 200-500 output tokens per request. At longer outputs (2,048+ tokens per request), concurrent capacity drops proportionally as more KV cache pool is consumed per sequence.
+
+Each flag has a specific function:
+
+* `-runtime nvidia `activates the NVIDIA Container Toolkit passthrough, and `-gpus all` exposes every available GPU to the container (replace with `-gpus '"device=0,1"'` for specific device IDs in multi-GPU configurations).
+* `v ~/.cache/huggingface:/root/.cache/huggingface` reuses the host’s HuggingFace cache so repeated container restarts skip the model download.
+* `HUGGING_FACE_HUB_TOKEN` authenticates access to gated models like meta-llama; the container reads this at startup and passes it to[ huggingface-hub](https://github.com/huggingface/huggingface%5Fhub) during model download.
+* `-ipc=host` is required for multi-GPU tensor parallelism. NCCL (the communication library PyTorch uses for tensor parallel all-reduce) communicates between GPU workers via POSIX shared memory in `/dev/shm`, and Docker’s default IPC namespace isolation breaks that transport. For single-GPU deployments the flag is not strictly required but remains harmless.
+* `-dtype auto` matches the dtype in the model’s config.json. Llama-3 models are trained in bfloat16; explicitly setting -dtype float16 on these models can degrade output quality without a memory benefit.
+* \-api-key enforces bearer-token authentication on the HTTP server. Always set this for any non-localhost deployment. Without it, any client that can reach port 8000 can submit unlimited inference requests (vLLM accepts any value by default).
+* `-gpu-memory-utilization 0.90` caps total GPU memory used by the model executor (weights, activations, and KV cache combined) at 90% of available VRAM. After weights and activations are accounted for, the remaining headroom within that 90% cap becomes the KV cache pool. The remaining 10% acts as a safety buffer for framework overhead and unexpected allocations. Lowering the cap reduces maximum concurrent capacity but also reduces OOM risk on workloads with variable-length outputs.
+* [\-max-model-len 8192](https://docs.vllm.ai/en/stable/configuration/engine%5Fargs/) caps the maximum sequence length and determines how large the KV cache pool must be;[ halving this from the model’s native context length roughly halves the KV cache memory requirement](https://docs.vllm.ai/en/latest/configuration/conserving%5Fmemory/).
+* `-enable-prefix-caching` activates automatic KV block reuse for shared prefixes.
+
+Mounting a local model directory works better for production pods where cold-start download time and Hub rate limits are concerns. Add `-v /path/to/model:/model` and pass `--model /model` as the model argument.
+
+For reproducible deployments, pin the image tag to a specific release (e.g., `vllm/vllm-openai:v0.8.5`) rather than :latest. vLLM changes default behaviors between minor versions, including chunked prefill defaults and prefix caching behavior. See the[ vLLM engine arguments reference](https://docs.vllm.ai/en/stable/configuration/engine%5Fargs/) for the full flag surface.
+
+### **Deploying Llama-3-70B across four GPUs**
+
+For Llama-3-70B across four A100 80 GBs, add --tensor-parallel-size 4 and ensure the container has access to all four devices:
+
+For Llama-3-405B with FP8 quantization across eight H100 80 GBs, use --tensor-parallel-size 8 --quantization fp8 with the same core flag set.
+
+### **Getting GPU access on demand**
+
+If you don’t have an A100 or H100 available locally,[ Runpod](https://www.runpod.io/) provides on-demand access to H100, A100, and L40S GPUs with per-second billing. Spin up a GPU pod matching your model size (single A100 40 GB for 8B, quad A100 80 GB for 70B, 8x H100 for 405B), select the vllm/vllm-openai:latest image for pod deployment, set HUGGING\_FACE\_HUB\_TOKEN and VLLM\_API\_KEY in the pod environment variables, and expose port 8000\. Per-second billing means benchmarking vLLM against TGI costs a few dollars per test run rather than a reserved-instance commitment.[ Runpod Serverless](https://docs.runpod.io/serverless/vllm/overview) scales vLLM workers to zero between request bursts (note that serverless uses a dedicated worker image wrapper, not the raw vllm/vllm-openai image used for pod deployment).
+
+## **vLLM’s OpenAI-compatible API: sending requests and streaming responses**
+
+With a running container, the next step is sending requests. vLLM’s HTTP server exposes the same endpoints as the[ OpenAI API](https://platform.openai.com/docs/api-reference) (/v1/completions, /v1/chat/completions, /v1/models), which means any client already integrated with OpenAI’s Python SDK or direct HTTP calls works with zero modification beyond updating the base\_url and bearer token.
+
+A raw HTTP call to verify the endpoint is live and get a streaming response:
+
+The server sends back[ server-sent events (SSE)](https://docs.vllm.ai/en/latest/api/vllm/entrypoints/openai/responses/streaming%5Fevents/) with data: {...} prefixed JSON chunks, terminated with data: \[DONE\]. Each chunk contains a delta.content string with the next token or tokens. Setting "stream": false returns a standard completion object with all output tokens at once.
+
+Production Python clients using the[ openai](https://github.com/openai/openai-python) library (>= 1.0.0) point base\_url at the vLLM server and read the API key from the environment:
+
+The logprobs=True plus top\_logprobs=5 combination returns the top-5 candidate tokens at each generation step alongside their log probabilities. This is useful for calibration analysis, uncertainty quantification, and structured generation pipelines that steer generation based on token-level probability distributions. Mixing log probability output with content output in the same loop produces interleaved console output; in production clients, handle each stream separately.
+
+## **Production monitoring: metrics that matter**
+
+A running endpoint needs observability. vLLM exposes a[ Prometheus](https://prometheus.io/)\-compatible /metrics endpoint on the same port as the API server. A minimal scrape config is three lines:
+
+The /metrics endpoint requires no authentication even when --api-key is set, so you can scrape it without coordinating credentials with your observability stack. See the[ vLLM metrics reference](https://docs.vllm.ai/en/stable/usage/metrics/) for the full metric surface.
+
+Four metrics cover most production monitoring needs:
+
+* vllm:num\_requests\_running: sequences actively in the decode phase.
+* vllm:num\_requests\_waiting: queued but not yet started. Under sustainable load this should stay low; a persistently growing queue indicates you have reached throughput capacity.
+* vllm:gpu\_cache\_usage\_perc: fraction of the KV cache pool currently occupied. Keep this well below the preemption threshold.
+* vllm:e2e\_request\_latency\_seconds: histogram of end-to-end request latency including queue time. Watch p99 against your latency budget.
+
+[Sustained gpu\_cache\_usage\_perc above 90%](https://docs.vllm.ai/en/stable/configuration/optimization/) indicates the server is approaching its KV cache limit and will begin preempting sequences. The remediation is the same as described in the preemption section: reduce max sequence length, reclaim headroom by raising --gpu-memory-utilization toward 0.95, or scale out. Pair gpu\_cache\_usage\_perc with vllm:num\_preemptions\_total for a full picture of memory pressure.
+
+## **Frequently asked questions**
+
+**What is vLLM and what problem does it solve?** An open-source LLM inference and serving engine that addresses two production bottlenecks: KV cache memory fragmentation and GPU underutilization from static batching. PagedAttention manages KV cache memory in non-contiguous blocks, reducing waste by an order of magnitude compared to contiguous pre-allocation, while iteration-level continuous batching keeps GPUs saturated at every forward pass.
+
+**What is PagedAttention?** A KV cache memory management algorithm introduced in the[ Efficient Memory Management for Large Language Model Serving with PagedAttention](https://arxiv.org/abs/2309.06180) paper (SOSP 2023). It maps each sequence’s KV cache through a logical block table to non-contiguous physical blocks in GPU memory, applying the same virtual memory principle operating systems use for RAM, and eliminating the need to pre-allocate contiguous VRAM per request.
+
+**How does continuous batching improve LLM inference throughput?** The vLLM scheduler adds newly arrived requests to a running batch after each forward pass, the moment a previous sequence finishes. This prevents GPU idling caused by tail sequences in static batches, producing multifold throughput gains at high concurrency (see the benchmarks in the continuous batching section above).
+
+**What GPU do I need to run vLLM with Llama-3-70B?** In FP16, the minimum recommended configuration is four A100 80 GB GPUs with --tensor-parallel-size 4\. AWQ 4-bit quantization brings that down to a single A100 80 GB for lower concurrency workloads. See the hardware sizing table in the deployment section for the full model-to-GPU mapping.
+
+**How does vLLM compare to TGI and TensorRT-LLM?** vLLM offers the best balance of memory efficiency, model support breadth (200+ architectures), and deployment simplicity for most production workloads. TensorRT-LLM achieves higher raw throughput on NVIDIA Hopper GPUs but requires per-model engine compilation. TGI is competitive at lower concurrency but falls behind vLLM as request volume grows. See the comparison table above for a full breakdown.
+
+‍
+
+## Related guides
+
+* [Deploying AI Agents at Scale: Building Autonomous Workflows with Runpod's Infrastructure](https://www.runpod.io/articles/guides/deploying-ai-agents-at-scale-building-autonomous-workflows)
+* [SGLang in Production for LLM Pipelines](https://www.runpod.io/articles/guides/blog-sglang-production-llm-pipelines)
+* [GPU Cloud Servers for AI Workloads](https://www.runpod.io/articles/guides/gpu-cloud-servers-for-ai-workloads)
+* [How to Use WAN 2.6 on Runpod](https://www.runpod.io/articles/guides/wan-2-6-runpod)
+* [How to Use WAN 2.5 on Runpod](https://www.runpod.io/articles/guides/wan-2-5-runpod)
+* [Wan 2.2 ComfyUI: Run Wan 2.2 on Runpod](https://www.runpod.io/articles/guides/comfyui-wan-2-2)
+
+![Purple glow background](https://cdn.prod.website-files.com/69ce570adca53340abab8376/69e1d120e44fc5fb8bdabf77_glow-medium.avif)
+
+![](https://cdn.prod.website-files.com/69ce570adca53340abab8376/69e1cfae5ccab7246789bad6_background-stars-hollow.svg)
+
+Articles
+
+## Related articles
+
+[View All](https://www.runpod.io/articles)
+
+[How to run DeepSeek R1 on RunpodHow to run DeepSeek R1 on Runpod, covering the full 671B model and the distilled variants, GPU/VRAM requirements, Serverless deployment, and prompting tips for the reasoning model.](https://www.runpod.io/articles/guides/run-deepseek-r1-on-runpod)
+
+[Deploy vLLM on Runpod: OpenAI-compatible LLM inference server in 10 minutesDeploy vLLM on a Runpod GPU pod for an OpenAI-compatible LLM inference server in 10 minutes. Step-by-step setup, benchmarks, and cost comparisons vs. OpenAI and Anthropic APIs.](https://www.runpod.io/articles/guides/deploy-vllm-runpod-llm-inference)
+
+[LLM Inference from First Principles: Tokenization, KV Cache, and Serving at ScaleTrace an LLM request from tokenization through the KV cache to a live vLLM endpoint, with each concept tied to a config decision you can make today.](https://www.runpod.io/articles/guides/llm-inference-first-principles)
+
+[Hosting and Running Private AI AgentsWhat self-hosting a private AI agent looks like in practice, where Runpod fits in, and how to avoid the failure modes that trip up most private agent.](https://www.runpod.io/articles/guides/hosting-and-running-private-ai-agents)
+
+[What Are Multi-Agent AI SystemsMulti-agent AI systems explained: how they work, when to use them, which frameworks to build with, and how to deploy them on GPU infrastructure that scales.](https://www.runpod.io/articles/guides/what-are-multi-agent-ai-systems)
+
+[AI Inference vs Training: GPU Selection and CostLearn how AI inference and training differ in GPU requirements, VRAM sizing, and cost, and how to match each workload to the right hardware in production.](https://www.runpod.io/articles/guides/ai-inference-vs-training-gpu-guide)
+
+## Build what’s next.
+
+Build, train, and scale AI workloads on Runpod with cloud GPUs, Serverless, and Clusters.
+
+[Get started](https://console.runpod.io/deploy)
+
+Request a demo
+
+![Star field background](https://cdn.prod.website-files.com/69ce570adca53340abab8376/69df3777f96b96b86ab03b85_Background%20Stars.svg)
+
+```json
+{
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebPage",
+        "@id": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/#webpage",
+        "url": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/",
+        "name": "vLLM Explained: PagedAttention and Continuous Batching",
+        "description": "Learn how vLLM boosts LLM inference performance with PagedAttention and continuous batching. This guide covers KV cache optimization, GPU efficiency, and.",
+        "isPartOf": {
+          "@id": "https://www.runpod.io/#website"
+        },
+        "about": {
+          "@id": "https://www.runpod.io/#organization"
+        },
+        "mainEntity": {
+          "@id": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/#article"
+        },
+        "inLanguage": "en"
+      },
+      {
+        "@type": "Article",
+        "@id": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/#article",
+        "mainEntityOfPage": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/",
+        "headline": "vLLM Explained: PagedAttention and Continuous Batching",
+        "description": "Learn how vLLM boosts LLM inference performance with PagedAttention and continuous batching. This guide covers KV cache optimization, GPU efficiency, and.",
+        "image": [
+          "https://cdn.prod.website-files.com/67d20fb9f56ff2ec6a7a657d/6851a6263ab19185a7db2ae3_e3501b2e5eeac39a00cc46ddd17244b4_opengraph-cover-image.jpg"
+        ],
+        "author": {
+          "@type": "Person",
+          "name": "The Team at Runpod",
+          "url": "https://www.runpod.io/article-author/the-team-at-runpod",
+          "@id": "https://www.runpod.io/article-author/the-team-at-runpod#person"
+        },
+        "publisher": {
+          "@id": "https://www.runpod.io/#organization"
+        },
+        "datePublished": "2026-04-22",
+        "dateModified": "2026-08-25T20:16:30.445Z",
+        "inLanguage": "en"
+      },
+      {
+        "@type": "BreadcrumbList",
+        "@id": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/#breadcrumbs",
+        "itemListElement": [
+          {
+            "@type": "ListItem",
+            "position": 1,
+            "name": "Home",
+            "item": "https://www.runpod.io/"
+          },
+          {
+            "@type": "ListItem",
+            "position": 2,
+            "name": "Articles",
+            "item": "https://www.runpod.io/articles"
+          },
+          {
+            "@type": "ListItem",
+            "position": 3,
+            "name": "Guides",
+            "item": "https://www.runpod.io/articles/guides"
+          },
+          {
+            "@type": "ListItem",
+            "position": 4,
+            "name": "vLLM Explained: PagedAttention and Continuous Batching",
+            "item": "https://www.runpod.io/articles/guides/vllm-pagedattention-continuous-batching/"
+          }
+        ]
+      }
+    ]
+  }
+{
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "Organization",
+        "@id": "https://www.runpod.io/#organization",
+        "name": "Runpod",
+        "legalName": "Runpod Inc.",
+        "alternateName": ["runpod.io"],
+        "url": "https://www.runpod.io/",
+        "logo": {
+          "@type": "ImageObject",
+          "url": "https://cdn.prod.website-files.com/69ce570adca53340abab8376/69cfb722ebc6a6cfe4f48961_runpod-logo-white.svg"
+        },
+        "foundingDate": "2022-10-31",
+        "description": "Runpod is the AI Developer Cloud. It gives developers, researchers, and AI companies on-demand GPUs to deploy and scale workloads, from serverless inference to multi-node Clusters.",
+        "sameAs": [
+          "https://www.linkedin.com/company/runpod-io/",
+          "https://x.com/runpod_io",
+          "https://github.com/runpod",
+          "https://www.youtube.com/channel/UCrrgg7pwLmCfpF4nlj1cg0Q"
+        ],
+        "contactPoint": [
+          {
+            "@type": "ContactPoint",
+            "contactType": "customer support",
+            "email": "help@runpod.io",
+            "url": "https://www.runpod.io/contact",
+            "availableLanguage": [
+              "en"
+            ]
+          }
+        ]
+      },
+      {
+        "@type": "WebSite",
+        "@id": "https://www.runpod.io/#website",
+        "url": "https://www.runpod.io/",
+        "name": "Runpod",
+        "description": "Deploy, train, and scale AI workloads on high-performance GPU infrastructure with Runpod's Pods, Serverless Endpoints, Public Endpoints, and Clusters.",
+        "publisher": {
+          "@id": "https://www.runpod.io/#organization"
+        },
+        "inLanguage": "en"
+      }
+    ]
+  }
+```

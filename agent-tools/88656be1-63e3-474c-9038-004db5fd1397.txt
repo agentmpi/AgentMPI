@@ -1,0 +1,1160 @@
+The Token Not Taken: Sampling, State, and the Variability of AI Agent Outputs
+
+arXiv is now an independent nonprofit! Learn more×
+
+# The Token Not Taken: Sampling, State, and the Variability of AI Agent OutputsThanks: © 2026 Muhammad Zia Hydari and Raja Iqbal.
+
+Muhammad Zia Hydari University of Pittsburgh hydari@alum.mit.edu ORCID: 0000-0003-4522-326X Raja Iqbal Ejento.ai raja@ejento.ai
+
+June 7, 2026
+
+###### Abstract
+
+Agentic AI systems can behave differently across runs: the same request may produce a different plan, a different tool call, a different code edit, or a different final answer. Such variability arises from several layers that are often conflated. A foundation model is a large pretrained model, usually adaptable to many downstream tasks, that maps an input context to predictions over outputs. In many current agents, that model is embedded in an orchestration loop that plans, calls tools, observes results, and updates state. One explicit intrinsic source of variability in such systems is token generation: the model computes scores over possible next tokens, the scores are converted into probabilities, and a decoder may sample tokens using a pseudo-random number generator. A small sampled token difference can then propagate upward into a different tool call, code path, search query, or agent state. Other sources of variability are extrinsic to token sampling, including changing environments, live data, serving infrastructure, batch effects, and numerical details. By separating these layers, the manuscript clarifies what it means to call agentic AI systems stochastic, when such variability can be reproduced under matched conditions, and why deterministic execution need not imply identical behavior in deployed settings.
+
+## 1 Introduction
+
+Managers are often concerned that an AI agent may do something different across runs, even when the inputs are the same. It may write a different implementation plan, inspect different documents, call a different tool, generate different code, route a customer case differently, or stop at a different point in a workflow. While the tokens selected by a foundation model [1] play an important role in such variation, the managerial concern is rarely that the model selected one token rather than another. Managers worry about what gets done across runs.
+
+An agentic AI system is an application that uses a foundation model not merely to produce a one-shot answer, but to participate in a loop of reasoning, action, observation, and state update. OpenAI’s Agents SDK describes an agent as a large language model configured with instructions, tools, and optional runtime behavior such as handoffs, guardrails, and structured outputs [2]. OpenAI’s API guide similarly describes agents as applications that plan, call tools, collaborate across specialists, and keep enough state to complete multi-step work [3]. Anthropic’s tool-use documentation describes systems in which the model decides when to call a tool and returns a structured call that is executed either by the client application or by Anthropic’s infrastructure [7]. LangChain’s agent abstraction is organized around a model, tools, prompt, middleware, and an execution loop [8].11 1 LangChain is an open-source framework for building applications around language models; it supplies the orchestration loop, tool interfaces, and memory components sketched here. The OpenAI Agents SDK and Anthropic’s tool-use interface play comparable roles. Figure 1 sketches how these pieces fit together.
+
+Figure 1: Anatomy of an agentic AI system. A foundation model and decoder sit inside an orchestration loop, surrounded by instructions, memory and retrieval, tools, guardrails, and an external environment.
+
+Foundation model (LLM) Decoder agent runtime / orchestration loop System instructions, role, and policies Memory & retrieval (history, RAG) Guardrails & output validation Tools: search, code, database, APIs External environment: web, files, clock, users intrinsic sampling enters here
+
+Here are three practical examples.
+
+Example 1.
+
+Coding agents. GitHub documents a Copilot coding agent that can be assigned tasks, work in a repository, and create code changes in a pull request workflow [9]. OpenAI describes Codex as a coding agent that can help with software development tasks [5]. For the same issue, a coding agent might inspect different files, generate different tests, or implement a fix with a different design.
+
+Example 2.
+
+Customer support agents. A support agent may have tools for customer lookup, refund eligibility, issuing credits, and escalation to a human. For the same customer message, one run may ask a clarifying question, another may check account status first, and another may recommend escalation. The system’s variability is observed as a different action in a business process.
+
+Example 3.
+
+Research and analysis agents. A data-analysis agent might generate Python code, execute it, inspect an error message, revise the code, and summarize the result. A research agent might issue search queries, retrieve documents, read results, and synthesize an answer. Tool-using systems explicitly support actions such as fetching data, running code, and calling APIs [4, 7].
+
+1. References
+
+These examples put the phenomenon at the level at which users experience it: variation in plans, actions, observations, and outcomes. Much of the intrinsic variation in such systems begins in foundation-model token generation, but the agent loop can amplify a small textual difference into a different trajectory.
+
+The rest of the manuscript proceeds from systems behavior to token generation and back. Table 1 collects the symbols used throughout. Section 2 gives a compact state-machine model of an agent. Sections 3 and 4 explain what happens inside a single foundation model call: vocabulary, logits, probabilities, and decoding. Section 5 explains how token-level variation becomes agent-level variation. Section 6 clarifies common misconceptions, including reproducibility and GPU nondeterminism. Section 7 draws out what this means for evaluating deployed agents. The appendices provide runnable code for a toy sampler and for twin foundation-model replicas.
+
+Table 1: Notation used throughout the manuscript.
+
+| Symbol | Meaning |
+| --- | --- |
+| $r$ | Agent round. One round may include one model call, one parsed action, one observation, and a state update. |
+| $S_{r}$ | Agent state before round $r$ . |
+| $G$ | User’s goal or task. |
+| $C_{r}$ | Conversation history available to the agent at round $r$ . |
+| $M_{r}$ | Memory, retrieved context, or other stored information. |
+| $\mathsf{Tools}_{r}$ | Tools available to the agent at round $r$ . |
+| $E_{r}$ | Current environment state at round $r$ , including relevant live data, files, database contents, API status, web observations, user interactions, or time. |
+| $Y_{r}$ | Output sequence generated by the model call at agent round $r$ . |
+| $L_{r}$ | Length of the output sequence $Y_{r}$ generated at round $r$ . |
+| $A_{r}$ | Action parsed from $Y_{r}$ , such as a text response, tool call, code edit, or database query. |
+| $O_{r}$ | Observation returned by a tool or environment after action $A_{r}$ . |
+| $\mathcal{E}$ | Environment/tool response map that executes an action and returns an observation, possibly depending on the current environment state. |
+| $\mathcal{V}$ | The model’s fixed token vocabulary. |
+| $K=|\mathcal{V}|$ | Vocabulary size. |
+| $\tau_{i}$ | The $i$ th candidate token in the vocabulary. |
+| $m$ | Current context length, that is, the number of tokens in the input sequence currently being processed by the model. |
+| $n$ | Token-generation step or token-position index. |
+| $c_{n}$ | Context available before producing generated token $o_{n}$ . |
+| $o_{n}$ | Token produced at generation step $n$ ; appending it yields $c_{n+1}$ . |
+| $d$ | Hidden dimension of the model; each token position is represented by a vector in $\mathbb{R}^{d}$ . |
+| $d_{k}$ | Key/query dimension within an attention head, used in the scaling $\sqrt{d_{k}}$ . |
+| $H$ | Matrix of hidden representations, $H\in\mathbb{R}^{m\times d}$ , with one row per token position. |
+| $h_{m}$ | Hidden vector at the final position of a context of length $m$ , used to predict the next token. |
+| $W_{U}$ | Output projection, or unembedding, matrix that maps the final hidden vector to one score per vocabulary token. |
+| $b$ | Bias vector in the output projection. |
+| $\theta$ | The model’s parameters (weights); the subscripts in $f_{\theta}$ and $P_{\theta}$ indicate dependence on them. |
+| $z_{i}$ | Raw unnormalized score, or neural-network logit, assigned to token $\tau_{i}$ . |
+| $p_{i}(T)$ | Probability assigned to token $\tau_{i}$ after applying softmax with temperature $T$ . |
+| $P_{\theta}(\cdot\mid c_{n})$ | The model’s native next-token distribution given context $c_{n}$ (temperature $T=1$ ). |
+| $T$ | Temperature parameter. Higher values flatten the distribution; lower values sharpen it. |
+| $R_{r}$ | Pseudo-random number generator state used in model call $r$ . |
+| $u_{n}$ | A pseudo-random draw used to sample a token at token step $n$ . |
+| $D_{\lambda}$ | Decoding procedure with parameters $\lambda$ , such as temperature, top- $k$ , or top- $p$ . |
+| $\mathcal{V}_{k}(c_{n})$ | Top- $k$ subset of the vocabulary for context $c_{n}$ . |
+| $\mathcal{V}_{p}(c_{n})$ | Top- $p$ , or nucleus, subset of the vocabulary for context $c_{n}$ . |
+
+## 2 A compact model of agentic stochasticity
+
+Figure 2: Agentic stochasticity. The agent repeatedly turns model outputs into actions and observations. A small sampled token difference can change a tool call, code edit, or subsequent state.
+
+Agent state $S_{r}$ goal, memory, history, tools Foundation model scores over tokens Decoder greedy or sampled Action $A_{r}$ text, tool call, code Environment / tools observation $O_{r}$ Updated state $S_{r+1}$ output $Y_{r}$ When sampling is used, token-level stochasticity enters here.
+
+Let an agentic system maintain a state
+
+| $$S_{r}=(G,C_{r},M_{r},\mathsf{Tools}_{r},E_{r}),$$ |
+| --- |
+
+where $G$ is the user’s goal, $C_{r}$ is the conversation history at agent round $r$ , $M_{r}$ is memory or retrieved context, $\mathsf{Tools}_{r}$ is the currently available tool set, and $E_{r}$ contains environment information such as time, files, database contents, retrieved documents, web observations, or API responses.22 2 A state is simply the information the system has available at a given moment. For an agent, the state may include visible conversation history, hidden system instructions, retrieved context, memory, tool definitions, tool outputs, and external observations. At round $r$ , the state $S_{r}$ is serialized into an initial context $c_{r,1}$ ; the token loop then indexes $n$ over $c_{r,n}$ . The agent calls a foundation model. The model and decoder produce an output sequence
+
+| $$Y_{r}=(o_{r,1},o_{r,2},\ldots,o_{r,L_{r}}),$$ |
+| --- |
+
+where each $o_{r,n}$ is a generated token. The output sequence may be ordinary prose, code, JSON, a tool call, a plan, or a structured response. The agent then parses this output into an action:
+
+| $$A_{r}=\operatorname{Parse}(Y_{r}).$$ |
+| --- |
+
+The environment/tool response map $\mathcal{E}$ represents the external system that executes the agent’s action and returns what the agent observes. The observation $O_{r}$ depends not only on the action $A_{r}$ , but also on the current environment state $E_{r}$ . This state may include deterministic tools, live databases, web services, files, clocks, APIs, or human-facing systems whose contents may change over time. Thus,
+
+| $$O_{r}=\mathcal{E}(A_{r};E_{r}).$$ |
+| --- |
+
+The agent updates its state:
+
+| $$S_{r+1}=\operatorname{Update}(S_{r},Y_{r},A_{r},O_{r}).$$ |
+| --- |
+
+This gives the agentic loop:
+
+| $$S_{r}\rightarrow Y_{r}\rightarrow A_{r}\rightarrow O_{r}\rightarrow S_{r+1}.$$ |
+| --- |
+
+The key intrinsic stochastic step is the generation of $Y_{r}$ . Before the pseudo-random stream is fixed or revealed, the output is naturally described as a sample from a distribution,
+
+| $$Y_{r}\sim D_{\lambda}\big(P_{\theta}(\cdot\mid S_{r})\big),$$ |
+| --- |
+
+where $P_{\theta}(\cdot\mid S_{r})$ denotes the foundation model’s token probabilities conditioned on the current agent state and $D_{\lambda}$ denotes the decoding procedure with parameters $\lambda$ . Once the pseudo-random number generator state $R_{r}$ is also fixed, together with the model weights, the context, the decoding procedure, and the numerical execution environment, the same step is a deterministic function of its inputs,
+
+| $$Y_{r}=D_{\lambda}\big(P_{\theta}(\cdot\mid S_{r}),R_{r}\big).$$ |
+| --- |
+
+This pair of expressions states the thesis precisely: the decoder samples, yet a run with a fixed pseudo-random state is reproducible.33 3 This is the same distinction used in simulation. A Monte Carlo simulation can be described probabilistically, but a particular run with a fixed seed is fully reproducible if the program and numerical environment are controlled.
+
+Figure 2 summarizes the loop. The token-level stochasticity enters inside the model call, but it becomes consequential when the output is parsed as an action.
+
+### 2.1 Intrinsic and extrinsic sources of variation
+
+It is important not to attribute all agent variability to token sampling. The useful distinction is between variability that is intrinsic to token sampling and variability that is extrinsic to it. Table 2 lists the one intrinsic source alongside three classes that are extrinsic to sampling.
+
+Table 2: Sources of variation in agentic AI systems, and whether a fixed pseudo-random seed can remove each one.
+
+| Source | What varies | Can a seed remove it? |
+| --- | --- | --- |
+| Intrinsic sampling | The decoder samples tokens from a model-provided probability distribution. | Often yes, in a controlled setup with fixed model, fixed prompt, fixed decoding parameters, and synchronized pseudo-RNG state. |
+| Numerical and serving effects | Batch composition, kernel choices, precision, routing, or model-serving details can slightly perturb logits. | Not always. Some can be controlled in self-hosted systems; many are hidden in managed services. |
+| Environment variation | Live databases, web search results, time, files, APIs, user interactions, or tool outputs change between runs. | No. A seed cannot make the external world remain unchanged. |
+| Application logic | Retries, timeouts, parsing rules, validation failures, fallback paths, or guardrails change the agent path. | Sometimes. It depends on whether the application state and event timing are controlled. |
+
+The discussion emphasizes intrinsic sampling because it is the clearest meaning of the claim that model output is stochastic. In production agents, however, extrinsic environment variation can be equally important or larger. Fixing the seeds for the pseudo-random number generators can reproduce token sampling under controlled conditions, thereby controlling one intrinsic source of variability. It cannot, however, reproduce extrinsic changes such as a changed web page, a different database row, the current clock time, or a failed API call.
+
+## 3 What a foundation model computes at a single token step
+
+To understand where intrinsic stochasticity enters, we zoom in on one foundation model call. The most common case for text generation is autoregressive generation: the model generates one token at a time, and each generated token becomes part of the context for the next token.44 4 A token is a unit used by the model’s tokenizer. It may be a word, part of a word, punctuation, whitespace, or a byte-level fragment. The model does not usually operate directly on English words.
+
+### 3.1 The next-token choice is over a fixed vocabulary
+
+A tokenizer maps text into token IDs. Let the model’s fixed vocabulary be
+
+| $$\mathcal{V}=\{\tau_{1},\tau_{2},\ldots,\tau_{K}\}.$$ |
+| --- |
+
+Here $K=|\mathcal{V}|$ is the vocabulary size. The model is not choosing the immediate next token from all possible sentences, paragraphs, or future continuations. It is assigning a score to each token in a finite vocabulary, typically on the order of tens of thousands or hundreds of thousands of tokens, depending on the tokenizer. The combinatorial explosion appears over multi-token continuations. If a model has $K$ possible next tokens at each step and generates $L$ future tokens, then there are up to
+
+| $$K^{L}$$ |
+| --- |
+
+possible token sequences of length $L$ . With $K=50{,}000$ and $L=20$ , this is
+
+| $$50{,}000^{20}\approx 9.5\times 10^{93}.$$ |
+| --- |
+
+The immediate next-token choice is finite, but the space of possible continuations is astronomically large. For comparison, this quantity is often described as being larger than many physical counts used for intuition, including rough estimates of atoms in the observable universe. The exact comparison is less important than the order-of-magnitude lesson: multi-token continuations grow exponentially in length.
+
+### 3.2 How the unnormalized scores are created
+
+Suppose the current context contains $m$ tokens, written $x_{1},x_{2},\ldots,x_{m}$ . The transformer maps this sequence into a matrix of hidden representations,
+
+| $$H=f_{\theta}(x_{1},x_{2},\ldots,x_{m})\in\mathbb{R}^{m\times d},$$ |
+| --- |
+
+where each row of $H$ corresponds to one token position and $d$ is the model’s hidden dimension. The hidden vector corresponding to the final position, treated as a column vector, is
+
+| $$h_{m}=(H_{m,:})^{\top}\in\mathbb{R}^{d}.$$ |
+| --- |
+
+This vector summarizes, for purposes of next-token prediction, what the model has computed from the context.
+
+The model then applies a final linear map, often called the language-model head or unembedding matrix:
+
+| $$z=W_{U}h_{m}+b,$$ |
+| --- |
+
+where $W_{U}\in\mathbb{R}^{K\times d}$ and $b\in\mathbb{R}^{K}$ . Equivalently, for candidate token $\tau_{i}$ ,
+
+| $$z_{i}=w_{i}^{\top}h_{m}+b_{i},$$ |
+| --- |
+
+where $w_{i}^{\top}$ is the row of $W_{U}$ associated with token $\tau_{i}$ . The number $z_{i}$ is the model’s raw score for token $\tau_{i}$ . It is not yet a probability. It can be positive, negative, or zero.
+
+In neural-network terminology, the vector
+
+| $$(z_{1},z_{2},\ldots,z_{K})$$ |
+| --- |
+
+is commonly called the vector of logits.55 5 In classical statistics, a logit is a log-odds transformation. In neural-network software, “logits” usually means the raw pre-softmax scores. In discrete choice theory, the probabilities produced by the softmax form are often called multinomial logit choice probabilities [17]. The same word therefore refers to different but related objects across fields. Some models omit the bias term, and some tie $W_{U}$ to the input embedding matrix. Those architectural details do not change the conceptual point: the transformer produces a hidden vector, and a final linear map converts that vector into one score per vocabulary token.
+
+The transformer computation inside $f_{\theta}$ is itself a deterministic sequence of numerical operations given fixed weights and inputs. One attention operation has the form
+
+| $$\operatorname{Attention}(Q,K_{\mathrm{att}},V)=\operatorname{softmax}\left(\frac{QK_{\mathrm{att}}^{\top}}{\sqrt{d_{k}}}\right)V.$$ |
+| --- |
+
+Here, attention lets each position in the sequence pull information from other positions, weighted by relevance: queries $Q$ ask what the current position is looking for, keys $K_{\mathrm{att}}$ describe what earlier positions contain, and values $V$ hold the information to be combined; here $d_{k}$ is the dimensionality of the query and key vectors [16]. The point of including the equation is not to make the reader implement attention. It is to show that the forward pass is a fixed numerical computation: matrix products, normalizations, nonlinear activations, a softmax, and weighted sums.
+
+At inference time, the model is normally put in evaluation mode. This matters because some training techniques deliberately inject randomness. For example, dropout randomly zeroes some activations during training and rescales the remaining activations to compensate, while PyTorch’s Dropout documentation notes that during evaluation the dropout module computes the identity function [14]. Thus, the inference forward pass is designed to be a deterministic function of its inputs, weights, and numerical execution conditions.
+
+### 3.3 From logits to probabilities
+
+A probabilistic decoder needs a probability distribution. The raw scores $z_{i}$ are converted into probabilities using the softmax function.66 6 The softmax function takes a vector of real numbers and returns positive numbers that sum to one. If $z_{i}$ is larger than $z_{j}$ , then $\exp(z_{i})$ is larger than $\exp(z_{j})$ , so larger scores receive larger probabilities. The denominator normalizes the values so that the total probability is one. Write the model’s native next-token distribution (at temperature $T=1$ ) as $P_{\theta}(\tau_{i}\mid c_{n})$ . A sampler may reshape it with a temperature $T>0$ ; the temperature-scaled probability assigned to token $\tau_{i}$ is
+
+| $$p_{i}(T)=\frac{\exp(z_{i}/T)}{\sum_{j=1}^{K}\exp(z_{j}/T)}.$$ |
+| --- |
+
+In vector notation,
+
+| $$p(T)=\operatorname{softmax}(z/T).$$ |
+| --- |
+
+The resulting vector
+
+| $$p(T)=(p_{1}(T),p_{2}(T),\ldots,p_{K}(T))$$ |
+| --- |
+
+is a probability distribution over the fixed vocabulary $\mathcal{V}$ .
+
+In discrete choice language, the expression above has the form of a multinomial logit choice probability. In neural-network language, it is the softmax probability obtained from the logits. There is no “logit of a logit.” There is a raw score vector $z$ , commonly called logits in neural-network usage, and softmax converts that vector into probabilities.
+
+## 4 Decoding: turning probabilities into an output sequence
+
+Decoding is the procedure that turns the model’s scores or probabilities into emitted tokens.77 7 Decoding here does not mean translating hidden thoughts into English. It means algorithmically choosing the next output token from the model’s scores or probabilities. The model does not directly produce a complete paragraph in one step. It repeatedly computes a next-token distribution, the decoder selects a token, the selected token is appended to the context, and the process repeats.
+
+### 4.1 Deterministic decoding
+
+A deterministic decoder does not use random draws. The simplest case is greedy decoding. After the model has converted logits into probabilities, greedy decoding chooses
+
+| $$o_{n}=\operatorname*{arg\,max}_{t\in\mathcal{V}}P_{\theta}(t\mid c_{n}),\qquad c_{n+1}=c_{n}\mathbin{\|}o_{n}.$$ |
+| --- |
+
+The equation says that, among all vocabulary tokens $t\in\mathcal{V}$ , the decoder selects the token assigned the highest probability by the foundation model given the current context $c_{n}$ . The selected token $o_{n}$ is appended to the context, producing $c_{n+1}$ . No pseudo-random number generator is used in this step. Hugging Face’s generation documentation describes greedy search as selecting the most probable next token at each step [11].
+
+Under fixed weights, fixed prompt, fixed numerical environment, and fixed decoding settings, greedy decoding is deterministic. This is why it is imprecise to say that a foundation model is inherently stochastic. The same model can often be run with deterministic decoding or with stochastic decoding. Under deterministic decoding, the output sequence need not be stochastic in the sampling sense. Determinism, however, is not the same thing as quality. Greedy decoding can become repetitive because it repeatedly makes locally most likely next-token choices, a failure mode related to neural text degeneration [18].
+
+### 4.2 Sampling-based decoding
+
+A sampling decoder uses the same probability distribution differently. Instead of choosing the highest-probability token, it treats the next-token probabilities as probabilities. If
+
+| $$p(T)=(p_{1},p_{2},\ldots,p_{K}),$$ |
+| --- |
+
+then the decoder samples a token
+
+| $$o_{n}\sim\operatorname{Categorical}(p_{1},p_{2},\ldots,p_{K}).$$ |
+| --- |
+
+A categorical distribution is the distribution over one draw from a finite set of alternatives: token $\tau_{1}$ is selected with probability $p_{1}$ , token $\tau_{2}$ with probability $p_{2}$ , and so on.
+
+In a computer implementation, this sampling is typically done with a pseudo-random number generator, not physical randomness.88 8 A pseudo-random number generator is a deterministic algorithm that produces a sequence of numbers designed to behave like random draws for practical purposes. The initial internal state is often controlled by a seed. Same seed plus same sequence of consumed draws gives the same pseudo-random stream. A simple way to see the sampling step is to form cumulative probabilities
+
+| $$F_{i}=\sum_{j=1}^{i}p_{j}.$$ |
+| --- |
+
+The decoder draws a pseudo-random number $u_{n}\in[0,1)$ and selects the smallest index $i$ such that
+
+| $$F_{i}>u_{n}.$$ |
+| --- |
+
+For example, if the probabilities over four tokens are
+
+| $$(0.10,0.20,0.30,0.40),$$ |
+| --- |
+
+then the unit interval can be divided into intervals of lengths $0.10$ , $0.20$ , $0.30$ , and $0.40$ . A pseudo-random number falling in a given interval selects the corresponding token. PyTorch’s torch.multinomial is one implementation of this kind of sampling and accepts an explicit generator argument [13]. A self-contained sampler that uses no neural network is given in Appendix A. Figure 3 illustrates this lookup for the example above.
+
+Figure 3: Sampling as a lookup on the unit interval. The probabilities $(0.10,0.20,0.30,0.40)$ partition $[0,1)$ into four sub-intervals. A single pseudo-random draw $u$ selects the token whose interval contains it. Reusing the same $u$ with the same intervals always selects the same token, which is why sampling is reproducible when the random stream is controlled.
+
+$\tau_{1}$ $0.10$ $\tau_{2}$ $0.20$ $\tau_{3}$ $0.30$ $\tau_{4}$ $0.40$ 0.00.100.300.601.0 $u=0.45$ $u$ lands in $\tau_{3}$ ’s interval $[0.30,0.60)$ , so token $\tau_{3}$ is selected
+
+This is the clearest sense in which model output is stochastic during ordinary sampling-based generation: the model computes a distribution, and the decoder draws from that distribution.
+
+### 4.3 Temperature, top- $k$ , and top- $p$
+
+Temperature changes the shape of the distribution before sampling:
+
+| $$p_{i}(T)=\frac{\exp(z_{i}/T)}{\sum_{j=1}^{K}\exp(z_{j}/T)}.$$ |
+| --- |
+
+Higher $T$ flattens the distribution and gives lower-ranked tokens more probability mass. When sampling is used, this increases the role of randomness. Lower $T$ concentrates probability mass on the highest-scoring tokens. When sampling is used, this makes the next-token choice more nearly deterministic. As $T$ approaches zero from above, the distribution concentrates on the highest-scoring token, and the procedure approaches greedy decoding.99 9 The formula itself is defined for $T>0$ . Setting $T=0$ literally would require division by zero. Implementations that expose temperature = 0 usually special-case it as greedy or near-greedy decoding rather than substituting zero into the formula. A related subtlety: if the maximizing logit is unique, the $T\to 0^{+}$ limit places all mass on one token, but if several tokens tie for the maximum, that limit is uniform over the tied set, whereas algorithmic greedy decoding (for example argmax) breaks the tie deterministically, typically by lowest index, so practical greedy decoding stays deterministic. Figure 4 shows the same logits reshaped at three temperatures.
+
+Figure 4: Temperature reshapes the same logits before sampling. All three panels use the identical raw scores; only $T$ changes. Low temperature concentrates probability on the top token (near-greedy), while high temperature spreads mass toward lower-ranked tokens, which increases the role of the random draw. The horizontal axis lists the six candidate tokens in fixed order; the vertical axis is probability.
+
+$T=0.5$ sharp $T=1$ baseline $T=2$ flat
+
+Top- $k$ and top- $p$ sampling restrict the distribution before sampling. In top- $k$ sampling, let $\mathcal{V}_{k}(c_{n})\subseteq\mathcal{V}$ be the set of the $k$ highest-probability tokens under the current context. The restricted distribution is
+
+| $$\tilde{p}_{i}=\begin{cases}\dfrac{p_{i}}{\sum_{\ell:\,\tau_{\ell}\in\mathcal{V}_{k}(c_{n})}p_{\ell}},&\tau_{i}\in\mathcal{V}_{k}(c_{n}),\\[9.0pt] 0,&\tau_{i}\notin\mathcal{V}_{k}(c_{n}).\end{cases}$$ |
+| --- |
+
+The equation says: keep only the $k$ most likely tokens, set all other probabilities to zero, and rescale the remaining probabilities so they again sum to one. The decoder then samples from $\tilde{p}$ . In top- $p$ , or nucleus, sampling, sort the tokens from most probable to least probable. Let $\mathcal{V}_{p}(c_{n})\subseteq\mathcal{V}$ be the smallest prefix of the sorted tokens whose cumulative probability is at least $p$ . The decoder sets the probability of all other tokens to zero, renormalizes over $\mathcal{V}_{p}(c_{n})$ , and samples from the resulting distribution. Nucleus sampling was proposed as a way to avoid the degeneracy of deterministic decoding while also avoiding the long tail of very low-probability tokens [18].
+
+In temperature sampling, top- $k$ sampling, and top- $p$ sampling, the distribution is modified before token selection. If the final selection is by sampling, the pseudo-RNG enters at that point.
+
+### 4.4 Why text generation is sequential
+
+After the decoder selects a token, the token is appended to the context. If the current context is $c_{n}$ and the selected token is $o_{n}$ , then
+
+| $$c_{n+1}=c_{n}\mathbin{\|}o_{n}.$$ |
+| --- |
+
+This gives the autoregressive loop:
+
+| $$\text{score tokens}\rightarrow\text{decode one token}\rightarrow\text{append token}\rightarrow\text{repeat}.$$ |
+| --- |
+
+Token $n+1$ cannot be generated in the ordinary autoregressive way until token $n$ has been selected, because the selected token becomes part of the next input context.
+
+This sequential dependence is one reason text generation can be slow. Many computations inside a single forward pass can be parallelized efficiently on GPUs. Modern implementations also use a KV cache, which stores attention keys and values from previous tokens so the model need not recompute all earlier token representations from scratch.1010 10 A KV cache stores the “key” and “value” matrices used by attention for previous tokens. It speeds up generation but does not remove the sequential dependency that the next accepted token depends on the previous accepted token. But the high-level generation loop remains sequential at the token level. Long answers usually take longer because they require more decode steps. Speculative decoding can accelerate this loop by proposing several candidate tokens with a smaller model and then verifying them with the larger model, but the final accepted sequence still has to be consistent with the autoregressive model.1111 11 Speculative decoding is a speed technique. It should not be confused with a different reasoning algorithm. It proposes candidate future tokens, verifies them, and accepts or rejects them under rules intended to preserve the target model’s distribution.
+
+Figure 5 summarizes a single decoding step end to end.
+
+Figure 5: The token-generation pipeline. The model’s forward pass computes logits and probabilities. The explicit source of sampling stochasticity is the decoder. The serving layer can also perturb logits, so deterministic decoding does not guarantee identical outputs in every deployed system.
+
+Context $c_{n}$ Forward pass transformer Logits $z_{1},\dots,z_{K}$ Softmax, temp. $T$ probabilities $p$ Decoder Token $o_{n}$ Deterministic under controlled weights, context, shapes, and numericsappend selected token and repeat Greedy: deterministic Sampling: PRNG draw, stochastic Serving system: batch composition, batch-size-dependent kernels, precision, model version, MoE routing
+
+## 5 From token choices to agent trajectories
+
+A single foundation model call may generate many tokens. The agent may then interpret the completed sequence as text, code, JSON, a function call, a tool argument, or a plan. At agent round $r$ , write the generated sequence as
+
+| $$Y_{r}=(o_{r,1},o_{r,2},\ldots,o_{r,L_{r}}).$$ |
+| --- |
+
+If sampling changes $o_{r,5}$ , the remaining tokens may change because the subsequent context changes. At the token level,
+
+| $$c_{r,6}=c_{r,5}\mathbin{\|}o_{r,5}.$$ |
+| --- |
+
+At the agent level, a changed output sequence can change the parsed action:
+
+| $$A_{r}=\operatorname{Parse}(Y_{r}).$$ |
+| --- |
+
+A different action can produce a different observation $O_{r}$ , and a different observation changes the next state $S_{r+1}$ . Thus, stochasticity compounds across two nested loops:
+
+1.
+
+The token loop: score next tokens, decode one token, append it, and repeat.
+
+2.
+
+The agent loop: generate a model output, parse it as an action, observe the environment, update state, and repeat.
+
+This is why agentic systems can feel more variable than ordinary chat completions. In ordinary chat, a different sampled phrase may simply be a different wording. In an agent, a different sampled token can alter a tool call, a database query, a code patch, or a decision to continue or stop.
+
+Consider a support-agent tool call represented as JSON. The model might generate one of the following outputs:
+
+{"tool": "lookup_order", "arguments": {"order_id": "A173"}}
+
+{"tool": "escalate_case", "arguments": {"reason": "refund dispute"}}
+
+A few different tokens can change the business action. Similarly, a data agent may generate
+
+WHERE status = ’active’
+
+versus
+
+WHERE status IN (’active’, ’pending’)
+
+The difference is small as text but material as a database query. Figure 6 traces how one differing token sends the agent down a different branch.1212 12 For readability the figure labels a branch by a whole identifier such as lookup_order. A real tokenizer splits such identifiers into subword tokens, so the branch point is the first subword token that differs between runs. The amplification argument is unchanged: once any token in the serialized action differs, the parsed action and its consequences can diverge.
+
+Figure 6: How a single token flips a trajectory. Two runs share an identical token prefix, then sampling selects a different token at one step. Parsed as a tool call, that one difference sends the agent down a different branch, with a different action and a materially different outcome. This is the amplification from token-level sampling to agent-level behavior.
+
+identical prefix (same tokens in both runs) $o_{1}$ $o_{2}$ $o_{3}$ $o_{4}$ sample $o_{5}$ $o_{5}=$ lookup_order $o_{5}=$ escalate_case read order, answer customer open ticket, human handoff one different sampled token
+
+## 6 What stochasticity does not mean
+
+### 6.1 Reasoning traces and reasoning paths
+
+The language of “reasoning paths” can also cause confusion. A reasoning path is a candidate chain of intermediate steps, partial conclusions, or candidate continuations leading from a prompt to an answer. A hypothetical search system might try one path that solves a problem algebraically, another path that uses a numerical example, and another path that looks for a counterexample. It might evaluate those paths and choose among them.
+
+Some AI applications do implement explicit search-like or multi-candidate procedures. The ReAct framework studies interleaved reasoning traces and actions in language-model agents [19]. Toolformer studies models that decide which APIs to call, when to call them, and what arguments to pass [20]. Multi-agent systems such as AutoGen explore designs in which multiple LLM-based agents converse and coordinate [21]. These are agent-level or application-level designs around model calls.
+
+A standard transformer forward pass, however, does not ordinarily choose a random route through the network. Given the same token IDs, weights, and controlled numerical execution, it applies the same layers in the same order: attention operations, matrix multiplications, feed-forward layers, normalization steps, and output projection. The usual stochasticity in generation enters when the decoder samples output tokens.
+
+This point also applies to many “reasoning” or extended-thinking models as users experience them. A visible or hidden reasoning trace is still generated as a token sequence, possibly with different prompting, training, or inference scaffolding. Variation across traces does not by itself imply that the neural network used a hidden random path selector. It may simply reflect sampling over a longer chain of intermediate tokens. A vendor or application may add search, self-consistency, reranking, or tool execution around the model, but that is additional orchestration rather than the ordinary transformer forward pass randomly branching internally.
+
+Mixture-of-experts models require a small clarification.1313 13 A mixture-of-experts model routes each token to a subset of specialized sub-networks, often called experts, rather than applying the same feed-forward sub-network to every token. MoE routing is a kind of data-dependent routing decision inside the model. It is not necessarily random. Given the same input, same weights, same batch composition, and same routing implementation, it can be deterministic. It is therefore not a counterexample to the main point. It is a routing decision, not a coin flip. In deployed systems, however, MoE routing can interact with batch composition and load-balancing details, so it belongs among practical sources of variation.
+
+### 6.2 It does not mean irreproducible in principle
+
+Stochastic sampling can be exactly reproducible under matched conditions. Suppose two model replicas $i$ and $j$ have the same weights, the same tokenizer, the same decoding code, the same input context, a deterministic forward pass, and synchronized pseudo-RNG streams. At token step $n$ , assume
+
+| $$c_{i,n}=c_{j,n},\qquad R_{i,n}=R_{j,n}.$$ |
+| --- |
+
+The controlled forward pass gives the same probability distribution:
+
+| $$p_{i,n}=p_{j,n}.$$ |
+| --- |
+
+The same RNG state gives the same pseudo-random draw:
+
+| $$u_{i,n}=u_{j,n}.$$ |
+| --- |
+
+The same sampler applied to the same probability distribution and the same draw gives
+
+| $$o_{i,n}=o_{j,n}.$$ |
+| --- |
+
+After appending the same token, the contexts remain equal:
+
+| $$c_{i,n+1}=c_{j,n+1}.$$ |
+| --- |
+
+The RNG states also advance in the same way. By induction, the two replicas generate the same token sequence.
+
+The condition “controlled forward pass” matters. The proof assumes that equal contexts produce equal logits. That is true in the toy CPU demonstration in Appendix B, where we use evaluation mode, fixed weights, fixed shapes, manual one-token sampling, and explicit pseudo-RNG generators. It may fail in a deployed service if the numerical or serving conditions perturb logits. The next subsection explains that distinction.
+
+This is why “stochastic” should not be equated with “unrepeatable.” A pseudo-random generator can make a sampled process reproducible when the seed, model, software, hardware, inputs, and sequence of random draws are controlled. Some commercial APIs expose seed-like controls, but they may still describe determinism as best-effort because backend infrastructure can change [6].
+
+### 6.3 It does not necessarily mean the GPU used a pseudo-RNG
+
+There is a separate issue called numerical nondeterminism. It is tempting to explain irreproducibility at temperature zero by saying that GPU threads finish in different orders and therefore floating-point sums are accumulated differently. That explanation contains a real mathematical ingredient: floating-point arithmetic is finite precision and is not perfectly associative. In exact real arithmetic,
+
+| $$(a+b)+c=a+(b+c).$$ |
+| --- |
+
+In floating-point arithmetic, the two sides can differ slightly because intermediate results are rounded.
+
+But the simple “concurrency plus floating-point” explanation is not the whole story for LLM inference. He and collaborators at Thinking Machines Lab argue that, for common LLM inference forward passes, individual kernels can be deterministic for fixed input shapes, while user-visible nondeterminism often arises because inference servers are not batch-invariant [15]. A kernel is a low-level GPU routine that implements an operation such as matrix multiplication, normalization, or attention. Batch invariance means that the output for one request should be the same regardless of what other requests share the same batch. In many practical serving systems, your prompt is silently batched with other users’ prompts. If the batch size or shape changes, the library may use a different accumulation pattern, tiling strategy, or kernel path. The forward pass can be deterministic for a given batch while not being invariant to which batch your request lands in.
+
+This distinction is important. The GPU need not be using a pseudo-RNG. The serving system may simply process your request in different batch contexts across runs. The model call can then receive slightly different logits, even under greedy decoding. If two tokens are nearly tied, a tiny logit perturbation can flip the highest-probability token. Once one token differs, the subsequent context differs, and the rest of the sequence can diverge.
+
+PyTorch’s reproducibility documentation makes a related distinction: one can control random number generators, and one can also configure deterministic algorithms for operations that might otherwise be nondeterministic on a specific platform and release [12]. Those are different controls. Seeding a PRNG addresses sampling randomness; deterministic kernels and batch-invariant serving address numerical and systems-level reproducibility.
+
+### 6.4 It does not mean deterministic decoding is always safe
+
+Greedy decoding removes the explicit sampling draw. It does not remove every source of variation in an agentic system. The environment can change. A tool can fail. A web page can update. A database query can return a different row. A guardrail can route the case differently. A service provider can update a model or change a backend.
+
+Therefore, “temperature zero” should be read narrowly. It usually means that the decoder is no longer intentionally sampling from a distribution. It does not guarantee that a complete agentic application will always take the same trajectory.
+
+## 7 Implications for evaluating agentic AI systems
+
+For a manager, product owner, or technical evaluator, the key question is not simply, “Is the model stochastic?” The better question is, “At which layer can variation enter, and what variation matters for this use case?”
+
+1.
+
+Separate semantic variability from operational variability. Two answers may differ in wording but be equivalent for the business task. Two tool calls may differ in a way that changes cost, risk, or compliance exposure.
+
+2.
+
+Record the full agent trajectory, not only the final answer. For agentic systems, logs should include model inputs, model outputs, tool calls, tool results, retries, guardrail decisions, and state updates. The final answer alone hides where stochasticity entered.
+
+3.
+
+Control intrinsic randomness during debugging. Use deterministic decoding or fixed seeds when the goal is regression testing, classroom demonstration, or isolating a bug. But do not confuse reproducibility in a toy setting with reliability in a deployed environment; see the cautions in Appendix C.
+
+4.
+
+Freeze the environment when evaluating reproducibility. If the agent uses a live database, search index, clock, or external API, then a repeated run is not the same experiment unless those inputs are fixed or replayed.
+
+5.
+
+Use distributional evaluation. For stochastic systems, a single run is often insufficient. Evaluate success rates, failure modes, variance across runs, sensitivity to prompts, and sensitivity to tool outputs.
+
+6.
+
+Design guardrails around actions, not just words. In agents, the consequential output may be a tool call, database update, code patch, or email draft. Guardrails should validate actions and arguments before execution.
+
+A useful summary is:
+
+A foundation model can compute next-token probabilities deterministically, a decoder can sample from those probabilities stochastically, and an agentic system can amplify sampled token differences into different plans, tool calls, observations, and outcomes. In deployed agents, changing environments and serving systems add further sources of variation.
+
+## Appendix A Toy sampler with no neural network
+
+Before using an actual language model, it is useful to isolate the sampling mechanism. Suppose the probability distribution over four tokens is
+
+| $$p=(0.10,0.20,0.30,0.40).$$ |
+| --- |
+
+Two pseudo-RNGs initialized with the same seed will produce the same sequence of pseudo-random draws. Therefore, they will produce the same sampled tokens if they consume the same number of draws in the same order.
+
+1 import torch
+
+2
+
+3 probs = torch.tensor([[0.10, 0.20, 0.30, 0.40]])
+
+4
+
+5 rng_i = torch.Generator(device="cpu").manual_seed(7)
+
+6 rng_j = torch.Generator(device="cpu").manual_seed(7)
+
+7
+
+8 draws_i = []
+
+9 draws_j = []
+
+10
+
+11 for _ in range(10):
+
+12 draws_i.append(torch.multinomial(probs, 1, generator=rng_i).item())
+
+13 draws_j.append(torch.multinomial(probs, 1, generator=rng_j).item())
+
+14
+
+15 print(draws_i)
+
+16 print(draws_j)
+
+17 print("Identical:", draws_i == draws_j)
+
+The important point is not the particular numbers printed. The important point is that stochastic sampling is reproducible when the pseudo-RNG state and sampling procedure are matched.
+
+## Appendix B Twin GPT-2 demonstrations: sampling and greedy decoding
+
+This appendix demonstrates two related claims. First, stochastic token generation can be reproducible under matched model, input, decoder, and pseudo-RNG conditions. Second, greedy decoding can produce identical twin outputs without using token-level randomness. Both demonstrations use openai-community/gpt2, the small GPT-2 model available through Hugging Face [10]. GPT-2 is more fluent than a minimal testing model while remaining tractable enough for a short Google Colab or CPU demonstration.
+
+The demonstrations use two replicas rather than one model run twice for a reason. The point is to dramatize reproducibility across matched instances, analogous to two servers that have the same model, same input, same decoding rule, and, for sampling, the same pseudo-random stream. A single model run twice can also be reproducible, but only if all relevant state is reset exactly.
+
+### A. Reproducible stochastic sampling with twin GPT-2 models
+
+This first script keeps sampling. It does not turn sampling off. Instead, it makes sampling reproducible by giving each replica its own pseudo-RNG initialized to the same seed. The decoder uses top- $k$ sampling, so it samples only from the top 50 candidates rather than from the full vocabulary.
+
+1 # ============================================================
+
+2 # Twin GPT-2 demonstration with reproducible stochastic sampling
+
+3 # ============================================================
+
+4
+
+5 # In Google Colab, run this once if needed:
+
+6 # !pip install -q transformers accelerate
+
+7
+
+8 import os
+
+9 import random
+
+10 import numpy as np
+
+11 import torch
+
+12 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+13
+
+14 # -----------------------------
+
+15 # Configuration
+
+16 # -----------------------------
+
+17 MODEL_NAME = "openai-community/gpt2"
+
+18 PROMPT = "Agentic AI systems are stochastic because"
+
+19 SEED = 12345
+
+20 STEPS = 40
+
+21 TEMPERATURE = 0.8 # Must be > 0. T = 0 makes this division undefined (inf/nan); for greedy (T = 0) decoding, use the greedy script below.
+
+22 TOP_K = 50
+
+23 DEVICE = "cpu" # CPU gives the cleanest reproducibility demonstration.
+
+24
+
+25 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+26
+
+27 # -----------------------------
+
+28 # Reduce avoidable nondeterminism
+
+29 # -----------------------------
+
+30 random.seed(SEED)
+
+31 np.random.seed(SEED)
+
+32 torch.manual_seed(SEED)
+
+33 torch.set_num_threads(1)
+
+34
+
+35 try:
+
+36 torch.use_deterministic_algorithms(True)
+
+37 except Exception as e:
+
+38 print("Could not enable deterministic algorithms:", e)
+
+39
+
+40 # -----------------------------
+
+41 # Load tokenizer and twin models
+
+42 # -----------------------------
+
+43 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+44
+
+45 model_i = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+
+46 model_j = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+
+47
+
+48 # .eval() matters because it disables training-time randomness such as dropout.
+
+49
+
+50 # -----------------------------
+
+51 # Same initial input sequence
+
+52 # -----------------------------
+
+53 input_i = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+54 input_j = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+55
+
+56 # -----------------------------
+
+57 # Independent pseudo-RNGs with the same seed
+
+58 # -----------------------------
+
+59 rng_i = torch.Generator(device=DEVICE).manual_seed(SEED)
+
+60 rng_j = torch.Generator(device=DEVICE).manual_seed(SEED)
+
+61
+
+62 # -----------------------------
+
+63 # One-token top-k sampling function
+
+64 # -----------------------------
+
+65 @torch.inference_mode()
+
+66 def sample_one_token(model, input_ids, rng):
+
+67 """
+
+68 Compute next-token logits, restrict to the top-k tokens,
+
+69 convert to probabilities, and sample one token using rng.
+
+70 """
+
+71 output = model(input_ids)
+
+72
+
+73 # Raw next-token scores for the final position in the sequence.
+
+74 logits = output.logits[:, -1, :]
+
+75
+
+76 # Temperature reshapes the distribution.
+
+77 logits = logits / TEMPERATURE
+
+78
+
+79 # Restrict to the TOP_K highest-scoring tokens.
+
+80 top_values, top_indices = torch.topk(logits, k=TOP_K, dim=-1)
+
+81
+
+82 # Convert the restricted logits into probabilities.
+
+83 probs = torch.softmax(top_values, dim=-1)
+
+84
+
+85 # Sample a position inside the top-k set using the explicit pseudo-RNG.
+
+86 sampled_position = torch.multinomial(
+
+87 probs,
+
+88 num_samples=1,
+
+89 generator=rng,
+
+90 )
+
+91
+
+92 # Map the sampled top-k position back to the original vocabulary token ID.
+
+93 next_token = top_indices.gather(dim=-1, index=sampled_position)
+
+94 return next_token
+
+95
+
+96 # -----------------------------
+
+97 # Generate from both replicas
+
+98 # -----------------------------
+
+99 sampled_i = []
+
+100 sampled_j = []
+
+101
+
+102 for n in range(STEPS):
+
+103 # Same context at the beginning of each step.
+
+104 assert torch.equal(input_i, input_j), f"Contexts differ before step {n}"
+
+105
+
+106 # Pedagogical choice: we recompute the full forward pass each step (stateless,
+
+107 # matches the math). This omits the KV cache, so the model reprocesses the whole
+
+108 # context every step; production systems cache attention keys/values to avoid
+
+109 # that redundant recomputation.
+
+110 next_i = sample_one_token(model_i, input_i, rng_i)
+
+111 next_j = sample_one_token(model_j, input_j, rng_j)
+
+112
+
+113 # Same model state, same context, same decoder, same RNG state.
+
+114 assert torch.equal(next_i, next_j), f"Diverged at step {n}"
+
+115
+
+116 sampled_i.append(next_i.item())
+
+117 sampled_j.append(next_j.item())
+
+118
+
+119 # Append the sampled token to each context.
+
+120 input_i = torch.cat([input_i, next_i], dim=-1)
+
+121 input_j = torch.cat([input_j, next_j], dim=-1)
+
+122
+
+123 # -----------------------------
+
+124 # Results
+
+125 # -----------------------------
+
+126 print("Token IDs from model i:")
+
+127 print(sampled_i)
+
+128
+
+129 print("\nToken IDs from model j:")
+
+130 print(sampled_j)
+
+131
+
+132 print("\nSequences identical:", sampled_i == sampled_j)
+
+133
+
+134 print("\nOutput from model i:")
+
+135 print(tokenizer.decode(input_i[0], skip_special_tokens=True))
+
+136
+
+137 print("\nOutput from model j:")
+
+138 print(tokenizer.decode(input_j[0], skip_special_tokens=True))
+
+The expected diagnostic line is:
+
+Sequences identical: True
+
+The exact generated prose can change if package versions, model revisions, or numerical settings change. The invariant demonstrated by the script is that the two replicas match each other under the same controlled conditions. Sampling is still present: the key line is torch.multinomial(..., generator=rng). The pseudo-RNG stream is simply synchronized across replicas.
+
+### B. Greedy decoding with twin GPT-2 models
+
+The second script removes token-level sampling entirely. There is no torch.multinomial call, and the pseudo-RNG is not used for token selection. At each step, the decoder chooses the token with the largest logit.
+
+1 # ============================================================
+
+2 # Twin GPT-2 demonstration with greedy decoding
+
+3 # ============================================================
+
+4
+
+5 # In Google Colab, run this once if needed:
+
+6 # !pip install -q transformers accelerate
+
+7
+
+8 import os
+
+9 import random
+
+10 import numpy as np
+
+11 import torch
+
+12 from transformers import AutoTokenizer, AutoModelForCausalLM
+
+13
+
+14 # -----------------------------
+
+15 # Configuration
+
+16 # -----------------------------
+
+17 MODEL_NAME = "openai-community/gpt2"
+
+18 PROMPT = "Agentic AI systems are stochastic because"
+
+19 SEED = 12345
+
+20 STEPS = 40
+
+21 DEVICE = "cpu" # CPU gives the cleanest reproducibility demonstration.
+
+22
+
+23 os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+24
+
+25 # -----------------------------
+
+26 # Reduce avoidable nondeterminism
+
+27 # -----------------------------
+
+28 # These seeds are not used by greedy token selection. They are included
+
+29 # to keep the broader numerical and software environment controlled.
+
+30 random.seed(SEED)
+
+31 np.random.seed(SEED)
+
+32 torch.manual_seed(SEED)
+
+33 torch.set_num_threads(1)
+
+34
+
+35 try:
+
+36 torch.use_deterministic_algorithms(True)
+
+37 except Exception as e:
+
+38 print("Could not enable deterministic algorithms:", e)
+
+39
+
+40 # -----------------------------
+
+41 # Load tokenizer and twin models
+
+42 # -----------------------------
+
+43 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+44
+
+45 model_i = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+
+46 model_j = AutoModelForCausalLM.from_pretrained(MODEL_NAME).to(DEVICE).eval()
+
+47
+
+48 # .eval() disables training-time randomness such as dropout.
+
+49
+
+50 # -----------------------------
+
+51 # Same initial input sequence
+
+52 # -----------------------------
+
+53 input_i = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+54 input_j = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+55
+
+56 # -----------------------------
+
+57 # Greedy one-token decoder
+
+58 # -----------------------------
+
+59 @torch.inference_mode()
+
+60 def greedy_one_token(model, input_ids):
+
+61 """
+
+62 Compute next-token logits and choose the highest-scoring token.
+
+63 This is deterministic greedy decoding.
+
+64 """
+
+65 output = model(input_ids)
+
+66 logits = output.logits[:, -1, :]
+
+67 next_token = torch.argmax(logits, dim=-1, keepdim=True)
+
+68 return next_token
+
+69
+
+70 # -----------------------------
+
+71 # Generate from both replicas
+
+72 # -----------------------------
+
+73 generated_i = []
+
+74 generated_j = []
+
+75
+
+76 for n in range(STEPS):
+
+77 # Same context at the beginning of each step.
+
+78 assert torch.equal(input_i, input_j), f"Contexts differ before step {n}"
+
+79
+
+80 # Pedagogical choice: we recompute the full forward pass each step (stateless,
+
+81 # matches the math). This omits the KV cache, so the model reprocesses the whole
+
+82 # context every step; production systems cache attention keys/values to avoid
+
+83 # that redundant recomputation.
+
+84 next_i = greedy_one_token(model_i, input_i)
+
+85 next_j = greedy_one_token(model_j, input_j)
+
+86
+
+87 # Same model state, same context, same deterministic decoder.
+
+88 assert torch.equal(next_i, next_j), f"Diverged at step {n}"
+
+89
+
+90 generated_i.append(next_i.item())
+
+91 generated_j.append(next_j.item())
+
+92
+
+93 # Append the selected token to each context.
+
+94 input_i = torch.cat([input_i, next_i], dim=-1)
+
+95 input_j = torch.cat([input_j, next_j], dim=-1)
+
+96
+
+97 # -----------------------------
+
+98 # Results
+
+99 # -----------------------------
+
+100 print("Token IDs from model i:")
+
+101 print(generated_i)
+
+102
+
+103 print("\nToken IDs from model j:")
+
+104 print(generated_j)
+
+105
+
+106 print("\nSequences identical:", generated_i == generated_j)
+
+107
+
+108 print("\nOutput from model i:")
+
+109 print(tokenizer.decode(input_i[0], skip_special_tokens=True))
+
+110
+
+111 print("\nOutput from model j:")
+
+112 print(tokenizer.decode(input_j[0], skip_special_tokens=True))
+
+The expected diagnostic line is again:
+
+Sequences identical: True
+
+The interpretation is different. In the sampling script, the two replicas match because the stochastic sampling draws are reproducible under synchronized pseudo-RNG states. In the greedy script, the two replicas match because token selection is deterministic: at each step the decoder chooses the highest-scoring token. The greedy output may still be repetitive, bland, or caught in a high-probability loop. That is not a failure of the demonstration. It illustrates that determinism and output quality are separate properties. This is one reason practical systems often use sampling, top- $k$ , top- $p$ , temperature, repetition penalties, or related decoding controls.
+
+### Why the same visible prompt may not repeat under sampling
+
+For sampling-based decoding, using the same visible prompt is not sufficient if the pseudo-RNG state has advanced. The following snippet illustrates the point. It should be run after the sampling script above.
+
+1 input_a = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+2 input_b = tokenizer(PROMPT, return_tensors="pt").input_ids.to(DEVICE)
+
+3
+
+4 rng = torch.Generator(device=DEVICE).manual_seed(SEED)
+
+5
+
+6 first_draw = sample_one_token(model_i, input_a, rng)
+
+7 second_draw = sample_one_token(model_i, input_b, rng)
+
+8
+
+9 print("First sampled token ID:", first_draw.item())
+
+10 print("Second sampled token ID:", second_draw.item())
+
+11 print("Same visible prompt, but the RNG state advanced between draws.")
+
+The two sampled tokens may coincide by chance, but there is no guarantee because the second call consumes the next pseudo-random number in the stream. To reproduce a sampled draw exactly, one must reset or restore the RNG state, not merely reuse the same visible prompt.
+
+### Proof idea for the twin sampling demonstration
+
+The sampling demonstration rests on an induction argument under controlled numerical conditions.
+
+1.
+
+At step $0$ , both replicas have the same context and the same RNG state.
+
+2.
+
+If the contexts are equal, the deterministic forward passes produce equal logits and equal probabilities.
+
+3.
+
+If the RNG states are equal, the samplers receive the same pseudo-random draw.
+
+4.
+
+Equal probabilities plus equal pseudo-random draw imply equal selected token.
+
+5.
+
+Appending equal tokens preserves equality of contexts, and consuming one draw advances both RNGs in the same way.
+
+6.
+
+Therefore, the same reasoning applies at the next step.
+
+The phrase “deterministic forward pass” is doing real work. The demonstrations use CPU execution, fixed model weights, evaluation mode, a fixed tokenizer, fixed input shapes, and manual one-token decoding. A production inference server may violate that assumption if batch composition, kernels, precision, routing, or model version differ.
+
+## Appendix C Practical cautions for extending the demonstration
+
+The GPT-2 demonstrations are intentionally controlled. Larger models and deployed agentic systems may require more care.
+
+1.
+
+Use CPU for the cleanest classroom demonstration. GPU inference is fast, but exact reproducibility can require deterministic kernels, fixed shapes, fixed batch composition, and batch-invariant serving.
+
+2.
+
+Use evaluation mode. Training mode may include dropout or other training-time stochasticity. Inference demonstrations should use model.eval().
+
+3.
+
+Avoid hidden random draws. High-level generation APIs may consume random numbers in ways that are not visible. Manual one-token sampling makes the pseudo-RNG step explicit.
+
+4.
+
+Keep the RNG streams synchronized. Same seed at initialization is not enough if one replica consumes an extra random draw. The key condition is same RNG state at each token step.
+
+5.
+
+Record model and software versions. Exact output strings can change if the model weights, tokenizer, library version, or numerical kernels change.
+
+6.
+
+Do not generalize from a toy model to all deployed services. A commercial agent may include routing, retrieval, tool calls, safety layers, dynamic batching, retries, and changing external data. Those layers can introduce additional variation even if the underlying model call is controlled.
+
+## References
+
+- [1] Rishi Bommasani, Drew A. Hudson, Ehsan Adeli, Russ Altman, Simran Arora, Sydney von Arx, Michael S. Bernstein, Jeannette Bohg, Antoine Bosselut, Emma Brunskill, and others. 2021. On the Opportunities and Risks of Foundation Models. Stanford CRFM. https://arxiv.org/abs/2108.07258
+- [2] OpenAI. Agents. OpenAI Agents SDK documentation. Accessed June 6, 2026. https://openai.github.io/openai-agents-python/agents/
+- [3] OpenAI. Agents SDK. OpenAI API documentation. Accessed June 6, 2026. https://developers.openai.com/api/docs/guides/agents
+- [4] OpenAI. Tools. OpenAI Agents SDK documentation. Accessed June 6, 2026. https://openai.github.io/openai-agents-python/tools/
+- [5] OpenAI. Codex. OpenAI Developers documentation. Accessed June 6, 2026. https://developers.openai.com/codex
+- [6] OpenAI. How to make your completions outputs consistent with the new seed parameter. OpenAI Cookbook. Accessed June 6, 2026. https://developers.openai.com/cookbook/examples/reproducible_outputs_with_the_seed_parameter
+- [7] Anthropic. Tool use with Claude. Claude API documentation. Accessed June 6, 2026. https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview
+- [8] LangChain. Agents. LangChain documentation. Accessed June 6, 2026. https://docs.langchain.com/oss/python/langchain/agents
+- [9] GitHub. About GitHub Copilot coding agent. GitHub Docs. Accessed June 6, 2026. https://docs.github.com/copilot/using-github-copilot/coding-agent/about-assigning-tasks-to-copilot
+- [10] Hugging Face. openai-community/gpt2. Hugging Face model repository. Accessed June 7, 2026. https://huggingface.co/openai-community/gpt2
+- [11] Hugging Face. Generation strategies. Transformers documentation. Accessed June 6, 2026. https://huggingface.co/docs/transformers/generation_strategies
+- [12] PyTorch. Reproducibility. PyTorch documentation. Accessed June 6, 2026. https://docs.pytorch.org/docs/main/notes/randomness.html
+- [13] PyTorch. torch.multinomial. PyTorch documentation. Accessed June 6, 2026. https://docs.pytorch.org/docs/2.12/generated/torch.multinomial.html
+- [14] PyTorch. Dropout. PyTorch documentation. Accessed June 6, 2026. https://docs.pytorch.org/docs/main/generated/torch.nn.modules.dropout.Dropout.html
+- [15] Horace He and Thinking Machines Lab. 2025. Defeating Nondeterminism in LLM Inference. Thinking Machines Lab: Connectionism. DOI:10.64434/tml.20250910. https://thinkingmachines.ai/blog/defeating-nondeterminism-in-llm-inference/
+- [16] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. 2017. Attention is all you need. Advances in Neural Information Processing Systems. https://arxiv.org/abs/1706.03762
+- [17] Kenneth E. Train. 2009. Discrete Choice Methods with Simulation. 2nd ed. Cambridge University Press.
+- [18] Ari Holtzman, Jan Buys, Li Du, Maxwell Forbes, and Yejin Choi. 2020. The curious case of neural text degeneration. International Conference on Learning Representations (ICLR). https://arxiv.org/abs/1904.09751
+- [19] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik Narasimhan, and Yuan Cao. 2023. ReAct: Synergizing reasoning and acting in language models. International Conference on Learning Representations (ICLR). https://arxiv.org/abs/2210.03629
+- [20] Timo Schick, Jane Dwivedi-Yu, Roberto Dessi, Roberta Raileanu, Maria Lomeli, Luke Zettlemoyer, Nicola Cancedda, and Thomas Scialom. 2023. Toolformer: Language models can teach themselves to use tools. Advances in Neural Information Processing Systems. https://arxiv.org/abs/2302.04761
+- [21] Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li, Erkang Zhu, Li Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu, Ahmed Hassan Awadallah, Ryen W. White, Doug Burger, and Chi Wang. 2024. AutoGen: Enabling next-gen LLM applications via multi-agent conversation framework. Conference on Language Modeling (COLM). https://arxiv.org/abs/2308.08155

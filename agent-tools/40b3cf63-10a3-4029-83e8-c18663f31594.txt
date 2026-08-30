@@ -1,0 +1,1620 @@
+# MPI Benchmarking Revisited: Experimental Design and Reproducibility
+
+arXiv (Cornell University). Published: 2015-05-28. Preprint. 6 citations.
+
+## Authors
+
+- Sascha Hunold: h-index 16; 823 citations
+- Alexandra Carpen-Amarie: h-index 12; 559 citations
+
+## Topics
+
+- Parallel Computing and Optimization Techniques
+- Distributed systems and fault tolerance
+- Advanced Data Storage Technologies
+
+---
+
+# MPI Benchmarking Revisited:
+
+Sascha Hunold and Alexandra Carpen-Amarie
+
+Abstract—The Message Passing Interface (MPI) is the prevalent programming model used on today’s supercomputers. Therefore, MPI library developers are looking for the best possible performance (shortest run-time) of individual MPI functions across many different supercomputer architectures. Several MPI benchmark suites have been developed to assess the performance of MPI implementations. Unfortunately, the outcome of these benchmarks is often neither reproducible nor statistically sound. To overcome these issues, we show which experimental factors have an impact on the run-time of blocking collective MPI operations and how to control them. We address the problem of process and clock synchronization in MPI benchmarks. Finally, we present a new experimental method that allows us to obtain reproducible and statistically sound MPI measurements. Index Terms—MPI, benchmarking, clock synchronization, reproducibility, statistical analysis ✦ 1 INTRODUCTION Since the Message Passing Interface (MPI) was standardized in the 1990s, it has been the prevalent programming model on the majority of supercomputers. As MPI is an essential build ing block of high-performance applications, performance problems in the MPI library have direct consequences on the overall run-time of applications. Library developers and algorithm designers have one question in common: which algorithm works better (is faster) for a given communication problem? For example, which implementation of broadcast is faster on p = 128 processors using a payload of m = 64 Bytes? As today’s parallel systems can hardly be modeled analytically, empirical evaluations using run-time tests of MPI functions are required to compare different MPI implementations. It is therefore important to measure the run-time of MPI functions correctly. MPI library developers rely on benchmark suites to test their implementations. The problem is that the results of these benchmarks may vary significantly, where Table 1 shows one example. The table compares the minimum and maximum run-time of an MPI_Bcast on 16 nodes that were reported by 30 different calls (mpiruns) to the Intel MPI Benchmarks. The third column lists the difference between the minimum and maximum run-time in percent. We can see that for payloads of up to 512 Bytes, the run-times have an error of roughly 10 %. One solution might be to change the default parameters of the Intel MPI Benchmarks. For example, one could force the benchmark to perform more measurements. But the question then becomes: how many runs are sufficient to obtain reproducible results? It is a common practice—when comparing MPI imple mentations as part of a scientific publication—to choose one of the available benchmarks and compare the results. Many MPI benchmarks report either the mean, the median, or the
+
+• are with the TU Wien, Faculty of Informatics, Institute of Information Systems, Research Group for Parallel Computing, Favoritenstrasse 16/184-5, 1040 Vienna, Austria E-mail: {hunold,carpenamarie}@par.tuwien.ac.at
+Table 1
+Minimum and maximum run-time of MPI_Bcast obtained from 30
+different runs of the Intel MPI Benchmarks on 16 × 1 processes with
+NEC MPI 1.2.8 on TUWien.
+Msg. size min(avg) max(avg) diff
+[Bytes] [µs] [µs] [%]
+0 0.04 0.04 0.00
+1 2.93 3.12 6.09
+2 2.83 3.20 11.56
+4 2.82 3.06 7.84
+8 2.86 3.13 8.63
+16 2.84 3.14 9.55
+32 3.13 3.44 9.01
+64 3.15 3.51 10.26
+128 3.62 4.03 10.17
+256 4.34 4.90 11.43
+512 5.41 5.91 8.46
+1024 6.88 7.05 2.41
+2048 9.52 9.71 1.96
+4096 13.52 13.91 2.80
+8192 19.30 19.66 1.83
+16384 32.21 33.13 2.78
+32768 53.57 54.47 1.65
+minimum run-time. The problem is that without using a
+dispersion metric and a rigorous statistical analysis, we can
+hardly determine whether an observation is repeatable or
+the result of chance.
+In this article, we make the following contributions to
+the problem of accurately benchmarking blocking collective MPI
+operations:
+1) We show that a precise synchronization of clocks is
+key to measure MPI functions accurately.
+2) We present a novel clock synchronization algorithm
+that has two advantages: (1) it is accurate as it
+accounts for the clock drift between processes, and
+(2) provides a good trade-off between time and
+accuracy.
+3) We establish a list of (experimental) factors that, we
+show, do significantly influence the outcome of MPI
+performance measurements.
+4) We propose a novel benchmarking method, includ
+
+Table 2 Comparison of measures for several MPI benchmark suites.
+
+benchmark name ref. version mean min max measure of dispersion Intel MPI Benchmarks [1] 4.0.0 ✓ ✓ ✓ ✗ MPIBench [2] 1.0beta ✓ ✓ sub-sampled data MPIBlib [3] 1.2.0 ✓ conf. interv. of the mean (default 95%) mpicroscope [4] 1.0 ✓ ✓ ✓ ✗ mpptest [5] 1.5 min of means ✗ NBCBench [6] 1.1 ✓(+median) ✓ ✓ ✗ OSU Micro-Benchmarks [7] 4.4.1 ✓ ✓ ✓ ✗ Phloem MPI Benchmarks [8] 1.0.0 ✓ ✓ ✓ ✗ SKaMPI [9] 5.0.4 ✓ std. error ing an experimental design and an appropriate data analysis strategy, that allows for a fair comparison of MPI libraries, but which is most importantly (1) statistically sound and (2) reproducible. We start by summarizing other MPI benchmarking approaches in Section 2 and discuss their strengths and shortcomings. Section 3 introduces our general experimental framework that we use for all experiments conducted as part of this article. In Section 4, we show the practical implications of applying different process synchronization methods and also present our novel clock synchronization algorithm. Section 5 takes a closer look at factors that may influence the experimental outcome (the run-time of an MPI function). Section 6 describes our method for comparing the performance of MPI libraries in a statistically sound manner. We summarize related work in Section 7 with an emphasis on statistically sound experiments, before we conclude in Section 8.
+
+2 A BRIEF HISTORY OF MPI BENCHMARKING We now give a history of MPI benchmarking. Ever since the first MPI standard was announced in 1995, several MPI benchmark suites have been proposed. Some of the best known MPI benchmark suites are summarized in Table 2. The table includes information about the measures (e.g., min, max) that each benchmark uses to present run-times and which measure of dispersion is provided. It is complemented with the run-time measurement approaches implemented by each benchmark, which are separately summarized in the four pseudocode listings in Table 3. Furthermore, Table 4 details the methods selected by each of the investigated benchmarks for computing and presenting the measured run-times. The data in Table 2 was gathered to the best of our knowledge, since some benchmarks, like the Special Karlsruher MPI-Benchmark (SKaMPI), have been released in many incarnations and some other ones, like the MPIBench, are currently not available for download 1. We therefore also rely on the respective articles describing the benchmarks. mpptest was one of the first MPI benchmarks [5] and was a part of the MPICH distribution. Gropp and Lusk carefully designed mpptest to allow reproducible measurements for realistic usage scenarios. They pointed out common pitfalls when conducting MPI performance measurements, such as ignoring cache effects. In particular,
+
+1. We obtained the source code of MPIBench 1.0beta through private communication.
+
+to ensure cold caches when sending a message, mpptest uses a send and a receive buffer which are twice as big as the cache level that should be “cold”. Then, the starting address of a message to be sent is always advanced in this larger buffer, trying to ensure that the data accessed are not cached. If a starting address does not leave enough space for the message to be sent, it is reset to the beginning of the buffer. At the time of designing mpptest, most of the hardware clocks were coarse-grained and therefore did not allow a precise measurement of one call to a specific MPI function (as this would have often resulted in obtaining a 0). To overcome this problem and to improve the reproducibility of results, mpptest measures the time t of nrep consecutive calls to an MPI function and computes the mean t¯i = t/nrep of these nrep observations. This measurement is repeated k times and the minimum over these k samples is reported, i.e., min1≤ i≤ k t¯i. The SKaMPI benchmark is a highly configurable MPI benchmark suite [9] and features a domain-specific language for describing individual MPI benchmark tests. SKaMPI also allows to record MPI timings by using a window-based pro cess synchronization approach, in addition to the commonly used MPI_Barrier (cf. measurement schemes (MS1) and (MS4) in Table 3). SKaMPI reports the arithmetic mean and the standard error of the run-times of MPI functions. It uses an iterative measuring process for each test case, where a test is repeated until the current relative standard error is smaller than a predefined maximum. MPIBlib by Lastovetsky et al. [3] works similarly to SKaMPI, as it computes a confidence interval of the mean based on the current sample. It stops the measurements when the sample mean is within a predefined range (e.g., a 5 % difference) from the end of a 95% confidence interval. MPIBlib implements multiple methods for computing the sample mean, as shown in schemes (PS2) and (PS4) in Table 4. It also provides an additional scheme that measures the run time on the root process only, but which we omitted for reasons of clarity. mpicroscope [4] and OSU Micro-Benchmarks [7] per form repeated measurements of one specific MPI func tion for a predefined number of times. They report the minimum, the maximum, and the mean run-time of a sample. mpicroscope attempts to reduce the number of measurements using a linear (or optionally exponential) decay of repetitions, i.e., if no new minimum execution time in a sample of nrep consecutive MPI function calls was found, the remaining number of repetitions is decreased. The Intel MPI Benchmarks [1] use a measurement method
+
+Table 3 Measurement schemes (MS) for blocking MPI collectives found in different MPI benchmarks. In scheme (MS4), depending on the implementation, Get_Time returns the local time (measured with MPI_Wtime or RDTSC) or a logical global time.
+
+| (MS1) MPIBlib, OSU | SKaMPI, MPIBench, mpicroscope, Micro-Benchmarks | NBCBench, |  | (MS2) Intel MPI Benchmarks, mpptest |  | (MS3) Phloem | MPI Benchmarks |  | (MS4) | SKaMPI, NBCBench |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1: for 2: 3: 4: 5: 6: l s_time[obs] // | 1 in to obs MPI_Barrier l s_time[obs] execute MPI l e_time[obs] += t OSU Micro-Benchmarks | do nrep MPI_Wtime = function MPI_Wtime = l e_time[obs] | - | MPI_Barrier 1: // MPI_Wtime 2: = s_time 1 3: in to for obs nrep 4: execute MPI function MPI_Wtime 5: = e_time 6: = t (e_time s_time)/nrep − | or omitted do | MPI_Barrier 1: 2: = s_time 3: for obs 4: execute MPI_Barrier 5: 6: = e_time 7: = t (e_time | MPI_Wtime 1 in to do nrep MPI function // MPI_Wtime s_time)/nrep − | or omitted | SYNC 1: CLOCKS() DECIDE 2: on start_time 1 3: in to for obs 4: WAIT_UNTIL(start_time l 5: s_time[obs] 6: execute l 7: e_time[obs] | and do nrep = GET_TIME() MPI function = GET_TIME() | win_size + win_size) obs · |
+|  |  |  | Commonly | used data processing | schemes | Table (PS) for benchmarking | 4 | blocking collective | MPI operations. |  |  |
+|  | (PS1) | SKaMPI |  | (PS2) MPIBlib, | mpicroscope |  | Micro-Benchmarks | (PS3) OSU |  | (PS4) MPIBlib |  |
+| 1: for 2: REDUCE 3: each l max[obs] SORT(l 4: l 5: t= 6: print | 1 in to obs l t_local[obs] nrep process MAXp(l = max) l max[ nrep/4 MEANnrep/2(l | do nrep l = e_time[obs] local on root: t_local p : (nrep t), | l - s_time[obs] run-times from [obs]) - nrep/4)] STDEVnrep/2(l | 1: in for obs l 2: t_local[obs] REDUCE 3: each process l max[obs] MEANnrep(l 4: print MEANnrep(l print t) MAXnrep(l | 1 to do nrep l = e_time[obs] local run-times nrep on root: t_local MAXp(l [obs]) = p CInrep(l max), max), mpicroscope max) // | l - s_time[obs] from max) // MPIBlib MINnrep(l max), | 1: local_time REDUCE 2: each min_lat max_lat mean_lat 3: print max_lat | = t/nrep local_time process to root: = MINp(local_time) = MAXp(local_time) = SUMp(local_time) / nrep mean_lat, min_lat, | l 1: from 2: for 3: process 4: 5: print | NORMALIZE_TIMES(l global= 1 in to obs nrep REDUCE l to root: l max_gl[obs] l l t[obs] = max_gl[obs] MEANnrep(l | e_time) do global[obs] from each global MAXp(l = [obs]) p l - s_time[obs] CInrep(l t), t) |
+|  |  |  |  |  |  |  |  |  |  |  |  |
+|  | (PS5) | MPIBench |  | (PS6) | NBCBench |  | (PS7) Intel Phloem | MPI Benchmarks, MPI Benchmarks |  | mpptest (PS8) |  |
+| l 1: s_time= l 2: e_time= GATHER 3: cess 4: for 5: 6: 7: l 8: t= 9: print | NORMALIZE_TIMES(l NORMALIZE_TIMES(l l e_time, on into root 1 in rank in for obs = i (rank t l final[i] REMOVE_OUTLIERSp· MIN(l t), | s_time l e_time l final to do p 1 to nrep 1) − e_time l = final MAX(l | s_time) e_time) from each s_time l , final do + nrep obs · s_time l [i] - [i] final t nrep(l final) MEAN(l t), t) | 1: in for obs l 2: t_local[obs] pro OP(l 3: = t // OP ∈ GATHER median}4: t l into t MAXp(l 5: max= max t 6: print | 1 to do nrep l = e_time[obs] t_local) min, max, mean, { from each process t t) | l - s_time[obs] on root | GATHER 1: on root 2: print MEANp(l | average times l process into MINp(l MAXp(l t), t) | BROADCAST t 1: t cess 2: collect t), repetitions scheme | t MINreps(t) of | from the pro root over several the measurement |
+
+than some threshold time tthresh are treated as outliers. To compute tthresh, they determine the 99th percentile of the sample, denoted as t99, and then define tthresh = t99 · a for some constant a ≥ 1 (default a = 2). Grove also shows the distribution of run-times obtained when measuring MPI_Isend with different message sizes [10, p. 127]. He highlights the fact that the execution time of MPI functions is not normally distributed.
+
+similar to mpptest, i.e., the time is taken before and after executing nrep consecutive calls to an MPI function. Then, the benchmark computes the mean of the run-times over these nrep consecutive calls for each MPI rank. The final report includes the minimum, maximum, and average of these means across all ranks. The Phloem MPI Benchmarks [8] for MPI collectives measure the total time to execute nrep consecutive MPI function calls and compute the mean run-time for each rank. In addition, the Phloem MPI Benchmarks can be configured to interleave the evaluated MPI function calls with calls to MPI_Barrier in each iteration. Minimum, maximum, and average run-times across MPI ranks are provided upon benchmark completion. Grove and Coddington developed MPIBench [2], which, in addition to mean and minimum run-times, also plots a sub-sample of the raw data to show the dispersion of measurements. They discuss the problem of outlier detection and removal. In their work, the run-times that are bigger
+
+NBCBench was initially introduced to assess the run-time of non-blocking collective implementations in comparison to their blocking alternatives [6]. Later, Hoefler et al. explained how blocking and non-blocking collective MPI operations could be measured scalably and accurately [11]. The authors show that calling MPI functions consecutively can lead to pipelining effects, which could distort the results. To address these problems, they implement a window-based synchro nization scheme, requiring O (log p) rounds to complete, compared to the O (p) rounds needed by SKaMPI, where p denotes the number of processes.
+
+4 Algorithm 1 MPI timing procedure. 1: procedure TIME_MPI_FUNCTION(func, msize, nrep) // func - MPI function // msize - message size // nrep - nb. of observations 2: initialize time array l t with nrep elements 3: for obs in 1 to nrep do 4: SYNC_PROCESSES() // either MPI_BARRIER or window-based sync. 5: l s_time_local[obs] = GET_TIME() 6: execute func (msize) 7: l e_time_local[obs] = GET_TIME() 8: if sync method == MPI_Barrier then 9: for obs in 1 to nrep do 10: l t_local[obs] = l e_time_local[obs] − l s_time_local[obs] 11: MPI_REDUCE(l t_local, l t, nrep, MPI_MAX, root) 12: else 13: normalize l s_time_local, l e_time_localto the global reference clock 14: MPI_REDUCE(l s_time_local, l s_time, nrep, MPI_DOUBLE, MPI_MIN, root) 15: MPI_REDUCE(l e_time_local, l e_time, nrep, MPI_DOUBLE, MPI_MAX, root) 16: for obs in 1 to nrep do 17: l t[obs] = l e_time[obs] − l s_time[obs] 18: if my_rank == root then 19: for obs in 1 to nrep do 20: print l t[obs]
+
+3 EXPERIMENTAL SETUP As the results of this paper heavily rely on the empirical analysis of hypotheses, we first introduce our measurement scheme for blocking, collective MPI functions, the data processing methods applied, and the parallel machines used for conducting our experiments.
+
+3.1 Notation The benchmarks NBCBench and Netgauge are related. For example, Hoefler et al. state the following: “We used our new findings to implement a new benchmark scheme in the benchmark suite Netgauge. The implementation bases on NBCBench [..]” [12]. For that reason, we use NBCBench to refer to the MPI benchmark and Netgauge to the algorithm that synchronizes clocks hierarchically. We use the following notation in the remainder of the article, which we borrowed from Kshemkalyani and Singhal [13]. The clock offset is the difference between the time reported by two clocks. The skew of the clock is the difference in the frequencies of two clocks and the clock drift is the difference between two clocks over a period of time.
+
+3.2 Timing Procedure In the experiments presented in this article, we measure the time for completing a single MPI function using the method shown in Algorithm 1. Before the start of a benchmark run, the experimenter chooses the number of observations nrep (sample size) to be recorded for an individual test, where a test consists of an MPI function, a message size, and a number of processes. Before starting to measure the run-time of an MPI function, all processes need to be synchronized. We examine two kinds of synchronization approaches: (1) the use of MPI_Barrier and (2) the window-based synchro nization scheme. Advantages and disadvantages of each synchronization method will be discussed in more detail in Section 4. Depending on the type of synchronization, we use different ways to compute the time to complete a collective MPI operation, as detailed in Algorithm 1 (lines 8–17).
+
+3.2.1 Completion Time based on Local Times In this case, each MPI process holds an array containing nrep local time measurements (run-times to complete a given MPI function). We apply a reduction operation (max) on that array and collect the results on the root process. Thus, the run-time of an MPI function func using p processes in iteration i, 0 ≤ i ≤ nrep, is given as lt[i] = max0≤ r<p{ lt[i]} . In other words, the run-time of an MPI function is defined as the maximum local run-time over all processes. This run-time computation procedure is typically applied for measurements where processes are synchronized using MPI_Barrier.
+
+3.2.2 Completion Time based on Global Times When globally-synchronized clocks are available, we define the time to complete an MPI operation as the difference between the maximum finishing time and the minimum starting time among all processes. All nrep starting and finishing timestamps from all processes are gathered as vectors on the root node. Then, the root node computes the time of an MPI function func using p processes in iteration i like this lt[i] = max0≤ r<p{ le_time[i]}− min0≤ r<p{ ls_time[i]} . We use this method to compute the completion time in all our experiments in which we employ a clock synchronization method.
+
+3.3 Window-based Process Synchronization SKaMPI [14] was (to the best of our knowledge) the first MPI benchmark suite that used a window-based synchronization strategy to measure the run-time of MPI functions. Its window-based synchronization method works as follows: (1) The distributed clocks of all participating MPI processes are synchronized relative to a reference clock. To this end, each MPI process computes its clock offset relative to a master process (e.g., process 0) to be able to normalize its time to the master’s reference clock. (2) The master process selects a start time, which is a point in time that lies in the future, and broadcasts this start time to all participating processes. (3) Since each process knows the time difference to the master process, all processes are now able to wait for this start time before executing the respective MPI function synchronously. When one MPI function call has been completed, all processes will wait for another future point in time before starting the next measurement. The time period between these distinct points is called a “window”. This synchronization method shown in scheme (MS4) of Table 3 is used for all benchmarking experiments that rely on window-based process synchronization in this paper.
+
+3.4 High-Resolution Time Measurements Hoefler et al. discussed the problem that the resolution of MPI_Wtime is typically not high enough for measuring short time intervals [12]. They therefore use the CPU’s clock register to count the number of processor cycles since reset. More specifically, Netgauge implements a time measurement mechanism based on the atomic RDTSC instruction, which provides access to the TSC register and which is supported by the x86 and x86-64 instruction set architectures (ISA). How ever, several problems can arise when using this mechanism.
+
+First, Hoefler et al. point out that dynamic frequency changes, which are automatically enabled in modern processors, can modify the CPU clock rate and thus compromise the time measurements. Second, in multi-processor systems, CPU clocks are not necessarily synchronized, requiring the processes to be pinned to cores to guarantee valid cycle counter values. This RDTSC mechanism is vulnerable to out-of-order instruction executions supported by most modern proces sors [15], [16]. To overcome this issue, we performed our measurements using the equivalent RDTSCP call, which guarantees instruction serialization, that is, it makes sure that all instructions have been executed when the timestamp counter is read. Unless otherwise specified, we fixed the frequency to the highest available value and pinned each process to a specific core in all our experiments involving RDTSCP-based time measurements. As all our experimental platforms are Linux systems, we checked the TSC-related flags provided by /proc/cpuinfo. On all our systems, the flags constant_tsc and nonstop_tsc were set, indicating that the speed of up dating the TSC register is independent of the current core frequency. Nevertheless, we need to make sure that processes are pinned to cores throughout the measurements to avoid accidentally reading the TSC register of another core.
+
+3.5 Data Processing Most of the benchmarks listed in Table 2 use some form of implicit outlier removal (e.g., taking the minimum time recorded). In addition, many benchmarks perform a number of warm-up rounds to fill caches or to set up communication links. After the initial warm-up phase has completed, the measurements taken are used to compute the final statistics. One problem is that the operating system noise can lead to relatively large variations of the measured run-time at any moment within the benchmark execution. A second problem is that it is hard to estimate how many warm-up rounds are sufficient to reach a “steady state”. To make our benchmark method robust against these two problems, we use Tukey’s outlier filter to remove outliers after all measurements have been recorded [17, p. 126]. When applying this filter, we remove all measurements from the sample that are either smaller than Q1 − 1.5 · IQR or larger than Q3 + 1.5 · IQR. IQR denotes the interquartile range between quartiles Q1 and Q3.
+
+3.6 Parallel Machines The parallel machines used for conducting our experiments are summarized in Table 5. On the TUWien system, we have dedicated access to the entire cluster. The Edel (G5k) system belongs to Grid’5000 2, which features the OAR job scheduler that allows us to gain exclusive access to a set of nodes connected to the same InfiniBand (IB) switch. On VSC-1, VSC-3, and Cartesius (SURFsara), we also made sure that our allocations include dedicated nodes only. However, we have no dedicated access to the switches as in the case of the other two machines.
+
+2. http://www.grid5000.fr
+
+4 MPI PROCESS SYNCHRONIZATION REVISITED Now, we turn our attention to the problem of synchronizing MPI processes, and its implication on performance results. A commonly employed synchronization method for MPI processes is the use of the MPI_Barrier call. The problem is that the completion of MPI_Barrier only ensures that all processes have called this function, but processes can still leave the barrier skewed in time. Depending on the amount of skew and the actual test case, the run-time of subsequent MPI calls can fluctuate considerably. For instance, a process skew of 5 µs introduced by calling MPI_Barrier has more effect on an MPI_Bcast with a message size of 8 Bytes than it has on an MPI_Bcast with 8 KiBytes. Hoefler et al. also point out that a call to MPI_Barrier can influence the collective operation being benchmarked when both operations use the same network [11]. In order to prevent such problems with MPI_Barrier, several MPI benchmarks use a window-based process syn chronization scheme to ensure that all processes start calling a given MPI function at the same time. We will take a closer look at both synchronization methods and discuss their advantages and disadvantages. Then, we will investigate the synchronization quality of MPI_Barrier. Afterwards, we propose a novel clock synchronization method, which combines features of sev eral competitors, namely (1) learning and applying a model of the clock drift and (2) optionally, synchronization in O (log p) steps. Finally, we will examine whether the window-based synchronization methods are competitive with MPI_Barrier.
+
+4.1 MPI Process Synchronization in the Wild The clock synchronization algorithm used in SKaMPI is similar to Cristian’s algorithm [18] and works as follows: one of the p MPI processes is selected as the master process with which all other processes will synchronize. Then, a number of ping-pong messages is exchanged between process pairs, and the processes’ local time is piggy-backed on a ping pong message. Using this approach, the master process can determine the clock differences between itself and each of the other processes. The clock offset computed at the master process is later broadcast to the others, which allows all processes to compute a logical global time. The logical global clock is used to synchronize processes, as shown in Algorithms 7 and 8. A major drawback of SKaMPI’s approach is that it re quires linear time to synchronize distributed clocks. To speed up the clock synchronization, Hoefler et al. implemented a more scalable method, which only requires a logarithmic number of steps to complete (depending on the number of processes). It is used in both NBCBench and Netgauge [12]. Their method outlined in Algorithms 11, 12, and 13 works as follows: the set of processes is divided into two groups: one group (GROUP 1) contains all processes up to the largest rank that is a power of two, and a second group (GROUP 2) contains the remaining processes. The clock synchronization is done in two phases. In the first one, all processes in GROUP 1 synchronize their clocks in a tree-like fashion in log p rounds. In the second phase, each remaining process
+
+Table 5 Overview of parallel machines used in the experiments.
+
+| name nodes | interconnect MPI libraries compilers |
+| --- | --- |
+| 36 2.3 Dual Opteron 6134 @ TUWien 436 2.66 Dual Xeon 5550 @ VSC-1 2000 Dual Xeon E5-2650V2 VSC-3 72 2.27 Dual Xeon E5520 @ Edel (G5k) 64 Dual Xeon E5-2450V2 @ Cartesius (SURFsara) | GHz IB QDR MT26428 NEC MPI/LX 1.2.11 gcc 4.4.7 NEC MPI 1.2.8 MVAPICH 1.9 MVAPICH 2.1a GHz IB QLogic 12200 Intel MPI 4.1 gcc 4.4.7 2.6 @ GHz IB QDR-80 Intel MPI 5 gcc 4.4.7 MVAPICH 2.0a-qlc GHz IB QDR MT26428 MVAPICH 1.9 gcc 4.7.2 2.5 GHz IB Mellanox ConnectX-3 FDR Intel MPI 4.1 gcc 4.4.7 |
+
+process/host id 1 2
+
+[µ s ] 0
+
+0 10 20 30 40 50 time at process 0 [s]
+
+Figure 1. Clock drift between a reference host and six other hosts on TUWien (Exp. details: Appendix C.1).
+
+of GROUP 2 synchronizes its clock with one distinct partner process from GROUP 1 in one additional round. Algorithm 7 shows the pseudocode of SKaMPI’s method to determine the clock offsets between two processes. SKaMPI synchronizes the clock of each process with the clock of the root node in O (p) steps (cf. procedure COM PUTE_AND_SET_CLOCK_OFFSETS in Algorithm 8). Hoe fler et al. showed how the time to compute these clock offsets can be reduced by using a tree-like synchronization process [12] (see Algorithms 11 and 12). The benchmarking methods proposed in SKaMPI and NBCBench rely on a periodic re-adjustment of the window size to cope with run-times that are too large to fit into the synchronization window. Further, they implement a minimal re-synchronization mechanism that broadcasts a new point in time used for synchronizing processes for each new experiment (e.g., for a different message size to be benchmarked). However, neither SKaMPI nor NBCBench implement a re-synchronization of the distributed clocks to counterbalance the clock drift, cf. Algorithms 10 and 14. Jones and Koenig proposed a clock synchronization method that takes the clock drift between distributed pro cesses into account [19]. Their method is based on the assumption that the clock drift is linear in time. Each process learns a linear model of the clock drift by exchanging ping-pong messages with a single reference process. After computing the linear model of the clock drift (using a linear regression), each process can determine a logical global time by adjusting its local time relative to the time of the reference process. In the ping-pong phase, local times are exchanged between each process and the reference process. When processes receive a local timestamp from the reference process, some time has already passed, which is the time for transferring the timestamp message. To account for this delay, the received timestamps are corrected by half of the mean round-trip time (RTT). Jones and Koenig do not further detail how the RTT is obtained, even though the estimation of the RTT could be a source of error.
+
+time [12]. We re-conducted their experiment to examine the clock drift on our current machines, but using a finer resolution than what was done in [12] (we only measure in the range of seconds instead of hours). Figure 1 shows that the maximum clock drift between two hosts of our cluster is about 700 µs (|− 400 µs| +300 µs) after 50 s. Thus, not accounting for the clock drift will lead to highly in accurate window-based measurements, with a drift error in the range of microseconds after only a few seconds of conducting measurements. Hence, a window-based scheme must precisely deal with both clock offset and clock drift.
+
+4.2.1 The Error of the Frequency Estimation As mentioned in Section 3.4, Netgauge supports reading the TSC registers to obtain fine-grained timers. In order to con vert elapsed clock ticks into seconds, the update frequency of the TSC registers is required. Netgauge applies the following method to estimate this frequency: the estimation routine sleeps for a fixed amount of time, in case of Netgauge for 1 s, and measures the number of ticks elapsed in this period. The process is repeated until a minimum number of ticks (given a search time threshold) has been recorded for the fixed-size sleeping period. In this way, Netgauge is able to estimate the update frequency of the TSC register. We were interested in evaluating how accurate Net gauge’s method for estimating the CPU frequency is, and whether it would be beneficial to use it for our benchmarking purposes. We conducted an experiment (see Algorithm 19), in which we called Netgauge’s frequency estimation macro (HRT_CALIBRATE) 100 times on 16 different nodes (each clocked at 2.3 GHz), and recorded the estimated frequency on each core. Figure 2 shows the frequency variation obtained 4.2 Sources of Error for Clock Synchronization In Section 3.3, we have introduced the window-based synchronization scheme to measure the run-time of one MPI function call. As this scheme requires synchronized, dis tributed clocks, we now show some pitfalls when applying this scheme. In the context of MPI benchmarking, Hoefler et al. have shown that two processor clocks are linearly drifting over
+
+0
+
+50
+
+0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15
+
+processor id
+
+H z ]
+
+Figure 2. Differences of clock speeds obtained on 16 nodes (processes) for 100 calls to HRT_CALIBRATE of Netgauge (TUWien, Exp. details: Appendix C.2).
+
+0
+
+250
+
+500
+
+750
+
+1000
+
+0 1 2 3 4 5 6 7 8 9 10 time since synchronization [s] 0 [µ s ]
+
+Calibrated frequency Fixed frequency
+
+Figure 3. Mean clock drift and 95 % confidence intervals for the Netgauge synchronization (16 × 1 processes, 10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.3).
+
+on each of the 16 nodes. The results indicate that for most nodes the estimated frequency variation lies in the range of 10 kHz to 20 kHz, which at first glance suggests that such an estimation method would be reproducible. However, if we analyze the error of this frequency estimation, we obtain a variation of roughly 10 kHz for all cores (which translates to 10− 5 GHz). That means, if we assume that a processor runs at a fixed clock frequency of 2.3 GHz, then the error is 10− 5 2.3 ≈ 4.3 · 10− 6. Consequently, applying this frequency estimation method in the context of MPI benchmarking results in an inherent timing error of 1 µs per second.
+
+We also examined whether this error could be reduced when using a fixed clock frequency to convert clock ticks obtained from RDTSC/RDTSCP into seconds. We therefore compared the clock drift of Netgauge using its original frequency estimation to the clock drift with a fixed frequency (here we fixed it to 2.3 GHz). Figure 3 compares the mean clock drifts over 10 mpirun calls, which were measured for both frequency estimation methods (cf. Algorithm 20). Surprisingly, the clock drifts are significantly different de pending on whether we estimate the clock frequency or not. According to these results, the clock drift after 10 s using Netgauge’s frequency estimation is almost 10 times bigger than when we use a fixed frequency. As a consequence, we have decided to use a fixed clock frequency when converting the clock ticks (obtained from RDTSC) into seconds for our window-based MPI benchmarking scheme.
+
+1 10 20 30 40 bin id of 100 individual runs
+
+MPI Barrier Netgauge SKaMPI
+
+MPI Bcast, 8192 Bytes, window size 300 µs
+
+Figure 4. Drifting run-times of MPI_Bcast (mean + CI) using Net gauge and SKaMPI synchronization methods compared to the results obtained with MPI_Barrier (8192 Bytes, 32 × 16 processes, 4000 mea surements, 1 call to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.4).
+
+## 4.2.2. The Error of Accounting for the Clock Offset only
+
+Now, we examine how accurately the clock synchronization schemes of Netgauge and SKaMPI work in practice. We designed an experiment that measures the individual run times of 4000 consecutive calls to MPI_Bcast using 512 pro cesses (distributed over 32 compute nodes). The process synchronization between calls to MPI_Bcast is either done by using an MPI_Barrier call or by applying the window based schemes implemented in Netgauge or SKaMPI with a fixed window size. Figure 4 shows the development of the mean run-time of MPI_Bcast over time. For presenta tion purposes, we binned every group of 100 consecutive, individual measurements and only plotted the bin means and their confidence intervals. As expected, the run-time of MPI_Bcast stays relatively stable when synchronizing with MPI_Barrier (as this process synchronization method is independent of the clock). However, the binned run times increase over time when a window-based scheme is applied. The underlying problem is that neither Netgauge nor SKaMPI consider the clock drift when synchronizing clocks. Instead, both benchmarks “only” determine the clock offset between processes. In conclusion, we contend that clock synchronization schemes need to consider the clock drift when computing the logical global clock.
+
+## 4.3. Accounting for the Clock Drift and Offset
+
+Jones and Koenig propose a method to synchronize dis tributed clocks while considering the clock drift and the clock offset [19]. Their goal was to have accurately synchronized clocks for implementing co-scheduling algorithms of parallel applications and tracing functionality in the MPI domain. Algorithm 15 presents the clock synchronization method proposed by Jones and Koenig. The idea is to learn a linear model of the clock drift between a process and the reference process. The algorithm of Jones and Koenig relies on two parameters. N_FITPTS specifies how many points (a fitpoint is a tuple containing a reference clock timestamp and a clock offset) will be recorded as input for the linear regression analysis. N_EXCHANGES denotes the number of ping-pong messages exchanged between a pair of processes to obtain
+
+Algorithm 2 HCA clock synchronization.
+
+p - number of processes r - current process rank (0 to p − 1) lm - linear model of the current process (defined by a slope and an intercept) to adjust the local clock to the reference time of root l model - array of p linear models l model[0] = (0, 0) // reference clock hierarchical_intercepts - if defined, compute intercepts hierarchically (instead of directly between each r and root) start_time - next window start time, updated after each sync initial_time - local timestamp used to adjust the local clock to the time 0 of the synchronization start maxpower = 2b log2pc 1: procedure SYNC_CLOCKS(N_FITPTS, N_EXCHANGES) 2: initial_time = GET_TIME() // compute linear models of each clock’s drift relative to root 3: SYNC_CLOCKS_POW2(N_FITPTS, N_EXCHANGES) 4: SYNC_CLOCKS_REMAINING(N_FITPTS, N_EXCHANGES) // send final linear models from root to each process 5: MPI_SCATTER(l model, 1, T_PAIR_DOUBLE, lm, 1, T_PAIR_DOUBLE, root) #Ifndef hierarchical_intercepts 6: COMPUTE_AND_SET_ALL_INTERCEPTS(lm) #EndIfndef 7: MPI_BARRIER() 8: start_time = GET_ADJUSTED_TIME() + win_size 9: MPI_BCAST(start_time, 1, MPI_DOUBLE, root) a single fitpoint. The entire method works as follows: a process exchanges N_EXCHANGES ping-pong messages with the master process, where each message carries the local time of a process. The remote process computes the time difference between its local time and the local time of the reference process. Since these measured clock offsets have a relatively large variance on many networks, the process only keeps one of these (N_EXCHANGES many) time differences by selecting the median value. Then, this ping-pong exchange phase between a process and the master (reference) process is repeated N_FITPTS times. Finally, each remote process computes its model of the clock drift relative to the master process by fitting a linear regression model to the recorded clock offsets (time differences). In addition, since each of the measured clock offsets needs to be corrected by rtt/2 to account for the network latency, we present our method for estimating the RTT between two processes in Algorithm 17. Once the clock drift model is established, each measured local time can be normalized to the reference time of the master process by applying a drift correction, as shown in Algorithm 16.
+
+4.4 HCA Algorithm for Clock Synchronization We want to combine the advantages of the synchronization algorithm developed by Jones and Koenig (JK) with the synchronization scheme applied by Netgauge. We propose a novel algorithm that synchronizes distributed clocks in a hier archical way, but also takes the clock drift into account. Jones and Koenig already noted in their article that they had chosen a O (p) scheme for better accuracy, “whereas a balanced O (log p) scheme may complete in milliseconds with higher variance (owing to the multiple reference stratums)” [19]. We still want to explore the possibility of applying such a O (log p) scheme to improve the scalability of the original algorithm of Jones and Koenig. Algorithm 3 shows the pseudocode of our novel algo rithm called HCA (for Hunold and Carpen-Amarie). The Algorithm 3 Hierarchical linear models of the clock drift.
+
+1: function GET_ADJUSTED_TIME 2: return GET_TIME() - initial_time 3: procedure SYNC_CLOCKS_POW2(N_FITPTS, N_EXCHANGES) // compute linear models of the clock drifts for processes with // indices between 0 and (maxpower − 1) 4: round = 1 5: if r ≥ maxpower then return 6: while 2 round ≤ maxpower do 7: if (r mod 2 round) == 0 then // process with reference clock 8: client = r + 2 round− 1 9: rtt = COMPUTE_RTT(r, client) 10: LEARN_MODEL_HCA(N_FITPTS, N_EXCHANGES, rtt, r, client) #Ifdef hierarchical_intercepts 11: COMPUTE_AND_SET_INTERCEPT(NULL, client, r) #EndIfdef // receive linear models collected by the client 12: MPI_RECV(l model client , 2 round− 1, T_PAIR_DOUBLE, client) 13: l model[client] = l model client [0] // save client model 14: for i in 1 to (2 round− 1 − 1) do // compute resulting models 15: l model[client + i] = MERGE_LMS(l model[client], l model client [i]) 16: else if (r mod 2 round) == 2 round− 1 then // client 17: p_ref = r − 2 round− 1 18: rtt = COMPUTE_RTT(p_ref, r) 19: l model[r] = LEARN_MODEL_HCA(N_FITPTS, N_EXCHANGES, rtt, p_ref, r) #Ifdef hierarchical_intercepts 20: COMPUTE_AND_SET_INTERCEPT(l model[r], r, p_ref) #EndIfdef // send all new linear models to the reference process 21: MPI_SEND(l model[r], 2 round− 1, T_PAIR_DOUBLE, p_ref) 22: round = round + 1 23: procedure SYNC_CLOCKS_REMAINING(N_FITPTS, N_EXCHANGES) // compute linear models of the clock drifts for processes with // indices between maxpower and (p − 1) 24: if maxpower == p then return 25: if r < p − maxpower then // process with reference clock 26: client = r + maxpower 27: rtt = COMPUTE_RTT(r, client) 28: LEARN_MODEL_HCA(N_FITPTS, N_EXCHANGES, rtt, r, client) #Ifdef hierarchical_intercepts 29: COMPUTE_AND_SET_INTERCEPT(NULL, client, r) #EndIfdef 30: else if r ≥ maxpower then // client 31: p_ref = r − maxpower 32: rtt = COMPUTE_RTT(p_ref, r) 33: lm = LEARN_MODEL_HCA(N_FITPTS, N_EXCHANGES, rtt, p_ref, r)
+
+#Ifdef hierarchical_intercepts 34: COMPUTE_AND_SET_INTERCEPT(lm, r, p_ref) #EndIfdef 35: sub_comm = create communicator comprising process ranks (0, maxpower, maxpower + 1, . . . , p − 1) 36: if r == root then 37: MPI_GATHER(lm, 1, T_PAIR_DOUBLE, 38: tmp_lm, 1, T_PAIR_DOUBLE, root, sub_comm) 39: for j in 0 to (p − maxpower − 1) do 40: q = maxpower + j 41: l model[q] = MERGE_LMS(l model[j], tmp_lm[j + 1]) 42: else if r ≥ maxpower then 43: MPI_GATHER(lm, 1, T_PAIR_DOUBLE, 44: tmp_lm, 1, T_PAIR_DOUBLE, root, sub_comm) 45: procedure COMPUTE_AND_SET_ALL_INTERCEPTS(lm) // compute intercepts for the model lm of the current process r 46: if r 6 = root then 47: COMPUTE_AND_SET_INTERCEPT(lm, r, root) 48: else 49: for i in 0 to (p − 1) s.t. i 6 = root do 50: COMPUTE_AND_SET_INTERCEPT(lm, i, root)
+
+computational structure of HCA works similarly to the algorithm described by Hoefler et al. [12]. The difference, however, is that instead of determining only the clock offset of each process relative to the root, HCA computes a linear model of the clock drift of each process to obtain a global clock. The algorithm synchronizes clocks in two steps. In the
+
+9 Algorithm 4 Clock drift model for a pair of processes. 1: function LEARN_MODEL_HCA(N_FITPTS, N_EXCHANGES, rtt, p1, p2) 2: slope = 0, intercept = 0 3: if my_rank == p1 then // process with reference clock 4: for idx in 0 to N_FITPTS − 1 do 5: for i in 0 to N_EXCHANGES − 1 do 6: MPI_RECV(tdummy, 1, MPI_DOUBLE, p2) 7: tremote = GET_ADJUSTED_TIME() 8: MPI_SEND(tremote, 1, MPI_DOUBLE, p2) 9: else if my_rank == p2 then // client process 10: for idx in 0 to N_FITPTS − 1 do 11: for i in 0 to N_EXCHANGES − 1 do 12: MPI_SEND(tdummy, 1, MPI_DOUBLE, p1) 13: MPI_RECV(tremote, 1, MPI_DOUBLE, p1) 14: local_times[i] = GET_ADJUSTED_TIME() 15: l diff[i] = local_times[i] − tremote − rtt/2 16: l diff = SORT(l diff) 17: yfit[idx] = COMPUTE_MEDIAN(l diff) 18: idx_median = i s.t. (0 ≤ i < N_EXCHANGES & l diff[i] == yfit[idx]) 19: xfit[idx] = local_times[idx_median] 20: slope, intercept = LINEAR_FIT(xfit, yfit, N_FITPTS) 21: return NEW_LM(slope, intercept) 22: procedure COMPUTE_AND_SET_INTERCEPT(lm, client, p_ref) // compute the intercept using the SKaMPI method 23: if r == client then 24: diff = SKAMPI_PINGPONG(client, p_ref) 25: diff_timestamp = GET_ADJUSTED_TIME() 26: lm.intercept = lm.slope · (− diff_timestamp) + diff 27: else if r == p_ref then 28: diff = SKAMPI_PINGPONG(client, p_ref)
+
+29: function MERGE_LMS(lm1, lm2) 30: new_lm.intercept = lm1.intercept + lm2.intercept − lm2.intercept · lm1.slope 31: new_lm.slope = lm1.slope + lm2.slope − lm1.slope · lm2.slope 32: return new_lm first step, the clock drifts of processes with ranks smaller than the largest power of two (0, . . . , 2b log2 pc − 1) are estimated in function SYNC_CLOCKS_POW2 of Algorithm 3. Then, in the second step, the remaining processes with larger ranks (≥ 2b log2 pc) compute their linear models of the clock drift with respect to the already synchronized processes in one additional round (cf. SYNC_CLOCKS_REMAINING function). The major difference to the synchronization method found in Netgauge is the call to LEARN_MODEL_HCA, which determines the model of the clock drift between two processes (Algorithm 4). The parameters N_FITPTS and N_EXCHANGES play the same role as in the algorithm of Jones and Koenig. Further, we use the same RTT estimation function as we did for the JK synchronization, which is presented Algorithm 17. In the case of Netgauge, intermediate clock offsets are summed up in a tree-like fashion to compute the offset of each process relative to the reference root node. To similarly build linear models of the clock drift, we needed to solve the problem of combining linear regression models. More formally, let us assume we have three processes located on different hosts called p1, p2, and p3, such that each process has its own clock. If the clocks of hosts p1 and p2 have an offset of diffp1,p2, and the clocks of p2 and p3 have an offset of diffp2,p3, the clock offset between p1 and p3 can be computed as diffp1,p3 = diffp1,p2 + diffp2,p3.
+
+Therefore, we apply a similar transitive computation to combine linear regression models to obtain the clock drift between different processes. If the clock drifts are computed in one round for process pairs (p1, p2) and (p2, p3), the question becomes: how should these two linear models be combined such that p3 can obtain its clock drift with respect to p1? Let us denote the model of the clock drift of p2 relative to p1 as t 2→ 1(t1) = t1 − t2 = s 2→ 1t1 + i 2→ 1. Similarly, the clock drift of p3 relative to p2 is given as t 3→ 2(t2) = t2 − t3 = s 3→ 2t2 + i 3→ 2. The computation of the clock drift between p3 and p1 is shown in Equation 1 and implemented in MERGE_LMS (cf. line 29 of Algorithm 4).
+
+t 3→ 1 (t1) = s 3→ 1 t1 + i 3→ 1 = t1 − t3 = s 2→ 1 t1 + i 2→ 1 + s 3→ 2 t2 + i 3→ 2
+
+= s 2→ 1 t1 + i 2→ 1 + s 3→ 2 (t1 − s 2→ 1 t1 − i 2→ 1 ) + i 3→ 2 = t1(s 2→ 1 + s 3→ 2 − s 2→ 1 s 3→ 2 ) + i 2→ 1 − s 3→ 2 i 2→ 1 + i 3→ 2 .
+
+To estimate the error of the computed linear model of the clock offset as a function of time, we conducted a statistical analysis for each pair of processes. We performed an experiment in which, for 15 pairs of processes running on different nodes, we measured 1000 fitpoints. We estimated the confidence intervals of both the slope and the intercept of each process pair. In the case of the slope, the length of the confidence interval is at most 2 × 10− 8, whereas the intercept computation revealed much wider confidence intervals, in the order of 100 ms. The consequence of these larger intervals is that the intercept computed with a linear regression analysis will decrease the accuracy of the initial clock offset with a high probability. Thus, the global clock error will increase over time. To minimize the impact of the intercept error, we do not use the intercepts computed with a linear regression analysis. Instead, we have explored two approaches that appeared to be promising for computing the intercepts of the clock drift. Both approaches rely on SKaMPI’s method for determining the clock offset between two processes at a given point in time (SKAMPI_PINGPONG). The intercepts can be obtained by measuring the clock offset between two processes and then using the already computed slope to find the intercept of the linear clock model (COMPUTE_AND_SET_INTERCEPT of Algorithm 4). The reason why we have selected the SKaMPI method for computing the offset is that it provided us with the lowest initial clock offset values, as it will be shown in the first experiment in Section 4.5. The first approach is to compute the intercepts in O (p) rounds after completing the hierarchical computation of the clock models, which only requires O (log p) rounds. We employ SKaMPI’s clock synchronization to measure the clock offset between the root and each of the other p− 1 processes as shown in function COMPUTE_AND_SET_ALL_INTERCEPTS. The advantage is that the intercept is measured for each clock model separately. Thus, the intercept error only depends on the accuracy of a single SKaMPI synchronization and on the error of the slope, which was found to be very small (10− 8). The second approach is to compute the intercepts during the hierarchical computation of the clock model in O (log p) rounds. This algorithmic option is enabled by defining the SKaMPI synchronization point measured offset
+
+adjusted intercept -179.15582980 -179.15582975 -179.15582970 -179.15582965
+
+0.0 0.1 0.2 0.3 0.4 0.5 time [s]
+
+Figure 5. Adjusting the intercept of the linear model using SKaMPI clock synchronization method after learning the slope of the clock drift.
+
+global variable hierarchical_intercepts. In this case, we measure the clock offset and compute the new intercept by adjusting the offset using the clock model. Then, the intercept obtained from the linear regression is replaced with this new intercept. Here, the SKaMPI method is used to measure the clock offset for a pair of processes in each round. In order to compute the clock model between each process and the root, the linear models are combined hierarchically using Equation (1). The advantage of this method compared to the first approach is its better scalability. The downside is that relying on a combined intercept for the linear model increases the error of the logical global clock. The intercept used in the linear models represents the clock offset at time zero. However, the clocks provided by the system (RDTSC, MPI_Wtime) can start at arbitrary values. For this reason, we use a logical local clock that starts with value zero (by subtracting the initially found timestamp, cf. line 1 of Algorithm 3). Figure 5 depicts our method for obtaining accurate linear models of the drift. First, the fitpoints are measured using timestamps that are adjusted to the initial local time. Next, the slope and the (temporary) intercept are computed using these fitpoints. Then, we re-measure the clock offset at a given point in time (called synchronization point) by applying the SKaMPI approach. Finally, the adjusted (and therefore final) intercept is computed based on the slope and the measured clock offset. We would like to point out that HCA should be consid ered as a general framework to synchronize clocks. In the present paper, we have used the method of Jones and Koenig to compute the clock drift model and SKaMPI’s method to improve the accuracy of the model intercept. However, the concrete implementations of (1) how to obtain the linear model or (2) how to measure the clock offsets can be modified by substituting the functions LEARN_MODEL_HCA and COMPUTE_AND_SET_INTERCEPT, respectively. We now need to estimate the errors introduced by hierarchically combining linear models using HCA. Let s 2→ 1, s 2→ 1 be the confidence interval of the slope (of the clock drift) of process p2 relative to p1, and h i 2→ 1,i 2→ 1 i the confidence interval of the corresponding intercept. The im pact of merging two linear models (according to Equation 1) on the resulting slope and intercept can be computed as follows: s 3→ 1 = s 2→ 1 + s 3→ 2 − max(s 2→ 1s 3→ 2, s 2→ 1s 3→ 2, s 2→ 1s 3→ 2, s 2→ 1s 3→ 2) s 3→ 1 = s 2→ 1 + s 3→ 2 − min(s 2→ 1s 3→ 2, s 2→ 1s 3→ 2, s 2→ 1s 3→ 2, s 2→ 1s 3→ 2) . i 3→ 1 = i 2→ 1 + i 3→ 2 − max(i 2→ 1s 3→ 2, i 2→ 1s 3→ 2,i 2→ 1 s 3→ 2,i 2→ 1 s 3→ 2) i 3→ 1 = i 2→ 1 + i 3→ 2 − min(i 2→ 1s 3→ 2, i 2→ 1s 3→ 2,i 2→ 1 s 3→ 2,i 2→ 1 s 3→ 2)
+
+In the case of the first approach of our algorithm, we are only interested in the errors of merging slopes, as the computed (linear regression) intercepts are disregarded in favor of clock offsets measured with SKaMPI in a linear fashion. The confidence intervals (CIs) of the computed slopes in our experiments on machine TUWien were in the order of 10− 8. The CI of the resulting slope only depends on the initial slopes and increases linearly with the number of performed merge operations due to the negligible resulting slope products. Thus, the error of the slope grows logarithmically in the number of processes when using our hierarchical way of combining linear regression models. Consequently, the merging error will only reach the order of microseconds when the experiment is conducted on 2 100 processes. The second approach of the HCA method relies on hierarchically combining both intercepts and slopes. In our case, the values of the computed slopes are several orders of magnitude smaller than those of the intercepts, as the clocks do not steeply drift apart. Thus, when combining intercepts according to Equation 2, the sum of the initial intercept values will have a major impact on the resulting intercept. The confidence interval of the final intercept will consequently increase linearly with the number of merge operations applied.
+
+4.5 Evaluation of Clock Synchronization Methods To compare the synchronization schemes of SKaMPI and Netgauge (NBCBench) to the competitors, we have extracted the relevant clock synchronization algorithms from their respective benchmarking framework. In particular, it means that we use a fixed window size and disable the dynamic adaptation implemented by SKaMPI and NBCBench. This allows for a fairer analysis of the clock drifts. Furthermore, we rely on scheme (MS4) of Table 3 for measuring run-times. The run-times are based on global times as described in Section 3.2.2. The tuple (N_FITPTS, N_EXCHANGES) needed for HCA and JK is specified in each figure. In the following experiments, we show results obtained for HCA when applying each of the two approaches we previously described. In the case of the first approach, we use a hierarchical way of computing the slopes and the linear way of obtaining the intercepts (O (log p) + O (p) rounds), while the second approach computes both the slope and the intercept hierarchically in O (log p) rounds. The HCA method applying the first approach is simply denoted “HCA” in the legend of all the experiments, whereas the label “HCA2” is used for the second approach. In practice, the estimation of the drift slope using linear regression typically requires many more ping-pong messages 0.00 0.25 0.50 0.75 1.00 1.25 1.50
+
+2 4 8 16 32 # processes [µ
+s
+]
+HCA (1000,100)
+HCA2 (1000,100)
+JK (1000,100)
+Netgauge
+SKaMPI (a) 1 process per node
+
+0 32 64 128 256 512 # processes
+
+HCA (1000,100)
+HCA2 (1000,100)
+JK (1000,100)
+Netgauge
+SKaMPI (b) 16 processes per node Figure 6. Clock offset directly after synchronizing the processes (10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.5).
+
+than the offset computation with SKaMPI for a pair of processes. Thus, p − 1 SKaMPI rounds can be much shorter than O (log p) rounds of the hierarchical slope computation. In our experimental setting (e.g., number of processes), a simple analytic model revealed that the first approach of HCA does not incur a significant run-time overhead compared to the second approach, since the time for obtaining the values for the linear regression is dominating. As a consequence, we only show results for both implementations of the HCA method in this section and only apply the first approach in the remainder of the paper. In our first experiment, we apply each of the previously described synchronization methods to obtain a global clock for every process. Then, we measure the clock offset between the root process and each of the other processes directly after the synchronization phase has been completed. To that end, the root process exchanges a number of ping-pong messages with all other processes and estimates its clock offset relative to the global time computed on each process. Figure 6(a) presents the maximum clock offset measured between any process and the reference process directly after finishing the clock synchronization. We used one MPI process per compute node in this experiment. Let diff j r,root be the clock offset between process r and process root in ping-pong round j (in total nrounds = 10). The maximum clock offset is computed as max0≤ r<p(min0≤ j<nrounds(diff j r,root)) for each synchronization algorithm. Each experiment was repeated 10 times (different calls to mpirun). The graph shows that the clock offset measured directly after synchronizing the clocks with SKaMPI or Netgauge is very small, i.e., we measured an offset of at most 0.2 µs for up to 8 different compute nodes. However, the method of Netgauge leads to significantly larger offsets when the number of processes (and therefore the number of synchronization rounds) increases. The JK synchronization method produces slightly larger clock offsets for a small number of processes (2–16) compared to SKaMPI and Netgauge, due to the inaccuracy of JK’s approach for computing linear models. We also checked how the HCA algorithm compares to the other clock synchronization methods. Figure 6(a) shows that for up to 32 processes (1 process per node), the maximum clock offsets obtained with the first approach of HCA are similar to the offsets yielded by the SKaMPI method. In the particular case of 32 processes, the maximum clock offset is clustered around 0.25 µs, which represents an improvement over all other methods. The second approach of HCA leads to slightly larger offset values, while it still outperforms the method of Jones and Koenig, as well as the method of Netgauge for 32 processes. However, HCA-based clock off sets show an increasing trend with the number of processes, which is a consequence of hierarchically combining linear models. The picture does not change for larger numbers of processes, as shown in Figure 6(b). Here, SKaMPI still syn chronizes the distributed clocks with the highest precision, but the relative difference to JK is smaller. Netgauge, in contrast, will lead to the least synchronized clocks among its competitors for 256 or more processes on our machine, due to its hierarchical way of combining the computed offsets. Both approaches of the HCA method appear to be viable alternatives to SKaMPI, as they result in clock offsets in the same order of magnitude. However, it is important to recall that real clocks are drifting apart, as shown in Figure 1. To evaluate the syn chronization methods in this scenario, we performed another experiment, in which we measured the clock offset over time (clock drift). The root process waits in a loop for a given amount of time (e.g., 1 s) and then measures its clock offset to all other processes. In this way, we can determine how much the logical global time is drifting on each process. Figure 7 presents the clock drift measured for 512 pro cesses on 32 nodes of our 36 node cluster (TUWien). We see that the clock synchronization methods that account for the clock drift (JK and both HCA approaches) are superior to the ones that only compute the initial clock offset to a reference clock (Netgauge and SKaMPI). This experiment also highlights the disadvantage of hierarchically combining linear model intercepts in the case of HCA2, which shows larger clock offsets than HCA for 512 processes. While these results suggest that the method of Jones and Koenig leads to the most precise measurements for long execution times, its synchronization mechanism is slow, as it serializes the computation of linear models. We are therefore interested in understanding the trade-off between the most accurate clock offset that is obtainable and the time it takes to synchronize the processes.
+
+0 2 4 6 8 10 12 14 16 18 20 time since synchronization [s] 0 [µ s ]
+
+HCA (1000,100)
+HCA2 (1000,100)
+JK (1000,100)
+Netgauge
+SKaMPI
+
+Figure 7. Clock drift for 512 (32 × 16) processes after 0, 2, 4, . . ., 20 s (distribution of maximum offsets over 10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.6)
+
+Figure 8 shows the Pareto frontier of the clock offset versus the synchronization time, which visualizes the possi ble configuration choices. We also added the mean time to complete a call to MPI_Barrier as a baseline. It provides an insight on the magnitude of process imbalance when synchronizing measurements through MPI_Barrier calls and a limit to the clock offset that is acceptable for window based synchronization methods to prove useful in bench marking contexts. The figure plots the clock offsets that were measured five seconds after completing each clock synchro nization method. We see that the clock offsets obtained with Netgauge and SKaMPI are relatively large (≈ 80 µs), but both need less than one second to complete. In contrast, the time to complete the clock synchronization phases of JK and HCA depends on the number of sent ping-pong messages needed to compute the regression models. Thus, the parameters number of fitpoints and number of exchanges have a strong influence on the quality of the clock synchronization. Figure 8 indicates that both implementations of HCA are able to synchronize the clocks with a higher precision than what MPI_Barrier can provide, while only requiring at most 10 s to finish the synchronization process. The method of Jones and Koenig, on the other hand, produces even smaller clock offsets, but requires at least 30 s (in the (100, 30) case) to complete.
+
+4.6 A Closer Look at MPI_Barrier So far, we have examined the accuracy of different clock synchronization methods for the window-based bench mark scheme. It remains an open question how much the MPI_Barrier synchronization affects the results. The use of MPI_Barrier for process synchronization is portable but not necessarily reproducible or fair. Every MPI implementation might use a different algorithm to im plement the barrier, with possibly different synchronization characteristics. The advantage of synchronizing processes with MPI_Barrier is that this method is independent of a logical global clock, and thus, subsequently measured run-times will not experience a drift. Further, processes will typically require a shorter waiting time compared to a window-based scheme, which makes the MPI_Barrier benchmarks usually faster to complete a set of experiments.
+
+(100,100) (1000,100)(500,100) (500,20) (500,50) (700,50) (100,100) (1000,100)(500,100) (500,20) (500,50) (700,50) (100,30) (100,50) (200,30) (100,100) 0 0 20 40 60 80 100 120 synchronization duration [s]
+
+0 [µ s ]
+
+HCA HCA2 JK
+
+Netgauge SKaMPI
+
+MPI Barrier run-time
+
+Clock offset vs. sync duration (#fitpoints, #exchanges)
+
+Figure 8. Median clock offset (after 5 s) vs. synchronization phase duration for 512 processes (32 × 16) (10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.8).
+
+Local times Global times
+
+70
+
+80
+
+90
+
+100
+
+110
+
+120 10 20 30 40 10 20 30 40 bin id of 100 individual runs
+
+HCA MPI Barrier
+
+MPI Allreduce, 32768 Bytes, window size 1000µs
+
+Figure 9. Run-time of MPI_Allreduce obtained when using window based synchronization and MPI_Barrier-based synchronization and two different approaches for computing the run-time (32 KiBytes, 16 × 1 processes, 4000 runs, bin size: 100, MVAPICH 2.0a-qlc, VSC-3, Exp. details: Appendix C.9).
+
+However, we need to examine how well the synchronization using MPI_Barrier really works in practice. Typically, MPI benchmarks that use MPI_Barrier to synchronize processes between measurements define the run-time of an MPI function as the maximum local run time measured on each process. The problem with this way of estimating the run-time is that it is assumed that all processes leave MPI_Barrier and enter the MPI call to be benchmarked almost synchronously. When we compared measurements obtained with window-based and MPI_Barrier-based schemes, we en countered cases for which we initially had no explanation. The graph on the left-hand side of Figure 9 shows one of these experiments, where we compare the run-time of MPI_Allreduce obtained with a window-based scheme (in which clocks were synchronized using HCA) to the run-time obtained when synchronizing with MPI_Barrier. The mean run-time of MPI_Allreduce when applying the MPI_Barrier synchronization was about 70 µs (computed by using local run-times), while the same call took approx imately 100 µs using the window-based scheme. As this difference seemed very large, it needed further investigation. We repeated the experiment for MPI_Allreduce, but
+
+IntelMPI 5 MVAPICH 2.0a-qlc 0 5 10 15 0 5 10 15 rank
+
+Figure 10. Synchronization imbalance of MPI_Barrier implementations. Exit times of each process relative to the first process that leaves the barrier (mean of 1000 measurements and 95 % confidence intervals, 16 × 1 processes, one mpirun, HCA synchronization, window size: 100 µs, VSC-3, Exp. details: Appendix C.10).
+
+this time, while we still synchronized processes using MPI_Barrier, we measured global times on each pro cess using our HCA method to normalize local times to the root’s reference clock (cf. Section 3.2.2). The chart on the right-hand side of Figure 9 shows the resulting run times of MPI_Allreduce for both synchronization methods (MPI_Barrier and window-based with HCA), where all times were obtained using globally-synchronized clocks. Now, the resulting run-times are much closer and their difference can reasonably be explained by the way the two synchronization schemes work. Nevertheless, we still need to explain the gap between the observed run-times when we switch from local to global times to determine the overall run-time. Ideally, both run time computation methods should lead to similar results. Therefore, we investigated the skew of MPI processes when they exit the MPI_Barrier function. For this purpose, we applied the HCA method to synchronize clocks and recorded the global timestamp of each process at the end of the MPI_Barrier call. The results of this experiment are shown in Figure 10. The graphs compare the process skew after completing MPI_Barrier, measured with Intel MPI 5 (left) and MVAPICH 2.0a-qlc (right). Surprisingly, a call to MPI_Barrier using MVAPICH 2.0a-qlc resulted in a large process skew. In particular, the mean exit times between process 0 and process 15 differed by more than 40 µs. This finding directly explains why the measurements in the previous experiment (cf. Figure 9) showed such a large difference in run-time. The experiments discussed here only indicate the po tential impact of using MPI_Barrier to synchronize pro cesses on MPI benchmarking results. They are not meant to point out potential performance problems of libraries such as MVAPICH. Therefore, we show results obtained with MVAPICH 2.0a-qlc, which is not the latest version of MVAPICH, but the one that was pre-installed on the system and for which we experienced this significant process skew. Last, we would like to demonstrate how misleading the run-time measurements can be when the experimenter relies on MPI_Barrier for process synchronization. Figure 11 compares the normalized run-times of MPI_Bcast obtained with either an external benchmark-provided dissemination barrier (cf. [20]) or the barrier implementation provided by
+
+Dissemination barrier MPI Barrier 0.50 0.75 1.00 1.25 1.50
+
+2
+6
+2
+7
+2
+8
+2
+9
+2
+10
+2
+11
+2
+12
+2
+13
+2
+15
+2
+6
+2
+7
+2
+8
+2
+9
+2
+10
+2
+11
+2
+12
+2
+13
+2
+15 message size [Bytes]
+
+r u n t im e Intel MPI 5 MVAPICH 2.0a-qlc
+
+Figure 11. Distribution of normalized median run-times of MPI_Bcast for Intel MPI 5 and MVAPICH 2.0a-qlc, when measurements are synchro nized using a call to MPI_Barrier or an external barrier implementation (16 × 1 processes, 1000 measurements, 10 calls to mpirun, VSC-3, Exp. details: Appendix C.11).
+
+each library. We have executed 10 distinct calls to mpirun, in each of which 1000 measurements were recorded. We compute the median of each sample and normalize the run times for one message size to the median run-time of these 10 medians of MVAPICH 2.0a-qlc. We observe, especially for the smaller message sizes (2 6 Bytes to 2 11 Bytes), that there is no clear winner between Intel MPI 5 and MVAPICH 2.0a qlc when our own barrier implementation is used (left hand side). However, when we employ the library-provided MPI_Barrier implementation for synchronizing processes, we see a significant performance difference between the libraries. In such cases, one could easily draw wrong conclu sions.
+
+4.7 Summary of Distributed Clock Synchronization Methods We have shown that the choice of a clock synchronization method used for MPI benchmarking has tremendous effects on the outcome. The clock synchronization method imple mented by SKaMPI can achieve very accurate timings, but since the logical global clocks are drifting quickly, only a small number of MPI operations can be measured precisely, which of course depends on the length of each MPI function call. In case the experimenter wants to measure for a longer period of time (e.g., several milliseconds or even seconds), the approaches used in SKaMPI and Netgauge simply lead to inaccurate measurements. To overcome this problem, one could start re-synchronizing the clocks after a given amount of time has passed or use a clock synchronization algorithm that accounts for the clock drift. The approach of Netgauge is more scalable than the clock synchronization used in SKaMPI. However, it possesses an increased synchronization error since it combines estimated clock offsets, which themselves entail an error. Additionally, Netgauge uses a heuristic to estimate the CPU frequency, which is a potential source of error. The clock synchronization method of Jones and Koenig accurately synchronizes a set of distributed clocks as it considers the clock drift between processes. Thus, it can be used for measuring MPI functions over a longer time span. This approach could be used if very accurate window-based measurements are required and if the relatively long time for completing the clock synchronization can be tolerated.
+
+Our clock synchronization method, called HCA, can be seen as a trade-off between achieving a higher accuracy for longer runs like JK and providing the speed of Netgauge. It suffers from the same problem as Netgauge, as it combines models with an inherent experimental error. Nevertheless, in our MPI benchmarking setup the HCA algorithm emerged as the best option for process synchronization compared to
+
+MPI_Barrier, SKaMPI, or Netgauge when measurements over longer periods of time (we have tested for up to 20 s) for many processes are needed.
+
+Last, we note that using a library-provided implemen tation of MPI_Barrier may lead to unforeseeable results, as processes can become significantly skewed when they leave MPI_Barrier. The decision whether to rely on
+
+MPI_Barrier should therefore be done after investigating the behavior of the implementation on the given network.
+
+Nevertheless, an MPI benchmark should provide its own
+
+MPI_Barrier implementation for fairly comparing two
+
+MPI libraries.
+
+After examining the MPI benchmarking process, we now turn to characterizing and analyzing the performance data. A good understanding of the performance data is essential for selecting and applying the right statistical test for comparing
+
+MPI alternatives. But for a rigorous statistical analysis, we need a deeper insight into our system and the factors that influence the run-times to be measured. Le Boudec points out that “knowing all factors is a tedious, but necessary task. In particular, all factors should be incorporated, whether they interest you or not” [21].
+
+Hence, we will first examine the shape of sampling distributions of run-time measurements. Then, we will ana lyze potential experimental factors in the remainder of this section. However, we decided to exclude “obvious” factors of MPI performance experiments, such as the communication network, the number of processes, and the message size.
+
+## 5.1. Sampling Distributions of MPI Timings
+
+To apply a statistical hypothesis test, we need to make sure that all its assumptions are met. For example, many tests assume that the data follow a specific probability distribution, e.g., the dataset is normally distributed. We now examine the experimentally obtained distributions of MPI function run-times.
+
+We first ran a large number of MPI experiments to investigate various sampling distribution of MPI timings.
+
+The experiments were conducted for several MPI functions such as MPI_Bcast, MPI_Allreduce, MPI_Alltoall, or MPI_Scan. Figure 12 shows the distribution of run-times for 10 000 calls to MPI_Scan with a payload of 10 000 Bytes and to MPI_Allreduce with a payload of 1000 Bytes, both for 16 processes (one process per node). We used a kernel density estimator (density in R) to obtain a visual representation of the sampling distribution. The figure indicates that the sampling distributions are clearly not normal, and interest ingly, in both distributions we can see two distinct peaks.
+
+The peak on the right is much smaller, but it appears in many of the histograms for small execution times (less than 200 µs).
+
+MPI Scan, 16x1 procs, 10 000 Bytes runtime [µs] 80 90 100 110 120
+
+0 . 0 0 . 0 0 . 1 .
+1
+5 MPI Allreduce, 16x1 procs, 1000 Bytes
+
+runtime [µs] 20 30 40 50
+
+0 . 0
+
+0
+
+0 . 0 0 . 0 0 . 1
+
+Figure 12. Histogram of the time needed to complete a call to MPI_Scan with 10 000 Bytes (left) and to MPI_Allreduce with 1000 Bytes (right) on
+
+TUWien (MPI_Barrier synchronization, NEC MPI 1.2.8, Exp. details:
+
+Appendix C.14).
+
+MPI Allreduce, sample size: 30 sample mean [µs] 20 25 30 35 40
+
+0 . 0
+
+0
+
+0 . 1
+
+0
+
+0 . 2
+
+0
+
+-3 -2 -1 0 1 2 3
+
+2 2 2 6 3 0 3 4 Normal Q-Q Plot
+
+Theoretical Quantiles
+
+MPI Allreduce, sample size: 500 sample mean [µs] 20 25 30 35 40
+
+0 . 0 0 . 4 0 . 8 -3 -2 -1 0 1 2 3
+
+2
+
+9 . 0
+
+3
+
+0 . 0
+
+3
+
+1 . 0
+
+Normal Q-Q Plot
+
+Theoretical Quantiles
+
+Figure 13. Distribution of sample means and Q-Q plots when sam pling using different sample sizes from the probability distribution for MPI_Allreduce (cf. Figure 12).
+
+Similar distributions were obtained for experiments with
+
+MPI_Alltoall and MPI_Bcast, as well as on other parallel machines (see Figures 41, 42, and 43 in Appendix D.6).
+
+Since the measured run-times do not follow a normal distribution, we must be careful when computing statistics such as the confidence interval for the mean. The central limit theorem (CLT) states that sample means are normally distributed if the sample size is large enough. In practice, we most often do not know in advance how large the sample size should be such that the CLT holds. Many textbooks, like the books by Lilja [22] or Ross [23], state that a sample size of 30 is large enough to obtain a normally distributed mean. However, Chen et al. [24] report in a recent study that samples need to include at least 240 observations, such that the sample means follow a normal distribution.
+
+We are interested in how many repetitions of a single measurement are needed within one call to mpirun such that the CLT holds for the computed sample mean. To answer this question, we analyzed distributions of sample means by randomly sampling from the set of 10 000 previously measured MPI run-times of MPI_Allreduce (cf. Figure 12). In particular, we drew 500 samples containing 10, 20, . . ., 500 observations each, computed the mean of each sample, and built a histogram of the sample means for each sample size. Figure 13 shows two histograms and their corresponding Q-Q plots for a sample size of 30 and 500. The data provides evidence that a sample size of 30 is not large enough to obtain a normally distributed sample mean. In our particular case, 500 observations were required so that the distribution of sample means was normally shaped. We therefore advise scientists to carefully verify the sample distributions in order to compute meaningful confidence intervals of the sample mean when benchmarking MPI functions. A similar suggestion has been made recently by Hoefler and Belli [25].
+
+5.2 Factor: The Influence of mpirun After taking a closer look at the results of the sampling experiment shown in Section 5.1, we noticed that the sample means were slightly different between calls to mpirun. To investigate the effect of mpirun, we conducted a series of experiments to determine whether distinct calls to mpirun produce different sample means (statistically significant).The experimental setup was the following: We executed 30 dis tinct calls to mpirun and within each mpirun we mea sured each individual run-time of 1000 calls to a given MPI function. Figure 14 presents a subset of the gathered experimental results. The graphs compare the means and their 95 % confidence intervals for 30 distinct calls to mpirun, a given MPI function, and a message size. The data yielded by this experiment provide convincing evidence that the run-time means obtained from distinct calls to mpirun are different. The differences between these means, however, are often not very large (3 %–5 %), yet they are statistically significant. Our finding that different calls to mpirun have a signif icant effect on the experimental outcome is very important for designing MPI benchmarks. As a consequence, it is insufficient for an MPI benchmark to collect MPI run-time measurements only from a single call to mpirun. Instead, several calls to mpirun are required to correctly account for the variance between different calls. The problem of finding out how many calls to mpirun are needed is tightly connected to the statistical hypothesis test to be applied. We discuss this question in more detail in Section 6. Figure 15 (right) shows the distribution of 500 sample means of the run-time of MPI_Allreduce obtained from 500 distinct calls to mpirun. For every call to mpirun, we recorded 1000 run-time measurements and computed their mean. We can observe that the means are normally distributed. If the distributions obtained from different mpiruns are relatively similar, the normality distribution of the means is a consequence of the central limit theorem. However, we cannot formally assume that the computed means are normally distributed, as each mpirun could produce a completely different distribution of run-times. In such cases, we need to check for normality either using the Kolmogorov-Smirnov or the Shapiro-Wilk test [26].
+
+5.3 Factor: Uncontrollable System Noise Several run-time distributions shown so far exhibited a longer tail or a second smaller peak on the right. Thus, it might be possible that subsequent measurements of MPI functions are similar. Then the question becomes whether different measurements, taken in sequence, are independent from each other. This verification of the measurement inde pendence is essential, as virtually all statistical hypothesis tests assume that random variables are independent and identically distributed (iid). If this assumption is violated, statistical measures could be misleading, e.g., the computed confidence interval of the mean could be too small [21, p. 47]. Le Boudec suggests to evaluate the autocorrelation of the experimental data [21]. Consequently, we computed the autocorrelation of our experiments and show some of the results in Figure 16. Autocorrelation is typically used in time-series analysis, and it estimates the correlation between two values of the same variable measured at different times as a function of the time lag between them. In particular, the autocorrelation coefficient 3 at lag h is computed as the ratio of the autocovariance Ch to the variance C0. A significant correlation of measurements in the data can be seen when a line in the lag plot at a specific lag value exceeds the significance level. If all values were chosen randomly, for example from a normal distribution, then individual measurements are uncorrelated. Figure 16(a) shows that the experimental data exhibit a significant correlation between measurements. An immediate consequence is that not all assumptions for applying hypothesis tests hold true as measurements are correlated. One way to remove the correlation is the use of data sub-sampling, as stated by Le Boudec [21]. Indeed, when we sub-sample 1000 observations from the original sample of 10 000 observations, the run-times become uncorrelated as shown in Figure 16(b). When we compare both histograms presented in Figure 16, we can observe that data sub sampling has almost no effect on the sample mean. Hence, we do not apply a sub-sampling strategy in the remainder of the article, but we need to keep in mind that measurements are potentially dependent.
+
+5.4 Factor: Synchronization Method After introducing and discussing several clock synchroniza tion methods in Section 4, we now want to evaluate their effect on MPI benchmarking results. We start by looking at the evolution of run-time measure ments over a longer period of time in Figure 17. This graph compares the run-times of MPI_Allreduce measured using the synchronization method of Jones and Koenig with the ones obtained using an MPI_Barrier. The plot exposes two critical issues when measuring and analyzing MPI perfor mance data. First, we see a significant difference between the mean and median run-times, which we computed for each bin of 10 000 runs. The difference is also present when outliers are removed (using Tukey’s method, cf. Section 3.5). Second, the use of a window-based synchronization method might allow the experimenter to obtain more accurate results.
+
+3. http://www.itl.nist.gov/div898/handbook/eda/section3/ autocopl.htm
+
+1 10 20 30 distinct mpirun 16x1 procs, MPI Bcast, 8192 Bytes (a) TUWien, NEC MPI 1.2.8 0 10 20 30 distinct mpirun
+
+32x1 nodes, MPI Bcast, 2048 Bytes (b) VSC-1, Intel MPI 4.1
+
+31.2 31.6 32.0 32.4 1 10 20 30 distinct mpirun
+
+16x1 procs, MPI Bcast, 8192 Bytes (c) Edel (G5k), MVAPICH 1.9
+
+Figure 14. Mean and 95 % confidence interval of the time to complete a call to MPI_Bcast (with a different size of the payload) for 30 distinct calls to mpirun, using MPI_Barrier for synchronization (Exp. details: Appendix C.12).
+
+1 10 20 30 40 50 60 70 80 90 100 distinct mpirun
+
+30
+
+31
+
+32
+
+33
+
+34
+
+35 0.0 0.5 density
+
+Figure 15. Distribution of mean run-time values of MPI_Allreduce and respective density estimation (16 × 1 processes, 1000 measure ments, 500 calls to mpirun, JK synchronization, window size 1 ms, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.13).
+
+But even with a very precise clock synchronization method, such as the algorithm of Jones and Koenig, the run-times will gradually drift apart over time. Now, we would like to know how the different clock synchronization algorithms compare to each other in terms of clock drift. Figure 18 compares the resulting run-times for MPI_Allreduce with a message size of 8192 Bytes obtained with different synchronization methods. The run-times are computed as medians of bins over 10 experiments, where for each experiment we binned every 100 measurements and computed their means. We can observe that a window-based approach might improve the accuracy of the execution time of MPI functions. For example, in Figure 18, the run-times measured with Netgauge, JK, or HCA are smaller than the ones measured with MPI_Barrier. However, as explained before, the run-times obtained with SKaMPI and Netgauge increase in time. From the experiments shown above, we also see that the differences between the run-times measured with either a window-based or an MPI_Barrier-based scheme are relatively small. For that reason, the practitioner may ask two questions: (1) Is MPI_Barrier good enough to reasonably compare MPI measurements? and (2) How large should the window size be to get accurate measurements for window based synchronization schemes?
+
+In our opinion, question (1) cannot be answered generally as it depends on the actual goal of an experiment and the implementation of MPI_Barrier. If the experimenter seeks to obtain the most accurate timings for short-running MPI functions, the use of a window-based scheme is recom mended. For a fair comparison of MPI implementations, relying on MPI_Barrier may be completely sufficient if the same MPI_Barrier algorithm is used by all of them.
+
+To investigate how large the window size should be in order to achieve a good trade-off between the number of correct measurements and the duration of the entire experiment, we varied the window size and recorded the number of out-of-sync measurements. The implementations of the window-based schemes found in Netgauge and SKaMPI increase the window size when the number of incorrect measurements exceeds some threshold. However, in the experiment shown in Figure 19, we keep the window size constant for comparison reasons. We can see that the percentage of measurements that need to be discarded is similar for all synchronization methods, when we measure the run-time of the MPI_Alltoall function 1000 times. It was also expected that this percentage decreases when the window size is increased as shown in the figure.
+
+Now, one open question remains: How large should the window (size) be? On the one hand, the larger the window size that we select, the more time will elapse, which will result in a larger clock drift. On the other hand, if the window size is too small, we will have to dismiss many measurements. For this reason, Figure 20 compares the mean run-times measured with increasing window sizes for different clock synchronization methods. The figure shows that the run time of MPI_Scan obtained using the HCA synchronization method stays relatively stable regardless of the window size. This is not the case for the clock synchronization methods used in Netgauge or SKaMPI; here, the run-times increase when the window size grows. This behavior is again a consequence of ignoring the clock drift in their clock synchronization methods.
+
+MPI Bcast, 16 procs, 10 000 Bytes runtime [µs] 30 35 40 45 50
+
+0 . 0 0 . 1 0 . 2
+
+0 20 40 60 80 100
+
+-0 . 2 0 . 2 0 . 6 1 . 0
+
+Lag
+
+A F (a) all run-times runtime [µs]
+
+30 35 40 45 50
+
+0 . 0 0 . 1 0 . 2
+
+0 20 40 60 80 100
+
+0 . 0 0 . 4 0 . 8
+
+Lag
+
+A F (b) sub-sample of run-times
+
+Figure 16. Distribution of run-times for MPI_Bcast and the corresponding autocorrelation plot (1000 Bytes, 16 × 1 processes, 1000 runs,
+
+MPI_Barrier synchronization, NEC MPI 1.2.8, TUWien, Exp. details: Appendix C.14).
+
+1 5 10 15 20 25 30 35 40 45 50 bin id of 10 000 individual runs
+
+JK MPI Barrier mean median
+
+MPI Allreduce, 1000 Bytes
+
+Figure 17. Mean and median of run-times of MPI_Allreduce when synchronizing either with the method of Jones and Koenig (window size: 1 ms) or MPI_Barrier (1000 Bytes, 16 × 1 processes, 500 000 runs, bin size: 10 000, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.15).
+
+1 10 20 30 40 bin id of 100 individual runs
+
+HCA (1000,100) HCA2 (1000,100) JK (1000,100)
+
+MPI Barrier NetGauge SKaMPI
+
+MPI Allreduce, 8192 Bytes, window size 500µs
+
+Figure 18. Drifting run-times of MPI_Allreduce (median of 10 experi ments, 8192 Bytes, 32 × 16 processes, 4000 runs, bin size 100, window size: 500 µs, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.17).
+
+## 5.5. Factor: Pinning MPI Processes
+
+It is well-known that the performance of MPI applications might be sensitive to the way processes are pinned to
+
+CPUs, as pinning can influence several performance-relevant properties, such as the cache reuse or the applicability of intra-node communication.
+
+In the context of MPI benchmarking, CPU pinning is certainly required if we want to use the RDTSC instruction to
+
+0
+
+10
+
+20 150 180 200 250 400 600 800 1000 10000 window size [µs]
+
+HCA NetGauge SKaMPI
+
+MPI Alltoall, 8192 Bytes
+
+Figure 19. Percentage of incorrect measurements for MPI_Alltoall (8192 Bytes, 16 × 1 processes, 1000 measurements, 10 calls to mpirun, HCA synchronization, MVAPICH 2.1a, TUWien, Exp. details: Ap pendix C.16).
+
+132
+
+134
+
+136
+
+138
+
+140 150 200 250 400 600 800 1000 window size [µs]
+
+HCA Netgauge SKaMPI
+
+MPI Scan, 8192 Bytes
+
+Figure 20. Impact of the window size on the run-time of MPI_Scan (me dian run-time distribution of 10 calls to mpirun, 8192 Bytes, 16 × 1 pro cesses, 1000 measurements, HCA synchronization, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.16).
+
+measure the run-time, since unpinned processes might result in erroneous results (cf. Section 3.4). Yet, the more general question is: Does pinning affect the execution time of MPI functions?
+
+Figure 21 shows the results of an experiment in which we investigate whether the run-time of an MPI function changes if processes are pinned to CPUs or not (using
+
+MPI_Wtime for time measurements). The figure presents the histograms of run-times for MPI_Allreduce and various message sizes. Each histogram is generated by accumulating all run-time measurements from 10 different calls to mpirun.
+
+We can clearly see a significant difference in the shape of 1000 Bytes 10000 Bytes 4096 Bytes 8192 Bytes
+
+0 0
+
+1000
+
+1500 60 70 80 140 160 180 200 80 90 100 110 120 130 110 130 150 170 run-time [µs]
+
+Pinning No pinning
+
+Figure 21. Pinning effect on the run-time of MPI_Allreduce (256 pro cesses (16 × 16), 1000 measurements, 10 calls to mpirun, MPI_Wtime, HCA synchronization, window size: 1 ms, NEC MPI 1.2.11, TUWien (Exp. details: Appendix C.18).
+
+2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13
+
+message size[Bytes]
+
+O1
+O2
+O3
+
+MPI Allreduce, 16x1 processes
+
+Figure 22. Compiler effect on the run-time of MPI_Allreduce (median run-time distribution of 30 calls to mpirun, 16 × 1 processes, 1000 mea surements, HCA synchronization, window size: 1 ms, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.19).
+
+the histograms and between the mean run-times, which are marked with a vertical line. Even though there could be cases where pinning has no effect on measurements, we have shown that pinning is an experimental factor to be considered in the context of MPI benchmarking.
+
+## 5.6. Factor: Compiler and Compiler Flags
+
+It seems self-evident to consider the compiler and the compiler flags as being significant experimental factors of MPI benchmarking applications. We still need to measure this effect to support our conjecture. We conducted an experiment in which we measured the run-time of a call to MPI_Allreduce with the same version of MVAPICH. We recompiled the entire library (MVAPICH 2.1a) with gcc 4.4.7, but for each experimental run we changed the optimization flag to either -O1, -O2, or -O3. Figure 22 clearly shows that compiling the library using -O3 outperforms the versions with other optimization flags. Even though it seems obvious, our message is this: if an MPI benchmarking experiment does not clearly state the compiler and the compilation flags used, the results will not be comparable or might not even be trustworthy.
+
+2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13
+
+message size[Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, CPU frequency set to 2.3 GHz
+
+100
+
+200
+
+300
+
+2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13
+
+message size[Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, CPU frequency set to 0.8 GHz
+
+Figure 23. DVFS configuration effect on MPI_Allreduce run-times (median run-time distribution of 30 calls to mpirun, 16 × 1 processes, 1000 measurements, HCA synchronization, window size: 1 ms, MVA PICH 2.1a vs. NEC MPI 1.2.11, TUWien, Exp. details: Appendix C.20).
+
+5.7 Factor: DVFS The majority of today’s processors offer dynamic voltage and frequency scaling (DVFS) capabilities to reduce the energy consumption of the chip. Changing the core frequency is therefore an obvious factor for computationally-intensive workloads. In this work, we investigate whether the choice of the DVFS level may alter the run-times of MPI operations. We conducted an experiment on TUWien, in which we compared the run-times of MPI_Allreduce for two different MPI implementations, MVAPICH 2.1a and NEC MPI 1.2.11, and for two different DVFS levels, 2.3 GHz and 0.8 GHz. Figure 23 presents the results of this experiment. The upper graph shows that MVAPICH outperforms NEC MPI for message sizes of up to 2 10 Bytes when all processors are running at a fixed frequency of 2.3 GHz. In contrast, when we change the frequency to 0.8 GHz for all the processors, NEC MPI dominates MVAPICH for all message sizes. Additionally, we see that the individual run-times of MPI_Allreduce increase significantly when reducing the cores’ frequencies. The key observation is that the DVFS level needs to be carefully stated. Two MPI implementations may compare and behave differently depending on the chosen DVFS level.
+
+5.8 Factor: Warm vs. Cold Cache Gropp and Lusk [5] had already named the problem of “ignor[ing] cache effects” among the perils of performance measurements. They pointed out that the time to complete a send or receive operation depends on whether the send and receive buffers are in the caches or not. Therefore, mpptest uses larger arrays for sending and receiving messages, but the offset from where messages are sent or received is
+
+MPI Allreduce, 16x1 processes
+
+Table 6 Experimental factors in MPI benchmarking.
+
+Cold cache Warm cache
+
+| factor | example |
+| --- | --- |
+| MPI implementation network synchronization mpirun compiler / flags DVFS level cache pinning | MVAPICH 2.1a IB QDR MT4036 method window-based scheme clock synchronization: HCA 100 window size: µs 10 distinct calls -O3 gcc 4.3 2.3 GHz no cache control (messages might be cached and reused) -bind-to-core |
+
+2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13 message size[Bytes]
+
+Figure 24. Cold cache vs. warm cache: median run-times for MPI_Allreduce (median run-time distribution of 10 calls to mpirun, 16 × 1 processes, 1000 measurements, HCA synchronization, window size: 1 ms, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.21).
+
+recorded from different calls to mpirun. The second lesson, that we found quite surprising, was that determining which MPI implementation is better for a given case depends on the configuration of the experimental factors. For example, the run-time of MPI_Bcast might be shorter with library A using DVFS level “low”, but library B will provide a faster MPI_Bcast implementation in DVFS level “high”. Of course, our list of examined experimental factors is not exhaustive, and we are aware that other factors could also impact the experimental outcome. One such example is the operating system. Since many of such factors are often uncontrollable, we need to address them statistically. In conclusion, we advise MPI experimenters to carefully list the settings of all experimental factors, besides the obvious factors such as number of processes, message size, and parallel machine. Table 6 is our proposal of a list of experimental factors that, we believe, should be attached to all MPI benchmark data.
+
+changed in a block-cyclic way at every iteration, to reduce the chance that data resides in cache. The influence of caching was shown by Gropp and Lusk using mpptest for measuring the run-time of point-to-point communication. In the present work, we investigate how large the effect of caching is on blocking collective MPI operations. Instead of using buffer-cycling, we implemented another approach: we assume that the size of the last level of data cache, which is private to each core, is known. On current hardware this is often cache level 2. Let the size of this data cache be SLLC Bytes. We allocate an auxiliary buffer bufaux containing SLLC Bytes. Now, we alter our MPI benchmark as follows: we overwrite the entire buffer bufaux (using memset) after each iteration, i.e., when one measure ment of a collective MPI call has been completed. This way we attempt (since we do not know the hardware details) to ensure that our message buffer used for the MPI operation is not cached. The effect of caching is shown in Figure 24, in which we can see that the reuse of message buffers between subsequent MPI calls, in this case MPI_Allreduce, has a significant impact on the run-time. As a result, MPI benchmarks must clearly state whether and how the caching of messages (buffers) is controlled.
+
+6 STATISTICALLY RIGOROUS AND REPRODUCIBLE MPI BENCHMARKING After investigating the factors that may influence results of MPI benchmarks, we now propose a method to compare MPI implementations by using statistical hypothesis testing. Our goal is to establish an experimental methodology that aims to reproduce the test outcome between several experiments. We motivate the need for a more robust evaluation method by showing the results in Figure 25. On the left hand side, we see a comparison between the run-time of MVAPICH and NEC MPI when executing MPI_Allreduce with various message sizes. Each bar represents the mean run time computed for 1000 individual measurements of a single call to mpirun. One might say that such a comparison is fair (due to the large number of repetitions) and we contend this is common practice when analyzing experimental results in the context of MPI benchmarking. However, when we look at the results shown on the right-hand side, the outcome changes significantly. For example, the ratio of mean run times for a message size of 2 1 Bytes has now changed. This observation matches the result of our factor analysis, in which we have discovered that the call to mpirun is an experimental factor (cf. Section 5.2). Therefore, we emphasize again that an MPI benchmark needs to collect data from multiple mpirun calls to be fair and reproducible.
+
+5.9 Summarizing Experimental Factors Our initial goal was to allow a fair and reproducible com parison of the performance of MPI implementations. A well defined experimental design is one requirement to achieve that goal, and therefore, the analysis of experimental factors is of major importance. We have analyzed factors, such as compiler flags or cache control, and evaluated whether they have a significant effect on the experimental outcome. The influence of some factors on the performance measurements was not surprising, for example, we had expected that the DVFS level would affect the run-times. However, the experiments led to two main results: The first lesson we learned was that the execution time of MPI benchmarks varies significantly between calls to mpirun. As a consequence, a reproducible and fair comparison of run-time measurements requires that performance data are
+
+0
+
+2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13 2 14 2 15
+
+message size [Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, run 1
+
+-1.0 -0.5 2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13 2 14 2 15
+
+message size [Bytes] r e l .
+
+H /
+
+I ) 0
+
+2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13 2 14 2 15
+
+message size [Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, run 2
+
+-1.0 -0.5
+
+0.0 0.5 1.0
+
+2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2 10 2 11 2 12 2 13 2 14 2 15
+
+message size [Bytes] r e l .
+
+M V A P
+
+IC
+
+H / N E C M P
+
+I )
+
+Figure 25. Comparison of mean run-times of MPI_Allreduce and different message sizes for two distinct calls to mpirun (16 × 1 processes, 1000 measurements per message size, HCA synchronization with window sizes adapted to each message size, MVAPICH 2.1a vs. NEC MPI 1.2.11,
+
+TUWien, Exp. details: Appendix C.22).
+
+## 6.1. Design of Reproducible Experiments
+
+Our new experimental design for measuring MPI per formance data is shown in Algorithm 5. The procedure BENCHMARK generates the experimental layout and has five parameters, two of them being important for the statistical analysis: (1) n denotes the number of distinct calls to mpirun for each message size, and (2) nrep specifies the number of measurements taken for each message size in each call to mpirun. In total, we measure the execution time of a specific MPI function for every message size n · nrep times. In the procedure BENCHMARK in Algorithm 5, we issue n calls to mpirun, where the number of processes p stays fixed. To respect the principles of experimental design (randomization, replication, blocking) as stated by Mont gomery [27], we randomize the experiment by shuffling the order of experiments within a call to mpirun. The procedure SCAN_OVER_MPI_FUNCTIONS has three parameters: the list of message sizes (lmsize), the list of MPI functions to be tested (lfunc), and the number of observations (nrep) to be recorded for each message size. The procedure creates a list (lexp) containing the experiments covering all message sizes and MPI functions. The order of elements in this list is shuffled before each item (experiment) is executed. The procedure BENCHMARK of Algorithm 5 is executed for each MPI implementation. After the measurement results have been gathered, we apply the data-analysis procedure shown in Algorithm 6. Here, we group run-time measure ments by the message size, the type of MPI function, and the number of processes. We remove statistical outliers from each of these measurement groups. Last, we compute averages (the median and the mean) for each group of measurements and store them in a table. By applying this data-analysis method, we obtain a distribution of averages (medians or Algorithm 5 Design of MPI experiment. 1: procedure BENCHMARK(p, n, l msize, l func, nrep) // p - nb. of processes // n - nb. of mpiruns // l msize - list of message sizes // l func - list of MPI functions // nrep - nb. of measurements per run 2: for i in 1 to n do 3: mpirun -np p SCAN_OVER_MPI_FUNCTIONS(l msize, l func, nrep)
+
+4: procedure SCAN_OVER_MPI_FUNCTIONS(l msize, l func, nrep)
+5: l exp ← ()
+
+6: for all msize in l m do 7: for all func in l func do 8: l exp.add( TIME_MPI_FUNCTION(func, msize, nrep) ) 9: shuffle(l exp) // create random permutation of calls in place 10: for all exp in l exp do 11: call exp
+
+Algorithm 6 Analysis of benchmark data. 1: procedure ANALYZE_RESULTS(l msize, l p, l func, n) // l msize - list of message sizes // l p - list of processes // l func - list of MPI functions // n - nb. of mpiruns
+
+2: for all msize ∈ l msize, p ∈ l p, func ∈ l func do 3: for i in 1 to n do
+4: l t i = { l t[msize][p][func][i][j] for all 1 ≤ j ≤ nrep}5: l t i = remove_outliers(l t i) 6: v[msize][p][func][i] = (median(l t i), mean(l t i)) 7: print v // table with results
+
+means) over n calls to mpirun for each message size, MPI function, and number of processes.
+
+## 6.2. Fair Performance Comparison Through Statistical Data Analysis
+
+Now, the situation is as follows: we run our benchmark on two MPI implementations A and B, perform the data
+
+*** ** *** *** *** *** * *** *** *** * * ** *** ***
+
+2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2
+
+10
+
+2
+
+11
+
+2
+
+12
+
+2
+
+13
+
+2
+
+14
+
+2
+
+15 message size [Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, Wilcoxon, sample size/mpirun: 10 *** *** *** *** *** *** *** *** *** *** *** *** *** *** *** ***
+
+50
+
+2 0 2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2
+
+10
+
+2
+
+11
+
+2
+
+12
+
+2
+
+13
+
+2
+
+14 message size [Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, Wilcoxon, sample size/mpirun: 100
+
+Figure 26. Comparison of the run-time distributions obtained when measuring MPI_Allreduce with a sample size of 10 (left) and 100 (right) per message size. The statistical significance was computed using the WILCOXON TEST (16 × 1 processes, 30 calls to mpirun, HCA synchronization with window sizes adapted to each message size, MVAPICH 2.1a vs. NEC MPI 1.2.11, TUWien, Exp. details: Appendix C.22).
+
+analysis according to Section 6.1, which gives us a distribu tion of averages for each measurement point. The question then becomes: how can we compare the measured results in a statistically sound way? We could reduce all the values from the distribution to a single value using the minimum, the maximum, or the average, and then compare two MPI implementations based on this single value. However, our goal is to provide evidence that a measured performance difference has a high probability of being reproducible and that it is not merely a result of chance. Since we have two averages (the mean and the median) for each measurement group, we have several options for selecting a statistical test. If we use the computed median values as basis for our hypothesis test, we could employ the nonparametric Wilcoxon–Mann–Whitney test (Wilcoxon sum-of-ranks, in the remainder: WILCOXON TEST) for com paring alternatives [28]. The advantage of the WILCOXON TEST (besides being nonparametric) is that it makes no assumption on the underlying distribution; in particular, it “does not require the assumption of normality” [23]. We could also employ the WILCOXON TEST on the distribution of means, but in this case the T-TEST for two independent samples is also a promising candidate. The T-TEST assumes that the underlying population is normally distributed and that the variances of both populations are equal [26]. We first have to make sure that our sample means computed for each mpirun are normally distributed. If the underly ing distributions obtained from each mpirun are similarly shaped, then it is possible that also their means are normally distributed. For example, the Q-Q plot of the mean run-times (Figure 27) suggests that the distribution of means, which was presented in Figure 15 of Section 5.2, is normally shaped. In addition, the Kolmogorov-Smirnov and the Shapiro-Wilk test do not reject the null hypothesis, such that we can assume normality for the distribution of means. However, if the means follow a normal distribution, we also need to verify that the variances are equal. If the homogeneity of variance assumption is violated, several adaptations to the T-TEST have been proposed (cf. [26, p. 458], [17]). One adaptation is the so-called WELCH’S T-TEST that can be applied when two
+
+-3 -2 -1 0 1 2 3
+3
+1
+3
+2
+3
+3
+3
+4
+
+Normal Q-Q Plot
+
+Theoretical Quantiles
+
+Figure 27. Q-Q plot of mean run-times obtained from different calls to mpirun (cf. Figure 15).
+
+samples have unequal variances. In the remainder of our analysis, we use the WILCOXON TEST exclusively. The reason is that the rigorous verification of the distributions of means (over mpiruns) showed that the mean run-times (obtained from mpiruns) are often normally distributed, but unfortunately not all of them. Applying a T TEST in cases in which the means are not normally distributed will not give us the desired statistical confidence, and the test results would be misleading (since the assumptions of the test are violated). We now demonstrate how to apply the WILCOXON TEST to our data and discuss why the test helps us to provide a fair comparison of MPI implementations. Figure 26 shows our statistical comparison method applied to run-times measured for MPI_Allreduce with both NEC MPI and MVAPICH. Let us focus first on the graph on the left of this figure, where we compare the distributions of means recorded for different message sizes. Each distribution contains 30 elements, which are the median run-times measured in each of the 30 calls to mpirun. We apply the WILCOXON TEST
+
+*** *** *** *** *** *** *** *** *** *** *** *** *** *** 2
+0
+2
+1
+2
+2
+2
+3
+2
+4
+2
+5
+2
+6
+2
+7
+2
+8
+2
+9
+
+2
+
+10
+
+2
+
+11
+
+2
+
+12
+
+2
+
+13
+
+2
+
+14
+
+2
+
+15 message size [Bytes]
+
+MVAPICH NEC MPI
+
+MPI Allreduce, Wilcoxon, sample size/mpirun: 100
+
+Figure 28. Comparison of the run-times of MPI_Allreduce while applying the WILCOXON TEST with “less” as alternative hypothesis (16 × 1 processes, 30 calls to mpirun, HCA synchronization with window sizes adapted to each message size, MVAPICH 2.1a vs. NEC MPI 1.2.11, TUWien, Exp. details: Appendix C.22).
+
+on the two distributions of medians for each message size. The test does not only report whether the null hypothesis (both population means are equal) is rejected or not, but it also provides a p-value. To obtain a graphical representation of the p-value and therefore the statistical significance, we represent the p-value by a sequence of asterisks. One asterisk (∗ ) represents a p-value of p ≤ 0.05, two asterisks denote p ≤ 0.01, and three asterisks denote p ≤ 0.001. It also means that if asterisks are absent in a specific case, the null hypothesis could not be rejected, and thus, the statistical test does not provide sufficient evidence which implementation is better. We used a significance level of 0.05 (5 %) for all experiments. When we look at the left graph of Figure 26, in which we applied the WILCOXON TEST, we see that using a hypothesis test can indeed help to separate cases, for which a decision can hardly be made only by looking at the distributions. For example, the differences between the distributions for 2 5 and 2 6 Bytes seem to be negligible. However, the WILCOXON TEST reveals that there is evidence that the sample medians are different in the case of 2 5 Bytes, but not in the case of 2 6 Bytes. The graph on the right of Figure 26 presents the results when applying the WILCOXON TEST with a sample size of 100 per mpirun. It is not surprising that the variances of the distributions of the averages decrease, and thus, a larger sample size helps the hypothesis test to separate averages with a higher significance. The graphs in Figure 26 compare the run-time distribu tions of two MPI implementations and show the statistical results when testing whether the population averages are equal. Yet, in a practical scenario one might rather ask a question like: Is MPI library X faster than library Y for MPI function F? To answer such a question, we change the alternative hypothesis of the test to “less” (null hypothesis: H0 : µA = µB, alternative hypothesis: Ha : µA < µB, where µ denotes the average). Figure 28 presents the results of the same experiments as shown in the bottom right corner of Figure 26, but now we check whether the run-time of MPI_Allreduce is smaller with MVAPICH than with NEC MPI. We see that for the two cases 2 11 and 2 12 Bytes the null hypothesis could not be rejected, and thus, in these cases the run-time of MPI_Allreduce using MVAPICH is not smaller than when using NEC MPI. We note that this result does not immediately imply that NEC MPI is faster than MVAPICH in these cases. To verify this, the test should use the alternative hypothesis “greater”.
+
+6.3 Evaluating the Outcome Reproducibility Until now, we have investigated the factors that potentially influence the benchmarking of MPI functions and have shown how statistical hypothesis tests help us to fairly compare the performance of two MPI libraries. One of our initial goals was to develop a benchmarking method that leads to a reproducible experimental outcome (see Table 1). To examine the reproducibility of our benchmarking method, we conducted the following experiment: We ran our benchmarking method (cf. Algorithm 5) for ntrial=30 times. Each of the ntrial runs gave us one distribution of run-times per message size, which contains n=30 values. Since we obtain a distribution of distributions, we collapse the inner distribution into a single value. To do so, we compute the mean of the n=30 values measured for one message size in each of the ntrial distributions. Then, we normalize the run-time values by computing the ratio of each mean to the minimum mean. We obtain a distribution of ntrial=30 normalized run-time values for our benchmarking method, presented in Figure 29(c). We can observe that the maximum relative difference between the 30 runs is very small (less than 5 % for 2 14 Bytes). As a comparison, we also conducted ntrial=30 runs of the Intel MPI Benchmarks 4.0.2 and SKaMPI 5. We used the stan dard configuration of the two benchmark suites (in particular, we used the default values of the number of repetitions for each message size). We compute the normalized run-time of each measurement for a specific message size as follows: t norm msize,i = tmsize,i/t∗msize , for all i, 1 ≤ i ≤ ntrial = 30, where t∗msize = min1≤ i≤ ntrial (tmsize,i). We can see in Figure 29(a) and Figure 29(b) that the normalized run-times of Intel MPI Benchmarks and SKaMPI exhibit a significantly larger variance for smaller message sizes than our benchmarking approach. The higher variance can be explained by the influence of system noise on experiments with small message sizes. In such cases, an MPI benchmark needs to record a sufficiently large number of repetitions across several calls to mpirun. Unfortunately, the Intel MPI Benchmarks and SKaMPI simply do not implement such reproducibility policies. Overall, we can state that our benchmarking approach notably improves the reproducibility of the performance results compared to the Intel MPI Benchmarks and SKaMPI. The price for a better reproducibility, however, is a longer run-time of the overall benchmark, caused by the need to take into account the clock drift between processes and to record a larger number of measurements per message size.
+
+2 1 2 2 2 3 2 4 2 5 2 6 2 7 2 8 message size [Bytes] (a) Intel MPI Benchmarks 4.0.2 1.0 1.1 1.2 1.3 message size [Bytes]
+
+(b) SKaMPI 5
+
+1.0 1.1 1.2 1.3
+
+2 0 2 2 2 3 2 4 2 5 2 6 2 7 2 8 message size [Bytes] (c) Our method
+
+Figure 29. Distribution of normalized run-times reported by the Intel MPI Benchmarks (left), SKaMPI (center), and our method (right) when testing the performance of MPI_Bcast for various message sizes (16 × 1 processes, HCA synchronization with window sizes adapted to each message size for Figure 29(c), MVAPICH 2.1a, TUWien, Exp. details: Appendix C.23).
+
+The statistically rigorous analysis of experimental data has been the focus of numerous studies over the last years, driven by the need for establishing a fair comparison of algorithms across different computing systems. Vitek and Kalibera contend that “[i]mportant results in systems research should be repeatable, they should be reproduced, and their evaluation should be carried with adequate rigor”. They show that a correct experimental design paired with the right statistical tests is the cornerstone for reproducible experimental results [29]. The authors stress the fact that knowing and understanding the controllable and uncontrollable factors of the experiment is crucial for obtaining sound experimental results. The state of performance evaluation in Java benchmark ing was investigated by Georges et al. [30]. They examined the performance of different garbage collectors for the Java Virtual Machine (JVM). The paper demonstrates that the answer to the question of which garbage collector is faster changes completely depending on the performance values investigated (e.g., mean, median, fastest, etc.). The authors show how to conduct a statistically rigorous analysis of JVM micro-benchmarks. In particular, they explain the need for considering confidence intervals of the mean and show that the Analysis of Variance (ANOVA) can be used to compare more than two alternatives in a sound manner. Mytkowicz et al. dedicated an entire article to the problem of measurement bias in micro-benchmarks [31]. The authors examine the run-time measurements of several SPEC CPU2006 benchmarks, when each benchmark is either compiled with the optimization flag -O2 or -O3. In theory, the programs compiled with -O3 should run faster than the ones compiled with -O2. However, the authors discovered that the resulting performance not only depends on obvious factors such as the compilation flags or the input size, but also on less obvious factors, such as the link order of object files or the size of the UNIX environment. A possible solution is to apply a randomized experimental setup. Please refer to the books of Box et al. [32] and Montgomery [27] for more details on randomizing experiments. Touati et al. developed a statistical protocol called Speedup-Test that can be used to determine whether the speedup obtained when modifying an experimental factor, such as the compilation flag (-O3), is significant [33]. The article presents two tests, one to compare the mean and one to compare the median execution times of two sets of observations. For a statistically sound analysis, they base both Speedup-Test protocols on well-known tests, such as the Student’s T-TEST to compare means or the Kolmogorov Smirnov test to check whether two samples have a common underlying distribution. Chen et al. proposed the Hierarchical Performance Testing (HPT) framework to compare the performance of computer systems using a set of benchmarks [24]. The authors first contend that it is generally unknown how large the sample size needs to be, such that the central limit theorem holds. They show that for some distributions a sample size “[i]n the order of 160 to 240” is required to apply statistical tests that require normally distributed data [24]. Since such a high number of experiments seems infeasible for them, they propose a nonparametric framework to compare the performance improvement of computer systems. The HPT framework employs the nonparametric Wilcoxon Rank-Sum Test to compare the performance score of a single benchmark and the Wilcoxon Signed-Rank Test to compare the scores over all benchmarks. Gil et al. presented a study on micro-benchmarking on the JVM, in which they show that the mean execution times over several JVM invocations may significantly differ [34]. The described effect is very similar to the work presented here, as our micro-benchmark also needs to start an environment (the MPI environment using mpirun), which can affect the mean run-time.
+
+We have revisited the problem of benchmarking MPI func tions. Our work was motivated by the need (1) to fairly compare MPI implementations using a sound statistical analysis and (2) to allow a reproducibility of the experimental results. We have experimentally shown that the clock and process synchronization methods used to benchmark MPI functions have a tremendous effect on the run-time. We have also pointed out that the use of MPI_Barrier can potentially skew processes in such a way that the run-times measured are meaningless. To overcome the problem of synchronizing processes with MPI_Barrier, we have investigated the window-based approach, for which we require globally synchronized clocks. We have shown that it is essential to consider the clock drift between processes when seeking accurate MPI timings. For this reason, the clock synchro nization methods used in Netgauge or SKaMPI—that only determine clock offsets—will introduce a larger run-time error into run-time measurements of MPI functions unless the experiment is very short-lived. We have analyzed experimental factors of MPI experi ments, for example, we have demonstrated that changing the DVFS level or the compiler flags can alter the outcome of the MPI benchmark. However, our most important finding is that a call to mpirun is a factor of the experiment, i.e., different calls to mpirun can produce significantly different means (or medians), even if all other factors and the input data stay unmodified. After investigating the implications and consequences of various synchronization methods and experimental factors, we have proposed a novel MPI benchmarking method. We have shown how to apply hypothesis tests such as the WILCOXON TEST to increase the fairness and the evidence level when comparing benchmarking data. Last, we have demonstrated that our benchmarking method also improves the reproducibility of results in such a way that the measured performance values exhibit a much smaller variance across different experiments compared to other MPI benchmark suites.
+
+We thank Maciej Drozdowski (Poznan University of Tech nology), Peter Filzmoser (TU Wien), Friedrich Leisch and Bernhard Spangl (University of Natural Resources and Life Sciences, Vienna), Jesper Larsson Träff (TU Wien), Alf Gerisch (TU Darmstadt), and Thomas Geenen (SURFsara) for discussions and comments. Experiments presented in this paper were carried out using the Grid’5000 testbed, supported by a scientific interest group hosted by Inria and including CNRS, RENATER and several Universities as well as other organizations (see https://www.grid5000.fr).
+
+## References
+
+[1] “Intel(R) MPI Benchmarks,” http://software.intel.com/en us/articles/intel-mpi-benchmarks. [2] D. A. Grove and P. D. Coddington, “Communication benchmarking and performance modelling of MPI programs on cluster computers,” The Journal of Supercomputing, vol. 34, no. 2, pp. 201–217, 2005. [3] A. L. Lastovetsky, V. Rychkov, and M. O’Flynn, “MPIBlib: Bench marking MPI communications for parallel computing on homo geneous and heterogeneous clusters,” in EuroPVM/MPI, 2008, pp. 227–238. [4] J. L. Träff, “mpicroscope: Towards an MPI benchmark tool for performance guideline verification,” in EuroMPI, 2012, pp. 100–109. [5] W. Gropp and E. L. Lusk, “Reproducible measurements of MPI performance characteristics,” in EuroPVM/MPI, 1999, pp. 11–18. [6] T. Hoefler, A. Lumsdaine, and W. Rehm, “Implementation and performance analysis of non-blocking collective operations for MPI,” in Proceedings of the 2007 ACM/IEEE Conference on Supercomputing (SC). ACM, 2007, pp. 1–10. [7] “OSU MPI benchmarks,” http://mvapich.cse.ohio state.edu/benchmarks/. [8] “Phloem MPI Benchmarks,” https://asc.llnl.gov/sequoia/ benchmarks/. [9] R. Reussner, P. Sanders, and J. L. Träff, “SKaMPI: a comprehensive benchmark for public benchmarking of MPI,” Scientific Program ming, vol. 10, no. 1, pp. 55–65, 2002.
+
+## 6.2. Fair Performance Comparison Through Statistical Data Analysis
+
+[10] D. Grove, “Performance modelling of message-passing parallel programs,” Ph.D. dissertation, University of Adelaide, 2003. [Online]. Available: http://hdl.handle.net/2440/37915 [11] T. Hoefler, T. Schneider, and A. Lumsdaine, “Accurately measuring collective operations at massive scale,” in Proceedings of the 22nd IEEE International Parallel & Distributed Processing Symposium, PMEO’08 Workshop, 04 2008. [12] ——, “Accurately measuring overhead, communication time and progression of blocking and nonblocking collective operations at massive scale,” International Journal of Parallel, Emergent and Distributed Systems, vol. 25, no. 4, pp. 241–258, 2010. [13] A. D. Kshemkalyani and M. Singhal, Distributed Computing: Prin ciples, Algorithms, and Systems, 1st ed. New York, NY, USA: Cambridge University Press, 2008. [14] T. Worsch, R. Reussner, and W. Augustin, “On benchmarking collective MPI operations,” in EuroPVM/MPI, ser. LNCS, no. 2474, 2002, p. 271–279. [15] AMD, “AMD64 Architecture Programmer’s Manual Volume 2: System Programming, rev. 3.23,” http://amd-dev.wpengine. netdna-cdn.com/wordpress/media/2012/10/24593_APM_v21. pdf, 2015, accessed: 17/02/2015. [16] Intel, “Intel 64 and IA-32 Architectures Software Devel oper?s Manual, Volume 2B: Instruction Set Reference, N-Z, Order Number: 253667-053US,” http://www.intel. com/content/www/us/en/architecture-and-technology/ 64-ia-32-architectures-software-developer-vol-2b-manual.html, 2015, accessed: 17/02/2015. [17] R. Hogg and E. Tanis, Probability and Statistical Inference. Prentice Hall, 2006. [18] F. Cristian, “Probabilistic clock synchronization,” Distributed Com puting, vol. 3, no. 3, pp. 146–158, 1989. [19] T. Jones and G. A. Koenig, “Clock synchronization in high-end computing environments: a strategy for minimizing clock variance at runtime,” Concurrency and Computation: Practice and Experience, vol. 25, no. 6, pp. 881–897, Jul. 2012. [20] G. Taubenfeld, Synchronization Algorithms and Concurrent Program ming. Upper Saddle River, NJ, USA: Prentice-Hall, Inc., 2006. [21] J.-Y. Le Boudec, Performance Evaluation of Computer and Communica tion Systems, ser. Computer and communication sciences. EFPL Press, 2010. [22] D. Lilja, Measuring Computer Performance. Cambridge University Press, 2005. [23] S. Ross, Introductory Statistics. Elsevier Science, 2010. [24] T. Chen, Y. Chen, Q. Guo, O. Temam, Y. Wu, and W. Hu, “Statistical performance comparisons of computers,” in HPCA. IEEE, 2012, pp. 399–410. [25] T. Hoefler and R. Belli, “Scientific benchmarking of parallel computing systems: twelve ways to tell the masses when reporting performance results,” in Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC 2015, 2015, pp. 73:1–73:12. [Online]. Available: http://doi.acm.org/10.1145/2807591.2807644 [26] D. J. Sheskin, Handbook of Parametric and Nonparametric Statistical Procedures, 4th ed. Chapman & Hall/CRC, 2007. [27] D. C. Montgomery, Design and Analysis of Experiments. John Wiley & Sons, 2006. [28] M. Hollander and D. Wolfe, Nonparametric Statistical Methods, ser. Wiley Series in Probability and Statistics. Wiley, 1999. [29] J. Vitek and T. Kalibera, “R3: Repeatability, reproducibility and rigor,” SIGPLAN Not., vol. 47, no. 4a, pp. 30–36, Mar. 2012. [Online]. Available: http://doi.acm.org/10.1145/2442776.2442781 [30] A. Georges, D. Buytaert, and L. Eeckhout, “Statistically rigorous Java performance evaluation,” in OOPSLA, 2007, pp. 57–76. [31] T. Mytkowicz, A. Diwan, M. Hauswirth, and P. F. Sweeney, “Producing wrong data without doing anything obviously wrong!” in ASPLOS, 2009, pp. 265–276. [32] G. Box, J. Hunter, and W. Hunter, Statistics for Experimenters: Design, Innovation, and Discovery. Wiley-Interscience, 2005. [33] S. A. A. Touati, J. Worms, and S. Briais, “The Speedup-Test: A Statistical Methodology for Program Speedup Analysis and Computation,” Concurrency and Computation: Practice and Experience, vol. 25, no. 10, pp. 1410–1426, 2013. [34] J. Gil, K. Lenz, and Y. Shimron, “A microbenchmark case study and lessons learned,” in SPLASH Workshops, 2011, pp. 297–308.
+
+APPENDIX A LIST OF VARIABLES variable data type description p uint number of processes msize uint message size nrep uint number of repetitions (in one mpirun) n uint number of calls to mpirun win_size double window size start_time double start time in window-based synchronization func address MPI function lmsize list<uint> list of message sizes lfunc list<address> list of MPI calls lexp list<exp> list of experiments (exp is a 3-tuple (msize, func, nrep)) root uint rank of root process my_rank uint rank of current process t double run-time s_time, e_time double timestamps lp list<uint> list of processes lt array<double> list of run-times ls_time, le_time array<double> list of timestamps myoffset double clock offset of the current process diff double clock offset ldiff list<double> list of clock offsets rtt double round trip time (rtt) lrtt list<double> list of rtts N_FITPTS uint number of points to fit linear model (HCA, JK) N_EXCHANGES uint number of ping-pong messages exchanged to record one fitpoint (HCA, JK) N_PINGPONGS uint number of ping-pong messages for rtt estimation lm tuple (double, dou ble) linear model of the clock drift defined by a tuple (slope, intercept) lmodel list<address> list of linear models tremote uint current time on remote process tlocal uint local time of current process tglobal uint global (normalized) time of current process r, server, client, p_ref uint process ranks
+
+APPENDIX B
+PSEUDO-CODES OF CLOCK SYNCHRONIZATION
+METHODS
+B.1 The SKaMPI Benchmark
+
+Algorithm 9 Timing procedure (SKaMPI and Netgauge).
+
+1: procedure MEASURE(func, msize) 2: s_time = GET_TIME() 3: func(msize) 4: e_time = GET_TIME() 5: t = e_time − s_time 6: return t
+
+Algorithm 10 The SKaMPI benchmark.
+
+| Algorithm |  | Clock offset between two processes. 7 |
+| --- | --- | --- |
+| 1: 2: −∞3: ∞4: 5: 6: 7: 8: 9: 10: 11: 12: 13: 14: 15: 16: 17: 18: 19: 20: 21: | function | SKAMPI_PINGPONG(p1, p2) td_min = td_max = N_PINGPONGS = 100 N_PINGPONGS i 0 1 in to for do − == if then my_rank p1 = GET_TIME() s_last MPI_SEND(s_last, 1, MPI_DOUBLE, p2) MPI_RECV(t_last, 1, MPI_DOUBLE, p2) = GET_TIME() s_now = MAX(td_min, s_now) td_min t_last − = MIN(td_max, s_last) td_max t_last − == else if then my_rank p2 MPI_RECV(s_last, 1, MPI_DOUBLE, p1) = GET_TIME() t_last MPI_SEND(t_last, 1, MPI_DOUBLE, p1) = GET_TIME() t_now = MAX(td_min, t_now) td_min s_last − = MIN(td_max, t_last) td_max s_last − = + td_max)/2 diff (td_min return diff |
+|  |  |  |
+| Algorithm and | synchronization | Clock offsets measurement relative to the root 8 window initialization. |
+| 1: 2: 3: 4: 5: 6: 7: 8: 9: 10: 11: 12: 13: 14: 15: 16: 17: 18: 19: 20: 21: 22: 23: 24: 25: 26: 27: 28: 29: 30: 31: 32: 33: | diff l start_time procedure procedure function function | - list of clock offsets of the current process relative to each of the others - timestamp of the first synchronization window COMPUTE_AND_SET_CLOCK_OFFSETS i 0 1 in to for do p − l diff[i] = 0 i 0 1 in to for do p − MPI_BARRIER() == if then my_rank root l diff[i] = SKAMPI_PINGPONG(root, i) == i else if then my_rank l diff[root] = SKAMPI_PINGPONG(root, i) == if then my_rank root diff l = tmp MPI_BCAST(tmp, p, MPI_DOUBLE, root) i 1 1 in to for do p − l diff[i] = tmp[i] + l diff[root] INITIALIZE_FIRST_SYNC_WINDOW == if then my_rank root = GET_TIME() start_time MPI_BCAST(start_time, 1, MPI_DOUBLE, root) START_SYNC(win_size, counter) = 0 sync_error = l diff[root] + + 1) next_win start_time (counter win_size − · = GET_TIME() time > if then time next_win STARTED_LATE = sync_error < while do time next_win = GET_TIME() time return sync_error STOP_SYNC(win_size) = 0 sync_error = GET_TIME() time > if then time next_win win_size − TOOK_TOO_LONG = sync_error return sync_error |
+
+1: procedure BENCHMARK(l func, l msize, max_rep, min_rep) // l func - MPI functions to benchmark // l msize - list of message sizes // max_rep/min_rep - max/min number of measurements for each message size max_std_err - max standard error of measurements 2: COMPUTE_AND_SET_CLOCK_OFFSETS() 3: INITIALIZE_FIRST_SYNC_WINDOW() 4: for msize in l msize & func in l func do 5: win_size = 0 6: while stop 6 = TRUE do 7: set nrep 8: for i in 0 to nrep − 1 do 9: l error_local[i] = START_SYNC(win_size, i) 10: l t_local[i] = MEASURE(func, msize) 11: l error_local[i] = l error_local[i]+STOP_SYNC(win_size) 12: compute total_time 13: MPI_GATHER(l t_local, nrep, MPI_DOUBLE, l t, nrep, MPI_DOUBLE, root) 14: MPI_ALLREDUCE(l error_local, nrep, MPI_DOUBLE, l error, nrep, MPI_DOUBLE, MPI_MAX) 15: if my_rank == root then 16: l t_final.add({ l t[i] ∀ i < nrep s.t. l error[i] == 0} ) 17: if n_errors ≥ nrep/4 then 18: win_size =MAX(2 · win_size, total_time/(nrep + 1) · 1.5) 19: max_consec_errors = MAX((j − i) s.t. l error[k] > 0, i ≤ k ≤ j ) 20: if max_consec_errors > nrep/2 then 21: nrep = MAX(nrep/2, 4)
+
+22: std_error = COMPUTE_STD_ERROR(l t_final) 23: stop = (LEN(l t_final) ≥ max_rep) or (LEN(l t_final) ≥ min_rep & std_error ≤ max_std_error) 24: MPI_BCAST(win_size, 1, MPI_DOUBLE, root) 25: MPI_BCAST(nrep, 1, MPI_DOUBLE, root) 26: MPI_BCAST(stop, 1, MPI_DOUBLE, root) 27: INITIALIZE_FIRST_SYNC_WINDOW() 28: print l t_final
+
+Algorithm 11 Clock offsets measurement relative to the root and synchronization window initialization.
+
+r - current process rank p - number of processes maxpower = 2b log2pc l diff - list of clock offsets of the current process relative to each of the others myoffset - clock offset of the current process relative to root start_time - next window start time, updated after each sync 1: procedure SYNC_CLOCKS_POW2 // compute clock offsets of processes with ranks between 0 and maxpower − 1 2: round = 1 3: if r ≥ maxpower then return 4: while 2 round ≤ maxpower do 5: if r mod 2 round == 0 then // client 6: server = r + 2 round− 1 7: l diff[server] = COMPUTE_OFFSET(r, server) // receive time differences collected by the server 8: MPI_RECV(recvdiffs, 2 round− 1 − 1, MPI_DOUBLE, server) // compute final time differences 9: for i in 0 to (2 round− 1 − 2) do 10: l diff[server + i + 1] = l diff[server] + recvdiffs[i] 11: if r mod 2 round == 2 round− 1 then // server 12: client = r − 2 round− 1 13: diff = COMPUTE_OFFSET(client, r) // send all the time differences to the client 14: MPI_SEND(l diff[r + 1], 2 round− 1 − 1, MPI_DOUBLE, client) 15: round = round + 1 // send final time differences from root to all processes 16: MPI_SCATTER(l diff, 1, MPI_DOUBLE, myoffset, 1, MPI_DOUBLE, root) 17: procedure SYNC_CLOCKS_REMAINING // compute clock offsets of processes with ranks between maxpower and p − 1 18: if maxpower == p then return
+
+19: if r < p − maxpower then 20: server = r + maxpower 21: diff = COMPUTE_OFFSET(r, server) 22: diff = diff + myoffset 23: MPI_SEND(diff, 1, MPI_DOUBLE, server) 24: else if r ≥ maxpower then 25: client = r − maxpower 26: diff = COMPUTE_OFFSET(client, r) 27: MPI_RECV(myoffset, 1, MPI_DOUBLE, client) 28: procedure INITIALIZE_FIRST_SYNC_WINDOW 29: N = 10 30: local_bcasttime = run-time of N executions of MPI_Bcast 31: MPI_REDUCE(local_bcasttime, bcasttime, 1, MPI_DOUBLE, root) 32: start_time = GET_TIME() + bcasttime 33: MPI_BCAST(start_time, 1, MPI_DOUBLE, root) 34: start_time = start_time − myoffset // adjust next start time to local clock
+
+Algorithm 12 Clock offset between two processes.
+
+1: procedure COMPUTE_OFFSET(client, server) 2: N_PINGPONGS = 100 3: rtt = 0 4: while rtt ≤ min(last N_PINGPONGS) do 5: if my_rank == client then 6: s_time = GET_TIME() 7: MPI_SEND(s_time, 1, MPI_DOUBLE, server) 8: MPI_RECV(tremote, 1, MPI_DOUBLE, server) 9: e_time = GET_TIME() 10: rtt = e_time − s_time 11: diff = s_time + rtt/2 − tremote 12: if my_rank == server then 13: MPI_RECV(s_time, 1, MPI_DOUBLE, client) 14: tremote = GET_TIME() 15: MPI_SEND(tremote, 1, MPI_DOUBLE, client) 16: return diff
+
+Algorithm 13 Synchronization function.
+
+1: procedure SYNC(win_size) 2: time = GET_TIME() 3: if time > start_time then // sync started too late 4: err = time − start_time 5: else 6: while time < start_time do 7: time = GET_TIME() 8: start_time = start_time + win_size 9: return err
+
+Algorithm 14 NBCBench measurement procedure.
+
+1: procedure BENCHMARK(l msize, func, nrep) // l msize - list of message sizes // func - MPI function to benchmark // nrep - number of measurements for each message size 2: SYNC_CLOCKS_POW2() 3: SYNC_CLOCKS_REMAINING() 4: for msize in l msize do 5: for i in 0 to WARMUP_ROUNDS do 6: MEASURE(func, msize) 7: for i in 0 to (nrep/10 − 1) do 8: runtimes[i] = MEASURE(func, msize) 9: local_est_runtime = MIN(runtimes) 10: MPI_ALLREDUCE(local_est_runtime, 1, MPI_DOUBLE, estimated_runtime, 1, MPI_DOUBLE, MPI_MAX) 11: if estimated_runtime · 5 · nrep > 10 seconds then 12: nrep = MAX(nrep/2, 4) 13: MPI_BCAST(nrep, 1, MPI_DOUBLE, root) // main measurement loop 14: INITIALIZE_FIRST_SYNC_WINDOW() 15: for i in 0 to nrep − 1 do 16: l error_local[i] = SYNC(win_size) 17: l t_local[i] = MEASURE(func, msize) 18: MPI_ALLREDUCE(l error_local, nrep, MPI_DOUBLE, l error, nrep, MPI_DOUBLE, MPI_MAX) 19: l t_local = { l t_local[i] ∀ i < nrep s.t. l error[i] == 0}20: if n_errors > 0.25 · nrep or LEN(l t_local) < 4 then 21: win_size = win_size · 1.5 22: REPEAT measurement for current msize 23: MPI_GATHER(l t_local, nrep, MPI_DOUBLE, l t, nrep, MPI_DOUBLE, root)
+
+24: print l t
+
+| Algorithm 15 | Linear Model of the clock drift. |
+| --- | --- |
+| - number of p r - current process - linear model lm intercept) - next start_time 1: functionLEARN_MODEL(N_FITPTS, = 0, 2: slope 3: if my_rank 4: for idx 5: for 6: 7: 8: 9: 10: if my_rank6 11: for idx 12: for 13: 14: 15: 16: diff l 17: yfit[idx] 18: 19: idx_median xfit[idx] 20: (slope, 21: 22: returnNEW_LM(slope, procedureSYNC_CLOCKS 23: 24: WARMUP_ROUNDS() i 1 25: in for l rtt[i] 26: MPI_SCATTER(l 27: 28: =LEARN_MODEL(N_FITPTS, lm 29: MPI_BARRIER() 30: start_time 31: MPI_BCAST(start_time, | processes (0 rank to 1) p − of the current process (defined by a and an slope to adjust the local clock to the reference time of root window start time, updated after each synchronization N_EXCHANGES, rtt, root) = 0 intercept == then root 0 1 in to do N_FITPTS− r 0 1) & = in to do root (p− r6 i 0 1 in to for do N_EXCHANGES− MPI_RECV(tdummy, 1, MPI_DOUBLE,r) =GET_TIME() tremote MPI_SEND(tremote, 1, MPI_DOUBLE,r) = then root 0 1 in to do N_FITPTS− i 0 1 in to do N_EXCHANGES− MPI_SEND(tdummy,1, MPI_DOUBLE, root) MPI_RECV(tremote,1, MPI_DOUBLE, root) local_times[i] =GET_TIME() l diff[i] = rtt/2 local_times[i]− tremote− =SORT(l diff) =COMPUTE_MEDIAN(l diff) N_EXCHANGES = i i < & s.t. 0≤ l diff[i] == yfit[idx] = local_times[median_idx] intercept) =LINEAR_FIT(xfit, yfit, N_FITPTS) intercept) 1 do top− =COMPUTE_RTT(root, i) rtt, 1, MPI_DOUBLE, rtt, 1, MPI_DOUBLE, root) N_EXCHANGES, rtt, root) = GET_NORMALIZED_TIME(GET_TIME()) + win_size 1, MPI_DOUBLE) |
+|  |  |
+| Algorithm 16 and HCA). | Local time normalization to reference clock (JK |
+| 1: functionGET_NORMALIZED_TIME(local_time) 2: return local_time− | + lm.intercept) lm.slope (local_time· |
+|  |  |
+| Algorithm 17 (JK and HCA). | Measurement of the RTT between two nodes |
+| functionCOMPUTE_RTT(p1, 1: 2: mean_rtt 3: WARMUP_ROUNDS() 4: if my_rank i 5: in for 6: MPI_RECV(tdummy, 7: tremote 8: MPI_SEND(tremote, 9: else if my_rank i 10: in for 11: s_time 12: MPI_SEND(s_time, 13: MPI_RECV(tremote, 14: e_time l rtt[i] 15: rtt l =REMOVE_OUTLIERS(l 16: 17: mean_rtt 18: return mean_rtt | p2) = 0 // send dummy ping-pong messages == then p1 0 1 to do N_PINGPONGS− 1, MPI_DOUBLE, p2) =GET_TIME() 1, MPI_DOUBLE, p2) == then p2 0 1 to do N_PINGPONGS− =GET_TIME() 1, MPI_DOUBLE, p1) 1, MPI_DOUBLE, p1) =GET_TIME() = s_time e_time− rtt) =MEAN(l rtt) |
+
+APPENDIX C OVERVIEW OF MPI EXPERIMENTS
+
+This section details the experimental setup and the pseudo code of each of the experiments presented in this paper. Unless otherwise stated, the following configuration is common to all the obtained results.
+
+Parameter Values parallel machine TUWien compiler gcc 4.4.7 compiler flags -O2 DVFS CPU frequency fixed to the highest available frequency level cache No cache control process pinning Core pinning (-bind-to rr / -pin_mode consec-rev) timing mechanism RDTSCP
+
+## Experiment: Clock Drift
+
+Parameter Values Details Experiment configuration - Figure 1 p 16 × 1 Number of nodes and processes per node nrep 100 Number of measured ping-pongs WARMUP_ROUNDS 10 Number of warmup rounds performed be fore measurement
+
+Algorithm 18 Experiment: Clock drift.
+
+1: WARMUP_ROUNDS() // dummy ping-pong messages between root and r 2: if my_rank == root then 3: for r in 0 to p − 1 do 4: if r 6 = root then 5: for rep in 0 to nrep − 1 do 6: l s_time_local[rep] = GET_TIME() 7: MPI_SEND(l s_time_local[rep], 1, MPI_DOUBLE, r) 8: MPI_RECV(l remote[rep], 1, MPI_DOUBLE, r) 9: l e_time_local[rep] = GET_TIME() 10: NANOSLEEP(0.5 s) 11: for rep in 0 to nrep − 1 do 12: print r, l s_time_local[rep], l e_time_local[rep], l remote[rep] 13: else if my_rank 6 = root then 14: for rep in 0 to nrep − 1 do 15: MPI_RECV(tdummy, 1, MPI_DOUBLE, root) 16: local_time = GET_TIME() 17: MPI_SEND(local_time, 1, MPI_DOUBLE, root)
+
+## Experiment: Frequency Calibration
+
+Parameter Values Details Experiment configuration - Figure 2 p 16 × 1 Number of nodes and processes per node nrep 100 Number of repetitions HRT_CALIBRATE - Frequency estimation function from Net gauge 2.4.6
+
+Algorithm 19 Experiment: Frequency calibration.
+
+1: for i in 0 to nrep − 1 do 2: HRT_CALIBRATE(freq) 3: l freq[i] = freq 4: MPI_GATHER(l freq, nrep, MPI_UINT64_T, all_freqs, nrep, MPI_UINT64_T, root) 5: if my_rank == root then 6: for r in 0 to p − 1 do 7: for rep in 0 to nrep − 1 do 8: print r, rep, all_freqs[r · nrep + rep]
+
+Parameter Values Details Experiment configuration - Figure 3 p 16 × 1 Number of processes n 10 Number of experiments nrep 10 Number of PingPong opera tions performed in each step to measure the clock offset sleep_time 1 s Waiting time between clock off set measurements nsteps 10 Number of clock offset measure ments MPI MVAPICH 2.1a MPI implementation
+
+Algorithm 20 Experiment: Clock offset after sync.
+
+1: compute l rtt- the list of rtts between root and process r 2: INIT_SYNC_MODULE() 3: for step in 1 to nsteps do 4: if my_rank == root then 5: for r in 0 to p − 1 do 6: if r 6 = root then 7: for j in 0 to nrounds − 1 do 8: MPI_SEND(s_time, 1, MPI_DOUBLE, r) 9: MPI_RECV(tremote, 1, MPI_DOUBLE, r) 10: if sync_type == HCA then 11: tlocal = GET_ADJUSTED_TIME() − l rtt[r]/2 12: else 13: tlocal = GET_TIME() − l rtt[r]/2 14: l global[r][j] = tremote 15: SLEEP(sleep_time) 16: else if my_rank 6 = root then 17: MPI_RECV(tdummy, 1, MPI_DOUBLE, 0) 18: if sync_type == HCA then 19: tlocal = GET_ADJUSTED_TIME() 20: else 21: tlocal = GET_TIME() 22: tglobal = GET_NORMALIZED_TIME(tlocal) 23: MPI_SEND(tglobal, 1, MPI_DOUBLE, 0) 24: if my_rank == root then 25: for r in 0 to p − 1 do 26: for j in 0 to nrounds − 1 do 27: print r, l ref[j], l global[j]
+
+C.4 Experiment: Run-time Drift in Netgauge and SKaMPI This experiment is based on Algorithm 5, in which the synchronization method has been set to either Netgauge, SKaMPI or MPI_Barrier.
+
+Parameter Values Details Experiment configuration - Figure 4 p 32 × 16 Number of processes n 1 Number of experiments nrep 4000 Number of measurements func MPI_Bcast Benchmarked function msize 8192 Bytes message size win_size 300 µs Window size MPI MVAPICH 2.1a MPI implementation
+
+## Experiment: Run-time of MPI_Barrier
+
+This experiment relies on Algorithm 20, where only one measurement round is performed after synchronization, instead of multiple nsteps.
+
+Parameter Values Details Algorithm parameters n 30 Number of MPIRUNs the experi ment was repeated nrep 100 000 Number of MPI_Barrier calls WARMUP_ROUNDS 10 Number of warmup rounds per formed before measurement
+
+|  |  |  |  |  |  |  |  |  |  |  | Experiment |  | configuration |  |  | - Figure |  |  | 8 |  |  |  |  |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | SLEEP_TIME |  |  | 0 s |  | No | waiting | time between synchroniza |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  |  |  |  |  |  | tion | and measurements |  |  |  | p |  |  |  | 32 | 16 × |  |  |  |  | Number | of processes |  |  |  |
+|  | nsteps |  |  | 1 |  | Number | of | clock offset estimations |  |  | MPI |  |  |  | MVAPICH |  |  | 2.1a |  |  | MPI implementation |  |  |  |  |
+|  | nrounds |  |  | 10 |  | Number | of | PingPong operations | per |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  |  |  |  |  |  | formed | in | each step to measure | clock |  | Experiment |  | configuration |  |  | - Figure |  |  | 36 |  |  |  |  |  |  |
+|  |  |  |  |  |  | offset |  |  |  |  | p |  |  |  | 16 | 1 × |  |  |  |  | Number | of processes |  |  |  |
+|  | N_FITPTS |  |  | 1000 |  | Number | of | fitpoints used to | fit linear |  | MPI |  |  |  | MVAPICH |  |  | 2.1a |  |  | MPI implementation |  |  |  |  |
+|  | (HCA/JK | sync.) |  |  |  | models |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | N_EXCHANGES |  |  | 100 |  | Number | of | ping-pong messages | ex |  | Experiment |  | configuration |  |  | - Figure |  |  | 37 |  |  |  |  |  |  |
+|  | (HCA/JK | sync.) |  |  |  | changed | to | obtain the difference | be |  | p |  |  |  | 15 | 8 × |  |  |  |  | Number | of processes |  |  |  |
+|  |  |  |  |  |  | tween | local | and reference times | corre |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  |  |  |  |  |  | sponding | to | a single fit point |  |  | MPI |  |  |  | MVAPICH |  |  | 1.9 |  |  | MPI implementation |  |  |  |  |
+|  | MPI |  |  | MVAPICH |  | 2.1a MPI | implementation |  |  |  | machine |  |  |  | Edel | (G5k) |  |  |  |  |  |  |  |  |  |
+|  | Experiment | configuration |  |  | - Figure | 6(a) |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  |  |  |  |  |  |  |  |  |  |  | Algorithm |  | Experiment: 21 |  |  |  |  | Run-time |  |  | of | MPI_Barrier |  |  |  |
+|  | p |  |  | [2–36]× | 1 | Number | of | processes |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | n |  |  | 10 |  | Number | of | experiments |  |  | 1: 2: | WARMUP_ROUNDS s_time | = GET_TIME() |  | MPI_Barrier of |  |  |  |  |  |  |  |  |  |  |
+
+Parameter Values Details Algorithm parameters Experiment configuration - Figure 6(b) p [2–36]× 16 Number of processes n 10 Number of experiments
+
+|  | Experiment | configuration |  |  | - Figure | 6(b) |  |  |  |  | 2: 3: | s_time i in for | = GET_TIME() 0 to nrep | − | 1 do |  |  |  |  |  |  |  |  |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | p |  |  | [2–36]× | 16 | Number | of | processes |  |  | 4: | MPI_BARRIER() |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | n |  |  | 10 |  | Number | of | experiments |  |  | 5: | e_time | = GET_TIME() |  |  |  |  |  |  |  |  |  |  |  |  |
+|  |  |  |  |  |  |  |  |  |  |  | 6: | local_time | = (e_time |  | s_time)/nrep − |  |  |  |  |  |  |  |  |  |  |
+
+1: WARMUP_ROUNDS of MPI_Barrier 7: MPI_REDUCE(local_time, t, 1, MPI_DOUBLE, MPI_MAX, root) 8: if my_rank == root then 9: print barrier time t
+
+This experiment is based on Algorithm 20, in which the synchronization method has been set to either HCA, JK, SKaMPI or Netgauge.
+
+Parameter Values Details Algorithm parameters (Algorithms 20 and 22) SLEEP_TIME 1 s Waiting time between clock offset mea surements nsteps 20 Number of clock offset estimations nrounds 10 Number of PingPong operations per formed in each step to measure clock offset
+
+N_FITPTS (HCA/JK sync.)
+
+Number of fitpoints used to fit linear models
+
+Parameter Values Details Algorithm parameters SLEEP_TIME 1 s Waiting time between clock offset mea surements nsteps 20 Number of clock offset estimations nrounds 10 Number of PingPong operations per formed in each step to measure clock offset
+
+10, 100, 200,
+300, 500,
+700, and
+1000
+
+N_EXCHANGES (HCA/JK sync.)
+
+[10–100] Number of ping-pong messages ex changed to obtain the difference be tween local and reference times corre sponding to a single fit point
+
+N_FITPTS (HCA/JK sync.)
+
+1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (HCA/JK sync.)
+
+100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times corre sponding to a single fit point
+
+Experiment configuration - Figure 8 p 32 × 16 Number of processes n 10 Number of experiments MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 36 p 16 × 1 Number of processes n 10 Number of experiments MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 37 p 15 × 8 Number of processes n 10 Number of experiments MPI MVAPICH 1.9 MPI implementation machine Edel (G5k)
+
+Experiment configuration - Figure 7 p 16 × 16 Number of processes n 10 Number of experiments MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 33 p 16 × 1 Number of processes n 10 Number of experiments MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 34 p 15 × 8 Number of processes n 10 Number of experiments MPI MVAPICH 1.9 MPI implementation machine Edel (G5k) Experiment configuration - Figure 35 p 16 × 1 Number of processes n 1 Number of experiments machine Cartesius (SURFsara) MPI Intel MPI 4.1 MPI implementation
+
+Algorithm 22 Experiment: Sync. duration.
+
+1: s_time = GET_TIME() 2: INIT_SYNC_MODULE() // compute clock drifts, linear models 3: e_time = GET_TIME() 4: sync_time_local = e_time − s_time 5: MPI_REDUCE(sync_time_local, sync_time, 1, MPI_DOUBLE, MPI_MAX, root) 6: print sync_time
+
+C.9 Experiment: Impact of the Timing Mechanism – Lo cal Times vs. Global Times This experiment is based on Algorithm 5, in which the synchronization method has been set to either HCA or MPI_Barrier.
+
+Parameter Values Details Experiment configuration - Figure 9 p 16 × 1 Number of processes n 1 Number of experiments nrep 4000 Number of measurements per ex periment func MPI_Allreduce Benchmarked function msize 32 KiB message size win_size 1 ms Window size N_FITPTS (HCA sync.)
+
+1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (HCA sync.)
+
+100 Number of ping-pong messages exchanged to obtain the differ ence between local and reference times corresponding to a single fit point MPI MVAPICH 2.0a-qlc MPI implementation machine VSC-3
+
+C.10 Experiment: MPI_Barrier Exit Times This experiment is based on Algorithm 5, in which the synchronization method has been set to HCA.
+
+Parameter Values Details Experiment configuration - Figure 10 p 16 × 1 Number of processes n 1 Number of experiments nrep 1000 Number of measurements per ex periment func MPI_Barrier Benchmarked function win_size 100 µs Window size N_FITPTS (HCA sync.)
+
+1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (HCA sync.)
+
+100 Number of ping-pong messages exchanged to obtain the differ ence between local and reference times corresponding to a single fit point
+
+MPI MVAPICH 2.0a-qlc, Intel MPI 5
+
+MPI implementation machine VSC-3
+
+C.11 Experiment: Barrier Implementation Impact This experiment is based on Algorithm 5, in which the synchronization method has been set to either MPI_Barrier or a dissemination barrier implemented into the benchmark.
+
+Parameter Values Details Experiment configuration - Figure 11 p 16 × 1 Number of processes n 10 Number of experiments nrep 1000 Number of measurements per ex periment func MPI_Bcast Benchmarked function msize 2 6–2 15 Bytes Message size MPI MVAPICH 2.0a-qlc, Intel MPI 5 MPI implementation machine VSC-3
+
+C.12 Experiment: The Influence of mpirun This experiment is based on Algorithm 5, in which the synchronization method has been set to MPI_Barrier.
+
+Parameter Values Details Algorithm parameters n 30 Number of experiments nrep 1000 Number of measurements per exper iment Experiment configuration - Figure 14 (a) p 16 × 1 Number of processes msize 8 KiB Message size func MPI_Bcast Benchmarked function MPI NEC MPI 1.2.8 MPI implementation Experiment configuration - Figure 14 (b) p 32 × 1 Number of processes msize 2 KiB Message size func MPI_Bcast Benchmarked function MPI Intel MPI 4.1 MPI implementation machine VSC-1 Experiment configuration - Figure 14 (c) p 16 × 1 Number of processes msize 8 KiB Message size func MPI_Bcast Benchmarked function MPI MVAPICH 1.9 MPI implementation machine Edel (G5k)
+
+C.13 Experiment: Distribution of Run-times with Window-based Synchronization This experiment is based on Algorithm 5, in which the synchronization method has been set to JK.
+
+Parameter Values Details Experiment configuration - Figure 15 p 16 × 1 Number of processes n 500 Number of experiments nrep 1000 Number of measurements per exper iment msize 1000 Bytes Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS 1000 Number of fitpoints used to fit linear models N_EXCHANGES 20 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI MVAPICH 2.1a MPI implementation
+
+C.14 Experiment: Run-time Histograms This experiment is based on Algorithm 5, in which the synchronization method has been set to either MPI_Barrier or HCA.
+
+C.15 Experiment: Run-time Drift – JK vs. MPI_Barrier Synchronization This experiment is based on Algorithm 5, in which the synchronization method has been set to either JK or MPI_Barrier.
+
+Parameter Values Details Experiment configuration - Figure 12, Figure 16 p 16 × 1 Number of processes n 10 Number of experiments nrep 1000 Number of measurements per ex periment
+
+Parameter Values Details Experiment configuration - Figure 17 p 16 × 1 Number of processes n 1 Number of experiments nrep 500 000 Number of measurements per exper iment msize 1000 Bytes Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS (JK) 1000 Number of fitpoints used to fit linear models
+
+Message size msize 10 000 Bytes, 1000 Bytes func MPI_Scan, MPI_Allreduce
+
+N_EXCHANGES (JK)
+
+Benchmarked function MPI NEC MPI 1.2.8 MPI implementation Experiment configuration - Figure 41 p 16 × 8 Number of processes n 20 Number of experiments nrep 4000 Number of measurements per ex periment msize 1 KiB, 8 KiB Message size func MPI_Bcast, MPI_Allreduce 20 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI MVAPICH 2.1a MPI implementation
+
+Benchmarked function win_size 500 µs Window size N_FITPTS (HCA sync.)
+
+1000 Number of fitpoints used to fit linear models
+
+C.16 Experiment: Impact of Window Size on Run-time and Number of Invalid Results This experiment is based on Algorithm 5, which has been repeated for HCA, SKaMPI and Netgauge.
+
+N_EXCHANGES (HCA sync.)
+
+100 Number of ping-pong messages exchanged to obtain the differ ence between local and reference times corresponding to a single fit point MPI MVAPICH 1.9 MPI implementation machine Edel (G5k) Experiment configuration - Figure 42 p 16 × 1 Number of processes n 3 Number of experiments nrep 4000 Number of measurements per ex periment msize 2 6–2 15 Bytes Message size func MPI_Bcast, MPI_Allreduce, MPI_Scan
+
+Parameter Values Details Experiment configuration - Figure 19, Figure 20 p 16 × 1 Number of processes n 10 Number of experiments nrep 1000 Number of measurements per exper iment msize 8 KiB Message size func MPI_Alltoall, MPI_Scan
+
+Benchmarked function win_size [150–10 000] µs Window size N_FITPTS (HCA)
+
+Benchmarked function 1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (HCA)
+
+win_size 500 µs Window size
+N_FITPTS (HCA
+sync.)
+
+1000 Number of fitpoints used to fit linear models 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI MVAPICH 2.1a MPI implementation
+
+N_EXCHANGES (HCA sync.)
+
+|  | MPI |  |  |  | Intel | MPI |  | 4.1 | MPI implementation |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | machine |  |  |  | Cartesius |  | (SURFsara) |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | Experiment |  |  | configuration |  |  | - Figure | 43 |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | p |  |  |  | 16 | × | 1 |  | Number of | processes |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | n |  |  |  | 10 |  |  |  | Number of | experiments |  |  |  |  |  |  |  |  |  |  |  |  |  |  |
+|  | nrep |  |  |  | 1000 |  |  |  | Number of | measurements per | ex |  |  |  |  |  |  |  |  |  |  |  |  |  |
+
+100 Number of ping-pong messages exchanged to obtain the differ ence between local and reference times corresponding to a single fit point periment msize 2 6–2 15 Bytes Message size func MPI_Bcast, MPI_Allreduce
+
+Benchmarked function win_size 1 ms Window size N_FITPTS (HCA sync.)
+
+1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (HCA sync.)
+
+100 Number of ping-pong messages exchanged to obtain the differ ence between local and reference times corresponding to a single fit point MPI MVAPICH 2.0a-qlc MPI implementation machine VSC-3
+
+C.17 Experiment: Run-time Drift Comparison This experiment is based on Algorithm 5, which has been repeated for each synchronization method.
+
+Parameter Values Details
+Algorithm parameters
+nrep 4000 Number of measurements per exper
+iment
+win_size 500 µs Window size
+N_FITPTS (JK,
+HCA) 1000 Number of fitpoints used to fit linear models
+
+N_EXCHANGES (JK, HCA) 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point
+
+Experiment configuration - Figure 18 p 32 × 16 Number of processes n 10 Number of experiments msize 8 KiB Message size func MPI_Allreduce Benchmarked function MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 38 p 15 × 8 Number of processes n 10 Number of experiments msize 32 KiB Message size func MPI_Bcast Benchmarked function MPI MVAPICH 1.9 MPI implementation machine Edel (G5k) Experiment configuration - Figure 39 p 16 × 1 Number of processes msize 8 KiB Message size n 3 Number of experiments func MPI_Scan Benchmarked function MPI Intel MPI 4.1 MPI implementation machine Cartesius (SURFsara) Experiment configuration - Figure 40 p 16 × 1 Number of processes msize 1 KiB Message size n 10 Number of experiments func MPI_Allreduce Benchmarked function MPI MVAPICH 2.0a qlc
+
+MPI implementation machine VSC-3
+
+C.18 Experiment: Pinning Effect This experiment is based on Algorithm 5 and was conducted using the HCA synchronization.
+
+Parameter Values Details Experiment configuration - Figure 21 p 16 × 16 Number of processes n 10 Number of experiments nrep 1000 Number of measurements per exper iment msize [1000– 10 000] Bytes
+
+Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS 1000 Number of fitpoints used to fit linear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI NEC MPI 1.2.11 MPI implementation clock MPI_Wtime clock source for time measurements
+
+C.19 Experiment: Compiler Effect This experiment is based on Algorithm 5 and was conducted using the HCA synchronization.
+
+Parameter Values Details Experiment configuration - Figure 22 p 16 × 1 Number of processes n 30 Number of experiments nrep 1000 Number of measurements per exper iment msize 2 6–2 13 Bytes Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS 1000 Number of fitpoints used to fit linear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI MVAPICH 2.1a MPI implementation
+
+C.20 Experiment: DVFS Effect This experiment is based on Algorithm 5 and was conducted using the HCA synchronization.
+
+Parameter Values Details Experiment configuration - Figure 23 p 16 × 1 Number of processes n 30 Number of experiments nrep 1000 Number of measurements per exper iment msize 2 6–2 13 Bytes Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS 1000 Number of fitpoints used to fit linear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point
+
+MPI MVAPICH 2.1a, NEC MPI 1.2.11
+
+MPI implementation
+
+C.21 Experiment: Caching Effect This experiment is based on Algorithm 5 and was conducted using the HCA synchronization.
+
+Parameter Values Details Experiment configuration - Figure 24 p 16 × 1 Number of processes n 10 Number of experiments nrep 1000 Number of measurements per exper iment msize 2 6–2 13 Bytes Message size func MPI_Allreduce Benchmarked function win_size 1 ms Window size N_FITPTS 1000 Number of fitpoints used to fit linear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference be tween local and reference times cor responding to a single fit point MPI MVAPICH 2.1a MPI implementation
+
+C.22 Experiment: Statistical Testing This experiment is based on Algorithm 5 and was conducted using the HCA synchronization.
+
+Parameter Values Details Experiment configuration - Figure 25, Figure 26, Figure 28 p 16 × 1 Number of processes n 30 Number of experiments nrep 1000 Number of measurements per ex periment msize 1–2 15 Bytes Message size func MPI_Allreduce Benchmarked function win_size adapted for each message size
+
+|  | msize |  |  |  | 1–2 | 15 Bytes |  | Message size |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | func |  |  |  | MPI_Allreduce |  |  | Benchmarked | function |  |
+|  | win_size |  |  |  | adapted | for | each | Window size |  |  |
+
+Window size N_FITPTS 1000 Number of fitpoints used to fit lin ear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference between local and reference times corresponding to a single fit point
+
+MPI implementation
+
+MPI MVAPICH 2.1a, NEC MPI 1.2.11
+
+C.23 Experiment: Reproducibility Evaluation This experiment relies on the Intel MPI Benchmarks 4.0.2, SKaMPI 5 and Algorithm 5 (using the HCA synchronization method) to measure the run-time of MPI_Bcast.
+
+Parameter Values Details
+Algorithm parameters
+Experiment
+runs 30 Number of times the full experi ment was repeated p 16× 1 Number of processes msize 1–2 15 Bytes Message size func MPI_Bcast Benchmarked function MPI MVAPICH 2.1a MPI implementation Experiment configuration - Figure 29(c) n 30 Number of mpiruns nrep 1000 Number of measurements per ex periment win_size adapted for each message size
+
+Window size N_FITPTS 1000 Number of fitpoints used to fit lin ear models N_EXCHANGES 100 Number of ping-pong messages ex changed to obtain the difference between local and reference times corresponding to a single fit point
+
+C.24 Experiment: Run-time Comparison This experiment is based on Algorithm 5, which has been repeated for each synchronization method.
+
+| repeated |  |  |  | for | each synchronization |  |  | method. |  |  |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  | Parameter |  |  |  | Values |  | Details |  |  |  |
+|  | Experiment |  |  | configuration |  | - Figure | 44 |  |  |  |
+|  | p |  |  |  | 32 | 16 × | Number | of processes |  |  |
+|  | n |  |  |  | 10 |  | Number | of experiments |  |  |
+|  | msize |  |  |  | 1–2 | 15 Bytes | Message | size |  |  |
+|  | func |  |  |  | MPI_Allreduce |  | Benchmarked |  | function |  |
+|  | nrep |  |  |  | 1000 |  | Number | of measurements | per | exper |
+|  |  |  |  |  |  |  | iment |  |  |  |
+|  | win_size |  |  |  | 150 | µs | Window | size |  |  |
+|  | N_FITPTS |  |  | (JK, | 1000 |  | Number | of fitpoints | used to fit | linear |
+|  | HCA) |  |  |  |  |  | models |  |  |  |
+|  | N_EXCHANGES |  |  |  | 100 |  | Number | of | ping-pong messages | ex |
+|  | (JK, |  | HCA) |  |  |  | changed | to | obtain the difference | be |
+|  |  |  |  |  |  |  | tween | local | and reference times | cor |
+|  |  |  |  |  |  |  | responding | to | a single fit point |  |
+|  | MPI |  |  |  | MVAPICH | 2.1a | MPI | implementation |  |  |
+
+APPENDIX D
+
+THEMATIC SUMMARY OF MEASUREMENTS
+
+1 2 3 4 5
+
+] s [µ
+
+HCA (1000,100)
+JK (1000,50)
+Netgauge
+SKaMPI
+
+s s 100 e c 300 r o p
+
+0
+
+t o 6 7 8 9 10 .
+
+iff
+
+50
+
+900 n im e
+
+600 u
+
+T q e
+
+0
+
+f r
+
+0
+
+0 2 4 6 8 10 12 14 16 18 20
+
+Time since synchronization [s] 11 12 13 14 15
+
+1200
+
+Figure 33. Clock drift for 16 × 1 processes after 0, 1, 2, . . ., 20 s
+
+(distribution of maximum offsets over 10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.6).
+
+0 3.6 4.0 4.4 3.6 4.0 4.4 3.6 4.0 4.4 3.6 4.0 4.4 3.6 4.0 4.4
+
+RTT [µs] D.3.2 Edel (G5k)
+
+Figure 30. Histogram of RTTs when sending 1000 ping-pong messages with 1 double (8 Bytes) payload between reference host (0) and 15 other hosts (1–15), (MVAPICH 2.1a, TUWien).
+
+] s [µ 0
+
+HCA
+JK
+NetGauge
+SkaMPI mean RTT from 1000 ping-pongs
+
+200 3.68 t
+
+T n u
+
+0 3.64 r
+
+|  |  |  |  |  |  |  |  | 0 |  | 1 |  | 2 3 4 5 6 7 8 9 10 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+|  |  |  | 1 2 3 4 | 5 6 7 8 9 | 10 |  |  |  |  |  |  | Time since synchronization [s] |
+|  |  |  | distinct mpirun | (experiment id) |  |  |  |  |  |  |  |  |
+
+Figure 34. Clock drift for 120 (15 × 8) processes after 0, 1, 2, . . ., 10 s (distribution of maximum offsets over 10 calls to mpirun, MVAPICH 1.9, Edel (G5k), Exp. details: Appendix C.6).
+
+Figure 31. Mean RTT (after outlier removal) computed from 1000 ping pongs between one pair of nodes (MVAPICH 2.1a, TUWien).
+
+D.2 Investigating the Number of Invalid Measurement for Window-based Process Synchronization ] s [µ 0
+
+MPI Bcast, 8192 Bytes
+
+HCA
+JK
+NetGauge
+SKaMPI 150 ]
+
+100 t o
+
+HCA NetGauge SKaMPI r e m .
+
+T c n 0 1 2 3 4 5 6 7 8 9 10 Time since synchronization [s] u o
+
+50 100 150 180 200 500 window size [µs
+
+Figure 35. Clock drift for 16 × 1 processes after 0, 1, 2, . . ., 10 s (1 call to mpirun, Intel MPI 4.1, Cartesius (SURFsara), Exp. details: Appendix C.6).
+
+Figure 32. Percentage of incorrect measurements for MPI_Bcast, (8 KiB, 16 × 1 processes, 1000 measurements, 10 calls to mpirun, MVA PICH 2.1a, TUWien).
+
+D.4.1 TUWien (100,100)
+
+(100,20)
+(100,30)
+(100,50)
+(1000,100) (1000,20) (1000,30) (1000,50) (200,100) (200,20) (200,30) (200,50) (500,100)(500,20) (500,30) (500,50) (700,100) (700,20) (700,30) (700,50)(10,100) (100,10) (200,20) (500,20) (200,50) (1000,10) (100,100) (500,50) (500,80) (500,100) (700,80) (700,100) (1000,100)
+
+0 1 2 3 4 5 6 7 8
+
+Synchronization duration [s]
+
+MPI Barrier runtime
+
+HCA JK
+
+Netgauge SKaMPI
+
+Clock offset vs. sync duration (#fitpoints, #exchanges)
+
+Figure 36. Median clock offset (after 2 s) vs. synchronization phase duration for 16 × 1 processes (10 calls to mpirun, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.8).
+
+D.4.2 Edel (G5k) (100,10) (100,100) (100,50) (1000,10) (1000,100)(1000,50) (300,10) (300,100) (300,50) (500,10) (500,50) (300,100) (300,200) (300,50) (500,10) (500,100) (500,50) 0 10 20 30 40 50 Synchronization duration [s]
+
+MPI Barrier runtime
+
+HCA JK
+
+Netgauge SKaMPI
+
+Clock offset vs. sync duration (#fitpoints, #exchanges)
+
+Figure 37. Median clock offset (after 5 s) vs. synchronization phase duration for 120 processes (15 × 8) (10 calls to mpirun, MVAPICH 1.9, Edel (G5k), Exp. details: Appendix C.8).
+
+D.5.1 Edel (G5k) 1 10 20 30 40 bin id of 100 individual runs
+
+HCA
+JK
+MPI Barrier
+NetGauge
+SKaMPI
+
+MPI Allreduce, 32768 Bytes, window size=500µs
+
+Figure 38. Drifting run-times of MPI_Allreduce (median of 10 experi ments, 32 KiB, 15 × 8 processes, 4000 runs, bin size 100, window size: 500 µs, MVAPICH 1.9, Edel (G5k), Exp. details: Appendix C.17).
+
+20
+
+40 1 10 20 30 40 bin id of 100 individual runs
+
+HCA (1000,100)
+JK (1000,100)
+MPI Barrier
+Netgauge
+SKaMPI
+
+MPI Scan, 8192 Bytes, window size 500µs
+
+Figure 39. Drifting run-times of MPI_Scan (median of 3 experiments, 8 KiB, 16 × 1 processes, 4000 runs, bin size 100, window size: 500 µs, Intel MPI 4.1, Cartesius (SURFsara), Exp. details: Appendix C.17).
+
+20
+
+30
+
+40
+
+1 2 3 4 5 6 7 8 9 10 bin id of 100 individual runs
+
+HCA
+JK
+MPI Barrier
+NetGauge
+SKaMPI
+
+MPI Allreduce, 1024 Bytes, window size 1000µs
+
+Figure 40. Drifting run-times of MPI_Allreduce (median of 10 exper iments, 1 KiB, 16 × 1 processes, 4000 runs, bin size 100, window size: 1 ms, MVAPICH 2.0a-qlc, VSC-3, Exp. details: Appendix C.17).
+
+D.6 Distribution of Measured Run-times D.6.1 Edel (G5k)
+
+MPI Bcast, 1024 Bytes runtime [µs] 12 13 14 15 16 17 0 .
+
+0 .
+
+0 .
+
+0 20 40 60 80 100
+
+-
+
+0 .
+
+2 0 .
+
+4 1 .
+
+Lag
+
+A C F
+
+MPI Allreduce, 8192 Bytes run-time [µs] 54 56 58 60 62 0 .
+
+0 .
+
+0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+Figure 41. Distribution of run-times and corresponding autocorrelation plots (16 × 8 processes, 4000 runs, HCA synchronization, window size: 500 µs, MVAPICH 1.9, Edel (G5k), Exp. details: Appendix C.14).
+
+MPI Bcast, 2048 Bytes run-time [µs] 11.0 11.5 12.0 0 20 40 60 80 100
+
+-
+
+0 .
+
+2 0 .
+
+2 0 .
+
+6 1 .
+
+0
+
+Lag
+
+A C F
+
+MPI Allreduce, 8192 Bytes run-time [µs] 26.5 27.0 27.5 28.0 0 .
+
+1 .
+
+2 .
+
+0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+MPI Scan, 4096 Bytes run-time [µs] 18.0 18.5 19.0 0 .
+
+1 .
+
+2 .
+
+0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+Figure 42. Distribution of run-times and corresponding autocorrelation plots (16 × 1 processes, 4000 runs, HCA synchronization, window size: 500 µs, Intel MPI 4.1, Cartesius (SURFsara), Exp. details: Ap pendix C.14).
+
+MPI Bcast, 8192 Bytes, run 1 run-time [µs] 40.2 40.4 40.6 40.8 41.0 41.2 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4
+
+Lag
+
+A C F
+
+MPI Bcast, 8192 Bytes, run 2 run-time [µs] 39.0 39.2 39.4 39.6 39.8 0 .
+
+0 1 .
+
+0 2 .
+
+0 3 .
+
+0 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+MPI Bcast, 8192 Bytes, run 3 run-time [µs] 40.5 41.0 41.5 42.0 42.5 0 .
+
+0 1 .
+
+0 2 .
+
+0 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+MPI Allreduce, 8192 Bytes, run 1 run-time [µs] 31.2 31.4 31.6 31.8 0 .
+
+0 1 .
+
+5 3 .
+
+0 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+MPI Allreduce, 8192 Bytes, run 2 run-time [µs] 31.5 32.0 32.5 0 .
+
+0 1 .
+
+0 2 .
+
+0 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+MPI Allreduce, 8192 Bytes, run 3 run-time [µs] 30 40 50 60 70 80 90 0 .
+
+0 0 0 .
+
+0 3 0 .
+
+0 6 0 20 40 60 80 100 0 .
+
+0 0 .
+
+4 0 .
+
+8
+
+Lag
+
+A C F
+
+Figure 43. Various distributions of run-times and corresponding autocor relation plots for several calls to mpirun (16 × 1 processes, 1000 runs,
+
+HCA synchronization, window size: 1 ms, MVAPICH 2.0a-qlc, VSC-3,
+
+Exp. details: Appendix C.14).
+
+D.7 Comparing Run-times measured using MPI_Barrier or Window-based Synchronization 2 0 2 2 2 3 2 4 2 5 2 6 2 7 2 8 2 9 2
+
+10
+
+2
+
+11
+
+2
+
+12
+
+2
+
+13
+
+2
+
+14
+
+2
+
+15 message size[Bytes]
+
+HCA sync.
+MPI Barrier sync.
+
+MPI Bcast, 32x16 processes, 10 mpiruns
+
+Figure 44. Distribution of normalized median run-times reported for MPI_Bcast with various message sizes, for the window-based syn chronization method HCA (window size: 150 µs) and MPI_Barrier, (10 calls to mpirun, 32 × 16 processes, 1000 runs, MVAPICH 2.1a, TUWien, Exp. details: Appendix C.24).

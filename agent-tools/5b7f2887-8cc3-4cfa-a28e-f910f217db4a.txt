@@ -1,0 +1,502 @@
+# AI Agent Workflow Orchestration on GPU Cloud: Temporal, Inngest, and Restate for Durable Multi-Step Pipelines (2026)
+
+_Deploy Temporal, Inngest, and Restate for durable AI agent workflows on GPU cloud. Side-by-side comparison, Spheron worker pool topology, cost analysis, and production checklist._
+
+A LangGraph agent running a 30-minute fine-tune trigger dies on a network blip at minute 29. No replay, no state. The job restarts from zero. This is the failure mode that naive agent loops hit in production. The fix is durable execution: a class of workflow engine that journals every step so your agent can resume from exactly where it stopped, regardless of what crashed.
+
+This guide covers three engines (Temporal, Inngest, and Restate) for production AI agent workflows on GPU cloud, with worker pool topology, a side-by-side comparison, live-priced cost analysis, and a production checklist.
+
+## Why Naive Agent Loops Break in Production
+
+Most teams start with a simple loop: call the LLM, parse the output, call a tool, repeat. This works fine in a notebook. It breaks in production for three specific reasons.
+
+### Timeout Cascades
+
+A multi-step agent workflow that takes 45 minutes to complete needs every single component to stay alive for 45 minutes: the client connection, the HTTP timeout on the orchestrator, the GPU activity worker, and the model server. Any one of these can time out independently. When they do, there is no partial state to recover. The whole thing restarts.
+
+### Partial Tool Calls and Duplicate Side Effects
+
+When a workflow crashes mid-activity, the question is not just "do I restart?" It's "did the tool call actually execute before the crash?" If the tool call went through but the ack was lost, a naive retry sends it twice. For idempotent reads this is fine. For writes (database updates, external API calls, model training jobs), duplicate execution causes corrupted state.
+
+### Retry Storms and GPU Waste
+
+Without coordination, multiple retries of the same failed workflow step can run simultaneously. On GPU workloads that cost $5-15/hr per card, an uncoordinated retry storm wastes real money and can exhaust your GPU pool before the underlying problem is fixed. Once you're running more than a handful of agents, the coordination requirements compound quickly. See [scaling AI agent fleets on GPU cloud](/blog/scale-ai-agent-fleets-gpu-cloud-mcp-orchestration/) for how concurrency limits and queue management fit into a production setup.
+
+## The Durable Execution Model
+
+Durable execution engines solve these problems by recording every step of the workflow as it runs, then replaying that history to reconstruct state after a crash. The three main approaches differ in how they implement the journal.
+
+**History-based replay (Temporal):** Temporal records a history of events for each workflow: activity scheduled, activity started, activity completed, etc. On replay, the workflow code re-executes deterministically, and completed steps are skipped by returning their recorded results. The workflow code runs again on the Temporal worker, but it completes instantly for already-finished steps.
+
+**Step journaling (Inngest):** Inngest checkpoints the output of each `step.run()` call to its backend. If the function fails mid-run, Inngest re-invokes it and replays completed step results from the checkpoint store. The function body re-runs, but calls to `step.run()` return cached results for already-completed steps.
+
+**Virtual objects and journal-based exactly-once (Restate):** Restate assigns each virtual object a unique key (e.g., a session ID). All handler calls on that object are serialized. Each `ctx.run()` call is journaled before execution. If the handler crashes mid-run, Restate re-invokes it and replays the journal, skipping already-executed runs. This gives exactly-once semantics without requiring idempotency keys in application code.
+
+## Temporal for GPU-Backed Agents
+
+Temporal is the strongest choice for long multi-step workflows where the history of events needs to survive days or weeks. It has the most mature ecosystem, the most configurability around timeouts, and the most explicit control over retry behavior.
+
+### Architecture: Workers, Task Queues, GPU Activity Routing
+
+The Temporal architecture maps directly onto a GPU worker pool:
+
+- **Temporal Server** runs on a CPU node (or managed service). It hosts the event history store, the task queues, and the web UI.
+- **Workflow Workers** poll the task queue for workflow tasks. These are CPU processes that run your deterministic workflow code.
+- **Activity Workers** poll the task queue for activity tasks. These are the GPU processes that run the actual compute: vLLM inference, fine-tuning, embedding generation.
+
+The key design decision: put GPU-bound operations in activities, not in workflow code. Workflow code must be deterministic and fast (it replays on every worker restart). Activities are where side effects live.
+
+```python
+# Temporal Python SDK
+import asyncio
+from datetime import timedelta
+from temporalio import activity, workflow
+from temporalio.client import Client
+from temporalio.worker import Worker
+import temporalio.exceptions
+
+@activity.defn
+async def run_vllm_inference(prompt: str, model: str) -> str:
+    # This runs on the GPU activity worker
+    # heartbeat_timeout is 60s; send a heartbeat every 30s during the HTTP call
+    # so Temporal detects preemption even when inference takes the full 120s
+    async def send_heartbeats():
+        while True:
+            activity.heartbeat("inference in progress")
+            await asyncio.sleep(30)
+
+    heartbeat_task = asyncio.create_task(send_heartbeats())
+
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            response = await client.post(
+                "http://localhost:8000/v1/completions",
+                json={"model": model, "prompt": prompt, "max_tokens": 2048}
+            )
+    finally:
+        heartbeat_task.cancel()
+        try:
+            await heartbeat_task
+        except asyncio.CancelledError:
+            pass  # expected: we cancelled the task ourselves after the HTTP call completed
+        except temporalio.exceptions.CancelledError:
+            raise  # propagate Temporal-initiated cancellation upward
+
+    return response.json()["choices"][0]["text"]
+
+@workflow.defn
+class AgentWorkflow:
+    @workflow.run
+    async def run(self, task: str) -> str:
+        # Step 1: Plan
+        plan = await workflow.execute_activity(
+            run_vllm_inference,
+            args=[f"Create a step-by-step plan for: {task}", "meta-llama/Llama-3-8B-Instruct"],
+            schedule_to_close_timeout=timedelta(minutes=5),
+            start_to_close_timeout=timedelta(minutes=4),
+            heartbeat_timeout=timedelta(seconds=60),
+        )
+        
+        # Step 2: Execute (long GPU activity)
+        result = await workflow.execute_activity(
+            run_vllm_inference,
+            args=[f"Execute this plan: {plan}", "meta-llama/Llama-3-70B-Instruct"],
+            schedule_to_close_timeout=timedelta(hours=2),
+            start_to_close_timeout=timedelta(hours=1, minutes=45),
+            heartbeat_timeout=timedelta(seconds=60),  # detect preemption within 60s
+        )
+        return result
+```
+
+The `heartbeat_timeout` is critical for GPU workers. Set it to well under your expected activity duration. If the GPU worker dies (spot preemption, OOM, crash), Temporal detects the missing heartbeat within one timeout interval and reschedules the activity.
+
+### Deploying Temporal Workers on Spheron
+
+```yaml
+# docker-compose.yml for Temporal server (CPU node)
+version: "3.8"
+services:
+  postgresql:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.29
+    depends_on:
+      - postgresql
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      - "7233:7233"
+
+  temporal-ui:
+    image: temporalio/ui:2.50
+    environment:
+      TEMPORAL_ADDRESS: temporal:7233
+    ports:
+      - "8080:8080"
+
+volumes:
+  postgres-data:
+```
+
+```python
+# GPU activity worker (runs on Spheron H100 or A100 instance)
+# Install: pip install temporalio httpx
+import asyncio
+from temporalio.client import Client
+from temporalio.worker import Worker
+
+async def main():
+    client = await Client.connect("your-temporal-server:7233")
+    
+    worker = Worker(
+        client,
+        task_queue="gpu-activities",  # dedicated GPU task queue
+        activities=[run_vllm_inference],
+        max_concurrent_activities=4,  # match your GPU parallelism
+    )
+    await worker.run()
+
+asyncio.run(main())
+```
+
+For large fine-tuning activities on [H100 SXM5 instances on Spheron](/gpu-rental/h100/), set `heartbeat_timeout` to 60 seconds and emit a heartbeat from within your training loop every 30 seconds. This way spot preemption gets detected in under a minute rather than waiting for the full `start_to_close_timeout`.
+
+The right `scheduleToStartTimeout` for GPU activities depends on your pool size. If you have 4 GPU workers and can queue up to 8 activities, set `scheduleToStartTimeout` to the time it takes to run 4 activities. If activities consistently hit this timeout, you need more GPU workers.
+
+## Inngest for Serverless Agent Flows
+
+Inngest is the right choice when your agents are event-driven: an external event (a webhook, a queue message, a cron trigger) starts an agent pipeline, and you want each step to be independently retried without managing a workflow server.
+
+### Step Functions with GPU Activities
+
+Inngest functions are composed of `step.run()` calls. Each step is checkpointed. If the function fails mid-run, Inngest re-invokes it and skips to the first uncompleted step.
+
+```typescript
+import { inngest } from "./inngest-client";
+
+export const agentPipeline = inngest.createFunction(
+  {
+    id: "agent-pipeline",
+    concurrency: { limit: 8 },  // max 8 parallel GPU workers
+    retries: 3,
+  },
+  { event: "agent/task.created" },
+  async ({ event, step }) => {
+    // Step 1: Generate embeddings (lighter GPU work)
+    const embeddings = await step.run("generate-embeddings", async () => {
+      const response = await fetch("http://gpu-worker-1:8001/v1/embeddings", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "BAAI/bge-large-en-v1.5",
+          input: event.data.documents,
+        }),
+      });
+      return response.json();
+    });
+
+    // Step 2: LLM inference (heavier GPU work, independent retry)
+    const answer = await step.run("llm-inference", async () => {
+      const response = await fetch("http://gpu-worker-2:8000/v1/completions", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: "meta-llama/Llama-3-8B-Instruct",
+          prompt: buildPrompt(event.data.query, embeddings),
+          max_tokens: 1024,
+        }),
+      });
+      return response.json();
+    });
+
+    return { answer: answer.choices[0].text };
+  }
+);
+```
+
+Each `step.run()` call has its own retry budget. If the LLM inference step fails, Inngest retries only that step, not the entire function including the embedding generation step. For GPU workloads this matters: you don't re-run the $0.96/hr L40S embedding step if it succeeded on the first attempt. For a deeper look at colocating embeddings, vector search, and LLM inference on a single GPU node to cut latency, see the [agentic RAG GPU infrastructure guide](/blog/agentic-rag-gpu-infrastructure-guide/).
+
+The `concurrency` option at the function level caps parallel GPU calls. Set this to match your provisioned GPU worker count so you do not queue more work than your pool can handle.
+
+### Event-Triggered Agent Pipelines
+
+Inngest works especially well for pipelines where a user action or external system triggers a multi-step GPU workflow:
+
+```typescript
+// Trigger from any service
+await inngest.send({
+  name: "agent/task.created",
+  data: {
+    query: "Summarize these 50 research papers",
+    documents: documentChunks,
+  },
+});
+```
+
+The GPU worker pool for Inngest doesn't need to be co-located with the Inngest server. Your [A100 GPU cloud workers](/gpu-rental/a100/) can live anywhere that can reach your vLLM endpoint. Inngest handles the retry logic and state; your GPU workers just need to accept HTTP requests.
+
+## Restate for Stateful Agents
+
+Restate is the right choice when you need per-session state and exactly-once tool execution as a first-class primitive. Each agent session is a virtual object, and tool calls within a session are deduplicated by the journal automatically. If you're evaluating which models handle tool-call failures and retries most gracefully before committing to this architecture, the [AI agent tool calling benchmarks](/blog/tool-calling-benchmarks-bfcl-tau-bench-latency-optimization/) post covers BFCL v4 and tau-Bench results for common open-weight models.
+
+### Virtual Objects and Exactly-Once Tool Calls
+
+```python
+# Restate Python SDK
+import restate
+from restate import VirtualObject, Context, ObjectContext
+
+agent_session = VirtualObject("agent-session")
+
+@agent_session.handler()
+async def handle_tool_call(ctx: ObjectContext, tool_input: dict) -> dict:
+    # ctx.run() is exactly-once: if this handler crashes after calling the tool
+    # but before returning, the next invocation skips the tool call and returns
+    # the journaled result
+    tool_result = await ctx.run(
+        "execute-tool",
+        lambda: call_gpu_tool(tool_input)
+    )
+    
+    # Update session state (durably stored by Restate)
+    history = await ctx.get("conversation_history") or []
+    history.append({"tool": tool_input, "result": tool_result})
+    await ctx.set("conversation_history", history)
+    
+    return tool_result
+
+@agent_session.handler()
+async def run_inference(ctx: ObjectContext, prompt: str) -> str:
+    history = await ctx.get("conversation_history") or []
+    
+    result = await ctx.run(
+        "llm-inference",
+        lambda: call_vllm(prompt, history)
+    )
+    return result
+
+async def call_gpu_tool(tool_input: dict) -> dict:
+    # The actual GPU call - this is where the compute happens
+    import httpx
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        response = await client.post(
+            "http://gpu-worker:8000/tool",
+            json=tool_input
+        )
+    return response.json()
+```
+
+The `ctx.run()` wrapper journals the call before executing it. If the handler crashes after execution but before the result is returned to the caller, Restate re-invokes the handler and serves the journaled result without calling the tool again. No idempotency keys needed in application code.
+
+### Deployment: Restate Runtime + Spheron GPU Service
+
+The Restate runtime itself is CPU-only. Deploy it on a small CPU node. Your agent service code runs as a plain HTTP server, which can be deployed on a [Spheron L40S instance](/gpu-rental/l40s/) if the agent handlers need GPU (e.g., direct embedding calls) or on a CPU node if they delegate to a separate vLLM endpoint.
+
+```yaml
+# docker-compose.yml for Restate runtime (CPU node)
+version: "3.8"
+services:
+  restate:
+    image: restatedev/restate:1.6
+    ports:
+      - "8080:8080"   # ingress for incoming requests
+      - "9070:9070"   # admin API
+      - "9071:9071"   # metrics
+
+  agent-service:
+    image: your-registry/agent-service:latest
+    environment:
+      VLLM_ENDPOINT: http://gpu-worker:8000
+    ports:
+      - "9080:9080"
+    # This can run on CPU if it only makes HTTP calls to a GPU backend
+    # Move to GPU node if you run local model inference here
+```
+
+```bash
+# Register the agent service with Restate
+curl -X POST http://restate-runtime:9070/deployments \
+  -H "Content-Type: application/json" \
+  -d '{"uri": "http://agent-service:9080"}'
+```
+
+Once registered, the Restate runtime handles routing, retries, and journaling. Callers just invoke the virtual object by session ID:
+
+```bash
+curl http://restate-runtime:8080/agent-session/session-123/run_inference \
+  -H "Content-Type: application/json" \
+  -d '"Summarize the uploaded documents"'
+```
+
+## Engine Comparison
+
+| Aspect | Temporal | Inngest | Restate |
+|--------|----------|---------|---------|
+| Execution model | History replay | Step journaling | Journal/virtual objects |
+| GPU activity timeout | Configurable heartbeats | Step-level retries | Exactly-once handler |
+| Self-hosted complexity | High (Cassandra/Postgres) | Medium | Low |
+| Serverless support | No | Yes | Yes |
+| Exactly-once semantics | Via idempotency keys | Via step IDs | Native |
+| Per-session state | Manual (via workflow state) | Manual (via metadata) | Native (virtual objects) |
+| Best for | Long multi-day workflows | Event-driven pipelines | Stateful per-session agents |
+| Production maturity | Highest | High | Medium (1.x) |
+| GPU heartbeat support | Yes (native) | Via step timeout | Via ctx.run() timeout |
+
+## Deployment Topology on Spheron GPU Cloud
+
+The right architecture separates orchestration from compute:
+
+**Orchestrator tier (CPU node):**
+- Temporal Server, Inngest Backend, or Restate Runtime
+- Handles workflow state, task queues, and retry logic
+- No GPU required
+- 4-8 vCPU, 16-32 GB RAM for typical workloads
+
+**Worker tier (Spheron GPU instances):**
+- Activity workers (Temporal) or function handlers (Inngest/Restate)
+- Pull tasks from the orchestrator's queue
+- Run the actual GPU compute: vLLM inference, embedding generation, fine-tuning
+- Sized to your workload: A100 80GB for high-throughput inference, H100 SXM5 for large fine-tuning activities
+
+The key reason to use bare-metal GPU here instead of serverless GPU: durable workflow engines assume workers are long-lived. Cold-starts of 30-120 seconds are acceptable for one-off tasks but break the workflow contract for activities that need to start within a defined `scheduleToStartTimeout`. A constantly-warm GPU worker pool with a known startup time is much easier to size correctly than cold-starting on every activity. Spheron charges [per second of actual GPU usage](https://docs.spheron.ai/billing), so keeping workers warm does not mean paying for idle time at a coarse hourly granularity.
+
+### Infrastructure as Code Example
+
+```yaml
+# docker-compose.yml: Full Temporal + GPU worker stack
+version: "3.8"
+services:
+  # Orchestrator tier (CPU node)
+  postgresql:
+    image: postgres:13
+    environment:
+      POSTGRES_USER: temporal
+      POSTGRES_PASSWORD: temporal
+      POSTGRES_DB: temporal
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+
+  temporal:
+    image: temporalio/auto-setup:1.29
+    depends_on: [postgresql]
+    environment:
+      DB: postgresql
+      DB_PORT: 5432
+      POSTGRES_USER: temporal
+      POSTGRES_PWD: temporal
+      POSTGRES_SEEDS: postgresql
+    ports:
+      - "7233:7233"
+
+  # vLLM server (GPU node - this runs on your Spheron GPU instance)
+  # Pin to a tested version; newer 0.9+ releases exist with performance improvements
+  vllm:
+    image: vllm/vllm-openai:v0.8.5
+    command: >
+      --model meta-llama/Llama-3-8B-Instruct
+      --max-model-len 32768
+      --max-num-seqs 64
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - capabilities: [gpu]
+    ports:
+      - "8000:8000"
+
+  # Temporal GPU activity worker (also on GPU node)
+  temporal-worker:
+    image: your-registry/temporal-gpu-worker:latest
+    environment:
+      TEMPORAL_HOST: temporal:7233
+      VLLM_ENDPOINT: http://vllm:8000
+      TASK_QUEUE: gpu-activities
+    depends_on: [temporal, vllm]
+
+volumes:
+  postgres-data:
+```
+
+For Kubernetes-based deployments with multi-GPU scheduling and priority queues, see the [MLOps pipeline orchestration guide](/blog/mlops-pipeline-gpu-cloud-kubeflow-zenml-metaflow-2026/) and the [Kubernetes GPU orchestration guide covering DRA and KAI Scheduler](/blog/kubernetes-gpu-orchestration-2026/).
+
+## Cost Analysis: Workflow Overhead vs LLM Cost
+
+Durable workflow engines add negligible overhead compared to GPU compute costs. The journal write that happens per activity call takes single-digit milliseconds. For a 4-hour H100 fine-tuning activity, this is rounding error.
+
+The real cost story is about failure recovery. A naive retry after a 3-hour-50-minute crash restarts from zero, wasting 3.9 hours of GPU time. A durable workflow with checkpointed state restarts from the last checkpoint, typically within minutes of the crash.
+
+**Live pricing (fetched 03 Jun 2026):**
+
+| GPU | On-Demand (per GPU/hr) | Best for |
+|-----|----------------------|---------|
+| H100 SXM5 | from $5.07 | Large fine-tuning, high-concurrency inference |
+| A100 80GB PCIe | from $1.48 | Cost-effective inference and training |
+| L40S PCIe | from $0.96 | Lightweight to mid-tier inference |
+
+> Pricing fluctuates based on GPU availability. The prices above are based on **03 Jun 2026** and may have changed. Check [current GPU pricing →](/pricing/) for live rates.
+
+**Cost of a crash without durable execution:**
+
+Scenario: 4-hour H100 SXM5 fine-tuning activity. Crash at hour 3.5. No checkpointing.
+
+- Hours wasted: 3.5
+- GPU cost wasted: 3.5 * $5.07 = $17.75
+- If this happens twice per week: $142/month in wasted compute
+
+**Cost with durable execution + checkpointing:**
+
+Same scenario, but the workflow checkpoints every 500 training steps (roughly every 15 minutes).
+
+- Max GPU time wasted per crash: ~15 minutes
+- Cost per crash: 0.25 * $5.07 = $1.27
+- Temporal/Inngest/Restate server overhead: ~$30-50/month (4 vCPU CPU node)
+
+The workflow engine pays for itself the first time your GPU activity crashes.
+
+**Orchestrator overhead is small:**
+
+| Component | vCPU | RAM | Monthly cost (estimate) |
+|-----------|------|-----|------------------------|
+| Temporal Server + PostgreSQL | 4 | 16 GB | ~$40/mo CPU |
+| Inngest Backend (self-hosted) | 2 | 8 GB | ~$20/mo CPU |
+| Restate Runtime | 2 | 4 GB | ~$15/mo CPU |
+
+These are CPU-only components. The GPU spend is entirely in your worker pool.
+
+## Production Checklist
+
+Before going to production with durable GPU workflows:
+
+1. **Idempotency keys on every external API call.** For Temporal activities, derive the key from `activity.info().workflow_id + activity.info().activity_id`. For Restate, `ctx.run()` handles this natively. For Inngest, `step.run()` IDs are the natural deduplication unit.
+
+2. **Heartbeat interval < 50% of activity timeout for GPU tasks.** If `heartbeat_timeout` is 60 seconds, emit a heartbeat every 30 seconds. Emit it from inside your training loop, not just at the start.
+
+3. **Compensation logic for partial fine-tune checkpoints.** If a fine-tuning activity is cancelled mid-run, the checkpoint directory may be in a partial state. Add a cleanup step that validates the checkpoint before the next run starts.
+
+4. **Structured logs include workflow run ID and activity ID.** Every log line from a GPU activity should include `workflow_id` and `activity_id` so you can trace a specific training run through your log aggregator.
+
+5. **Alert on workflow backlog depth.** More than N pending GPU activities in the task queue is a resource constraint signal. Wire an alert before workers are saturated, not after user-visible latency degrades.
+
+6. **Test replay correctness before going to production.** Deliberately kill a workflow mid-run and confirm the resumed run produces the same output. Non-deterministic workflow code breaks replay in subtle ways (timestamps, random seeds, network calls inside workflow code instead of activities).
+
+7. **Cap concurrency on GPU task queue to match provisioned GPU count.** If you have 4 GPU workers and each handles 2 concurrent activities, cap the task queue consumer at 8. Uncapped queues can schedule more activities than your pool can execute, causing cascading heartbeat timeouts.
+
+8. **Use spot GPU instances for non-user-facing activities.** With heartbeat-based preemption detection, spot interruptions become recoverable. The workflow engine reschedules the activity on any available worker. For user-facing real-time inference, keep workers on on-demand instances with predictable availability. See [Spheron instance types](https://docs.spheron.ai/concepts/instance-types) for the difference between spot and dedicated instances and their SLA guarantees.
+
+---
+
+> Long-running agent activities stay cost-predictable when the GPU worker pool bills per minute, not per cold-start. Durable workflow engines handle the retry logic; Spheron handles the GPU.
+>
+> [Spheron H100 →](/gpu-rental/h100/) | [On-demand A100 instances →](/gpu-rental/a100/) | [View all GPU pricing →](/pricing/) | **[Get started on Spheron →](https://app.spheron.ai)**

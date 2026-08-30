@@ -1,0 +1,570 @@
+Comparing, Contrasting, Generalizing, and Integrating Two
+Current Designs for Fault-Tolerant MPI
+Amin Hassani, Anthony Skjellum
+University of Alabama at Birmingham
+CH 115, 1300 University Blvd
+Birmingham, AL, 35205
+{ahassani,tony}@cis.uab.edu
+Ron Brightwell
+Sandia National Laboratories
+PO Box 5800
+Albuquerque, NM 87185-1319
+rbbrigh@sandia.gov
+ABSTRACT
+This paper compares and contrasts the respective approaches
+and key features of two contemporary proposals for faulttolerant MPI: User-Level Failure Mitigation (UFLM) and
+Fault-Aware MPI (FA-MPI). A goal of this paper is to show
+how these two proposals can potentially complement each
+other and also how they can plausibly leverage each other
+through modifications and/or extensions of their semantics
+and APIs. In particular, we show how to “weaken” and extend ULFM to help integrate it with FA-MPI, with corollary
+benefits of potential other uses of ULFM with other faulttolerant schemes as well. The reducibility of the approaches
+to each other is also discussed. This conceptual process helps
+identify clearly which components of each approach are minimally required and/or desirable for MPI standardization,
+versus layerable on top of a future MPI standard. Requirements posed by each on underlying protocols of MPI implementations are mentioned as these have important middledown implications on system and network design at scale.
+Keywords
+MPI, Fault-Tolerance, ULFM, FA-MPI
+1. INTRODUCTION
+Resilience is one of the most significant challenges facing large-scale scientific computing. Machines continue to
+grow in scale and core count in order to achieve ever higher
+levels of computational performance but without significant
+improvements in hardware reliability in most designs. Such
+platforms will necessarily be prone to increasing rates of failure. It is unclear at present if existing strategies for tolerating such faults and recovering from failures arising from such
+faults will continue to be effective. A recent study [10] on
+systems at the Los Alamos National Laboratory concluded
+that failure rate in supercomputers was linearly correlated
+with number of sockets in the subject systems. However, in
+addition to scale, environmental issues such as cosmic rays
+Permission to make digital or hard copies of all or part of this work for
+personal or classroom use is granted without fee provided that copies are
+not made or distributed for profit or commercial advantage and that copies
+bear this notice and the full citation on the first page. To copy otherwise, to
+republish, to post on servers or to redistribute to lists, requires prior specific
+permission and/or a fee.
+EUROMPI/ASIA ’14 Kyoto, Japan
+Copyright 2014 ACM X-XXXXX-XX-X/XX/XX ...$15.00.
+played a role in failure rate. In contrast to the concept of
+standard message passing and other portable program constructs used today, applications will need to adapt to diverse
+types and rates of faults on different systems, and even to
+different scales on the same instance of a system.
+MPI [8] was designed to achieve high performance-portability
+without regard to fault-tolerance in the application or API
+level. The MPI model is well-known to posit a reliable communication layer in which processes are always able to communicate once they become known. Any failure management is considered either or both the responsibility of the
+application and/or the underlying MPI library implementation itself transparently to the application. Except for
+registration of an error handler per-communicator (vs. perfunction or other granularity of error reporting), resource
+exhaustion, and invalid function argument detection, the
+MPI programming interface offers no fault-management capability or semantics. For instance, process failure typically
+causes either a hang or an abort of the parallel application;
+practical workarounds formally violate the MPI standard.
+1.1 Relaxing Absolute Consistency
+As mentioned above, MPI was not designed with fault tolerance in mind. This decision, while valid 20 years ago, leads
+to MPI programmers think in terms of absolute correctness
+and consistency when using MPI. Programs rarely check for
+any errors at run-time, particularly because such checks only
+reduce performance of MPI applications. However “always”
+or “absolute” consistency cannot not be assured in unreliable
+extreme systems. Programs need to assess the reliability of
+such system at run-time and act upon the special situations.
+So any fault-tolerant MPI cannot not guaranty 100% consistency because of a high complexity and unreliability of large
+systems. Any design decision that promises full reliability
+and consistency will eventually lead to high (unacceptable)
+overheads.
+A simple example involves the consensus problem in asynchronous systems. In order to achieve consistency regarding
+the state of the system, reaching agreement (consensus) on
+a decision among a set of peers is needed. However, it has
+been proven that solving consensus in asynchronous systems
+deterministically even with only one process failure is impossible [5] unless the system contains a failure detector [3].
+This approach is reasonable for systems that decouple the
+failure detector module from the application [3]. Although
+reaching scalable and reliable agreement between large number of peers is hard to achieve (particularly if the structure
+of communication in the algorithm is tree based), there are
+SAND2014-17365C
+special cases of process crashes that require an extremely
+complicated implementation and high overhead. Notably,
+logging the state of consensus and consequently recovering
+a process from failure on the same node is undesirable [7].
+Nevertheless, none of these consensus algorithms are fault
+tolerant to network partitioning failures. In other words, in
+such large systems, to achieve maximum scalability, consistency should not be a black-and-white outcome, but rather
+a certain level of uncertainty should be allowed for special
+cases, with additional effort and overhead accepted where
+full agreement can’t be reached.
+This discussion motivates that any fault-tolerant MPI for
+extreme scale systems should allow some level of inconsistency (at least some of the time), and that the required
+amount of agreement should be adjustable by accepting a
+concomitant level of application overhead. For instance, an
+MPI implementation might guarantee 9X% of full consistency with low fault-free overhead and the remaining time
+notify the application of its inability to achieve a consistent
+agreement at a certain, probably small, time period; thus,
+the application would forced in such events to do a partial
+or complete restart from the last checkpoint. Systems can
+plausibly be improved over their lifetimes by discovering and
+improving the fault modeling. Such steps do not necessarily
+improve the theoretical bound on agreement or reliability,
+but would improve the practical bound, similar to finding
+and removing residual faults (bugs) in software.
+1.2 Asynchronous Fault Management
+The path to Exascale and the concomitant need for scalable, dependable applications and reusable libraries motivate the use of (and allowable restriction to) non-blocking
+communication operations in message passing systems (at
+least for the purposes of revealing and focusing an effective
+fault tolerant message passing model, rather than coping
+with the added/accidental complexities of blocking legacy
+semantics under failures). Non-blocking operations have
+proven to be the best semantics in MPI for achieving overlap
+of computation, communication, and I/O [4]. Non-blocking
+semantics are also important aspects for fault-tolerance in
+MPI. At the moment of fault, all layers of system become
+instantaneously coupled and in a parallel system such faults
+can increase the tight coupling already extant between components. As an example, an MPI communication operation
+might hang because of a process failure in a remote process.
+In this situation, forward progress of the user thread in an
+unfaulted process will be impossible because of the coupling
+between the user thread and communication thread. However, in non-blocking semantics, a remote failure would not
+necessarily halt the user thread (unless MPI_WAIT or a similar
+operation is called for completion of an operation).
+Any fault-tolerant approach should address the consider
+the value of dissociating the user thread from the communication mechanism; this decoupling approach motivates the
+design of asynchronous fault tolerance, although the idea
+does not imply any type of transparent fault tolerance and
+recovery. In other words, fault management can be decided
+and programmed by the application, but the progress of detection, isolation, mitigation, and recovery from faults could
+be made asynchronous from a set of user threads. This approach allows for the potential of increased scalability of
+applications in unreliable environments. Asynchronous approaches has been shown successful in previous work such
+as checkpoint-restart [9]. Also, transactions have becoming important with emergence of transactional memories.
+While communication libraries provide comparatively more
+asynchronous mechanisms, there is also more opportunity to
+offload these mechanisms down to hardware for further scalability and performance. Furthermore, such offload needs
+support mechanisms such as efficient communication timeout mechanisms or failure detection (to make such mechanisms efficient, and also to help address fault free overhead).
+1.3 Trade-offs
+MPI designers and application programmers should not
+view a fault-tolerant MPI design strict as providing certain
+API routines in their code and presuming their application
+becomes fault tolerant simply by adding such operations.
+Rather, in order to achieve maximum net performance, scalability, and resilience, they should think in terms of tradeoffs between these three parameters. These trade-off can
+be based on different criteria such as the length of time of
+the running application, data size, the degree and kinds of
+coupling between components, asynchronicity of underlying
+algorithms and etc. Any fault-tolerant MPI should allow
+configuration between these three parameters to help achieve
+overall best operation under faulty conditions.
+2. CURRENT PROPOSALS
+Two current proposals for fault tolerance in MPI are UserLevel Failure Mitigation [1, 2] and Fault-Aware MPI [6, 11].
+The former is in the process of MPI standardization while
+the latter is a developing research effort being undertaken
+by the authors of this paper. In the following subsections
+an overview of both proposals is presented, with the goal
+of comparing and contrasting these efforts in advance of exploring ways to generalize and integrate them.
+2.1 FA-MPI
+Fault-Aware MPI [6, 11] introduces a transactional model
+of fault tolerance to MPI programming for the first time
+in order to address failure detection, isolation, mitigation,
+and recovery via application-driven policies. FA-MPI leverages non-blocking communication operations combined with
+a set of lightweight transactional TryBlock API extensions
+that can be nested to utilize the system and application hierarchy for failure detection and recovery. TryBlocks define
+the communication and computation boundary for failure
+management and this boundary can be configured to achieve
+a trade-off between scalability, performance and resilience.
+The goal is to enable applications to run to completion with
+higher probability than running on a non-fault-aware MPI.
+Scaling up and out and fault-free overhead are key concerns
+and can be managed through setting the transaction granularity.
+In order to build a tractable fault tolerant programming
+model, FA-MPI chooses to restrict MPI message passing to
+non-blocking communication operations at present, then extends MPI functionality with a transactional model designed
+to allow a series of communication, computation and I/O
+operations operations to be “tried” and then “committed”
+when all operations succeed, or be partially or completely
+“rolled backward” or “rolled forward” when some operations
+or processes fail. TryBlock is the fundamental building block
+of FA-MPI model. FA-MPI suggests a “per-transaction”—
+in contrast to “per-operation”—failure management. Try-
+Blocks open an entire window of opportunity for different
+degrees of optimization.
+A TryBlock starts with MPI_TRYBLOCK_STARTFA-MPI
+1
+, which
+is a locally collective operation2that binds a communicator
+to the TryBlock’s request handle. A TryBlock is completed
+(committed) by MPI_TRYBLOCK_FINISHFA-MPI. This function
+first acts as an MPI_WAITALL on the set of given request handles and then if the group-wise transaction flag is set in
+MPI_TRYBLOCK_STARTFA-MPI, it act as a synchronizing nonblocking collective operation that broadcast failures in a
+fault-tolerant collective over all surviving processes in the
+TryBlock’s communicator’s group. Upon return from this
+call, all surviving processes in the communicator’s group will
+have the same view of the system regarding faults. However
+if consensus cannot be reached, an error code defining this
+state is returned. TryBlocks can be both local and groupwise. In case of local, no synchronization needs to be done
+in the MPI_TRYBLOCK_FINISHFA-MPI.
+FA-MPI allows an application to detect and raise any failure (that cannot be detected by MPI itself) and to synchronize it at the end of transaction. This can be done
+through the application of MPI_REQUEST_RAISE_ERRORFA-MPI.
+These errors can be anything from predictions of failures,
+disk and process failures, computation errors, soft faults,
+etc. Also the API for raising errors allows applications to
+test their fault-tolerant methodology by intentional error injection. Once every process in a group knows about a given
+failure, appropriate action can potentially be taken (this action or actions is up to the application). Along with failure
+injection, application can “query” for failures through usage
+of the mechanisms introduced in [6].
+FA-MPI is not limited to a certain fault model such as
+single-event upset or process crashes. The fact that TryBlocks request handle contains all information about failures
+in the TryBlock, tools can be developed (probably outside
+the MPI standard but similar to the MPI’s tools API) to
+query and recover from such errors (when underlying resources and system health otherwise allow). Such tools can
+plausibly be automated and be written once and used several
+times with minor configuration changes, perhaps with only
+limited platform-specific logic. Such an approach would allow third-party libraries to provide a set of (semi-)automatic
+tools for recovery to complement FA-MPI’s mechanisms.
+In closing, we note that FA-MPI incorporates timeout
+mechanisms at the user thread to avoid the extra overhead
+and deadlocks that can be introduced by different types of
+hard and soft failures.
+2.2 ULFM
+User-level failure mitigation (ULFM) [1, 2] is a proposal
+for a fault-tolerant MPI designed by the MPI Forum’s faulttolerance working group (FTWG) and is currently under
+development and standardization as part of the MPI-4 standard (it began during the standardization of MPI-3). The
+goal of ULFM is to add fault-tolerant support to MPI through
+which a wide range of fault-tolerant techniques to be implemented. ULFM adds a minimal set of API extensions to
+1We suffix all functions with the name of the proposal that
+would add them to MPI if not already part of the MPI
+standard.
+2Every process in the group of a communicator must call
+the operation in a bounded amount of time but there is no
+need for actual synchronization.
+MPI and is more suitable for libraries providing resilience
+rather than for direct use by applications. It only addresses
+process failure and masks transient failures into process failure as a simplified approach to handling other faults. Process failure is defined as a state when a process becomes
+permanently unresponsive. Backward compatibility is one
+of the main concerns in the design of ULFM and support
+for legacy code is deemed important. In its current versions,
+ULFM imposes “per-operation” failure management.
+ULFM semantics are based on returning exception (error)
+codes from MPI routines involving in a communication. If
+an MPI operation is related to a crashed process and cannot
+continue execution or return correct results, the operation
+will return appropriate error codes such as MPI_ERR_PROC_-
+FAILEDULFM. The application then has to acknowledge this
+failure and either get the group of locally known failed ranks
+or continue execution ignoring failed processes. Revoking
+a communicator provides global error propagation and can
+prevents deadlock in blocking communication operations.
+MPI_COMM_FAILURE_ACKULFM is designed to acknowledge the
+locally known failures to prevent further communication functions from returning exceptions related to process failure of
+a specific rank. Point-to-point communication involving a
+failed process always return the exception and collective operations also always return the exception even with only one
+process failure (the return code in some collectives such as
+broadcast can vary in different ranks of a communicator).
+It seems that this function is useful only for any receive operations with wildcards for the source of communication. It
+basically re-enables the outstanding wildcards in the communicator involving a failed process. But any failure should
+be acknowledged for further recovery even if no wildcard is
+used. Fundamentally, the use of this function couples the
+user thread with failure detection.
+MPI_COMM_FAILURE_GET_ACKEDULFM returns the group of locally acknowledged failed ranks in a communicator. Locally
+known failed ranks are useful when application is strictly
+performing point-to-point or one-sided operations, but when
+collectives are used, locally known failures are not useful and
+further processing should be done for group-wise failure recovery.
+MPI_COMM_SHRINKULFM removes all failed ranks in a communicator and creates a smaller communicator with only instantaneously healthy ranks. In order for a group of peers to
+agree on a decision value, the ULFM design uses MPI_COMM_-
+(I)AGREEULFM. Agreement can be used to obtain transparent
+global fault/failure propagation. MPI_COMM_REVOKEULFM is a
+failure notification function. It is not a collective function
+but it impacts all the processes in the given communicator
+by invalidating the communicator as failed. Once a communicator is revoked, no other communication operation
+on the communicator can be performed, except MPI_COMM_-
+SHRINKULFM and MPI_COMM_(I)AGREEULFM. To use MPI_COMM_-
+REVOKEULFM one should first detect if a deadlock has occurred.
+A call to this function will cause all pending requests on a
+communicator to return; otherwise freeing a failed communicator is not necessary. Similar functions exist for MPI
+window and file objects within the ULFM model.
+2.3 Leveraging ULFM
+The main standardization goal of ULFM is backward compatibility with MPI-3 (and, in the future, MPI-4) and this
+has led to a synchronous and blocking design of its seman-
+tics. In order to leverage ULFM’s design for a more generalized and so-called weakened solution, there is a need
+for semantic modifications. The goal of ULFM has been to
+keep the number of API routines as small as possible, but
+the number of APIs is not as important as how much complexity a given approach will add to MPI implementations
+itself and to MPI applications,3
+ULFM requires the involvement of the user thread to verify the detection of process failures. In order to separate out
+the involvement of the user thread, this requirement should
+be modified4. One means to achieve this goal is to relax this
+requirement by removing the need for failure acknowledgement. Since a failure detector should exist in MPI implementations or a system’s underlying layers to achieve consensus,
+removing this function only changes the fault management
+semantics of receive operations for wildcards. A new operation (such as MPI_COMM_REENABLE_WILDCARDG-ULFM)
+5
+could be
+introduced instead. Another approach would be a routine
+directly to disable the wildcards whenever necessary instead
+of attempts to re-enable them. Data parallel programs often
+do not use wildcards so there is no impact on these common
+types of MPI applications.
+As discussed earlier, no practical fault-tolerant solution
+in large scale systems can guarantee full consistency at all
+times. In order to achieve “less complicated” consensus, processes should log their consensus state on reliable storage
+and restart with access to the same reliable storage for recovery, but this is not desirable for an MPI implementation because high overhead of logging. This requirement
+should be visible in the ULFM’s agreement function. Currently, the agreement function offers/promises/attempts full
+consistency by returning consistent error codes (or success)
+at all surviving ranks in a communicator. However, there
+should be a mechanism, such as new error code, indicating
+that achievement of consistency is not possible, or indicating that consistency has been achieved at approximately P
+ranks (1  P < N), where N is the number of processes in
+the group of the communicator. This approach could lead to
+support (or at least notification) of failures such as network
+partitioning.
+The current communicator shrink operation in ULFM changes
+ranks in some of the processes. However, certain applications need to preserve their ranks. There is a need for an operation such as “shrink and grow” to keep the ranks the same
+and spawn new processes for failed ranks. Although the
+current specification does not include a non-blocking shrink
+operation, there have been suggestions about adding this
+function to the proposal and FA-MPI, for instance, would
+require this changes to the specification in order to be useful
+for a better asynchronous recovery in applications.
+3. COMPARISON AND CONTRAST
+While ULFM’s goal is strong backward compatibility, FA3FA-MPI takes the alternative approach of seeking to add
+less complexity and overhead in favor of increased in number
+of APIs.
+4The FA-MPI approach is “fault bypass” vs ULFM’s “in
+thread detection.”
+5By G-ULFM we introduce our generalization of ULFM designed to provide a more asynchronous and less demanding
+set of requirements for fault awareness; in particular we will
+not require complete consensus. G-ULFM will prove easier
+to integrate with FA-MPI than canonical ULFM.
+MPI considers only a non-blocking subset of MPI. This choice
+is made because of complexities that blocking MPI introduce
+for resilience. In contrast to ULFM’s choice only to support
+process failure, FA-MPI can support several fault-models including process failure, application- detected failures (disk
+failure, soft errors), communication failure, and resource exhaustion related failures.
+Performance Resilience 
+Scalability 
+API 
+Portability 
+FT 
+Portability 
+FA#MPI'
+ULFM'
+Figure 1: Configurability of two approaches
+As shown in Figure 3, in comparison to ULFM, FA-MPI
+allows trade-offs between scalability, performance, and acquired resiliency through variations of the granularity and
+hierarchy of TryBlocks along with configuring of TryBlock
+(local or group-wise) being used. However, this strategy
+may result in less portability of the fault-tolerant method
+being used as an application running in different systems
+at different scales requiring modifications of the transaction
+granularity to achieve maximum performance and resilience.
+Since both proposal APIs are being proposed as set of MPI
+routines, API portability will remain valid.
+In this section, we discuss partial reducibility of the two
+proposals to each other. We define the reducibility of proposal A to B as the ability to implement B’s API and semantics using A’s API and semantics. Although both proposals are promising concepts and can be used in conjunction,
+it may not be possible to reduce exact APIs to each other,
+however one’s concepts partially can be implemented and/or
+used by the other.
+3.1 FA-MPI meets ULFM
+The issue discussed here is how FA-MPI can use ULFM
+constructs to survive process crashes, while also supporting other fault models. Since ULFM encourages libraries to
+implement complementary fault-tolerant semantics on top
+of it, it appears logical that FA-MPI should use the process
+fault-tolerant semantics of ULFM. In this section, we discuss
+why ULFM has to be generalized to be asynchronous to user
+thread and how FA-MPI can only use such the non-blocking
+subset ULFM.
+BSP-likes applications use a large number of communication and computation operations and use barrier synchronization before moving to the next iteration. This concept is
+being used in FA-MPI to allow detection, isolation, mitigation, and recovery to be done after the synchronization point
+(MPI_TRYBLOCK_FINISHFA-MPI). In other words, an optimal
+implementation using FA-MPI does not check for errors and
+failures in the critical path of computation. However, ULFM
+requires the acknowledgement of locally known failures in order to complete communication operations. In other words,
+ULFM needs the user thread to acknowledge each failure
+detection and as ULFM semantics demands, if failure is not
+acknowledged, it cannot appear in list of locally known or
+group-wise failures. In the view FA-MPI, acknowledging for
+locally known failures is not important because all failure
+detections are done at the end of TryBlock. Acknowledging failures is useful only for implementation of the consensus algorithm that add and remove processes to their list of
+suspected failed ranks and acknowledgement should not be
+used at MPI level. In order to achieve both application bypass and “fault bypass,” this acknowledgement should not be
+a requirement for failure detection. The acknowledgement
+contradicts the approach of separating failure management
+from the user thread. To solve this problem, a new routine
+should be introduced just to re-enable the receives with wild
+cards or to disable them whenever necessary.
+A nominal implementation of MPI_TRYBLOCK_FINISHFA-MPI
+can be an agreement algorithm followed by a fault-tolerant
+collective (for group-wise error propagation). This can be
+implemented using MPI_COMM_IAGREEULFM inside a loop to bypass the locally known failures, followed by a fault-tolerant
+collective if any process in the group should have detected
+any faults. However, if agreement is not used (because the
+rate of faults cannot be so high to interrupt the flow of
+program), implementations may be able to optimize the algorithm to remove the following fault-tolerant collective in
+many low-fault cases. This motivates the idea that low faultfree overhead is needed and this overhead should increase
+only by increased number of consecutive faults. If agreement is used, the fault-free overhead is O(allreduce) and
+in case of fault the overhead will be roughly O(allreduce ×
+num retries + allreduce).
+A better semantic approach for the agreement function
+is to allow more information to be exchanged rather than
+simply an integer value. This can be achieved by changing
+the value of integer to a larger size array struct. Also another
+suggestion is to change the bitwise AND of the integer flag of
+agreement function to bitwise OR. A bitwise AND makes the
+final value based on the decision of a single process. For
+example, if one of the processes decide value “zero,” then
+the final value will be “zero”. However with a bitwise OR,
+the same decision can be made if different bits are used for
+informing different decisions. For instance, a success can
+be ’1’ while a failure can be ’2’. If the final value is ’1’,
+then where was no failure, and if the final value was ’3’
+then some processes reported failure. If dead processes will
+implicitly contribute ’0’ to the flag, then AND operation will
+make sense, but since in ULFM semantics crashed processes
+do not contribute to the value of flag, a bitwise OR is more
+logical (more useful).
+In ULFM’s semantics, failure propagation is coupled with
+failure recovery through the revoke operation. Revoke is a
+failure-propagation mechanism such that if a process should
+detect a deadlock, it can revoke the communicator. Revoking a communicator causes associated communicators of all
+ranks in the communicator’s group, skipping failed ranks,
+to become invalid permanently for future operations. This
+routine could be used by FA-MPI to invalidate the communicator for further removal at the end of a TryBlock,
+but it should never be used inside a TryBlock. But, if
+the MPI implementation can offer effective garbage collection and the system can allow some resources be dedicated
+for resource exhaustion management and operation cancelation through retrieving resources, then FA-MPI can operate
+without revoking the communicator. Another suggestion
+is the local version of this function, namely MPI_COMM_REVOKE_LOCALG-ULFM. This new function is collective and only
+invalidates the communicator locally and has no effect on
+other processes.
+FA-MPI could utilize ULFM as the survival mechanism
+from process failure if the aforementioned modifications were
+made to the current ULFM proposal. In this case, the only
+ULFM routines that are needed for FA-MPI are: MPI_-
+COMM_IAGREEULFM, MPI_COMM_ISHRINKG-ULFM (not in the specification yet), and operations to obtain list of known failures such as MPI_COMM_FAILURE_GET_ACKEDULFM and MPI_-
+WIN_GET_FAILEDULFM.
+3.2 ULFM meets FA-MPI
+Unlike FA-MPI, ULFM only addresses process crashes so
+ULFM cannot be a total substitution for FA-MPI. However, we will show how FA-MPI can be reduced into a peroperation and blocking fault-tolerant API such as ULFM.
+Since a TryBlock can span the fault-management boundary
+anywhere from start and end of the application to a single
+operation, similar functionality to ULFM can be achieved by
+first converting blocking operations into non-blocking, then
+protecting each MPI routine by a TryBlock as the pseudocode in Figure 3.2. However this conversion will have
+high overhead and is not an ideal solution; it is shown to
+help identify how the two proposals are related.
+MPI_Tryblock_start (comm , MPI_TRYBLOCK_LOCAL ,& tryreq );
+MPI_Ioperation (input ,& request );
+MPI_Tryblock_finish ( tryreq ,1 ,& request );
+rc = MPI_Wait (& tryreq ,& trystat );
+/* check rc followed by failure query functions for
+failure notific ations */
+Figure 2: Using FA-MPI to capture per-operation
+failure management such as ULFM
+Agreement function can be implemented, partially, using
+only an empty TryBlock as shown in Figure 3.2. However
+it is not possible to carry the integer flag in the agreement
+function for bitwise AND among all alive peers, but similar
+functionality can be achieved by rasing an error value on
+TryBlock’s request handle inside the TryBlock and check for
+group-wise failures at the end. Other APIs such as revoke
+and failure acknowledgement cannot be implemented using
+FA-MPI.
+MPI_Tryblock_start (comm , MPI_TRYBLOCK_GLOBAL ,& tryreq );
+MPI_Tryblock_finish ( tryreq ,0 , MPI_REQUEST_NULL );
+rc = MPI_Wait (& tryreq ,& trystat );
+/* check rc followed by failure query functions for
+failure notific ations */
+Figure 3: Implementation of agreement function using TryBlocks in FA-MPI.
+3.3 Combining Approaches
+Along with discussion of implementation of FA-MPI using
+ULFM, ULFM routines can be used in conjunction with FA-
+Features ULFM G-ULFM FA-MPI G-ULFM+FA-MPI
+Support entire MPI 3.0 yes yes no yes
+Per-operation fault-management yes yes no (optional) no
+Per-transaction fault-management no no yes yes
+Guaranty of full consistency yes no no no
+Asynchronous to user thread no yes yes yes
+Hierarchical fault-management no no yes yes
+Fixed granularity of failure detection yes no no no
+Heavyweight revoke yes no no no
+Support multiple fault models no no yes yes
+Portable error code yes yes no no
+Table 1: Overview of futures of current and future fault-tolerant MPIs. Preferred features are marked as
+bold face.
+MPI for failure management of blocking operations. In other
+words, FA-MPI can support synchronous fault-tolerance with
+the help of ULFM. One simple way to do this is by allowing
+blocking communication functions to return from process
+failure and this error could be raised on a TryBlock’s request handle. Although this might reduce the capabilities
+of TryBlocks, it can be a nominal solution for a synchronous
+MPI application. This functionality is shown in Figure 3.3.
+MPI_Tryblock_start (comm , MPI_TRYBLOCK_LOCAL ,& tryreq );
+rc = MPI_operation (input ,& request );
+if(rc == MPI_PROC_FAILED )
+MPI_Request_raise_error ( tryreq ,rc);
+/* ... */
+MPI_Tryblock_finish ( tryreq ,1 ,& request );
+rc = MPI_Wait (& tryreq ,& trystat );
+/* check ’rc ’ followed by failure query functions for
+failure notific ations . If there was an error ,
+preferably shrink the communicator and recover .*/
+Figure 4: Using FA-MPI and ULFM for a blocking
+application.
+This latter functionality might be important as application needs and fault models are different and just one faulttolerant method might not be sufficient for a big application
+based on a number of code sources and libraries. This flexibility opens the opportunity for an application with mixed
+synchronicity semantics to utilize both approaches to gain
+more reliability at run time. Table 3.3 captures the current
+features in both proposals plus features that can be introduced by using the two approaches together.
+4. CONCLUSIONS AND FUTURE WORK
+This paper discusses approaches taken by two current
+fault-tolerant MPI proposals (ULFM and FA-MPI). A comparison and contrast between these proposals is presented
+and the discussion is followed by methodology of how can
+they complement each other. Overall, we would prefer that
+ULFM semantics were more asynchronous to the user thread
+and be “weakened” regarding consistency to help make trade
+offs of scalability and fault-free overhead (at the expense
+of potentially hierarchical recovery). An example is the
+weakening consistency requirements of the agreement operation to reduce its per-invocation overhead. Weakened
+consistency can be achieved partially by a timeout mechanisms and tunable algorithms. If these two requirements
+were added to ULFM, then FA-MPI could utilize a subset of
+that extended ULFM system (including only asynchronous
+operations to detect and survive from process failures). We
+discussed why these requirements are needed for future extreme scale systems, and showed both a generalized ULFM
+model (G-ULFM), discussed conceptual integration of our
+G-ULFM model with FA-MPI.
+For the future, we intend to demonstrate both the benefits of extending and modifying ULFM into G-ULFM, as
+well as providing successively more capable working prototypes of FA-MPI (independent of G-ULFM). Our purpose
+is to explore integration of FA-MPI with application middleware so that we can also assess how much non-portable
+code is needed for specific systems to implement effective
+fault tolerance on a specific system.
+5. ACKNOWLEDGMENTS
+This work was supported in part by the National Science Foundation under grant CCF-1239962 and Sandia National Laboratories under grant PO-1330625. Sandia National Laboratories is a multi-program laboratory managed
+and operated by Sandia Corporation, a wholly owned subsidiary of Lockheed Martin Corporation, for the U.S. Department of Energy’s National Nuclear Security Administration under contract DE-AC04-94AL85000.
+References
+[1] W. Bland, G. Bosilca, A. Bouteiller, T. Herault, and
+J. Dongarra. A proposal for user-level failure mitigation in the MPI-3 standard. Technical report, Tech.
+rep., Department of Electrical Engineering and Computer Science, University of Tennessee, 2012.
+[2] W. Bland, A. Bouteiller, T. Herault, G. Bosilca, and
+J. Dongarra. Post-failure recovery of MPI communication capability design and rationale. International
+Journal of High Performance Computing Applications,
+27(3):244–254, Aug. 2013.
+[3] T. D. Chandra and S. Toueg. Unreliable failure detectors for reliable distributed systems. J. ACM,
+43(2):225–267, Mar. 1996.
+[4] R. Dimitrov and A. Skjellum. Software architecture
+and performance comparison of mpi/pro and mpich.
+In International Conference on Computational Science,
+pages 307–315, 2003.
+[5] M. J. Fischer, N. A. Lynch, and M. S. Paterson. Impossibility of distributed consensus with one faulty process.
+Journal of the ACM (JACM), 32(2):374ˆaA¸S382, 1985. ˘
+[6] A. Hassani, A. Skjellum, and R. Brightwell. Design and
+evaluation of FA-MPI, a transactional resilience scheme
+for non-blocking MPI. FTXS ’14, Atlanta, GA, June
+2014.
+[7] J. Hursey, T. Naughton, G. VallAl’e, and R. L. Graham. ˜
+A log-scaling fault tolerant agreement algorithm for a
+fault tolerant MPI. In EuroMPI, pages 255–263, 2011.
+[8] Message Passing Interface Forum. MPI: a messagepassing interface standard version 3.0. Technical report,
+Sept. 2012.
+[9] K. Sato, N. Maruyama, K. Mohror, A. Moody, T. Gamblin, B. R. de Supinski, and S. Matsuoka. Design
+and modeling of a non-blocking checkpointing system. In Proceedings of the International Conference
+on High Performance Computing, Networking, Storage
+and Analysis, SC ’12, pages 19:1–19:10, Los Alamitos,
+CA, USA, 2012. IEEE Computer Society Press.
+[10] B. Schroeder and G. Gibson. A large-scale study of
+failures in high-performance computing systems. IEEE
+Transactions on Dependable and Secure Computing,
+7(4):337–350, Dec. 2010.
+[11] A. Skjellum and P. V. Bangalore. FA-MPI: fault-aware
+MPI specification and concept of operations: A transactional message passing interface & an alternative proposal to the MPI-3 forum. Technical Report UABCISTR-2012-011912, University of Alabama at Birmingham, Computer and Information Sciences, Feb. 2012.

@@ -1,0 +1,232 @@
+Durable Execution for AI Agent Runtimes: Checkpointing, Replay, and Recovery | Zylos Research
+
+## Executive Summary
+
+Durable execution is becoming one of the core reliability layers for production AI agents. The field is converging on a simple but demanding idea: persist completed execution boundaries, then recover after crashes without repeating tool calls, external mutations, human approvals, or outbound messages. Workflow engines such as Temporal, Restate, Inngest, Hatchet, DBOS, Cloudflare Workflows, AWS Lambda Durable Functions, and Azure Durable Task expose these primitives directly, while agent frameworks such as LangGraph, OpenAI Agents SDK, AutoGen, CrewAI, Dapr Agents, and Microsoft Agent Framework are adding persistence and checkpointing at the agent layer.
+
+The important distinction is that session memory is not durable execution. Saving chat history helps an agent remember, but it does not prove which shell command ran, which email was sent, which approval was granted, or whether a retry would duplicate a side effect. Durable agents need an execution journal, idempotent tool boundaries, versioned prompts and tools, durable human approvals, and recovery tests that intentionally crash the runtime at the worst possible moments.
+
+## Why Agents Need Durable Execution
+
+Most AI agent reliability discussions focus on reasoning quality: whether the model selected the right plan, used the right tool, or interpreted the user correctly. Those problems matter, but long-running production agents also inherit the older failure modes of distributed systems. A process can crash after an external API succeeds but before local state is written. A retry can send the same notification twice. A human approval can be lost in a chat transcript. A model or prompt can change between the original run and a recovery attempt.
+
+Durable execution addresses this class of problem by making progress recoverable. Instead of treating an agent run as an ephemeral stream of model calls and tool calls, the runtime records meaningful execution boundaries: the model response used for a decision, the exact tool input, the result receipt, the approval decision, the checkpointed graph state, or the completed workflow step. After a crash, the agent resumes from the recorded boundary rather than guessing from logs or redoing unsafe work.
+
+For autonomous coding and operations agents, this is not an academic concern. A long-running agent might install packages, modify files, create pull requests, send messages, restart services, wait for review, and continue after a human responds hours later. Without durable boundaries, recovery becomes improvisation. With durable boundaries, recovery becomes a controlled continuation.
+
+## The Workflow-Engine Baseline
+
+Workflow engines provide the cleanest vocabulary for durable execution because they were built for multi-step work that spans failures, retries, timers, and human waits.
+
+### Temporal: Event History and Deterministic Replay
+
+Temporal remains the reference model for deterministic replay. Workflow code is expected to be deterministic, while nondeterministic work and side effects are pushed into Activities. The Temporal service stores workflow event history and replays workflow code against that history to reconstruct state after a worker crash. Timers, signals, retries, task queues, and long-running workflows are first-class concepts.
+
+This model maps well to agents, but only if the agent builder respects the Workflow/Activity split. LLM calls, shell commands, API requests, file writes, random values, and wall-clock reads cannot simply sit inside deterministic workflow logic. They need to be Activities or otherwise recorded as durable external results. Pydantic AI's Temporal integration makes this point explicit by separating deterministic orchestration from nondeterministic agent steps.
+
+### Restate: Journaled Steps and Durable Callbacks
+
+Restate offers a similar durability model with a lighter application-programming feel. Application code records completed operations in a journal; on recovery, Restate replays the journal and skips work already completed. Its SDKs expose`ctx.run`-style durable steps, built-in key-value state, durable timers, idempotency keys, and callback waits called awakeables.
+
+For agents, Restate's framing is useful because it treats durability as something ordinary application handlers can use, not only a separate workflow-worker architecture. A model call or external tool call can be wrapped as a durable step whose result is recorded once and then replayed as data.
+
+### Inngest, Hatchet, DBOS, Cloudflare, AWS, and Azure
+
+Inngest emphasizes step memoization rather than full deterministic replay. Each`step.run` result is persisted; if the function re-executes, completed steps are skipped and stored results are injected. It also provides durable sleeps, event waits, retries, idempotency, concurrency controls, and checkpointing for lower inter-step latency.
+
+Hatchet exposes durable tasks that can wait for time, wait for events, or spawn child tasks while recording checkpoints in a durable event log. Its docs are careful about semantics: ordinary tasks are at-least-once, so idempotency remains the developer's responsibility unless durable boundaries are used carefully.
+
+DBOS persists workflow and step state in a database and has direct integrations for AI stacks, including OpenAI Agents. Cloudflare Workflows provides durable multi-step execution on Workers. AWS announced Lambda Durable Functions in December 2025 for steps, waits, checkpoints, replay, retries, and long suspensions. Microsoft's Durable Task for AI agents, updated in April 2026, positions Durable Task Scheduler as checkpointing and coordination infrastructure for agent frameworks.
+
+Across these systems, the primitives repeat:
+
+| Primitive | Why It Matters for Agents |
+| --- | --- |
+| Event history or step journal | Reconstructs what already happened after a crash |
+| Durable step result | Prevents re-running a completed LLM call or side-effecting tool call |
+| Durable timer or sleep | Allows agents to wait hours or days without occupying a live process |
+| External event wait | Models human approvals, webhooks, and asynchronous callbacks |
+| Retry policy | Handles transient failures without losing workflow state |
+| Idempotency key | Prevents duplicate effects when retries cross process or API boundaries |
+| Child workflow/task | Decomposes long agent plans into independently recoverable work |
+
+## Agent Frameworks Are Catching Up
+
+Agent frameworks increasingly expose persistence and recovery concepts, but their guarantees vary. Some persist conversation state; some persist graph state; some serialize run state for approval; fewer provide full durable execution across side effects.
+
+### LangGraph: Checkpoints, Time Travel, and Interrupts
+
+LangGraph persistence is one of the strongest agent-native checkpointing systems. With a checkpointer, LangGraph saves graph state at each superstep and organizes runs by thread. Those checkpoints support memory, fault recovery, state history, time travel, and human-in-the-loop workflows.
+
+LangGraph's durable execution docs are valuable because they do not hide the replay problem. On resume, later graph work can re-execute. Nondeterministic operations and side effects should be wrapped in tasks or nodes, and mutating operations still need idempotency. Its interrupt pattern gives a durable pause and resume mechanism for human approval, but code before an interrupt may run again, so approval boundaries must be placed carefully.
+
+The design lesson is clear: graph checkpoints are powerful, but they do not automatically make every node safe. The node boundary has to be engineered as a replay boundary.
+
+### OpenAI Agents SDK: Sessions, HITL State, and Tracing
+
+The OpenAI Agents SDK session system persists conversation items across turns using backends such as SQLite, Redis, SQLAlchemy, Dapr, OpenAI Conversations, encrypted sessions, or custom stores. This is useful for continuity, but session memory alone is not full durable execution.
+
+The SDK's human-in-the-loop support gets closer to a durable pause boundary. Tools can require approval; interrupted run state can be serialized and later resumed. That serialized state includes approvals, usage, tool input, nested resumptions, trace metadata, and conversation settings, so it should be treated as sensitive runtime state.
+
+Tracing records runs, LLM generations, tool calls, handoffs, guardrails, and custom events. Traces provide the shape of an execution journal, but observability is not the same thing as recovery. A trace can explain what happened; a durable journal must decide what may be replayed, skipped, compensated, or resumed.
+
+OpenAI's April 2026 Agents SDK update also points in this direction: externalized agent state, snapshotting, sandbox-aware orchestration, and rehydration into fresh containers are all durability-adjacent runtime concerns.
+
+### AutoGen, CrewAI, Dapr Agents, and Microsoft Agent Framework
+
+AutoGen supports saving and loading agent and team state, including message threads and group-chat manager state. Magentic-One adds useful orchestration concepts such as task ledgers and progress ledgers, but the public persistence model is closer to state serialization than workflow replay.
+
+CrewAI memory persists recallable facts, while CrewAI Flow persistence can persist flow state across executions using SQLite by default. That helps continuity, but precise recovery across external side effects still requires durable tool boundaries.
+
+Dapr Agents is more explicit about workflow-backed agents, describing durable, auditable, resumable LLM calls and tool executions with workflow checkpoint recovery. Microsoft's Agent Framework workflows similarly frames workflows as the right abstraction when order, gates, checkpoints, and recovery matter.
+
+## The Dangerous Middle: Checkpointing Without Side-Effect Discipline
+
+The biggest trap is believing that checkpoints alone solve durability. They do not. A checkpoint tells the runtime where it was. It does not automatically know whether an email was sent, whether a file was deleted, whether a payment was charged, or whether the user approved the exact artifact now being replayed.
+
+The high-risk operations are familiar:
+
+- Shell commands
+- File and database writes
+- Pull request creation
+- Ticket creation
+- Email, chat, and notification sends
+- Payment and billing operations
+- Package installation or service restarts
+- Human approvals for irreversible work
+
+Every mutating tool should be treated as a transaction boundary. The agent should record intent before execution, execute through a wrapper that provides idempotency where possible, and record a durable receipt after success. On retry, the runtime should inspect the receipt or idempotency key before doing anything again.
+
+Stripe's idempotency-key design is the standard example: the first result for a key is stored and returned on retries. AWS Lambda Powertools' idempotency utility applies the same principle to serverless functions. Agent tools need the same pattern at the operation layer, not just at the workflow layer.
+
+For "write local state and then publish" flows, the outbox pattern remains relevant. The agent writes its durable intent and local state in one transaction, then a separate dispatcher publishes the message or external request. If the process crashes, the outbox record remains and can be completed exactly once from the agent's perspective.
+
+## Human Approval Must Be Durable
+
+Human-in-the-loop is often described as an agent UX problem, but durable execution turns it into a correctness problem. If an approval is stored only as a chat message or transient model input, replay can become unsafe.
+
+A durable approval record should include:
+
+- Who approved
+- When they approved
+- What exact artifact they saw
+- A hash or version of the command, patch, message, or external action
+- The decision and any constraints
+- Expiry or reuse policy
+- Whether the approval survives replay or must be requested again
+
+Azure Durable Functions' human interaction pattern models approval as an external event that can be raced against a durable timeout. That is the right mental model for agents. Approval is not a prompt response; it is a durable event in the execution log.
+
+## Version Drift Is a Replay Hazard
+
+Agents are unusually exposed to version drift. The same logical step may depend on the model version, prompt text, tool schema, retrieval index, memory snapshot, sandbox image, policy rules, and API client version. If any of those change before recovery, replay can diverge.
+
+A robust durable agent should record:
+
+- Model identifier and relevant inference settings
+- Prompt version or content hash
+- Tool version and schema hash
+- Input and output hashes for tool calls
+- Retrieval index or memory snapshot version
+- Policy and approval-rule version
+- Runtime image or sandbox version for code execution
+
+Prompt lifecycle tooling is moving in this direction. LangSmith prompt management uses prompt commits and tags to pin production versions. A 2025 paper on prompt migration highlights the reliability risk created when LLM applications evolve across model and prompt versions. For durable execution, versioning is not just observability metadata; it is part of replay correctness.
+
+## Observability Helps, But It Can Leak
+
+Durable agents need rich traces because recovery and debugging require knowing what happened. OpenAI Agents SDK tracing and OpenTelemetry's GenAI semantic conventions show where the ecosystem is heading: model calls, tool calls, agent names, prompts, events, and outputs can all become telemetry.
+
+That richness creates a security problem. Agent traces can contain user data, prompts, tool arguments, shell output, file paths, secrets, or business context. Production systems should redact by default, sample aggressively, and route full-fidelity traces only to restricted storage. A safe pattern is to export sanitized spans with correlation IDs and hashes, while keeping sensitive payloads behind a stricter access boundary.
+
+Tracing should answer "what happened?" without becoming a second uncontrolled memory system.
+
+## Retry Storms and Global Budgets
+
+Retries are essential for durability, but nested retries can create self-inflicted outages. An LLM loop might retry a tool call; the SDK might retry the API request; the workflow engine might retry the step; the provider might retry internally. A 2025 paper on retry storms, RetryGuard, studies how default retry patterns across services can amplify cost and load.
+
+Agent runtimes need global retry budgets across the entire run. A durable workflow should know the total retry count, not just the local retry count for one HTTP client. Circuit breakers and backoff policies should apply at the agent-run level, especially when model loops can generate new retry attempts in response to failures.
+
+## A Practical Durable-Agent Architecture
+
+A production-grade durable agent runtime does not need to copy Temporal exactly, but it should borrow the same discipline. A practical architecture has five layers.
+
+### 1. Run and Step Journal
+
+Every run gets a stable`run_id`. Every meaningful operation gets a`step_id`. The journal records planned action, inputs, prompt/tool/model versions, approval status, result receipt, retry count, and error state. This becomes the source of truth for recovery.
+
+### 2. Replay Boundaries Around Nondeterminism
+
+LLM calls, tool calls, shell commands, external API requests, file writes, human approvals, and outbound messages are not ordinary code. They are replay boundaries. Their results should be recorded and reused on recovery unless the run explicitly enters a migration or compensation path.
+
+### 3. Idempotent Tool Wrappers
+
+Raw mutating tools should not be exposed directly to the model. The runtime should wrap them with idempotency keys, receipts, duplicate detection, and compensation metadata. A send-message tool should know whether a message with the same run and step key was already sent. A pull-request tool should know whether the branch or PR already exists.
+
+### 4. Durable Human Gates
+
+Approval gates should persist the exact artifact under review. Recovery should never assume that a human approval for one patch, command, or message applies to a later modified artifact.
+
+### 5. Recovery Test Suite
+
+Durability should be tested by crashing the runtime deliberately:
+
+- After an LLM response but before the next tool call
+- After an external API succeeds but before local state is written
+- After a file write but before the journal receipt
+- After human approval but before action execution
+- During trace export
+- During prompt or tool version rotation
+- While an outbound message is in the outbox
+
+If recovery cannot pass those cases, the system is relying on luck rather than durable execution.
+
+## What This Means for Zylos-Style Agents
+
+For a persistent agent system, durable execution is the bridge between memory and autonomy. Memory lets the agent know who it is and what it was doing. Durable execution lets it prove which operations happened, recover without duplication, and continue safely after interruption.
+
+The most important design stance is to avoid collapsing all persistence into chat history. A transcript is useful context, but it is not a recovery log. A durable agent needs separate records for identity/memory, conversation, execution, tool receipts, approvals, and observability. Those records can be summarized for the model, but the runtime should not depend on the model to infer them.
+
+The durable-agent stack is still fragmented, but the direction is clear. Workflow engines provide mature primitives. Agent frameworks are adding checkpoints and resumable state. The next generation of reliable agents will combine both: agent-native flexibility at the reasoning layer, workflow-grade durability at the execution boundary.
+
+## Sources
+
+- Temporal docs: https://docs.temporal.io/
+- Temporal durable execution guide: https://assets.temporal.io/durable-execution.pdf
+- Pydantic AI Temporal durable execution: https://ai.pydantic.dev/durable_execution/temporal/
+- Restate durable execution: https://docs.restate.dev/concepts/durable_execution/
+- Restate workflows: https://docs.restate.dev/tour/workflows
+- Restate journaling results: https://docs.restate.dev/develop/ts/journaling-results
+- Restate awakeables: https://docs.restate.dev/develop/python/awakeables
+- Inngest function execution: https://www.inngest.com/docs/learn/how-functions-are-executed
+- Inngest sleeps and waits: https://www.inngest.com/docs/features/inngest-functions/steps-workflows/sleeps
+- Inngest checkpointing: https://www.inngest.com/blog/introducing-checkpointing
+- Hatchet durable execution: https://docs.hatchet.run/v1/durable-execution
+- LangGraph persistence: https://docs.langchain.com/oss/python/langgraph/persistence
+- LangGraph durable execution: https://docs.langchain.com/oss/javascript/langgraph/durable-execution
+- LangGraph interrupts: https://docs.langchain.com/oss/python/langgraph/interrupts
+- OpenAI Agents SDK sessions: https://openai.github.io/openai-agents-python/sessions/
+- OpenAI Agents SDK human-in-the-loop: https://openai.github.io/openai-agents-python/human_in_the_loop/
+- OpenAI Agents SDK tracing: https://openai.github.io/openai-agents-python/tracing/
+- OpenAI Agents SDK evolution: https://openai.com/index/the-next-evolution-of-the-agents-sdk/
+- AutoGen state: https://microsoft.github.io/autogen/dev/user-guide/agentchat-user-guide/tutorial/state.html
+- AutoGen Magentic-One: https://microsoft.github.io/autogen/stable/user-guide/agentchat-user-guide/magentic-one.html
+- CrewAI memory: https://docs.crewai.com/en/concepts/memory
+- CrewAI flows: https://docs.crewai.com/en/concepts/flows
+- Dapr Agents: https://docs.dapr.io/developing-ai/dapr-agents/dapr-agents-why/
+- Microsoft Agent Framework workflows: https://learn.microsoft.com/en-us/agent-framework/journey/workflows
+- Microsoft Durable Task for AI agents: https://learn.microsoft.com/en-us/azure/durable-task/sdks/durable-task-for-ai-agents
+- DBOS durable workflows: https://docs.dbos.dev/why-dbos
+- DBOS OpenAI Agents integration: https://docs.dbos.dev/integrations/openai-agents
+- AWS Lambda Durable Functions announcement: https://aws.amazon.com/about-aws/whats-new/2025/12/lambda-durable-multi-step-applications-ai-workflows/
+- AWS Lambda Durable Functions docs: https://docs.aws.amazon.com/lambda/latest/dg/durable-functions.html
+- Cloudflare Workflows: https://developers.cloudflare.com/workflows/
+- Cloudflare Workflows GA: https://blog.cloudflare.com/workflows-ga-production-ready-durable-execution/
+- Azure Durable Task human interaction: https://learn.microsoft.com/en-us/azure/durable-task/common/durable-task-human-interaction
+- Stripe idempotent requests: https://docs.stripe.com/api/idempotent_requests
+- AWS Lambda Powertools idempotency: https://docs.aws.amazon.com/powertools/dotnet/utilities/idempotency/
+- LangSmith prompt management: https://docs.langchain.com/langsmith/manage-prompts
+- Prompt Migration paper: https://arxiv.org/abs/2507.05573
+- RetryGuard paper: https://arxiv.org/abs/2511.23278
+- OpenTelemetry GenAI semantic conventions: https://opentelemetry.io/docs/specs/semconv/gen-ai/
+- Outbox pattern overview: https://www.baeldung.com/cs/outbox-pattern-microservices

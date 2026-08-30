@@ -1,0 +1,2007 @@
+Preparing MPICH for Exascale
+Journal Title
+XX(X):1–17
+©The Author(s) 2016
+Reprints and permission:
+sagepub.co.uk/journalsPermissions.nav
+DOI: 10.1177/ToBeAssigned
+www.sagepub.com/
+SAGE
+Yanfei Guo1 Ken Raffenetti1 Hui Zhou1 Pavan Balaji2,13 Min Si2,13 Abdelhalim Amer3,13
+Shintaro Iwasaki2,13 Sangmin Seo4,13 Giuseppe Congiu5,13 Robert Latham1 Lena Oden6,13
+Thomas Gillis5,13 Rohit Zambre5,14 Kaiming Ouyang5,15 Charles Archer7,16 Wesley Bland2,16
+Jithin Jose8,16 Sayantan Sur5,16 Hajime Fujita9,16 Dmitry Durnov10 Michael Chuvelev10
+Gengbin Zheng10 Alex Brooks10 Sagar Thapaliya10 Taru Doodi5,16 Maria Garazan10 Steve
+Oyanagi11 Marc Snir12 and Rajeev Thakur1
+Abstract
+The advent of exascale supercomputers heralds a new era of scientific discovery, yet it introduces significant
+architectural challenges that must be overcome for MPI applications to fully exploit its potential. Among these challenges
+is the adoption of heterogeneous architectures, particularly the integration of GPUs to accelerate computation.
+Additionally, the complexity of multithreaded programming models has also become a critical factor in achieving
+performance at scale. The efficient utilization of hardware acceleration for communication, provided by modern
+NICs, is also essential for achieving low latency and high throughput communication in such complex systems. In
+response to these challenges, the MPICH library, a high-performance and widely used Message Passing Interface
+(MPI) implementation, has undergone significant enhancements. This paper presents four major contributions that
+prepare MPICH for the exascale transition. First, we describe a lightweight communication stack that leverages the
+advanced features of modern NICs to maximize hardware acceleration. Second, our work showcases a highly scalable
+multithreaded communication model that addresses the complexities of concurrent environments. Third, we introduce
+GPU-aware communication capabilities that optimize data movement in GPU-integrated systems. Finally, we present
+a new datatype engine aimed at accelerating the use of MPI derived datatypes on GPUs. These improvements in the
+MPICH library not only address the immediate needs of exascale computing architectures but also set a foundation
+for exploiting future innovations in high-performance computing. By embracing these new designs and approaches,
+MPICH-derived libraries from HPE Cray and Intel were able to achieve real exascale performance on OLCF Frontier
+and ALCF Aurora respectively.
+Introduction
+The Message Passing Interface (MPI) is the de-facto standard
+programming model for scientific applications running on
+distributed-memory systems. MPI provides a number of
+communication models in order to support the various
+communication requirements of high-performance parallel
+computing applications. The focus on performance is why
+many choose MPI, as they seek to run at the limits of
+computational power to enable scientific discovery. As
+we enter the exascale era, the continued evolution and
+enhancement of MPI are critical for harnessing the vast
+capabilities of leadership supercomputing resources.
+In order to achieve exascale performance, necessary architectural changes in high-performance computing systems
+have brought substantial challenges for systems software.
+For MPI to effectively unlock the full power of these systems,
+we took a ground up approach to the design of our software.
+A key challenge is the popularization of heterogeneity, especially the incorporation of GPU devices for computation.
+For GPU applications to scale, MPI must efficiently move
+data to and from GPU buffers both within a node and across
+many nodes. Another challenge is the increasing adoption
+of multithreaded programming models in conjunction with
+MPI as noted by Bernholdt et al. (2020). Historically, multithreaded MPI communication performance was lacking, due
+1Argonne National Laboratory
+2Meta
+3Cerebras Systems
+4Klaytn Foundation
+5NVIDIA
+6FernUniversitat in Hagen ¨
+7Cornelis Networks
+8Microsoft
+9Fastly
+10Intel Corporation
+11Hewlett Packard Enterprise
+12University of Illinois Urbana-Champaign
+13Work done when author was at Argonne National Laboratory
+14Work done when author was at University of California, Irvine
+15Work done when author was at University of California, Riverside
+16Work done when author was at Intel Corporation
+Corresponding author:
+Yanfei Guo, Argonne National Laboratory, Lemont, IL, USA.
+Email: yguo@anl.gov
+Prepared using sagej.cls [Version: 2017/01/17 v1.20]
+2 Journal Title XX(X)
+to both a lack of clarity in the MPI standard and unrealized
+optimization in implementations. Lastly, to best exploit the
+high-performance network in exascale supercomputers, MPI
+must take advantage of the available hardware acceleration capabilities offered by the high-performance network.
+Minimizing communication latency while simultaneously
+maximizing throughput is critical to application scaling and
+performance.
+This paper presents how we redesigned the MPICH library
+with the targeted goal of deploying on exascale systems.
+In particular, we address the stated challenges by providing
+the following: (1) A lightweight communication abstraction to better match modern low-level network APIs. The
+lightweight design enables us to access the higher-level features of the network interface card (NIC) via a low-overhead
+communication fast-path; (2) We identified bottlenecks in
+the multithreaded MPI communication implementation and
+developed novel approaches for optimization without the
+need for changes to the MPI standard; (3) We implemented
+GPU-awareness in MPICH to support the use of GPU buffers
+in communication APIs. (4) In tandem, we created Yaksa, a
+new datatype engine aimed at accelerating the use of MPI
+derived datatypes on GPUs. In partnership with vendors HPE
+Cray and Intel, these new designs were deployed on the first
+exascale systems in the world: OLCF Frontier and ALCF
+Aurora.
+Background and Motivation
+In this section, we briefly discuss the technology trends in
+exascale computing and how they affect MPI communication.
+Accelerated Computing with GPU
+Graphics Processing Units (GPUs) have become a cornerstone in the realm of high-performance computing (HPC)
+due to their exceptional performance, high throughput, and
+energy efficiency. Originally designed to accelerate graphics
+rendering, GPUs have evolved to tackle a broad range of
+computational tasks, making them invaluable for complex
+scientific calculations and data-intensive applications. This
+shift toward incorporating GPUs has led to the emergence of
+heterogeneous node architectures within computing systems.
+Unlike traditional CPUs, GPUs possess their own dedicated
+memory, resulting in a bifurcated memory system that adds a
+layer of complexity to programming and data management.
+The separation of GPU memory from the system’s main
+memory introduces specific challenges in the context of
+MPI communication. For effective data transfer in such an
+environment, the MPI library must be capable of discerning
+the location of the data buffer—whether it resides in the
+main memory or within the GPU’s memory. Furthermore, it
+must navigate the intricacies of moving data efficiently from
+the GPU memory to the Network Interface Card (NIC) for
+communication purposes. This process may necessitate an
+additional data copy step into the main memory, depending
+on the system’s architecture and the capabilities of the MPI
+implementation. Such operations can potentially impact the
+overall performance and efficiency of MPI communication
+in systems that leverage GPU acceleration.
+To address these challenges and optimize communication
+in heterogeneous architectures, advanced features and
+capabilities are being integrated into MPI libraries. One
+critical aspect is the ability to directly utilize inter-GPU
+links, such as NVIDIA’s NVLink, which facilitates faster
+data transfer between GPUs, bypassing the need for
+data to traverse through the main memory or the CPU.
+This capability significantly enhances the efficiency of
+data movement and communication in multi-GPU setups,
+enabling higher performance levels in computational tasks.
+As the use of GPUs in high-performance computing
+continues to grow, the evolution of MPI standards
+and libraries to fully support heterogeneous architectures
+and exploit GPU-specific features becomes increasingly
+important. This ongoing development is essential for
+maximizing the performance and efficiency of HPC
+systems, paving the way for new scientific discoveries and
+advancements in various fields.
+MPI+Threads
+The MPI-everywhere model of parallelism has served applications well for several decades, but scaling applications in
+this model is becoming increasingly difficult The biggest
+reason for this difficulty in scaling is that not all on-node
+resources scale at the same rate. Specifically, the number of
+cores available on a node is increasing rapidly. Other on-node
+resources such as memory, cache, TLB space, and network
+resources, however, scale much more slowly. Since the MPIeverywhere model uses a separate MPI process for each core,
+it inadvertently leads to a static split of all on-node resources,
+resulting in underutilization and wastage of resources. Consequently, researchers have been increasingly looking at
+hybrid MPI+threads programming (e.g., MPI+OpenMP) as
+an alternative to the traditional MPI-everywhere model.
+The communication performance of MPI+threads, however, is usually bad and unscalable with increased number
+of threads, especially when multiple threads are involved
+in communication (i.e., using MPI THREAD MULTIPLE).
+The reason is that all threads within an MPI process communicate using a single endpoint (a representation of underlying
+hardware resource at the NIC), which forces the MPI implementation to use locks on the endpoint for serialization. This
+model hurts communication throughput.
+Hardware Acceleration of Communication in
+NIC
+Recent high-performance networks have introduced many
+hardware features to accelerate the operations frequently
+performed in MPI communication. For example, the MPI
+standard uses a combination of source rank, tag, and
+communicator id of the incoming message to find the
+receive operation that is posted into the receive queue. This
+searching process is generally referred to as tag matching.
+High-performance interconnects, such as InfiniBand and
+Slingshot, provide a hardware tag-matching feature, which
+can efficiently perform this operation.
+Another important hardware technology is remote direct
+memory access (RDMA), where the NIC accesses memory
+directly bypassing the CPU. Avoiding extra overhead and
+directly invoking the NIC’s RDMA path is critical in
+Prepared using sagej.cls
+3
+achieving high-throughput, low-latency communications.
+Additionally, there may be hardware acceleration for
+selected collective communications.
+Optimized Design for Lightweight
+Communication
+In order to discuss the communication optimizations
+designed for exascale supercomputers, let us first establish
+the overall architecture of MPICH. As illustrated in Figure 1,
+MPICH comprises multiple layers of abstraction. The uppermost layer, referred to as the “MPI layer,” houses machineagnostic functionality, such as language bindings (C, C++,
+Fortran), independent collective algorithms, derived datatype
+management, and process group management. Beneath the
+MPI layer lies the machine-specific code, known as the
+“abstract device” or simply the “device” layer. Due to its
+dependence on the underlying hardware, this layer allows
+for multiple implementations tailored to different machine
+architectures, though some architectures share a common
+device. For this work, we developed a new device layer
+implementation called ch4 (Raffenetti et al. 2017). This
+new device is the successor to the ch3 device, which saw
+wide adoption on pre-exascale machines. Beyond the MPI
+and device layers, MPICH relies on a collection of internal
+and external libraries for functionality such as GPU support
+and hardware topology detection, which we describe in more
+detail in a later section.
+With minimum software overhead as the goal, we
+designed ch4 from the ground up. The overall architecture
+of ch4 is three layers: the ch4 core, the network modules
+(netmods), and the shared memory modules (shmmods).
+Notably, the ch4 infrastructure is designed to allow most
+MPI-level arguments to flow all the way down to the
+netmods and shmmods. In other words, little to no
+information is lost from the MPI call that triggered a
+data movement operation. This enables each netmod
+and shmmod to independently determine the optimal
+implementation for the operation. If a network or sharedmemory-specific optimization is not readily available, the
+module can simply fall back to the ch4 core’s activemessage-based implementation. To illustrate this, let us look
+at the steps involved in an MPI PUT operation.
+MPI Layer: MPI PUT is a function provided by the MPI
+library. Beginning at the MPI layer, MPI PUT implements
+the following: (1) check for errors in function arguments; (2)
+lookup the internal MPICH window object that corresponds
+to the MPI window handle provided by the user; and (3)
+thread-safety checking, which informs whether the threadsafe or thread-unsafe communication path is taken.
+CH4 Core: The MPI layer next calls into the device
+implementation to perform the MPI PUT operation. The
+ch4 core layer first checks for locality, meaning whether
+the communication target is a process on the same node, a
+different node, or whether it is the same process as the origin.
+In the case where the origin and target processes are the
+same, ch4 core handles the entire communication. ch4
+passes control down to the shmmod when processes are on
+the same node, and to the netmod for inter-node transfers.
+netmod/shmmod: After control is passed from the ch4
+core to the netmod or shmmod, a decision is made
+whether the communication is suitable for a direct
+implementation, or whether to fall back to the generic
+active-message implementation. In the case of MPI PUT,
+we wish to take advantage of hardware-supported RDMA
+write capabilities in the network. The netmod will check
+the operation arguments and decide whether to issue the
+communication “natively” via the network API, or to
+return control back to the ch4 core generic code. In the
+native case, the netmod will translate the communication
+arguments as needed for the network API in use (e.g.,
+MPI target window offset to remote address) and issue the
+necessary network operations prescribed by the semantics of
+MPI PUT.
+The key point to emphasize in the ch4 design is
+minimal software overhead. Communication arguments flow
+as directly as possible to the lowest layers of the software
+stack, unimpeded by intermediate layers. The semantics of
+an operation are never lost, thereby enabling the layer that
+eventually performs the communication to use all available
+information for optimization.
+Next, we will present instruction- and cache-level analysis
+of MPICH using the ch4 device. Furthermore, we show
+how this analysis led to optimizations to reduce software
+overheads in the fast-path.
+Instruction-Count Analysis of MPICH
+First, we analyze the instructions executed by MPICH
+in a “default” ch4 build. That is, a build without the
+use of extra compiler flags or configuration options. This
+build is representative of what most users would find
+on a typical system and includes convenient features for
+users and administrators. Notably, the default configuration
+includes argument error checking to ensure that, for
+instance, datatypes are properly committed before use in
+communication, and that the source or destination rank for
+a message is valid. In our experiments we used a static
+MPICH library, though both shared and static libraries are
+supported. To obtain an accurate instruction count, we used
+the Intel Software Development Emulator (SDE) (Intel 2024)
+to capture the instructions for executing the target MPI
+functions. We added the SSC MARK marker at the beginning
+and end of MPI ISEND and MPI PUT, which enables Intel
+SDE to record all the instructions being executed in those
+two functions. The experiment analyzes instruction count in
+MPICH v3.2, which was the first version when ch4 was
+released.
+MPICH v3.2 takes 221 instructions for MPI ISEND and
+215 instructions for MPI PUT in this configuration. We
+counted the instructions from the start of the MPI function
+call, down to the network communication layer, and back
+to the application. The intent is to show the number of
+instructions added by MPI to an application in lieu of
+bypassing MPI and directly coding the low-level network
+communication in the application itself. In short, it is the
+cost of the MPI abstraction. We analyze only MPI ISEND
+because the software path for MPI IRECV is similar.
+The default MPICH ch4 build already shows significant
+improvement over its predecessor in ch3. For example, an
+MPICH ch3 build (also referred to as MPICH/Original),
+takes 253 instructions for MPI ISEND and 1,342 instructions for MPI PUT. ch4 offers a 13% and 84% reduction
+Prepared using sagej.cls
+4 Journal Title XX(X)
+OneAPI HWLOC JSON-C
+Abstract Device Interface (ADI)
+MPI Interface
+Application
+GPU IPC
+Yaksa
+Datatype
+Engine
+MPL
+(Portable
+Funtionalities)
+Machine-independent 
+Collectives Derived Datatype Management Group Management
+C/Fortran Bindings
+CH4
+Netmods
+libfabric UCX
+Architecture-specific 
+Collectives
+Active Message
+Fallback
+GPU Support
+Fallback VCI StreamSupport
+Shmmod
+POSIX XPMEM GPU IPC
+CUDA HIP
+Figure 1. Overview of the MPICH software stack.
+in instructions for these calls, which can be attributed to
+the communication fast-path design in ch4. The reduction
+in instruction count here is because the fast-path in ch4
+bypassed the software emulation for MPI communication
+protocols. This is most notable in MPI PUT.
+This improvement is promising, but we also wish to
+understand the purpose of the remaining instructions. To do
+so, we carefully mapped the instructions to the code path for
+MPI ISEND and MPI PUT, the results of which are shown
+in Table 1. The instruction counts are obtained by analyzing
+the recorded instructions and attributing them back to their
+corresponding functionality in the MPICH source code.
+Table 1. Instruction counts for MPI calls
+Reason MPI ISEND MPI PUT
+Error checking 74 72
+Thread-safety check 6 14
+MPI function call 23 25
+Redundant runtime checks 59 62
+MPI mandatory overheads 59 44
+Some of the overheads noted in Table 1 can be reduced
+trivially. Error checking can catch user errors, such as
+incorrect function arguments and invalid buffer addresses.
+While a useful feature, error checking is not mandated by
+the MPI standard and offers little value to applications that
+have verified correct MPI usage. One way to reduce errorchecking overhead would be to provide two MPI library
+builds—with and without error checking enabled—so that
+users can choose.
+Similarly, thread-safety checks in MPICH are sometimes
+unnecessary. MPICH defaults to supporting thread safety at
+build time, which users can enable via MPI INIT THREAD.
+Having a single library to support single and multi-threaded
+usage is good for reducing complexity in distribution but
+adds overhead when thread safety is not needed. Another
+optimization possibility is to provide both a thread-safe and
+a thread-unsafe library, which users can select at link time.
+Function-call overheads from MPI are more difficult
+to avoid. In our analysis, each MPI function call takes
+16–18 instructions just to load the stack before the
+function can execute. Since the compiler must treat the
+function as somewhat of a black box, it is challenging
+to optimize instructions across function boundaries. The
+result is redundant or unnecessary checks are sometimes
+performed by MPI. An example is when an application calls
+MPI ISEND with MPI DOUBLE in the datatype argument.
+In MPICH, MPI DOUBLE is a compile-time constant that
+encodes the properties of the datatype directly in the handle
+value. MPI, however, cannot assume a built-in datatype
+is used in communication and therefore must inspect the
+handle and extract the necessary information at run time. The
+overheads associated with this can be attributed to the MPI
+library relying on functions rather than preprocessor macros.
+Inlining Code on the Critical Path
+To address the MPI function call overhead, we turn to
+link-time optimizations, such as link-time inlining. This
+optimization must be deployed with caution, as the total
+binary size of the application may increase significantly,
+coupled with builds that take extended amounts of time
+to complete. Fortunately, most compiler and linker suites
+implement advanced link-time inlining features, which can
+be selectively targeted at specific files.
+We started by inlining certain MPI library functions into
+the application. Because we are able to inline specific files,
+we can strategically inline performance-critical functions,
+such as MPI ISEND and MPI PUT, while others, such as
+MPI INIT, remain as regular function calls. This approach
+significantly cuts down on the amount of inlined code versus
+a more course-grained strategy, resulting in smaller binaries
+and acceptable build times.
+While simply inlining MPI functions eliminates the
+function call overhead in Table 1, it may not be effective
+at eliminating redundant runtime checks. In order to look
+more closely at the checks performed by MPI related
+to datatypes, we surveyed 62 applications for datatype
+usage. We examined the NAS parallel benchmarks (NASA
+2017), CORAL benchmarks (DOE 2017), DOE codesign
+applications (ANL 2017; ExaCT 2017), and other large
+applications that consume significant compute cycles at large
+supercomputing centers (Valiev et al. 2010; Fischer et al.
+Prepared using sagej.cls
+5
+2008). We found three classes of datatype usage in these
+applications.
+• Class 1 (derived datatypes): The use of derived
+datatypes was observed only in two applications,
+HACC (Habib et al. 2013) and MCB (MCB 2013).
+Both use such datatypes in the setup phase and not the
+performance-critical path.
+• Class 2 (direct predefined datatypes): Several applications directly use predefined datatypes, such as
+MPI DOUBLE or MPI INT, in the MPI communication call to describe the data layout.
+• Class 3 (indirect predefined datatypes): Some applications use predefined datatypes but not directly in
+the MPI communication call. Instead, the application
+selects an appropriate datatype at runtime and stores
+it in a variable that gets passed to MPI at function
+invocation.
+Due to their widespread use in performance-critical
+application code, we target the second and third classes
+for further optimization. For direct predefined datatypes,
+just inlining MPI function calls is enough to eliminate
+unnecessary runtime datatype checks. The compiler is able
+to see that the datatype is a constant value and can extract
+the information needed to evaluate the conditional statements
+later in the code. Conceptually, MPI is able to eliminate code
+needed to handle alternate datatypes since it knows only a
+single datatype will ever be used at a given call site.
+Indirect predefined datatypes are more challenging to
+address. Since the compiler may not be able to determine
+that the datatype variable is a constant value, inlining the
+function call will fail to optimize away the runtime checks.
+We observe that applications utilize indirect predefined
+datatypes as a way to provide compatible types between
+multiple libraries and languages (that is, by creating
+a user-defined MPI Datatype and mapping it to one
+of the predefined MPI datatypes). In LULESH (Karlin
+et al. 2013), the application baseType is mapped to
+MPI FLOAT or MPI DOUBLE depending on the floating
+point precision in use. Similar to LULESH, an internal
+function in Nekbone (nek 2017) uses a switch statement
+to select the desired predefined datatype and returns it via
+the function’s argument list. In this case, the function call
+adds a layer of indirection that makes it more difficult for
+the compiler to optimize. QMCPACK (Kim et al. 2018),
+LSMS (Sheehan et al. 1998), and miniFE (Lin et al. 2015) are
+C++ applications that use function templates to implement
+a type mapping that is conceptually similar to the one in
+LULESH.
+These applications require more aggressive inline settings
+to optimize away runtime datatype checking, expanding the
+scope to more files and functions than is typically considered.
+Modern compilers and linkers allow expanded inline settings
+via command-line flags, which we used in our experiments
+to enable link-time inlining across all files of the application
+as well as statically linked dependencies such as MPI. As we
+suspected, those runtime datatype checks do disappear when
+the entire application is visible to the optimizer, but the cost
+is much larger instruction count as well as binary size for the
+application.
+Network Address Virtualization with MPI
+Communicators
+One of the key abstractions of MPI is in how it logically
+represents groups of processes with integer ranks within
+opaque communication objects. To specify a process to
+send data to (or receive data from), a process provides the
+communication and rank as arguments to the communication
+call. The combination of communicator and rank is
+translated by MPI to some low-level address, whether it
+be an address in shared memory or a network address
+for communicating across nodes. In other words, the
+communicator object abstracts the physical communication
+layer from the application. MPI allows applications to build
+on top of the built-in communicators in MPI, such as
+MPI COMM WORLD, to create potentially different mappings
+of ranks to physical addresses.
+The conversion performed by MPI when communicator
+and rank are given as inputs to a function is nontrivial.
+The simplest implementation is an array, where each
+communicator has a mapping of ranks to addresses it
+can lookup via index. We measure this method as taking
+two instructions, though one of those is a costly memory
+dereference operation. Additionally, keeping the lookup
+mechanism simple has the tradeoff of a larger memory
+requirement. Each communicator must maintain an O(P)
+table of addresses, where P is the number of processes in the
+group of the communicator. (Guo et al. 2017) explored more
+sophisticated methods for converting communicator and rank
+to network address with the goal of minimizing memory
+usage. With this came the tradeoff of increased instruction
+counts, even for simple rank mappings.
+Per-Operation Completion Semantics
+MPI point-to-point communication exposes fine-grained
+completion semantics to the user. Each nonblocking
+communication operation returns a handle to an opaque
+request object. These handles must be managed at the
+application level and eventually completed (or freed)
+explicitly via subsequent calls to the MPI library. These
+fine-grained semantics offer maximum flexibility to the user,
+sometimes more than is necessary for a given application.
+For example, a stencil computation may issue several
+operations at a time and cannot move to its next iteration
+until all have completed. While stencil computations may not
+be the most complex, they are common in several HPC fluid
+dynamics and quantum chemistry applications.
+For an MPI library to comply with the specification, it
+must maintain request objects for each operation that can
+be completed individually. In terms of cost, each request
+represents additional memory usage and instruction counts.
+One way in which MPICH reduces the per-operation cost of
+managing request objects is by maintaining a preallocated
+global request. For operations that complete immediately,
+MPICH will increase the reference count of the already
+allocated and completed request and then return its handle
+to the user. This avoids the need for request allocation and
+initialization. When the global request is passed back to
+MPI by way of an MPI WAIT or MPI TEST call, MPICH
+observes that the request is complete and decrements the
+reference count, but since an internal reference is always
+Prepared using sagej.cls
+6 Journal Title XX(X)
+held, it is not deallocated. We measure the savings of this
+design as 10 instructions, including dereference instructions,
+over an implementation that allocates a new request even for
+immediately complete operations.
+Evaluation of Lightweight Communication
+Next we present a performance evaluation of MPICH/CH4
+compared to MPICH/Original. We use a variety of
+benchmarks and applications on multiple hardware and
+software platforms to give a comprehensive analysis of our
+work. To reiterate, the goal of MPICH/CH4 is to minimize
+the overhead in terms of instructions imposed by MPI
+on communication. Our target for these optimizations is
+latency-sensitive applications—those that are running at the
+strong-scaling limit—in order to reduce time to solution as
+much as possible using all the available computing power
+in the system. Accordingly, we perform our evaluation on
+benchmarks and applications along these lines.
+Experimental Testbeds
+For our experiments, we ran microbenchmarks on the “IT”
+and “Gomez” clusters at the Argonne Joint Laboratory
+for System Evaluation (JLSE). Each IT cluster node has
+two Intel E5-2699 v4 processors with an Intel Omni-Path
+interconnect. Gomez nodes have four Intel E7-8867 v3
+processors with a Mellanox EDR interconnect. Both IT and
+Gomez have dynamic frequency scaling disabled in order to
+collect stable and reproducible results.
+Microbenchmark Evaluations
+In this section we examine the message-issue rate of
+MPICH/CH4 compared to MPICH/Original. We look at
+MPI ISEND and MPI PUT operations using a benchmark
+designed to show the limit of what a single CPU core can
+inject into the network. The size of each message measured
+by the benchmark is a single byte.
+For the first measurement (Figure 2), we used the IT
+cluster to evaluate the MPICH/CH4/OFI stack because of
+its Intel Omni-Path Architecture interconnect, which has
+good support for Libfabric via the PSM2 provider. The
+second measurement (Figure 3) is on the Gomez cluster,
+which utilizes a Mellanox InfiniBand interconnect. Third
+(Figure 4), we simulate an infinitely fast network, one in
+which communication takes no time at all. We modified the
+MPI library to still perform all the necessary work to issue
+a communication, but without actually transmitting the data
+over a network.
+In each of the three experiments, we compare five different MPICH configurations: (1) baseline MPICH/Original
+(legend: “CH3”); (2) default MPICH/CH4 (legend: “CH4
+(default)”); (3) MPICH/CH4 with no error checking (legend:
+“CH4 (no-err)”); (4) MPICH/CH4 with no error checking
+or thread safety (legend: “CH4 (no-err-single)”); and (5)
+MPICH/CH4 with no error checking, no thread safety, and
+link-time inlining enabled (legend: “CH4 (no-err-singleipo)”). Performance notably improves as the instruction
+counts decrease in each step. Figure 2 shows the message
+rates of MPI ISEND and MPI PUT on Intel Omni-Path network. The majority of the performance improvement comes
+from the communication fast-path built in MPICH/CH4,
+0 2M 4M 6M 8M 10M
+CH3
+CH4 (default)
+CH4 (no-err)
+CH4 (no-err-single)
+CH4 (no-err-single-ipo)
+Message Rate (msg/s)
+MPI_Put MPI_Isend
+Figure 2. Message rates with OFI/PSM2.
+0 2M 4M 6M 8M 10M
+CH3
+CH4 (default)
+CH4 (no-err)
+CH4 (no-err-single)
+CH4 (no-err-single-ipo)
+Message Rate (msg/s)
+MPI_Put MPI_Isend
+Figure 3. Message rates with UCX.
+0 20M 40M 60M 80M 100M
+CH3
+CH4 (default)
+CH4 (no-err)
+CH4 (no-err-single)
+CH4 (no-err-single-ipo)
+Message Rate (msg/s)
+MPI_Put MPI_Isend
+Figure 4. Message rates with infinitely fast network.
+as shown by the difference between CH4 (default) and
+CH3 in Figure 2. The fast-path improved the message
+rate for MPI ISEND and MPI PUT by 77.9% and 334%,
+respectively. Similar improvements can be observed on Mellanox InfiniBand network, as shown in Figure 3, where
+CH4 (default) improves the message rate for MPI ISEND
+and MPI PUT by 250% and 445%, respectively. Note that
+the significant improvement in MPI ISEND was partially
+because MPICH/CH3 can only use regular verbs transport while MPICH/CH4 with UCX will use the accelerated
+verbs transport. The results also show that if we can
+further optimize out the extra instructions in Table 1, we can
+achieve even higher performance. The most optimized option
+(CH4 (no-err-single-ipo)) achieved 98.2% higher message
+rate for MPI ISEND and 395.2% higher message rate for
+MPI PUT than CH3. Similar improvements can also be
+observed on Mellanox InfiniBand network, as shown in Figure 3, where CH4 (no-err-single-ipo) improves the message
+rate for MPI ISEND and MPI PUT by 262% and 475%,
+respectively.
+While the performance improvements are large, the
+performance is limited by the networks themselves and the
+costs involved with transmitting actual data. This is why the
+performance improvement of CH4 (no-err-single-ipo) over
+CH4 (default) is limited. As future networks continue to
+improve injection rate, we expect our lightweight design
+will continue to show benefits and even larger performance
+increases. Consider the results of the third experiment in
+Figure 4, where on an “infinitely fast” network, the message
+rate can be increased by several orders of magnitude if all
+these overheads are eliminated.
+Using the best-case performance from the experiments
+above, we further analyze the performance potential by
+Prepared using sagej.cls
+7
+0 40M 80M
+MPICH/CH4
+Network Addr Virtualization
+Per-op Completion
+All Together
+Message Rate (msg/s)
+Figure 5. MPI standard improvements for MPI ISEND on
+infinitely fast network.
+also combining the proposed improvements in rank-tonetwork-address translation and request-object initialization.
+Still using the “infinitely fast” network that completes all
+communication immediately, the performance is shown in
+Figure 5. Both changes offer another large improvement
+in MPI performance, eventually topping out at 87 million
+messages per second from a single CPU core. We only show
+the performance with MPI ISEND here because the message
+rate of MPI PUT is already bounded by the CPU before these
+optimizations (as shown in Figure 4).
+Efficient Multithreaded MPI Communication
+As modern HPC systems embrace increasingly hybrid
+hardware architectures, on-node runtimes, such as OpenMP,
+are gaining widespread traction. Consequently, the hybrid
+methodology of leveraging both OpenMP and MPI, often
+dubbed as MPI+Threads, has assumed greater significance.
+Nevertheless, MPI+Threads applications historically suffer
+from dismal MPI communication performance, especially
+in scenarios involving latency-sensitive small message
+communications, attributed to thread contention. This is
+shown by the orange curve in Figure 6.
+Modern network interface cards (NICs) can support
+multiple hardware communication contexts, thus allowing
+for independent, parallel communication streams from a
+single node. In the MPI-everywhere model, where multiple
+MPI processes are launched on a single node with each
+process running under MPI THREAD SINGLE, each MPI
+process uses an independent communication context. Thus,
+the MPI-everywhere model is able to show good scalable
+parallel communication performance, as shown by the green
+curve in Figure 6. However, attaining similar communication
+performance in MPI+Threads poses challenges. This is
+because the thread contexts are invisible to MPI, preventing
+an effective separation of communication streams.
+To address the performance issue in MPI+Threads, we
+designed a new approach, called virtual communication
+interface (VCI) (Zambre et al. 2020), to optimize the
+utilization of parallel communication streams and align
+them with the thread execution context. Figure 6 shows the
+improved message rate performance obtained with VCI via
+various API semantics. It demonstrates good scalability in
+performance, albeit slightly underperforming compared to
+the MPI-everywhere model due to the necessary locking
+overhead to ensure thread safety.
+We describe the design and implementation details of VCI
+in the following subsections.
+Virtual Communication Interfaces (VCIs)
+A virtual communication interface (VCI) provides an
+abstract representation of a communication stream. Each
+Figure 6. Message-rate scalability of 8-byte MPI Isend. The
+orange curve shows the message rate between two nodes in an
+MPI+Threads configuration without enabling multiple VCI. The
+green curve shows the message rate between two nodes in an
+MPI-Everywhere configuration where the number of cores
+represents the number of MPI processes under
+MPI THREAD SINGLE. The rest of the curves show the
+message rate in MPI+threads configuration where multiple VCIs
+are enabled. Various strategies of mapping thread contexts to
+VCIs are used according to the legend labels.
+VCI is backed by a communication context on the
+network hardware. This context includes an independent
+set of communication resources and maintains independent
+message matching and ordering according to MPI’s
+messaging semantics. Hence, with multiple VCIs, we obtain
+parallel communication streams in the MPI library. The
+realization of a VCI depends on the actual communication
+devices. In MPICH, a device refers to a lower-level
+communication back end. For Mellanox InfiniBand, a
+VCI is realized by a UCP worker in the UCX netmod
+(UCF-Consortium (2024)). The UCP worker contains verbs
+resources, which include a queue pair (QP) for transmission,
+a shared receive queue for reception, and a completion queue
+for progress. The QP maps to the micro UARs (hardware
+registers) on the Mellanox adapter (Mellanox reference
+manual, NVIDIA (2016)). For interconnects supported by
+the libfabric library (OFI-Working-Group (2024)), such as
+the HPE’s Slingshot interconnect (HPE (2024)), a VCI is
+realized in the OFI netmod as a libfabric endpoint. An
+endpoint maps to a hardware context on the network adapter.
+Finally, with on-node shared-memory communications, a
+VCI is realized as a dedicated shared-memory mailbox and a
+corresponding message queue.
+VCI mapping Because VCIs are supported by hardware
+contexts, they are a finite resource. For example, Intel
+OPA features only 160 hardware contexts on the HFI
+adapter (OPA User Guide, Intel (2020)). This is typically
+sufficient to support the number of threads on a single node.
+However, users are allowed to launch multiple processes
+on a single node, and the total number of threads is
+allowed to oversubscribe the available cores and may exceed
+the maximum number of VCIs the network hardware can
+support. Thus, MPICH only allocates a single VCI per
+process by default. Multiple VCIs can be allocated if users
+set a runtime control variable to inform the library of how
+many VCIs the application will need per MPI process.
+With a finite number of VCIs available in an MPI
+process, it requires an algorithm to map MPI operations
+to individual VCIs. An ideal mapping is to achieve a
+one-to-one perfect pairing from hardware threads to VCIs.
+Prepared using sagej.cls
+8 Journal Title XX(X)
+However, this is challenging because the thread contexts are
+invisible to an MPI library. There are no MPI semantics
+to associate with a thread context. An MPI library has
+to resort to alternative methods. One strategy is to assign
+separate VCIs to different communicators. A communicator
+in MPI guarantees a separate messaging context, which
+ensures correctness if communications concurrently occur
+in separate network streams. However, communicators
+are often not good surrogates for hardware threads.
+Communicators are typically used for logical architectural
+separation rather than for execution context separation. A
+mapping from communicators to VCIs may result in a single
+thread using multiple VCIs or multiple threads sharing a
+VCI. The former case results in a waste of VCI resources,
+while the latter results in thread contention and performance
+degradation.
+Before MPI 4.0, using communicators was the
+only method for applications to reliably separate
+communication context. MPI-4.0 introduces new
+info hints (e.g., mpi assert no any tag and
+mpi assert no any source) that would provide
+the users with more opportunities to express communication
+parallelism in their applications. For example, if an
+application hints that it does not use wildcards in its
+communication, MPI-4 would allow the user to expose
+communication parallelism through tags within a single
+communicator. There are also proposals to introduce new
+MPI objects that allow users to directly associate the
+thread execution context with them, thus providing a more
+straightforward method for users to control the usage of
+VCIs. In one proposal, the MPI Endpoints proposal by Dinan
+et al. (2014), MPI endpoints are introduced to represent
+MPI communication contexts. This allows applications to
+use different MPI endpoints in different threads explicitly.
+A prototype implementation of this proposal is available in
+MPICH’s GitHub repository. In another proposal, MPIX
+Stream (Zhou et al. (2022)), MPIX stream objects are
+introduced to represent execution contexts including threads.
+MPIX Stream is available as an MPI extension in recent
+MPICH releases.
+Informed application developers have several options to
+optimize VCI utilization and achieve good MPI+Threads
+performance as shown in Figure 6. While both the endpoint
+and the MPIX stream proposals offer direct mechanisms for
+users to manage VCIs, they are not standardized yet. Using
+communicators or info hints to express communication
+parallelism is within the current MPI standard, but they only
+indirectly affect VCI usage and hence the performance may
+be unpredictable.
+Connection establishment. Each VCI has its own transportlevel address that needs to be exchanged between the ranks
+to establish connections. We do so during the initialization of
+MPI. We first use PMI (Balaji et al. (2010)) to exchange the
+addresses of a single root VCI on every rank. Using the root
+VCI, we exchange the addresses of the rest of the VCIs using
+an allgather operation. As expected, establishing connections
+statically during initialization incurs an overhead that grows
+with the number of VCIs. Similarly, the finalization time
+increases since the tear-down time of VCIs is proportional
+to the number of VCIs.
+It is in our plan to support mechanisms to establish
+connections on demand. In addition to initialization time,
+the on-demand connection will also address the issue of
+overzealously taking hardware resources at initialization
+time.
+Optimizing multi-VCI communication
+Simply using multiple VCIs produces practically no
+performance benefit unless the implementation also employs
+key optimizations that We discuss in this section. Missing
+any of these key optimizations may result in performance
+bottlenecks due to serialization between the communication
+streams and severely impact the parallel performance.
+Per-VCI progress. Prior to the introduction of multiple
+VCIs, the progress function only needed to poll progress
+on a single VCI. However, when multiple VCIs are in
+use, a na¨ıve but correct implementation would require
+the progress function to poll progress on all VCIs. This
+approach would be detrimental to performance, particularly
+in scenarios where multiple threads are concurrently
+advancing operations. This is due to contention over the
+locks associated with each VCI, resulting in unnecessary
+serialization between threads in addition to the redundancy
+in progress polling.
+Given that all MPI communication operations are tied to a
+specific VCI, a progress call primarily needs to poll progress
+on the VCI on which the operation was posted. To enable
+per-VCI progress, we store the VCI used for an operation in
+its request object. Using the information stored in the request
+object, the progress function only polls progress on the VCIs
+that were used for the operations. If only a single request is
+involved in a progress call or when all the requests belong to
+a single VCI, the progress function only polls progress on a
+single VCI. When multiple threads exclusively use different
+VCIs, each per-VCI progress does not contend.
+Although per-VCI progress helps improve performance,
+progressing only the VCI used by the current request is
+potentially incorrect and can lead to deadlock.
+Consider the point-to-point example in Figure 7. This is a
+correct MPI program—the first synchronous send* on rank
+0 (line 3) should return because its matching receive has
+already been posted (line 9). With single VCI MPI libraries,
+this program completes because MPI Wait(req2) (line
+17) initiates the reception of MPI Ssend(comm1) by
+polling the single VCI that both communicators map
+to, thus allowing MPI Ssend(comm1) to return. With
+multiple VCIs and per-VCI progress, MPI Wait(req2)
+progresses only the VCI associated with comm2, preventing
+MPI Ssend(comm1) to complete and causing deadlock.
+In summary, the pure per-VCI progress model can improve
+performance, but the global progress model is necessary to
+ensure correctness even though it loses some performance.
+To account for such communication patterns, we use a hybrid
+progress model; that is, we perform one round of global
+progress after a certain number of unsuccessful per-VCI
+progress attempts to complete an operation.
+Per-VCI request management. Even when operations from
+multiple threads map to different VCIs, they contend on the
+∗conceptually similar to an MPI Send following the rendezvous protocol.
+Prepared using sagej.cls
+9
+1 /*Point-to-point example*/
+2 Rank 0:
+3 MPI_Ssend(comm1);
+4 MPI_Ssend(comm2);
+5
+6
+7
+8 Rank 1 / Thread 0:
+9 MPI_Irecv(comm1,req1);
+10 #pragma omp barrier
+11 #pragma omp barrier
+12 MPI_Wait(req1);
+13
+14 Rank 1 / Thread 1:
+15 MPI_Irecv(comm2,req2);
+16 #pragma omp barrier
+17 MPI_Wait(req2);
+18 #pragma omp barrier
+Figure 7. Example that would deadlock without shared
+progress of VCIs.
+request-class’s lock when they need to acquire a request
+(e.g., during an MPI Isend) or release it (e.g., during
+an MPI Wait). This contention creates a performance
+serialization effect when multiple threads are concurrently
+creating and releasing requests even though the operations
+are on different VCIs. To address this contention, we
+maintain separate request pools for each VCI. Access to each
+request pool is protected by a per-VCI lock. In MPICH,
+requests are represented using a 32-bit integer handle with a
+fixed bitmask to encode handle types and its internal memory
+slab index and block index. To implement a request pool,
+some bits are needed to encode the request pool index, which
+reduces the number of bits for the object index and thus
+reduces the maximum number of request objects that can
+be allocated per request pool. Currently, MPICH supports
+a maximum of 262,144 active request objects per VCI.
+This maximum can be adjusted by shifting the handle bits
+allocation or simply increasing the handle type to a 64-bit
+integer.
+Cache-line awareness for VCIs. We implement the VCI
+pool as an array of structs. Each VCI struct holds the lock
+for that VCI. Locks of consecutive VCIs are likely to lie on
+the same cache line, resulting in the effects of false sharing
+when threads map to different VCIs. Hence, we use compiler
+attributes to cache-align each VCI. In case the cache-line
+alignment is misconfigured at build time and results in false
+sharing, the concurrent messaging rate will drop due to the
+serialization effect from false sharing.
+Microbenchmark analysis
+We first measure the aggregate message rate of MPI Isend
+and MPI Put (passive target synchronization) using
+a communication-intensive benchmark. The benchmark
+demonstrates the maximum rate at which multiple cores can
+inject messages into the network simultaneously. Each core
+on the host node targets a distinct core on the remote node.
+We compare the following modes of execution.
+• MPI everywhere parallelism using the original
+MPICH version that uses one VCI.
+• MPI+threads (ser comm+orig mpich)—parallelism
+with the user not exposing communication parallelism
+on the original MPICH that uses one VCI and the
+Global critical section.
+• MPI+threads (ser comm+vcis)—same as above but
+using the optimized multi-VCI based MPICH/CH4.
+• MPI+threads (par comm+orig mpich)—parallelism
+with user-exposed parallelism on the original MPICH.
+• MPI+threads (par comm+vcis)—same as above but
+using the optimized multi-VCI based MPICH/CH4.
+• MPI+threads (Endpoints)—parallelism with uservisible endpoints on top of the optimized multi-VCI
+infrastructure where each endpoint is a VCI.
+We expect MPI everywhere to achieve the best
+performance. When the user exposes parallelism and
+the implementation enables multiple VCIs, and the user
+threads perfectly match the VCIs, we expect it to perform
+similarly well but may underperform MPI everywhere
+due to the overhead of locking. User-visible endpoints
+enable explicit control over VCIs, allowing users to
+specify the endpoint to use on the host and the remote
+endpoint to target. The communication performance of uservisible endpoints reflects the upper bound of the MPI-4
+implementation wherein users implicitly use VCIs through
+MPI-4 mechanisms. To match the performance of MPI
+everywhere, it requires binding semantics, e.g. the MPIX
+stream proposal from Zhou et al. (2022).
+For our analysis with MPI+threads, we spawn one rank
+per node with an OpenMP thread per core. MPI everywhere
+uses a rank per core. In our microbenchmarks with uservisible endpoints, each host-target thread pair uses its
+own endpoint, thus exposing communication parallelism
+to the MPI library. With MPI-4, when users do not
+expose parallelism (ser comm), all threads use the same
+communicator or window. In user-exposed parallelism
+(par comm), each thread pair uses its own communicator or
+window.
+Well-behaved communication
+For the different modes of execution on OFI/OPA and
+UCX/IB, Figure 8 shows the message-rate scalability of a
+small-message MPI Isend, and Figure 9 shows the message rate of MPI Isend with 16 cores across varying message sizes. MPI everywhere achieves the highest throughput
+in all cases. When users expose communication parallelism,
+they achieve the same performance irrespective of the use
+of VCIs (par comm) or user-visible endpoints. When users
+expose no communication parallelism (ser comm), there is
+no performance gain with increasing number of threads.
+Thread safety costs. A corresponding MPI everywhere
+configuration represents the practical upper bound of
+the communication performance of an MPI+threads
+configuration. Our optimized MPI+threads library utilizes
+the same level of network parallelism as MPI everywhere.
+However, MPI+threads incurs thread safety overheads over
+MPI everywhere even in the uncontended case. These
+overheads are most visible for small messages (see Figure 9)
+since the message rate is bound by the CPU, not by the
+network. The sources of the thread safety overheads are
+lock acquisitions and atomics for completion or reference
+counting. Figure 10 shows that if we disable locking and
+Prepared using sagej.cls
+10 Journal Title XX(X)
+0
+20
+40
+60
+1 2 4 8 16
+Number of cores
+Messages/s (x10^6)
+Isend; MPICH/OFI/OPA
+0
+20
+40
+60
+80
+1 2 4 8 16
+Number of cores
+Messages/s (x10^6)
+Isend; MPICH/UCX/IB
+MPI
+Everywhere
++Threads (ser_comm+orig_mpich)
++Threads (par_comm+orig_mpich)
++Threads (par_comm+vcis)
++Threads (ser_comm+vcis)
++Threads (Endpoints)
+Figure 8. Message-rate scalability of 8-byte MPI Isend.
+0
+20
+40
+60
+14
+1664
+256
+10244096
+1638465536
+Message size (B)
+Messages/s (x10^6)
+Isend; 16 cores; MPICH/OFI/OPA
+0
+20
+40
+60
+80
+14
+1664
+256
+10244096
+1638465536
+Message size (B)
+Messages/s (x10^6)
+Isend; 16 cores; MPICH/UCX/IB
+MPI
+Everywhere
++Threads (ser_comm+orig_mpich)
++Threads (par_comm+orig_mpich)
++Threads (par_comm+vcis)
++Threads (ser_comm+vcis)
++Threads (Endpoints)
+Figure 9. MPI Isend throughput with varying message sizes.
+MPI+Threads
+(+no atomics)
+MPI+Threads
+(+no locks)
+MPI+Threads
+MPI Everywhere
+0 25 50 75
+Messages/s (x10^6)
+Isend; MPICH/UCX/IB
+Note: Error bars overlap
+Figure 10. MPI+threads costs.
+atomics,† MPI+threads can match the throughput of MPI
+everywhere. One solution to mitigate thread-safety costs
+would be to allow users to provide hints as to which
+communicators will be accessed by a dedicated thread,
+thereby allowing the MPI library to disable locking for the
+VCIs of communicators accessed by dedicated threads.
+Not-so-well-behaved communication
+Similar to Figures 8 and 9, Figures 11 and 12 demonstrate,
+for the different modes of execution on OFI/OPA and
+UCX/IB, the throughput scalability of a small-message
+MPI Put, and the 16-core message rate of MPI Put across
+varying message sizes, respectively
+Network hardware limitations. The MPI+threads
+message rate of MPI Put on OFI/OPA is dismal even with
+exposed parallelism on VCIs and user-visible endpoints.
+The reason is that Intel OPA emulates its RMA operations
+in software, requiring the application on the target side to
+actively progress a VCI for a performance-oriented execution
+of the operation. When the application provides no help,
+OPA relies on its low-frequency PSM2 progress thread for
+completion of the operation. In our benchmark, all the
+threads from all processes first initiate their RMA operations
+in parallel. Then, one thread waits on an MPI barrier, after 0
+10
+20
+30
+40
+1 2 4 8 16
+Number of cores
+Messages/s (x10^6)
+Put; MPICH/OFI/OPA
+0
+25
+50
+75
+100
+1 2 4 8 16
+Number of cores
+Messages/s (x10^6)
+Put; MPICH/UCX/IB
+MPI
+Everywhere
++Threads (ser_comm+orig_mpich)
++Threads (par_comm+orig_mpich)
++Threads (par_comm+vcis)
++Threads (ser_comm+vcis)
++Threads (Endpoints)
+Figure 11. Message-rate scalability of 8-byte MPI Put.
+0
+10
+20
+30
+40
+14
+1664
+256
+10244096
+1638465536
+Message size (B)
+Messages/s (x10^6)
+Put; 16 cores; MPICH/OFI/OPA
+0
+25
+50
+75
+100
+14
+1664
+256
+10244096
+1638465536
+Message size (B)
+Messages/s (x10^6)
+Put; 16 cores; MPICH/UCX/IB
+MPI
+Everywhere
++Threads (ser_comm+orig_mpich)
++Threads (par_comm+orig_mpich)
++Threads (par_comm+vcis)
++Threads (ser_comm+vcis)
++Threads (Endpoints)
+Figure 12. MPI Put throughput with varying message sizes.
+0
+10
+20
+30
+40
+1 2 4 8 16
+Number of cores
+Messages/s (x10^6)
+MPI
+Everywhere
++Threads (ser_comm+orig_mpich)
++Threads (par_comm+orig_mpich)
++Threads (par_comm+vcis)
++Threads (ser_comm+vcis)
++Threads (Endpoints)
+Put; MPICH/OFI/OPA
+Figure 13. Parallel Win free.
+which all threads synchronize with a thread barrier. The
+communicator used for the MPI barrier internally uses a VCI
+different from those of the windows on which the RMA
+operations are issued. Thus, none of the threads directly
+make progress on the incoming messages of the RMA
+VCIs. The thread waiting on the MPI barrier occasionally
+performs global progress, so the benchmark eventually
+completes, but such global progress is infrequent and thus
+hurts performance.
+With UCX/IB, on the other hand, we see no such
+degradation in performance because Mellanox IB is capable
+of implementing contiguous MPI Put operations fully in
+hardware. Thus, even if the target threads are not making
+direct progress on the RMA VCIs, the operations still
+complete quickly.
+With MPI everywhere, each process has a single VCI.
+Thus, the target ranks waiting on an MPI barrier continuously
+progress the VCI being targeted by the initiator ranks.
+The main point demonstrated here is the tradeoff between
+dedicated progress and shared progress. MPI everywhere
+has no distinction between dedicated and shared progress
+†Since each thread maps to its own VCI in the MPI+threads
+microbenchmark, disabling thread safety, although incorrect, does not lead
+to erroneous behavior.
+Prepared using sagej.cls
+11
+0
+10
+20
+0 1 10 100 1000
+Target-side computation loop (x10^6)
+Messages/s (x10^6)
+16 cores; Put; MPICH/OFI/OPA
+Figure 14. Busy target.
+0
+20
+40
+0 1 2 4 8 16
+Number of serialized communicators
+Messages/s (x10^6)
+16 cores; 16 VCIs; Isend; MPICH/OFI/OPA
+Figure 15. Mapping mismatch
+because it only has a single VCI. For MPI+threads, when
+a single VCI is used (i.e., original MPICH), like MPI
+everywhere, it has no distinction between dedicated and
+shared progress either. But, for MPI+threads, when we
+use multiple VCIs, the same independence of VCIs that
+enables good performance through the avoidance of locks
+also hurts shared progress between the threads. One can work
+around this issue by, for example, having each thread be
+responsible for progress on its window (in the same way
+that MPI everywhere works). One possibility is that threads
+call MPI Win free on their own windows in parallel (see
+Figure 13), thus making progress on the corresponding VCIs,
+although how practical this possibility is in real applications
+remains to be seen.
+Busy target. Typically, the target side is involved in its
+own computational activities and does not just wait for
+communication to complete, as in Figure 13. The target’s
+computation then determines the productivity of operations
+that need the target VCI to be progressed. Figure 14 shows a
+deteriorating MPI Put message rate when the computation
+before the call to MPI Win free increases on the threads
+of the target rank.
+Mismatch in expected mapping to VCI. Even if the
+user exposes parallelism, parallel operations can contend
+on the same VCI because the number of VCIs available
+is hardware dependent and typically small, and these VCIs
+themselves are not exposed to the user. A simple first-come,
+first-served model of VCI allocation to communicators might
+not be the best strategy in this regard because the user cannot
+identify which communicators map to distinct VCIs and can
+therefore be used by different threads for better performance.
+Figure 15 shows the deteriorating effect on throughput for
+increasing amounts of serialization when there are 16 threads
+and the network hardware features only 16 contexts. The user
+is exposing communication parallelism, but the observed
+performance is low because of the mismatch in expectations
+of mapping to the underlying VCIs. One solution to this
+mismatch in expected mapping would be to allow users
+to provide hints as to which communicators are used by
+different threads and can benefit from independent VCIs.
+User-visible endpoints, compared to MPI-4, can perform
+better in this situation because they expose the network
+hardware contexts to the user. We note that user-visible
+endpoints could also be implemented as a virtual layer on
+top of internal VCIs. However, they form a closer mapping
+to network resources than what communicators do.
+Limiting MPI semantics
+Abstracting the use of VCIs through communicators can hurt
+certain irregular communication patterns. Figure 16 captures
+the communication pattern of Legion’s runtime (Bauer et al.
+2012), which maintains a set of threads where a few
+Figure 16. Dedicated threads.
+0
+1
+2
+3
+1 2 4 8 16
+Number of sender threads
+Messages/s (x10^6)
+Using
+Endpoints
+Communicators
+Isend; MPICH/OFI/OPA
+Figure 17. Performance
+are dominant message senders and a few are dedicated
+polling threads that receive messages. With MPI-4, each
+sender thread uses a separate communicator. However, the
+semantics of MPI require the receiver thread to iterate over
+the communicators, thus forcing the receiver to contend
+on the VCIs of the senders and hurting performance (see
+Figure 17). With user-visible endpoints, this contention does
+not exist since each thread uses a distinct endpoint and
+can directly address the endpoint of the remote receiver.
+The single receiver is a bottleneck with both user-visible
+endpoints and communicators. With communicators, the
+fraction of time spent by the receiver on a VCI’s lock
+decreases with increasing number of senders. Hence, its
+performance approaches that with endpoints.
+Communication with GPU Buffers
+The support of GPU buffers in MPI communication requires
+the MPI library to be able to handle different routes for
+data movement between GPUs and CPUs both within and
+across compute nodes. There are three challenges in building
+such an MPI library. First, the MPI library needs to interface
+with different programming models used by GPUs. For
+example, Intel GPUs use the SYCL programming model
+and the OneAPI library, which is significantly different
+from the CUDA API of NVIDIA GPUs. Second, the
+MPI library needs to support both internode and intranode
+communication using GPU buffers. Third, the MPI library
+needs to support GPU buffers with MPI derived datatypes.
+High-performance networks, such as InfiniBand, rely on
+device-registered buffers to achieve the best communication
+performance in internode communication. Depending on
+the message size, the MPI implementation usually needs
+to copy the message to a pre-registered bounce buffer or
+register the user buffer with the network interface card
+(NIC). Because GPU memory is separate from the host
+memory, communication using a GPU buffer may require
+an additional copy from GPU memory to host memory
+before the data can take the traditional route to network.
+Modern GPUs can avoid the extra copy between CPU
+and GPU with unified virtual addressing and direct GPUNIC communication capabilities such as GPUDirect RDMA.
+MVAPICH-GDR (Potluri et al. 2013) is one of the earliest
+works to support GPU communication in MPI. It supports
+Mellanox InfiniBand for GPUDirect RDMA for NVIDIA
+and AMD GPUs. Other more recent studies have further
+improved the GPU support in MPI implementations with
+a focus on collective communication, datatypes, and GPU
+IPC (Chu et al. 2016; Suresh et al. 2022; Hashmi et al.
+2020). Most of these optimizations need to be built on top
+of a GPU-aware MPI library. In this paper, we focused
+on the communication and datatype handling in a portable
+Prepared using sagej.cls
+12 Journal Title XX(X)
+GPU-aware MPI library. As part of ECP, the Open MPI
+team developed the LinkX transport to provide GPU support
+for both internode and intranode communication (Bernholdt
+et al. 2024). Open MPI also relies on Libfabric to provide
+an accelerated communication path on the HPE Slingshot 11
+network.
+With its lightweight design, MPICH can already leverage
+hardware support for GPU communication through the use
+of Libfabric and UCX. This design reduces the complexity
+of supporting internode communication with contiguous,
+and some types of noncontiguous, GPU buffers. MPICH
+only needs to do three things to fully support GPU
+communication:
+1. Interfacing with GPU programming models.
+2. Supporting internode communication with GPU when
+hardware feature is not usable (i.e., fallback path).
+3. Supporting intranode communication with GPU.
+Portable GPU Programming Interface
+We identified three categories of GPU programming capabilities required by MPICH and implemented abstraction
+functions in the MPL module. First, MPICH needs a device
+management capability. This allows MPICH to correctly
+query and initialize the GPU devices for communication.
+This is generally encapsulated in a single MPL gpu init
+function. MPICH needs basic information such as number
+of GPU devices and the connectivity between GPUs if interGPU links are present.
+Second, MPICH needs memory management capability.
+The majority of functions in the MPL layer are for memory
+management (as shown in Table 2). One of the widely used
+functions is MPL gpu query pointer attr, which
+checks whether a buffer address resides in CPU or
+GPU memory. MPICH queries for this buffer attribute
+to determine the correct communication path to be used.
+MPICH also relies on the memory allocation functions to
+manage temporary buffers for GPUs. We use two types
+of buffers: GPU buffers for packing and unpacking of
+noncontiguous user buffers on GPU, and GPU-registered
+host buffers for fallback communication path and shared
+memory transport. MPICH also encapsulates the GPU IPC
+related functions that are required for shared memory
+communication, which we discuss in a subsection below.
+Lastly, MPICH also needs data movement functions
+to support communication. However, we chose not to
+encapsulate most of them in the MPL layer. Instead, we built
+a separate datatype engine named Yaksa for handling all data
+movement including contiguous and noncontiguous buffers.
+MPI Fallback Communication with GPUs
+The MPICH fallback communication path is provided by the
+Active Message (AM) module. The AM module implements
+all MPI functionalities, which enables MPI communication
+with simple network capabilities—only basic send and
+receive operations are required for AM to work. This is one
+way for MPICH to support MPI communication on regular
+network stacks such as TCP/IP. For high-performance
+networks, the AM module is used only for operations that
+are not natively supported by the hardware, for example,
+complex noncontiguous datatypes and non-hardware RMA
+operations.
+We enable the GPU support in the AM module by using
+communication buffers allocated as GPU-registered host
+memory in AM. On the sender side, MPICH only needs to
+copy the data from the user buffer on GPUs to the temporary
+buffer used by AM before sending the data. Similarly, on the
+receiver side, MPICH will receive the incoming data into the
+preallocated temporary buffer and then copy it to the user
+buffer on GPUs. Note that it is also possible to use non-GPUregistered host buffer as the AM temporary buffer, but it may
+incur additional overhead when copying data because the
+GPU driver may use an internal GPU-registered temporary
+buffer. It will result in two memory copy steps: one from the
+host buffer to the GPU-registered host buffer, then the from
+GPU-registered host buffer to the GPU buffer. In this way, all
+MPI communication can support GPU buffers without any
+requirement for GPU-NIC direct communication support.
+We designed an optimization that uses temporary buffers
+on GPUs. The necessity of this optimization is due to
+the limited performance of communication with temporary
+buffers in the host memory. Copying from GPU buffers,
+especially non-contiguous GPU buffers, to host buffers is
+significantly slower than copying them to GPU buffers.
+Exascale supercomputers have GPUs and NICs that support
+direct GPU-NIC communication. If the communication
+needs to fallback to AM because the user buffer is noncontiguous, it takes a significant performance hit because
+of the temporary buffer in the host memory. Therefore,
+introducing an alternative route that enables packing and
+unpacking data with a GPU temporary buffer improves the
+performance.
+Another design choice in GPU fallback communication
+is that we use preallocated, fixed-size temporary buffers
+instead of allocating temporary buffers on demand. This
+allows us to keep the buffer allocation overhead out of
+the performance-critical path. In MPICH, we set the buffer
+to be 16 KB, which is sufficient for eager transmission.
+This design, however, does mean that large messages will
+have to be broken down intro smaller chunks that are sent
+separately. In MPICH, we implemented the communication
+protocol in a pipelined fashion where the data copying to
+the temporary buffer overlaps with sending of the buffer.
+Comparing to the on-demand allocation of big temporary
+buffers for large messages, it avoids the allocation overhead
+(by using preallocated buffers) and reduces the copying
+overhead (by overlapping).
+One caveat of using the preallocated GPU-registered
+buffers is related to GPU memory usage. The GPU device
+needs to maintain the mapping information of the GPUregistered host buffers. In practice, this memory overhead
+can be non-negligible (≈300 MB on NVIDIA GPUs). To
+avoid wasting resources, we defer the allocation of these
+buffers until they are needed for the first time in the MPI
+application.
+Intranode MPI Communication with GPU IPC
+MPICH’s shared memory transport provides send and
+receive capabilities through a shared memory region between
+processes on the same node. It uses the AM module to
+achieve the full MPI capability. With the GPU support in the
+Prepared using sagej.cls
+13
+Table 2. MPL functions of memory management and IPC for GPU.
+MPL CUDA HIP ZE
+MPL gpu query pointer attr cudaGetPointerAttributes hipGetPointerAttributes zeMemGetAllocProperties
+MPL gpu malloc cudaMalloc hipMalloc zeMemAllocDevice
+MPL gpu free cudaFree hipFree zeMemFree
+MPL gpu malloc host cudaMallocHost hipMalloc zeMemAllocHost
+MPL gpu free host cudaFreeHost hipFree zeMemFree
+MPL gpu register host cudaHostRegister hipHostUnregister zexDriverImportExternalPointer
+MPL gpu unregister host cudaHostUnregister hipHostUnregister zexDriverReleaseImportedPointer
+MPL gpu ipc handle create cudaIpcGetMemHandle hipIpcGetMemHandle zeMemGetIpcHandle
+MPL gpu ipc handle destroy N/A N/A ioctl
+MPL gpu ipc handle map cudaIpcOpenMemHandle hipIpcOpenMemHandle zeMemOpenIpcHandle
+MPL gpu ipc handle unmap cudaIpcCloseMemHandle hipIpcCloseMemHandle zeMemCloseIpcHandle
+AM module, intranode communication in MPICH is already
+GPU-aware. GPU Inter-Process Communication (IPC) is a
+mechanism that allows the sharing of GPU resources. The
+GPU in one process can access the memory buffer of the
+GPU in another process without the need of copying data to
+the host memory. This can be particularly useful in intranode
+MPI communication as it can improve the communication
+performance by avoiding the memory copy to the temporary
+buffer in the host memory. More importantly, it enables the
+intranode communication to utilize the fast inter-GPU links
+when possible.
+Figure 18 shows the GPU IPC communication in MPICH.
+The sender process first creates an IPC handle for the user
+buffer using MPL gpu ipc handle create. Then, this
+handle and the MPI communication metadata is sent to the
+receiver in a header message. Upon receiving this header,
+the receiver will try matching it with a posted receive. The
+receiver takes the IPC handle and maps the source buffer
+with MPL gpu ipc handle map. This creates a memory
+pointer for the source buffer in the receiver’s address space.
+Then, the receiver controls the GPU to copy the data from
+the mapped address of the source buffer into the receive
+buffer. Lastly, the receiver unmaps the IPC handle, sends a
+completion message to the sender, and completes the receive
+operation. The sender will close the IPC handle (not required
+for all GPUs) and complete the send operation. During this
+process, the transmission of user buffer is done through
+GPU IPC, and the control messages (header and completion
+messages) are done through the shared memory.
+The receiving process can map the IPC handle to any GPU
+that is usable to the process. This mapping choice determines
+which GPU compute engine will be used in the data copying.
+The GPU IPC in MPICH offers two general protocols for
+the buffer copying: a read protocol and a write protocol, as
+shown in Figure 19. In this example, the sender process and
+the receiver process use GPU 0 and GPU 1, respectively.
+In the read protocol, the receiver maps the IPC handle to
+the GPU where the receive buffer resides (GPU 1). In this
+case, the memory copy from the mapped buffer to the receive
+buffer will be performed by the copy engine in GPU 1; i.e.,
+the receiver GPU reads from the sender GPU. In the write
+protocol, the receiver maps the IPC handle to the sender’s
+GPU (GPU 0). The memory copy from the mapped buffer
+to the receive buffer will need to be performed by sender’s
+GPU, although it is logically equivalent to the copy in the
+read protocol. Generally, MPICH prefers the write protocol
+Create IPC
+Handle
+Header
+Match w/
+RECV
+Completion
+Notification
+Map IPC 
+Handle
+Copy Data
+SEND
+Completion
+RECV
+Completion
+Unmap IPC
+Handle
+Figure 18. GPU IPC
+Communication Protocol.
+WRITE Protocol
+Receiver Address Space
+DEST
+Buffer
+Mapped Buf
+w/ GPU 1
+IPC 
+Handle
+GPU 0 GPU 1
+Receiver Address Space
+DEST
+Buffer
+Mapped Buf
+w/ GPU 0
+Copy 
+Engine
+IPC 
+Handle
+READ Protocol
+SRC 
+Buffer
+Copy 
+Engine
+GPU 0
+SRC 
+Buffer
+GPU 1
+memcpy
+memcpy
+Figure 19. Inter-GPU Buffer Copy
+Protocols.
+for GPU IPC because it offers higher bandwidth than the
+read protocol. MPICH needs both protocols because the
+write protocol can only work if the receiver process can
+control the sender’s GPU, which may not be possible in
+practice.
+MPICH also supports noncontiguous buffers in GPU IPC.
+This is done by flattening‡the MPI derived datatype of the
+source buffer and including it in the header. The receiver
+will unflatten the received datatype and use it in the buffer
+copying. This step is needed because the MPI datatype of
+the source buffer may not be present on the receiver. MPICH
+sends the datatype only if its flattened version can fit in the
+header. The flattened datatype size increases only with the
+complexity of the datatype; the header space is sufficient for
+most regular MPI derived datatype patterns in applications.
+In the rare case of the flattened datatype being too big,
+MPICH will fallback to use packing and unpacking for
+noncontiguous GPU buffers.
+Performance
+We measured the point-to-point communication unidirection bandwidth using the OSU microbenchmarks. We
+used the ALCF Polaris supercomputer, where each node
+contains four NVIDIA A100 GPUs, each with 40 GB
+memory. Four NVLink connections are bonded together
+‡Flattening is the serialization of data structures describing the MPI derived
+datatype.
+Prepared using sagej.cls
+14 Journal Title XX(X)
+ 0
+ 20
+ 40
+ 60
+ 80
+ 100
+14
+1664
+256
+1K4K
+16K64K
+256K
+1M4M
+16M64M
+256M
+1G
+Bandwidth (GB/s)
+Message Size (B)
+Figure 20. Intranode
+Point-to-point Bandwidth with
+GPU.
+ 0
+ 5
+ 10
+ 15
+ 20
+ 25
+14
+1664
+256
+1K4K
+16K64K
+256K
+1M4M
+Bandwidth (GB/s)
+Message Size (B)
+Figure 21. Internode
+Point-to-point Bandwidth with
+GPU.
+between each pair of GPUs, providing 100 GB/s bandwidth.
+The compute nodes are connected with a 200 Gb/s HPE
+Slingshot 11 network. We measured the performance with
+contiguous buffers in order to demonstrate the maximum
+performance for MPICH’s GPU support. Figures 20 and 21
+show the communication bandwidth with MPI ISEND
+and MPI IRECV using GPU buffers. For intranode
+communication, MPICH’s GPU-IPC transport achieved a
+maximum of 83.4 GB/s. For internode communication,
+MPICH used HPE’s Libfabric library to support RDMA with
+GPU buffers, which allows us to saturate the Slignshot 11
+NIC and achieved 23.5 GB/s maximum bandwidth. Because
+MPICH is able to saturate the network, the communication
+performance with non-contiguous data or complex data
+would be determined by how fast the datatype engine is able
+to perform packing and unpacking of the data. In the next
+section, we focus on the new datatype engine in MPICH.
+GPU-efficient Datatype Engine
+The MPI datatype abstraction provides a powerful method
+to describe data with diverse memory layouts, facilitating
+the composition of clear and concise code for data
+movement. For example, stencil applications often need
+to exchange boundary data that is noncontiguous in
+memory. The strided noncontiguous pattern that represents
+the surface data of a Cartesian block can be easily
+described using an MPI vector datatype. The data exchange
+for this noncontiguous data can be expressed the same
+way as exchanging contiguous data using MPI Send and
+MPI Recv. This approach is superior to manually iterating
+the data movement over individual segments. Furthermore,
+the MPI datatype abstraction does not preclude optimizations
+inside implementations. Common optimization strategies
+employed by implementations include packing data into
+contiguous regions to compress communication latency or
+segmenting data into chunks and orchestrating pipelined
+communication to enhance bandwidth.
+It is important for an MPI implementation to have a
+high-performance datatype engine. Implementations must
+consistently outperform or match the efficiency of na¨ıve
+manual processing code across a wide range of scenarios.
+Failure to do so may lead application programmers to bypass
+MPI datatypes entirely, opting instead for manual coding
+approaches. However, this presents a significant challenge
+due to two primary factors. First, MPI datatypes can be
+arbitrarily nested. Unlike straightforward manual loops for
+strided data, a general datatype engine introduces additional
+branches at each level to accommodate all potential data
+structures. Second, a datatype engine must also facilitate
+partial packing and unpacking of arbitrary data sections.
+Crafting code capable of random access to arbitrarily nested
+data structures is inherently complex, often obstructing
+straightforward optimization efforts.
+The datatype engine used in earlier versions of MPICH is
+referred to as “dataloop” (Ross et al. 2003). The dataloop
+framework internally represents a datatype as a stack of
+structures with each layer of structure termed a dataloop.
+The term refers to a data iteration loop. All MPI datatypes
+are classified into five types of dataloops: contig, vector,
+block-indexed, indexed, and struct. At the center of the
+dataloop design is a “loop manipulation” function, which
+invokes action-specific functions to process leaf dataloops.
+Consequently, the dataloop design effectively segregates
+the representation of datatypes, segment iteration, and data
+actions. Experiments have shown that the dataloop datatype
+engine can rival the performance of manual processing in the
+majority of cases (Ross et al. 2003).
+However, the dataloop code is exceedingly intricate.
+Both the loop representation layer and loop manipulation
+layer must contend with general cases as well as specific
+optimizations. Furthermore, adapting the dataloop design
+to GPUs, where data transfer latency is substantial, proves
+challenging. The fallback path of transferring the GPU
+data to host staging memory to perform datatype packing
+and unpacking introduces significant additional latency.
+Implementing the leaf actions in GPU kernels also presents
+challenges. The segregation of loop manipulation and leaf
+action means that performance is largely impacted by the
+repeated latency in launching leaf actions, rather than the
+efficiency of the leaf action itself. To overcome these
+drawbacks and meet the demands of modern GPU-centric
+architectures, we designed a new datatype engine, called
+Yaksa. Yaksa is guided by the following design principles.
+1. Performance: Yaksa aims to achieve performance
+levels that either meet or surpass those achieved by
+optimized manual code.
+2. Abstractions: Yaksa’s interface abstractions are
+designed to be device agnostic. Implementations must
+support all memory types, including host memory and
+accelerator device memory such as CUDA, ROCm,
+and Level Zero.
+3. Interface: Yaksa features a standalone interface,
+enabling its utilization by non-MPI middleware, such
+as UCX, to facilitate support for MPI-like datatypes.
+To realize these objectives, Yaksa employs a three-layer
+architecture consisting of a frontend layer, a glue layer,
+and a backend device layer, as illustrated in Figure 22.
+The frontend layer remains agnostic to the underlying
+memory subsystem. Functions that operate independently
+of specific memory subsystems, such as datatype-to-IOV
+conversion and flattening/unflattening of datatypes, are
+entirely implemented within the frontend. For operations
+requiring knowledge of the actual memory subsystem, such
+as packing and unpacking, the frontend transforms irregular
+inputs into a collection of smaller regular inputs for the
+backend to handle. The glue layer interacts with the backend
+devices, queries buffer attributes, prepares staging buffers if
+necessary, and orchestrates pipelined data transfer. It also
+handles interactions that require multiple backend devices.
+The backend device layer is responsible for executing the
+Prepared using sagej.cls
+15
+Yaksa Datatype Engine
+Vector
+Indexed
+Struct
+…
+Datatype
+Frontend
+CPU
+Backend
+CUDA
+Backend
+HIP
+Backend
+ZE
+Backend
+CPU
+NVIDIA
+GPU
+AMD
+GPU
+Intel
+GPU
+Figure 22. Design of Yaksa datatype engine.
+ 0
+ 5
+ 10
+ 15
+Packing Bandwidth 
+user dataloop yaksa
+(GB/s)
+contig vector of vectors
+Figure 23. Comparison of datatype packing bandwidth for CPU
+buffers. Data evaluated on a dual-socket nodes with 2x Intel
+Xeon Max 9470C CPUs. Both the contig case and the vector of
+vectors case transfer 128 MB of data in total. The time is
+measured in milliseconds.
+actual packing and unpacking operations, tailored to each
+specific memory subsystem.
+To ensure optimal performance, Yaksa generates packing
+and unpacking kernel functions during compile time for all
+datatypes up to a configurable number of nesting levels, with
+the default set to three. For shallow datatypes, like a vector of
+vectors of doubles, a single kernel function suffices for both
+packing and unpacking. These kernel functions typically
+consist of straightforward nested loops, with the innermost
+loop typically comprising an assignment or memcpy
+operation. Consequently, most optimizing compilers can
+easily vectorize these kernel functions, thereby matching
+the performance of manually optimized code. For datatypes
+nested beyond the predetermined levels, Yaksa recursively
+iterates through the outer layers until reaching the inner
+layers, which can then be handled by calling kernel functions
+directly. Given the optimization of the inner loops, the
+overall performance is anticipated to approach the optimal
+level. The kernel functions can be easily generated as
+GPU kernel functions to utilize the many parallel cores
+of the GPU device. In addition, the GPU kernel functions
+can be launched asynchronously, allowing the data transfer
+progress to overlap with other tasks. Separate kernels for
+each memory subsystem are independently generated and
+optimized at compile time. The frontend selects the backend
+at runtime to provide GPU-aware datatype operations. While
+Yaksa is capable of querying memory attributes at runtime, it
+also offers the option for callers to provide memory attribute
+hints directly to Yaksa via info hints. This allows callers
+to bypass any additional overhead associated with attribute
+querying.
+ 0
+ 100
+ 200
+ 300
+ 400
+Packing Bandwidth 
+CUDA ROCm ZE
+(GB/s)
+contig vector of vectors
+Figure 24. Yaksa datatype packing performance for
+GPU-to-GPU buffers over 3 architectures. The contig datatype
+is MPI CHAR. The non-contig datatype is two levels of vector
+types both with 8 counts of base types followed with 2 counts
+gap. The total volume of data in both contig and non-contig
+tests are 128 MB. The time is measured in milliseconds.
+Figure 23 compares datatype packing performance for
+CPU buffers across manual (user) loop code, the former dataloop engine, and the new Yaksa engine. Both the dataloop
+and Yaksa engines demonstrate comparable performance for
+both contiguous and noncontiguous datatypes versus manual
+code. The dataloop even outperforms the manual code for
+the vector of vector case. This is possibly due to datatype
+optimization by the dataloop engine that simplifies some
+nested layers into simpler equivalent structures. We plan to
+implement a similar optimization in Yaksa.
+Figure 24 shows the performance results of Yaksa over
+major GPU architectures. The comparisons across different
+GPU architectures are less meaningful due to hardware
+differences. For all three architectures, the contiguous case
+uses the GPU’s copy engine, i.e., via the GPU runtime’s
+memcpy routine. The noncontiguous case uses the GPU’s
+compute engine, i.e., via direct memory assignment in GPU
+kernels.
+Conclusions
+This paper summarizes some of the technical challenges
+in building a high-performance MPI library for exascale
+parallel systems and describes solutions that MPICH adopted
+to address these challenges. The layered design of MPICH
+has enabled fast path communications that leverage hardware
+acceleration while supporting full MPI functionalities
+through software. MPICH uses the Virtual Communication
+Interface (VCI) to isolate the communication traffic
+generated by multithreaded MPI applications and map them
+to independent network resources. This design reduces the
+contention for concurrent MPI communication and improves
+NIC utilization. MPICH further provides general support
+for GPU buffers in MPI communication by introducing an
+abstraction layer for GPU-related operations. Overall, these
+advancements in MPICH library helped make it ready for
+exascale supercomputers and furthered MPICH’s adoption
+by vendor partners.
+Acknowledgements
+This research was supported by the Exascale Computing
+Project (17-SC-20-SC), a collaborative effort of the
+U.S. Department of Energy Office of Science and the
+National Nuclear Security Administration, and by the U.S.
+Prepared using sagej.cls
+16 Journal Title XX(X)
+Department of Energy, Office of Science, under Contract
+DE-AC02-06CH11357. This research used resources of the
+Argonne Leadership Computing Facility, a U.S. Department
+of Energy (DOE) Office of Science user facility at
+Argonne National Laboratory and is based on research
+supported by the U.S. DOE Office of Science Advanced
+Scientific Computing Research Program, under Contract
+No. DE-AC02-06CH11357. We gratefully acknowledge the
+computing resources provided by the Laboratory Computing
+Resource Center (LCRC) and the Joint Laboratory for
+System Evaluation (JLSE) at Argonne National Laboratory.
+This research also used resources of the Oak Ridge
+Leadership Computing Facility at the Oak Ridge National
+Laboratory, which is supported by the Office of Science
+of the U.S. Department of Energy under Contract No. DEAC05-00OR22725. We also thank other developers and users
+for their code contributions and experience reports.
+References
+(2013) Monte Carlo Benchmark (MCB). URL https://
+codesign.llnl.gov/mcb.php.
+(2017) Nekbone. URL https://github.com/Nek5000/
+Nekbone.
+ANL (2017) Center for exascale simulation for advanced reactors.
+URL https://github.com/ANL-CESAR.
+Balaji P, Buntinas D, Goodell D, Gropp W, Krishna J, Lusk E and
+Thakur R (2010) PMI: A scalable parallel process-management
+interface for extreme-scale systems. In: European MPI Users’
+Group Meeting. Springer, pp. 31–41.
+Bauer M, Treichler S, Slaughter E and Aiken A (2012) Legion:
+Expressing locality and independence with logical regions. In:
+SC ’12: Proceedings of the International Conference on High
+Performance Computing, Networking, Storage and Analysis.
+pp. 1–11. DOI:10.1109/SC.2012.71.
+Bernholdt DE, Boehm S, Bosilca G, Gorentla Venkata M,
+Grant RE, Naughton T, Pritchard HP, Schulz M and Vallee
+GR (2020) A survey of MPI usage in the US Exascale
+Computing Project. Concurrency and Computation: Practice
+and Experience 32(3): e4851. DOI:https://doi.org/10.1002/cpe.
+4851. URL https://onlinelibrary.wiley.com/
+doi/abs/10.1002/cpe.4851. E4851 cpe.4851.
+Bernholdt DE, Bosilca G, Bouteiller A, Brightwell R, Ciesko J,
+Dosanjh MG, Georgakoudis G, Laguna I, Levy S, Naughton
+T, Olivier SL, Pritchard HP, Schonbein W, Schuchart J and
+Shehata A (2024) Taking the MPI standard and the Open
+MPI library to exascale. The International Journal of High
+Performance Computing Applications 38(5): 491–507. DOI:
+10.1177/10943420241265936.
+Chu CH, Hamidouche K, Venkatesh A, Awan AA and Panda DKD
+(2016) CUDA kernel based collective reduction operations
+on large-scale GPU clusters. In: Proceedings of the
+16th IEEE/ACM International Symposium on Cluster, Cloud,
+and Grid Computing, CCGRID ’16. IEEE Press. ISBN
+9781509024520, p. 726–735. DOI:10.1109/CCGrid.2016.
+111. URL https://doi.org/10.1109/CCGrid.
+2016.111.
+Dinan J, Grant RE, Balaji P, Goodell D, Miller D, Snir M
+and Thakur R (2014) Enabling communication concurrency
+through flexible MPI endpoints. The International Journal of
+High Performance Computing Applications 28(4): 390–405.
+DOE (2017) CORAL Benchmarks. URL https://asc.llnl.
+gov/CORAL-benchmarks.
+ExaCT (2017) Center for exascale simulation of combustion
+in turbulence. URL https://www.exactcodesign.
+org/.
+Fischer PF, Lottes JW, Kerkemeier SG et al. (2008) Nek5000:
+Open source spectral element CFD solver. URL http://
+nek5000.mcs.anl.gov.
+Guo Y, Archer CJ, Blocksome M, Parker S, Bland W, Raffenetti
+K and Balaji P (2017) Memory compression techniques
+for network address management in MPI. In: 2017 IEEE
+International Parallel and Distributed Processing Symposium
+(IPDPS). pp. 1008–1017. DOI:10.1109/IPDPS.2017.18.
+Habib S, Morozov V, Frontiere N, Finkel H, Pope A and Heitmann
+K (2013) HACC: Extreme scaling and performance across
+diverse architectures. In: Proceedings of the International
+Conference on High Performance Computing, Networking,
+Storage and Analysis, SC ’13. New York, NY, USA:
+Association for Computing Machinery. ISBN 9781450323789.
+DOI:10.1145/2503210.2504566. URL https://doi.
+org/10.1145/2503210.2504566.
+Hashmi JM, Chu CH, Chakraborty S, Bayatpour M, Subramoni
+H and Panda DK (2020) FALCON-X: Zero-copy MPI
+derived datatype processing on modern CPU and GPU
+architectures. Journal of Parallel and Distributed Computing
+144: 1–13. DOI:https://doi.org/10.1016/j.jpdc.2020.05.008.
+URL https://www.sciencedirect.com/science/
+article/pii/S0743731520302872.
+HPE (2024) HPE Slingshot interconnect. URL
+https://www.hpe.com/us/en/compute/hpc/
+slingshot-interconnect.html.
+Intel (2020) Intel Omni-Path fabric host software – user guide.
+URL https://www.intel.com/content/dam/
+support/us/en/documents/network-and-i-o/
+fabric-products/Intel_OP_Fabric_Host_
+Software_UG_H76470_v16_0.pdf.
+Intel (2024) Intel® Software Development Emulator (Intel®
+SDE). URL https://www.intel.com/content/
+www/us/en/developer/articles/tool/
+software-development-emulator.html.
+Karlin I, Keasler J and Neely R (2013) LULESH 2.0 updates and
+changes. Technical Report LLNL-TR-641973.
+Kim J, Baczewski AD, Beaudet TD, Benali A, Bennett MC, Berrill
+MA, Blunt NS, Borda EJL, Casula M, Ceperley DM, Chiesa S,
+Clark BK, Clay RC, Delaney KT, Dewing M, Esler KP, Hao H,
+Heinonen O, Kent PRC, Krogel JT, Kylanp ¨ a¨a I, Li YW, Lopez ¨
+MG, Luo Y, Malone FD, Martin RM, Mathuriya A, McMinis
+J, Melton CA, Mitas L, Morales MA, Neuscamman E, Parker
+WD, Flores SDP, Romero NA, Rubenstein BM, Shea JAR, Shin
+H, Shulenburger L, Tillack AF, Townsend JP, Tubman NM,
+Goetz BVD, Vincent JE, Yang DC, Yang Y, Zhang S and Zhao
+L (2018) QMCPACK: An open source ab initio quantum Monte
+Carlo package for the electronic structure of atoms, molecules
+and solids. Journal of Physics: Condensed Matter 30(19):
+195901. DOI:10.1088/1361-648X/aab9c3. URL https:
+//dx.doi.org/10.1088/1361-648X/aab9c3.
+Lin PT, Heroux MA, Barrett RF and Williams AB (2015) Assessing
+a mini-application as a performance proxy for a finite element
+method engineering application. Concurrency - Practice and
+Prepared using sagej.cls
+17
+Experience 27(17): 5374–5389. DOI:10.1002/cpe.3587. URL
+http://dx.doi.org/10.1002/cpe.3587.
+NASA (2017) NAS Parallel Benchmarks. URL https://www.
+nas.nasa.gov/software/npb.html.
+NVIDIA (2016) Mellanox adapters programmer’s reference manual. URL https://
+network.nvidia.com/files/doc-2020/
+ethernet-adapters-programming-manual.pdf.
+OFI-Working-Group (2024) Libfabric programmer’s manual. URL
+https://ofiwg.github.io/libfabric/.
+Potluri S, Hamidouche K, Venkatesh A, Bureddy D and Panda
+DK (2013) Efficient inter-node MPI communication using
+GPUDirect RDMA for InfiniBand clusters with NVIDIA
+GPUs. In: 2013 42nd International Conference on Parallel
+Processing. pp. 80–89. DOI:10.1109/ICPP.2013.17.
+Raffenetti K, Amer A, Oden L, Archer C, Bland W, Fujita H,
+Guo Y, Janjusic T, Durnov D, Blocksome M, Si M, Seo S,
+Langer A, Zheng G, Takagi M, Coffman P, Jose J, Sur S,
+Sannikov A, Oblomov S, Chuvelev M, Hatanaka M, Zhao
+X, Fischer P, Rathnayake T, Otten M, Min M and Balaji
+P (2017) Why is MPI so slow? analyzing the fundamental
+limits in implementing MPI-3.1. In: Proceedings of the
+International Conference for High Performance Computing,
+Networking, Storage and Analysis, SC ’17. New York,
+NY, USA: Association for Computing Machinery. ISBN
+9781450351140. DOI:10.1145/3126908.3126963. URL
+https://doi.org/10.1145/3126908.3126963.
+Ross R, Miller N and Gropp WD (2003) Implementing fast and
+reusable datatype processing. In: European Parallel Virtual
+Machine/Message Passing Interface Users’ Group Meeting.
+Springer, pp. 404–413.
+Sheehan TJ, Shelton WA, Pratt TJ, Papadopoulos PM, LoCascio
+P and Dunigan TH (1998) The locally self-consistent
+multiple scattering code in a geographically distributed linked
+MPP environment. Parallel Computing 24(12): 1827–
+1846. DOI:https://doi.org/10.1016/S0167-8191(98)00080-5.
+URL https://www.sciencedirect.com/science/
+article/pii/S0167819198000805.
+Suresh KK, Khorassani KS, Chen CC, Ramesh B, Abduljabbar M,
+Shafi A, Subramoni H and Panda DK (2022) Network assisted
+non-contiguous transfers for GPU-aware MPI libraries. In:
+2022 IEEE Symposium on High-Performance Interconnects
+(HOTI). pp. 13–20. DOI:10.1109/HOTI55740.2022.00018.
+UCF-Consortium (2024) Unified communication X. URL https:
+//openucx.org.
+Valiev M, Bylaska E, Govind N, Kowalski K, Straatsma T,
+Van Dam H, Wang D, Nieplocha J, Apra E, Windus
+T and de Jong W (2010) NWChem: A comprehensive
+and scalable open-source solution for large scale molecular
+simulations. Computer Physics Communications 181(9):
+1477–1489. DOI:https://doi.org/10.1016/j.cpc.2010.04.018.
+URL https://www.sciencedirect.com/science/
+article/pii/S0010465510001438.
+Zambre R, Chandramowlishwaran A and Balaji P (2020) How
+I learned to stop worrying about user-visible endpoints and
+love MPI. In: Proceedings of the 34th ACM International
+Conference on Supercomputing, ICS ’20. New York, NY, USA:
+Association for Computing Machinery. ISBN 9781450379830.
+DOI:10.1145/3392717.3392773. URL https://doi.
+org/10.1145/3392717.3392773.
+Zhou H, Raffenetti K, Guo Y and Thakur R (2022) MPIX stream:
+An explicit solution to hybrid MPI+X programming. In:
+Proceedings of the 29th European MPI Users’ Group Meeting.
+pp. 1–10.
+Prepared using sagej.cls

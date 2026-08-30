@@ -1,0 +1,478 @@
+MPI Collectives with Programmable Smart Switches | Proceedings of the SC '25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis skip to main content
+
+Contents
+
+## Abstract
+
+### Abstract
+
+Programmable smart network devices are heavily used by cloud providers, but typically not for HPC. However, they provide opportunities for off-loading computations, in particular for collective operations, which are important for data intensive workloads in classic HPC and ML training. In this paper, we present a prototype called mpitofino to enable offloading MPI collectives (in particular reductions) onto smart switches over an Ethernet fabric. We target Intel’s programmable Ethernet switches equipped with a Tofino ASIC, and we use the P4 programming language to process collective packets on the chip’s low-latency data path. We demonstrate how the flexibility of P4 enables us to use RoCEv2 as protocol, utilizing RDMA hardware support on the nodes’ NICs. Furthermore, we implement mpitofino as a collective provider in Open MPI and discuss its desirable scaling characteristics. Finally, we demonstrate that mpitofino can achieve data throughput close to the 100GBit/s line rate.
+
+### AI Summary
+
+### AI-Generated Summary (Experimental)
+
+This summary was generated using automated tools and was not authored or reviewed by the article's author(s). It is provided to support discovery, help readers assess relevance, and assist readers from adjacent research areas in understanding the work. It is intended to complement the author-supplied abstract, which remains the primary summary of the paper. The full article remains the authoritative version of record. Click here to learn more.
+
+Click here to comment on the accuracy, clarity, and usefulness of this summary. Doing so will help inform refinements and future regenerated versions.
+
+To view this AI-generated plain language summary, you must have Premium access.
+
+## 1 Introduction
+
+Cloud providers use programmable smart network devices, such as switches and network interface cards (NICs), to isolate and dynamically allocate resources to their customers. Typically, these smart devices takeover the routing of network packets and therefore keep the host compute resources fully and securely availalable to the customers. High Performance Computing (HPC) systems currently do not deploy smart network devices, as virtualization and isolation is less of a concern for HPC. However, smart network devices can provide opportunities for off-loading compute. For example, smart network interface cards and switches may help in ensuring progress and enable better asynchronity of compute and communication [24], and may allow to re-locate parts of the computation for lowering communication requirements [13].
+
+One central important class of communication in a lot of HPC applications are collective operations (collectives), which involve multiple parallel processes working on a problem. These operations include those that only require collecting and/or spreading data across the processes, such as MPI_Allgather, and those that impose additional computation, e.g. reductions like MPI_Allreduce, to determine minimal, maximal, or average values over a data structure of an application domain distributed across all processes. Iterative solvers (such as CG and GMRES), for example, often assess convergence based on residual values and stop, e.g., if the maximal residual is below a given threshold [8]. Physics simulations want to determine the next maximal time step possible, derived from maximum distances of meshes or finite elements (e.g. based on CFL condition in CFD simulations [11]). Another recent application domain making heavy use of reductions is the parallel training of AI models. For example data-parallel training schemes aggregate local neural network gradients (weight changes) from different processes to maintain global consistent models during the training process [22].
+
+Reduction operations can be implemented using different algorithms. Global results are often calculated from partial aggregations in different processes using fan-in and fan-out tree communication structures with various strategies to properly distribute the work and to avoid contention. A different class of algorithms organizes the compute nodes in a ring and passes partial results to the corresponding neighbors until every node holds a copy of the global result. The best reduction protocol depends on the number of processes (participants) involved in the reduction, the network topology, the latency and bandwidth of links, and the amount of data to process/reduce. Due to these intricacies, the Message Passing Interface [17] (MPI, the defacto communication library used in HPC) defines an abstract interfaces for collectives and therefore reductions. MPI implementations often provide a large number of different concrete reduction strategies, tuned by vendors of HPC systems based on the network topology and system architecture, and select the best one based on the aforementioned properties. However note that all these algorithms, which perform computations on nodes, require multiple round trips and compute phases, hence exhibiting higher latency than e.g. point-to-poing communication.
+
+With the emergence of smart network devices such as smart NICs and smart switches, aggregations/reductions can be offloaded to these devices and do not need to be performed on the compute nodes anymore. This unburdens the compute nodes, and more importantly, allows running pieces of reduction operations in places in the network with high-bandwidth and high-radix connectivity, allowing for large node degrees in an aggregation tree without hitting bottlenecks. Therefore it unlocks the design of new reduction protocols that could leverage the compute resources in the network provided by these high-bandwidth and high-radix connectivity components to enable faster reductions, potentially outperforming traditional tree-based or ring-based protocols.
+
+In this paper, we investigate the use of smart switches for faster MPI reductions. In the simplest case, there is one high-radix switch in the middle of a star topology with direct connections to all the compute nodes. For a reduction with every participant interested in the result (e.g., MPI_Allreduce), all nodes send their partial values to the switch (round 1) which performs the reduction operation and sends back results to all nodes (round 2). On separate network links, only two messages are sent/received to/from the switch in corresponding two rounds: the input data and the result back. In contrast, a similar naive 2-round implementation with the reduction done on one of the N compute nodes triggers N − 1 times more traffic on the link to this node. Any tree-like splitting would increase the number of rounds and the latency. Note that these two rounds could be pipelined, because they use different data directions on the links, which allows to use the full bandwidth for the data in a streaming scheme without overhead. This scheme will outperform ring-based reduction algorithms, too, because they require multiple rounds of data transfers while the algorithm based on on-switch reductions requires only these two rounds - even on a more complex topology with multiple levels of switches.
+
+We use BF6064X-T smart switches with the Intel Tofino chipset, which can be programmed via the P4 language. While designed for network re-routing and network protocol flexibility, we use P4 to implement reductions on the Tofino chip (data plane) for highest performance. The switch also includes a regular x86 CPU which we use to run a control daemon (control plane) that is contacted by nodes for setting up the P4 configurations and reduction resources as required. While the smart switch is designed for Ethernet, P4 allows to implement support for RoCEv2, enabling RDMA. Using RoCEv2 NICs on the compute nodes (Nvidia ConnectX-6) allows to bypass the operating system, enabling high performance message passing on the nodes.
+
+We are not the first looking at offloading reductions to switches. SwitchML [21] is a very similar effort, but with a strong focus on machine learning and therefore hardcoding parameters that must be dynamic at run time to support MPI’s flexibility. Sharp is a implementation by Nvidia/Mellanox for their InfiniBand switches. We compare the approaches with our work in the related works section.
+
+The contributions of this paper are:
+
+•
+
+design and implementation of an open source library and system, mpitofino1, enabling offloading of reductions to smart switches with Tofino hardware;
+
+•
+
+a prototype of Open MPI extensions with a collective communication backend using the mpitofino library to offload MPI reductions to smart switches;
+
+•
+
+various evaluations showing the benefits of offloading MPI reductions to smart switches.
+
+Compared to prior art, our solution allows for more a flexible and dynamic data plane while maintaining line rate, offers a simpler but more flexible API to the control plane, and further improves support for unmodified commercial-of-the-shelf hardware (such as using unmodified RoCEv2 NICs and increasing the usable port count of the smart switch). It is also designed with a lookahead for potential future protocols, such as Ultra Ethernet.
+
+## 2 Related work
+
+SwitchML. [21] presents an in-network reduction scheme for Tofino switches targeting machine learning model training workloads. The authors explain the importance of accelerating the allreduce collective communication primitive for training. This includes aggregating (e.g., summing) the partial results computed on the nodes of a computing cluster, and broadcasting the result to all nodes. The training algorithm performs multiple iterations and triggers such a reduction after every iteration, exchanging a data volume of up to several gigabytes. The authors found that a typical model training workload on a commodity cluster consisting of 8 nodes connected with a 10 gigabit/s network spends more than 50% of the time in communication, and that only a small overlap of communication- and computation phases exists. This trend continues when increasing the network bandwidth.
+
+Their approach to reduce the communication time essentially reduces the volume of the exchanged data by aggregating it on a switch in the network, instead of sending partial sums to worker nodes for aggregation with other nodes’ partial results. For this, every node sent its locally computed partial result (gradient updates), which needs to be summed with the other nodes’ results, to the smart Ethernet switch. The switch then sums the data contained in the packets instead of forwarding them. Once all workers sent their data and the sum is complete, the switch broadcasts the result to all workers. Since such an algorithm is not implemented in a typical Ethernet switch’s silicon, they use Intel’s P4-programmable Tofino ASIC. As transport protocol they use RoCEv2 [7]
+
+In their evaluation, the authors compared the performance of their implementation to the collective communication framework “NCCL” [18], which uses a TCP transport and performs the aggregation on the nodes’ CPUs. They observed a speedup of up to 5.5x with SwitchML. To achieve these speedups, the authors had to put 75% of the switch’s ports into a special loopback-mode, which allows sending the packets multiple times through the switch and use larger packets, as each pass can only process a certain amount of data. Moreover they disabled RoCEv2 checksum verification on their NICs, because their P4 program does not implement checksum generation.
+
+Compared to SwitchML, our work provides a more flexible and dynamic data plane, which can be configured for different collective operations during runtime. This is crucial for implementing multiple different MPI collectives, and it allows for using multiple collectives even in a single program, while SwitchML is designed and optimized specifically for the allreduce operation in model training. In addition to that our design supports hierarchies of switches, while SwitchML focused on a single switch, stating that adding support for multiple switches was possible. Also, in our work, we re-design the reduction logic on the switch to reduce the number of ports in loopback mode to 50%, and we also implement the checksum generation (without checksum generation this number could even be reduced further). However SwitchML implements the far more complicated floating point arithmetic, while we used simpler 32-bit integer types.
+
+While our work, mpitofino, is based on SwitchML, some crucial differences are:
+
+•
+
+mpitofino provides a more flexible and dynamic dataplane, which can be configured for different collectives, operations, and data types at runtime; this flexiblity is also available from a single program
+
+•
+
+mpitofino is designed with support for large clusters in mind
+
+•
+
+the reduction logic of mpitofino supports all ports of a smart switch
+
+•
+
+mpitofino implements RoCEv2 checksum calculations, therefore allowing the use of unmodified RDMA capable NICs at the cost of 50% of the switch’s ports (which, in total, is still less than SwitchML’s 75%).
+
+•
+
+mpitofino implements automatic system configuration and network topology discovery, which is useful for large clusters
+
+•
+
+SwitchML, however, includes support for floating-point arithmetic (through converting values to/from a 32 bit fixed-point format on the nodes), while we left this to future work and focused on the infrastructure part of mpitofino instead
+
+SHArP. The Scalable Hierarchical Aggregation Protocol [14] by Mellanox is an in-fabric aggregation protocol for InfiniBand networks. It is built around Mellanox’s SwitchIB-2 InfiniBand switch ASIC. With SHArP, the switches aggregate the data from their connected nodes on-the-fly as it is transferred through the fabric, instead of letting compute nodes carry out the aggregation by copying partial results over a peer-to-peer network and combining them using nodes’ local compute capabilities. To achieve this, SHArP builds a spanning tree on top of the network’s physical topology. The aggregation is thenhandled by the switches with special ALUs built into the silicon. SHArP defines a root switch, which receives all partially aggregated streams of data, performs the final aggregation, and distributes the result to its descendants. This streaming approach is superior to classical ring- or tree based reduction protocols, because it comprises only two rounds in all cases (which might even be pipelined): sending data upstream to the root switch, and downstream to the nodes.
+
+To enable using SHArP in MPI, it is integrated with Open MPI through a component in Open MPI’s modular component architecture. Therefore, the user can select SHArP-enabled backends (e.g., UCC [23] shipped with Nvidia HPC-X Toolkit [9]) for collective communication if their cluster features a SHArP-capable interconnect. The authors observed up to 2.1x latency reduction for the MPI_Allreduce primitive when using SHArP.
+
+Our approach strives to implement similar functionality as SHArP, but on a standard-Ethernet based fabric while leveraging RoCEv2 to allow for having similar RDMA capabilities to those of InfiniBand networks. This allows for more flexibility, as it can be used in conventional data centers, and avoids expensive specialized switch ASICs. Finally, our work is open source and all the details of the reduction protocol are accessible to the community.
+
+## 3 Background
+
+P4. At the heart of networking equipment, there is typically a packet processor, which inspects, transforms, redirects, and forwards all networking packets sent through it. Various networking protocols are typically hardwired into these processors. As a result, a common problem in computer networking is adding support for new (potentially experimental) protocols to networking equipment, especially when deployed on a scale as large as the internet [19].
+
+Recently packet processors with a high degree of programmability (also known as data-plane programmability) emerged. These include smart NICs, but also switches like Intel’s Tofino, which we use in our work. One prominent programming languages for these devices is P4.
+
+P4, short for Programming Protocol independent Package Processors [3], is a domain-specific programming language for processing network packets. A P4 program typically contains three parts describing the actions performed on packets as they pass through the so-called data plane of the networking device: a parser, control block, and deparser. The parser is a programmable finite state machine, which extracts parts of a packet upon reception and makes them available to the control block. The highest degree of programmability can be found in the latter, which comprises match-and-action units (MAUs) driven by the match-and-action principle: The programmer defines tables that describe how to map parts of the parsed fields onto certain actions. Upon matching, an action can be triggered to alter the parsed values (e.g., parts of the packets), and make forwarding decisions. On some architectures (like Tofino), MAUs are equipped with local state, which can be altered by actions. The deparser’s task is serializing the final version of the parsed parts back into a byte-stream such that they can be sent as a network packet.
+
+A target-aware compiler translates the P4 program into executable machine code for the actual hardware. In contrast to the P4 program with the action definitions, the match-and-action table contents can be manipulated at run time by the so-called control plane software without recompiling the source code.
+
+Smart-switch Architecture of Tofino. Tofino, or rather the Tofino Native Architecture (TNA) is a P4-programmable Ethernet switching processor architecture [2], [1], [5].
+
+Figure 1 gives a high level overview of a single port of a Tofino-based switch. When a packet enters the switch through a physical connector, it is first deserialized by the SerDes (Serializer-Deserializer) and processed by a traditional Ethernet MAC (Medium Access Controller). Together, both perform the tasks associated with layer 1 in the ISO/OSI model. Next, the packet passes through the ingress pipeline, which consists of a parser, a deparser, and 12 stages of fully programmable match-and-action units (MAUs) corresponding to the respective units described in Section 3. The ingress pipeline hands the packet to the Traffic Manager (TM), which is the only point where packets may be forwarded to a different port or replicated to generate multicast traffic. It is not programmable and out of P4’s scope, but can be configured by the control plane software at runtime. After the TM, the packet passes through the target port’s egress pipeline, which is almost identical to the ingress pipeline and can be programmed independently. In addition to the functionality required by the P4 specification, Tofino’s stages offer advanced computing capabilities like persistent state registers, which our work (and SwitchML [21]) exploits as accumulators for reductions. However these stateful registers do only support big-endian integer addition, which requires floating point emulation for typical HPC use-cases (e.g. implemented in [10], [21]). We limited our work to 32 bit integers for the sake of simplicity.
+
+A coarse overview of Tofino’s per-port architecture
+
+As shown in figure 2, 16 of those structures form a pipe, and four pipes the entire Tofino ASIC. The TM is shared between the pipes and can forward packets between individual ports, independent of their respective pipe. To implement control plane code, practical Tofino-based switches contain an x86 processor. It configures the ASIC, and facilitates control-plane tasks that require more elaborate logic like complex routing protocols. For technical reasons sometimes packets need to be sent multiple times through the pipeline or exchanged with he x86 processor. For this, TNA offers special ports, which loop a packet back to the beginning of the ingress pipeline or forward it to the x86 processor, respectively.
+
+Overall structure of Tofino
+
+RDMA capable NICs. The ConnectX-6 NICs offer hardware-based Remote-Direct-Memory-Access (RDMA) through the RoCEv2 [7] protocol (when used in their Ethernet-based operating mode; they also support InfiniBand as physical networking layer). They have access to a compute node’s memory through PCI-Express, and connect to the smart switch via 100 GBit/s Ethernet. A client program, like mpitofino, simply posts RDMA transfers onto a queue using the ”InfiniBand Verbs” API, and the NICs will carry out the data transfer to- or from the remote node’s memory. The NICs offers optional hardware-based transmits in RoCEv2’s Reliably Connected transport mode, however we used the simpler Unreliably Connected mode for our work to have more control over the on-wire packets. This should not have an impact on throughput or latency.
+
+## 4 Collective Library Design
+
+From the collective primitives that MPI defines, we chose to focus on MPI_Allreduce, which, semantically, can be broken down into a reduction followed by a broadcast of the result such that it is available on all nodes. The main rationale for this choice is to ensure covering the needs for most of MPI functionalities while limiting the implementation efforts for prototyping. For example one could easily implement MPI_Reduce by discarding the result on all but one ranks, and MPI_Bcast by supplying zero-values as local data on all but one ranks. An allreduce with data size zero can be used for MPI_Barrier. These extensions do not require changes to the entire system, but only small additions to the client library. In other words, four of MPI’s collective primitives can be implemented by just implementing allreduce in the back end. In fact, this is similar to the original InfiniBand-based SHArP [14] implementation.
+
+In closer detail, our design needs to fulfill the following requirements:
+
+•
+
+Synchronization: The aggregation must behave as if all values have been received at the switch before they are aggregated, and the aggregation must be complete before the values are broadcast.
+
+•
+
+Arithmetic correctness: Our MPI_Allreduce implementation must calculate the aggregate value correctly using Tofino’s hardware.
+
+•
+
+Ordering: The packets must be written to the destination buffer in the same order they have been read.
+
+•
+
+Flow-/congestion control: No data must be lost when the capacity of individual nodes or links is exhausted.
+
+•
+
+Performance: The achieved throughput must be independent from the cluster size to exhibit a benefit over on-node computations.
+
+Note that support for a large number of ranks on a single node is not required, because one could use hierarchical collectives in such a case – e.g. perform intra-node reduction using a different technology and only use mpitofino for inter-node reductions.
+
+Given this, we explore if MPI_Allreduce can benefit from offloading computations to Tofino switches. In this section, we design a system, called mpitofino, to perform this offloading. First we describe how allreduce operations can benefit from in-network computing, and second we design a framework, both in P4 and the control plane, to support resource allocation and transferring data for collectives.
+
+### 4.1 Utilizing In-Network Computing for Allreduce
+
+Formulation of Reductions. A reduction is essentially the application of the following expression to the data elements in a buffer:
+
+\begin{equation*} Agg = V_0 \odot V_1 \odot \dots \odot V_{n-1} \end{equation*}
+
+, with V0,..., VN − 1 being vectors of values on ranks 0... N − 1, Agg the result vector, and ⊙ the reduction operation the user chose. For simplicity, we limit the data type for V0,..., VN − 1 to 32-bit integer and the operator to a 32-bit integer addition. Technically, most methods of parallelizing and offloading this linear chain of operations do only work if ⊙ is associative, which is not the case for all operations, including, e.g., floating point addition. In case of non-associative operations, e.g., when dealing with operations such as 64-bit floating point additions, the error introduced by changing the order in which these operations are applied is intrinsic to using MPI collectives, which are typically permissive in that sense (e.g., the MPI standard [17] specifies in section 6.9.1 that implementations may assume the reduce operation, through which it defines allreduce in section 6.9.6, to be associative and commutative, and Open MPI, which we augmented, does not ensure additional constraints).
+
+Tree-based allreduce with ranks (nodes) taking the burden of caclulating the reductions
+
+Reduction in the Absence of In-Network Compute. A naive approach of implementing allreduce might simply send all ranks’ source buffers to a single rank, aggregate the data there, and broadcast the result to all nodes. However this requires the specific single rank to receive (n − 1) · m data elements, with m ≔ dim(Vi), i ∈ 0,..., N − 1 the count off values to reduce, i.e. the per-node buffer’s size. Additionally, all other ranks remain idle while the single rank is receiving/sending messages from/to every other rank and computing the result. However, in practice network I/O is typically much slower than simple computations like a local summation on the single rank, and the bottleneck of such a naive approach will most likely turn out to be the single rank’s network-link bandwidth [16] (at least if the other nodes are only reachable through e.g. switches).
+
+A smarter approach (depending on the actual problem instance) uses binary trees [20],[6]. The basic principle is illustrated in figure 3. It consists of two phases: reduction and broadcast, each of which comprise multiple steps. During each step, a subset of all ranks in a communicator is active. Each second active rank sends its values to its “left” neighbor (the one with lower rank number), which aggregates the incoming data with its local data. Only the ranks that received data stay active in the next step. This scheme repeats until one rank remains, which has the final result of the reduction. The broadcast phase works in the opposite direction and does not alter the data – each rank just sends a copy of its data to the neighbor to the “right”. Open MPI’s implementation of the reduce-primitive for example uses a similar algorithm under certain circumstances (as can be seen from the source code [6]).
+
+For N ranks participating in the reduction, the total number of steps required is 2 · log 2N, and during each step data of size m will be transferred on at least one link (between two neighboring active ranks). Assuming that the time spent on computations is negligible, the duration of a step is determined by the link bandwidth, which is again the bottleneck. In total, the tree approach spends 2 · log 2N · m · const. time communicating, which is an improvement over the naive approach with (N − 1) · m · const. (for sufficiently large N). However, typically the different steps and phases of the reduction protocol could be pipelined by working on smaller chunks of data (e.g., in order to reduce overall latency) but the bandwidth bottleneck will remain. For example, in a four-node cluster, at least one node will receive (and send) data of twice the buffer’s size, which effectively halves the available bandwidth. The situation gets much worse for larger setups: on a cluster comprised of 128 nodes, the tree approach induces \((\log _{2}{128})^{-1} = \frac{1}{7}\) times more traffic over the aggregating node’s network link and reduces the available bandwidth by a factor of 7.
+
+Another class of reduction algorithms is based on ring-like communication structures. However they share that the number of distinct communication steps involved depends on the cluster size [15], too.
+
+Reductions with Smart Switches in the Picture. Ethernet-based networks use switches to connect the nodes. If the switches take the burden of aggregating the data streams as they are passing through them, the data does not need to be collected in a node for aggregation. Since the switch uses dedicated physical ports to connect to each compute node and the aggregations could be carried out internally by the switch at line rate, no single links would be bottlenecks. Figure 4 shows a simple pruned fat-tree network topology, in which switch-based aggregation might be used. It contains links from nodes to leaf switches, and from the leaf switches to the spine switches, which we refer to as internal links. Each switch aggregates all data from its children, and passes the result to its parent through an uplink. Note that even though all downstream ports of a switch might be saturated, a single uplink (of the same bandwidth) suffices to pass the partially aggregated result to the parent switch – thus in this topology, network links are no bottlenecks anymore, and in theory the aggregation performance is only determined by the link with least bandwidth.
+
+Because a single uplink of same bandwidth as the downlinks suffices in a pruned fat-tree topology, all links and switches can be of the same hardware type. This is an intrinsic property of our algorithm, because it builds a virtual reduction-tree with edges of equal bandwidth demand on top of a physical network topology (which matches a physical tree topology perfectly). Other topologies found in HPC clusters, like dragonfly networks, do not add additional benefits to a single isolated reduction, but add additional bandwidth for other communication tasks that may run on the links not used by mpitofino – or they add bandwidth for concurrent reductions on different communicators (i.e. groups of nodes).
+
+A fat-tree network topology with a blocking factor of 2:1 for reductions
+
+Ethernet transmits data as size-limited packets, and Tofino uses these packets as data units to process. This allows for forwarding-based decisions to happen on a per-packet basis. We exploit this property for pipelining of packets (shown in figure 5), and thus hiding of link- and processing latencies through multiple packets in-flight.
+
+Additionally, it is unlikely for all ranks to send their data at exactly the same time to the switch for aggregation (e.g., due to network jitter). For a reduction, where the switch inherently needs to wait until it collects all data from all the participating ranks before it can forward or broadcast, respectively, the aggregated result, this can induce excessive latencies. Therefore, pipelining multiple packets in-flight also helps to avoid latencies caused by jitter.
+
+Pipelined data flow with multiple packets in-flight to hide link- and processing latencies
+
+### 4.2 Data Plane Design
+
+Aggregation units. The reduction on the switch is implemented via a P4 program. When a packet enters the switch, the parser distinguishes it between a mpitofino-packet and other Ethernet packets. Some of the latter are redirected to the CPU and handled there, or forwarding for basic Ethernet switching. If it is a mpitofino-packet, the parser extracts the 32-bit integer onto TNA’s data-bus, which connects all stages of a pipeline. The packet does also include a reference to the resources allocated for reduction by the control plane. Each stage has a set of local state-registers allocated, which are shared across a pipe, and tables mapped to MAUs to select them according to the packet’s reference. TNA’s special ALUs for stateful registers add the packet’s values seamlessly to the state-registers, without creating race conditions if two packets arrive concurrently on separate ports. Each stage handles only a small number of values, because the number of ALUs per stage is limited. For the switch to know when a reduction is complete, it tracks the state in a bitmap implemented through another local state register in a stage. Each bit-position corresponds to a downstream-rank, and is set when the packet from that rank is received. The bitmap is compared to an expected value, and once they match, the (partial) result is either sent upstream or broadcast, respectively. Finally the deparser serializes the packet back into a byte-stream.
+
+Each packet incurs latency, because each NIC and link adds a delay. Additionally, passing a packet through the Tofino ASIC and the aggregation units adds delay, too. Therefore to achieve line rate, we support pipelining of multiple concurrent packets in-flight to hide these latencies, which requires the switch to support multiple concurrent reductions. Each of them has its own set of local state-registers, which are selected through different references in the packets, and reused once a processing a specific packet has finished. Additionally, this approach allows to run multiple unrelated collectives concurrently – the control plane just has to ensure that their resources do not overlap. This, in turn, enables support for multiple communicators.
+
+Overall, we use multiple sets of local registers on the ASIC to maintain state for reduction packets and pipelines. We call this combination of registers for intermediate results and state-tracking the aggregation unit. \ar[]todo: visuals. This approach to the data plane is very similar to SwitchML [21], however it is more flexible be cause the packets select an operation and datatype in addition to just registers. And of course we do not have to emulate floating point arithmetic at this stage of the implementation, because we restricted our prototype to 32 bit integers.
+
+Reduction tree. Similar to SHArP [14], mpitofino constructs a spanning tree on top of the physical topology. Reduction packets are aggregated on the switches of the networking fabric as they stream through uplinks from individual ranks and switches. The aggregated results are gathered at the root switch and broadcasted through the same spanning tree in opposite direction.
+
+RoCEv2 as the transport protocol. \ar[]can you also elaborate why TCP is out of the picture? maybe reason about the need to manage things like retransmisions manually? My point is before jumping into discussing the solution based on UDP, maybe first discuss the viable options and why we choose this option...
+
+We are using RoCEv2 [7] (short for RDMA over Converged Ethernet version 2) as transport protocol, because it provides hardware-RDMA support through specialized NICs, like Nvidia’s ConnectX-6, which we use. RoCEv2 is essentially InfiniBand over IP, using UDP as lightweight transport protocol, and offloads sending, receiving, and fragmenting data from/to host memory to the NIC’s dedicated hardware. During initial benchmarking, RoCEv2 turned out to be a lot more efficient than e.g. plain UDP sockets in Linux, which could not reach line rate. Moreover, RoCEv2 headers contain a destination queue-pair number, which can be used to select aggregation units from packets when they arrive at the switch (the aforementioned reference of resources). The major downsides of using RoCEv2 are large headers, which add overhead, and less flexibility. For example RoCEv2 uses an additional trailer with a checksum, which is difficult to compute. This checksum required us to set 50% of the switch’s ports into loopback mode just to add this trailer, because P4 and TNA do not have a concept for trailers – except for Ethernet’s checksum, which is handled by the MAC, they do virtually not exist in protocols using Ethernet. SwitchML [21] on the other hand does not implement RoCEv2 checksum calculation and therefore requires NICs which allow to disable checksum verification.
+
+Congestion and Flow Control. Not all links of a network provide exactly the same speed. Some links may even be shared by aggregation clients, for example when multiple ranks are co-located on a node. Therefore congestion control is an important design point in mpitofino. Flow control is equally important, because not all nodes are able to process packets at the same rate. We achieve both using a back-pressure based approach. It limits the number of packets in-flight to a maximum value, such that nodes are not allowed to send more data into the collective communication channel after it reached a certain capacity (they experience ”back-pressure”). If a node is faster than others, or the network, it has to wait until it received a result packet before it can send another data packet – hence regulating the outflow of packets. A NIC or switch on the sender-end of a busy link will queue packets, and therefore slow down the sending rank, which provides both flow- and congestion control.
+
+### 4.3 Control Plane Design
+
+System architecture of mpitofino
+
+In addition to the data plane described in the previous subsection, the system uses a control plane running on a dedicated out-of-band network to manage the data plane and in particular its resources on the switches, and build the aforementioned reduction trees. Its main task is mapping MPI communicators onto resources on the switches, and to provide means of accessing the collective services to client application. Figure 6 shows an overview of the entire system. Using a separate network for the control plane simplifies the implementation, as it avoids multiplexing the high-performance network for control plane traffic.
+
+The control plane is distributed across all switches through the switch daemons. Each switch has one running on its x86 processor. Apart from resources allocation, the switch daemons populate the tables defined by the P4 program according to the former. Additionally, they implement basic layer-2 Ethernet services like a self-learning switching table. On the client side, each node runs a node daemon which connects to its nearest switch daemon. The node daemon’s negotiate resource demands with the switch daemons based on the client programs’ requirements and therefore provide access for the programs to mpitofino. Finally, client programs link with our client library libmpitofino, which provides an easy-to-use API for collectives. It connects to the host nodes’ node daemon through a UNIX domain socket, and wraps the details of RDMA.
+
+Collective resource management on smart switches. To manage and maintain resource allocations on the switches (i.e., aggregation units) across all packets that are part of a reduction, and potentially multiple repetitive calls of the same collective in a loop (e.g., persistent collectives), we introduce the concept of collective channels. A collective channel has an identifier, which is associated with a RoCEv2 queue-pair-number, and is thus the only resource that needs to be addressed in each packet. It does also select the collective primitive, data type, and operation if required.
+
+Whenever a process in a communicator invokes a collective communication primitive to be handled by mpitofino, it asks the local node daemon about the collective channel identifier it shall use, and the IP-address to which it shall send the packets. The IP-address is unique for every switch (and will be the address of the switch to which the node is physically connected), but independent of the collective channel. These IPs are assigned manually by a network administrator. The control plane checks if it knows the collective channel already (because a different rank queried it before), and if not, allocates it. This is done first on the switch to which the node is directly connected on the high-performance network, since each node’s control plane agent connects to the nearest switch’s switch daemon. If that switch does not know about the channel, and is connected to other switches, it has to query the channel on the upstream switch as well – this goes on until the channel is queried on the root switch. Next, the leaf switch’s control plane agent waits for all other nodes of the channel (those associated with the same communicator and invoking the same collective), which are directly connected to it, to request the channel. Only then the switch daemons know all node addresses, and can configure the tables in the ASIC. For enabling the state-tracking mechanism to identify different ranks, each rank has an identifier, which must be unique throughout the cluster, too. For the sake of simplicity we use MPI’s rank identifiers in our prototype, because they are unique and do not add additional implementation burden. To encode the identifier in the RoCEv2 headers, each rank on the same node is assigned a different destination queue-pair-id, even though it references the same channel.
+
+Topology Manager. Figure 7 depicts the control plane in more details including the topology management and aggregation groups.
+
+Whenever a collective is invoked, the control plane needs to construct an aggregation tree containing the nodes with ranks that are part of the communicator on which the collective is invoked. As soon as more than one switch is involved, this includes selecting a root switch. Also, in practice, networks typically contain redundant links, hence a spanning tree needs to be constructed. For this task one of the switch daemons runs an additional component: the topology manager (TM). Through a protocol similar to the Link Layer Discovery Protocol (LLDP), but simpler, switches automatically discover neighboring switches on the ports of the high-performance network, and node daemons discover the switch to which they are directly connected. \ar[]is’t this LLDP? what is so special about it? why not just mentioning that? All daemons forward the gathered information to the topology manager, which maintains a representation of the entire network to setup the aggregation trees. However for improved scalability, the node daemons do not connect directly to the topology manager, but to its nearest switch daemon, which proxies the messages needed for setting up the aggregation trees.
+
+Control plane landscape with topology management and aggregation groups
+
+## 5 Implementation
+
+Integration in Open MPI. Open MPI is structured in a front-end where users face the API (that implements the MPI specification) and several exchangeable back-end modules, which implement the underlying operations on different network fabrics. The back-ends are part of Open MPI’s modular component architecture (mca), which contains multiple frameworks for different classes of communication primitives, among them the coll framework for collectives [6]. The different back-ends that are available for a framework are called components. Which component is selected during runtime depends on a dynamic weight, but the automatic choice may always be overridden by the user. We implemented a component for mpitofino, called mtof, in the coll-framework, and therefore make mpitofino accessible to all MPI-based applications.
+
+Implementation of libmpitofino. libmpitofino is a shared library written in C++ as the latter is easy to integrate with Open MPI, which is written in C, and provides extensive lifetime management capabilities. Moreover, we keep the code additions to Open MPI as minimal as possible, since it simplifies the mca-component and allows libmpitofino to use its decoupled data structures, which can be optimized for mpitofino. libmpitofino provides the functionalities for connecting to the node daemon and channel setup, and implements the client-side data plane code to actually send- and receive data through RDMA.
+
+When a collective is invoked for the first time, libmpitofino obtains a collective channel from the node daemon. This communication interchange uses Google protocol buffers [12] (“protobuf”) over a UNIX domain socket. After the completion of the collective, the library keeps a reference to the channel in a cache. This helps to prevent the overhead of setting up the channel in future invocations of the same primitive with the same operation and data type. While this may increase resource consumption, it speeds up loops of iterative algorithms that exchange data during iterations, which are common in HPC.
+
+For the actual data exchange, which follows channel setup, we use RoCEv2 in “unreliably-connected’ through libibverbs. However libmpitofino divides the source- and destination buffers into equally sized blocks before handing them to libibverbs’s send- and receive primitives. These blocks form the atomic data units of our back-pressure based congestion control/flow control scheme. libmpitofino simply stops posting send requests onto the RDMA queue when a certain number of outstanding requests is reached, until enough requests complete.
+
+RDMA typically involves direct access to the data buffer’s memory by the NICs. However, the switch’s ALUs use big-endian arithmetic, which is the standard byte-order in networking protocols, and therefore libmpitofino has to convert all data to big-endian before sending it with RDMA, and back to little-endian after receiving the result.
+
+Implementation details of the aggregation protocol. We choose a block size of 16 384 bytes, and a packet size of 256 bytes. Therefore, each block results in 16384/256 = 64 packets. Using such a small packet allows for a simpler P4 program, which does not have to re-circulate packets multiple times through the switch, hence reducing latency and not blocking large numbers of switch ports for re-circulations. However, we still had to put 50% of the switch’s ports into loopback mode to compute RoCEv2’s checksum. But note that this limitation is a consequence of using RoCEv2 and replacing the transport protocol used by mpitofino is simple.
+
+Limitations of our implementation. While our implementation is minimalistic in covering reduction operations, data types, and collective primitives, in contrast to SwitchML, which hard-codes an allreduce operation tailored to model training in the entire software stack, mpitofino and is easily extendable to support more data types, reduction operations, and collective primitives.
+
+Also, note that we did not implement the topology manager for simplicity, hence our prototype can only utilize a single switch.
+
+## 6 Evaluation
+
+methodology. Our main goal for the evaluation is benchmarking our prototype itself. Therefore we compare mpitofino to Open MPI’s builtin collectives implementation and let comparisons with real-world software that uses MPI collectives to future work. Moreover we do not compare mpitofino with SHArP or other HPC fabric technologies with support for on-fabric computing, because we use standard Ethernet hardware and therefore no direct performance comparison on the same hardware would be possible. The same holds for SwitchML [21] – we discover that both our implementation and SwitchML can reach line rate, but we skip a more detailed comparison as SwitchML uses a different API and therefore no direct comparison with the same microbenchmark is possible at this stage.
+
+Experimental setup. To gather performance data, we developed a small microbenchmark, which is included in the source repository2. It performs the same MPI_Alreduce invocation with summation over 32-bit integers (the only operation implemented by mpitofino) in a loop such that the total running time is in the order of a few seconds and the results are stable. Before the actual measurement is taken, the same amount of data is processed in exactly the same buffers during a warm-up phase. This ensures that we do not include setup costs or other artifacts like clock frequency scaling in the measurements. Then we measure the execution time of the benchmarking loop, while varying the buffer size handed to MPI_Allreduce, the set of nodes involved, and the number of MPI ranks per node. We report and compare the bandwidth usage in GB/s.
+
+Additionally, to further evaluate mpitofino, we use a modified implementation of OSU MPI micro-benchmarks [4] to allow for using integers instead of floating point data types.
+
+We report measurements conducted on real hardware, i.e., a 4-node cluster with a Tofino switch. Table 1 shows the hardware used in our test cluster. The Tofino ASIC in BF6064X has a total switching capacity of 6.4 TBit/s across all 64 100 GBit/s Ethernet ports, not counting full-duplex transmissions on ports.
+
+The version of Open MPI we used for benchmarking is 4.1.8 and we configured it to use the UCX point-to-point transport over RoCEv2.
+
+| Switch | STORDIS BF6064X-T |
+| --- | --- |
+| Tofino 6.4 TBit/s |
+| Intel(R) Xeon(R) CPU D-1548 @ 2.00GHz |
+| 4 nodes | 2x Intel Xeon 8360 |
+| 256 GiB RAM |
+| ConnectX-6 Dx part of BlueField 2 DPU (in NIC mode s.t. DPU is effectively disabled) |
+| 1x 100GBase-CR4 link to switch |
+
+Hardware setup used for the evaluations
+
+### 6.1 Bandwidth Measurements
+
+Single Rank per Node. To evaluate the achievable bandwidth, we compiled our microbenchmark with a buffer size of 1 GiB of 32-bit integers, and used 16 repetitions of the benchmarking loop. Figure 8 shows the bandwidth in relation to the number of nodes participating in the allreduce operation, with one rank per node. It compares the result with the performance of Open MPI’s builtin basic- and tuned collectives implementation obtained with the same setup. The peak throughout achieved with mpitofino on four nodes was 5.67 GB/s.
+
+Achieved bandwidth vs. node count for mpitofino and Open MPI’s native implementation; right diagram is a magnification of Open MPI’s graphs
+
+First of all, Open MPI’s measurements clearly suggest a dependency on the number of nodes involved in allreduce, while mpitofino shows no dependency at all. This is to be expected, because more nodes require additional data movement triggered by Open MPI’s peer-to-peer based aggregation algorithms over the network fabric reducing the effective reduction bandwidth. mpitofino’s measurement does not expose a dependency on the node count, because the on-switch reduction rate on the ASIC is very fast (regardless of the number of ports involved in the reduction) compared to data transfer on network links. Jitter on the nodes might counteract this, but cannot be observed in here – perhaps the cluster is too small for significant jitter to form.
+
+Second, mpitofino appears to achieve a much higher throughput compared to Open MPI measurements. This is counter intuitive. We made sure that Open MPI is also using RDMA over the high performance network, hence it should be able to utilize the full bandwidth. One difference is that Open MPI uses RoCEv2’s Reliable Connected (RC) mode while mpitofino uses Unreliable Connected, but this should not have a noticeable impact on speed. Generally this requires future investigation, but we propose that Open MPI might include architecture specific optimizations (such as non-temporary stores to main memory) while our implementation does include such and required them to reach these levels of performance. A comparison with a vendor-tuned MPI-implementation would be interesting but is not available on our test cluster.
+
+However, the maximum theoretical bandwidth of a 100GBase-CR4 connection is 9.47 GByte/s. mpitofino achieved only 59.9% of this, which corresponds to an average line rate of 59.9 GBit/s (but we did not measure the average line rate directly).
+
+Note that the bandwidth achieved with OSU microbenchmarks (6.8 GByte/s) is comparable.
+
+Multiple Ranks per Node. With a variable number of ranks co-located on each node, four nodes, and the same benchmarking settings as before, we get the measurements shown in Figure 9.
+
+Achieved bandwidth vs. number of ranks per node; four-node configuration
+
+Ideally the achieved gross bandwidth would be constant at 100 GBit/s for all implementations. For two and more ranks per node this holds for mpitofino, but Open MPI’s internal versions again cannot achieve line rate, though they seem to benefit strongly from increased parallelism. The fact that mpitofino cannot reach line rate with a single rank per node (which would be important for hierarchical aggregation) is probably caused by the our choice of the number of messages in flight – this is a trade-off in available resources between implicit parallelism and maximum allowed concurrent collectives on a switch.
+
+### 6.2 Latency Measurements
+
+Latency vs. Buffer Size. For latency measurements, we switched to small messages and performed 105 repetitions of them. Thus these messages cannot benefit from pipelining (i.e. multiple concurrent blocks in-flight), which makes this methodology a good fit for latency measurements. Figure 10 shows the latency vs. message size.
+
+Latency vs. data size; four node configuration
+
+For small messages, mpitofino’s latency is worse than Open MPI’s latencies. This shows that our data plane exhibits more latency as the physical limit. Note that we did not implement smaller message sizes than 256 bytes, hence all smaller buffers will exhibit the same latency. But this alone does not explain why mpitofino’s latency is almost constant for all buffer sizes below 2 048 bytes. However, as messages get larger, mpitofino shows lower latencies. This is probably caused by the increased use of pipelining and thus latency hiding, and the higher overall bandwidth usage achievable with mpitofino, as seen before.
+
+Latency vs. Number of Ranks. Figure 11 compares the latency with the number of ranks participating in the reduction. For the 2, 3, and 4 rank setups, we used 2, 3, and 4 nodes respectively. From 8 ranks onwards we used 4 nodes and 2, 3, or 4 ranks per node. We used the same repetition count of 105 as before and a fixed messages size of 256 bytes.
+
+Latency vs. number of ranks; 256 Byte messages; up to four nodes; > 4 ranks: multiple ranks per node
+
+All implementations exhibit higher latency as the rank count increases. Open MPI’s tuned collectives performs best, but exhibits a non-monotonic behavior. Perhaps Open MPI changes the algorithm depending on the node count. Open MPI’s tuned collectives start to show worse latencies as soon as multiple ranks are co-located on the nodes.
+
+mpitofino performs better than Open MPI’s basic collectives as soon as ranks are co-located on the nodes. The sudden rise in mpitofino’s latency at four ranks compared to three ranks is particularly interesting, because the fourth node (and in this case rank) is intentionally connected (via cables) to a physical port on a different pipe of the ASIC. Since a transparent reduction can only be carried out within a pipe, our P4 program creates partial results per pipe and chains pipes to aggregate the their partial results. Connecting multiple pipes in series increases the aggregation’s latency.
+
+### 6.3 OSU microbenchmarks
+
+To further evaluate mpitofino, we use the OSU MPI micro-benchmarks [4], employ four nodes and a single rank per node in this experiment. The resulting latency graphs, shown in figure 12, exhibit similar behavior to those of our own microbenchmarks, reaffirming our earlier reported results.
+
+Latency vs. size; 4 nodes; OSU microbenchmarks
+
+## 7 Conclusion
+
+We present the design and implementation of an open-source system mpitofino, including the data plane P4 code and the control plane, to enable offloading MPI reductions onto smart Ethernet switches, specifically Intel’s Tofino. For that we integrated with Open MPI. We show that our system can achieve line-rate on a 4-node cluster with one switch, with higher throughput compared to Open MPI’s built-in reduction implementations. However for small data-buffers, our system exhibits a larger latency than Open MPI’s algorithms. Optimizing these latencies is left for future work. Furthermore our system supports only 32-bit integer summation, but is extensible to other data types, reduction operations, and collective communication primitives.
+
+This work unlocks further research on feasibility and benefits of smart switches in HPC, in particular, whether the aforementioned extensions are feasible on Tofino switches with their resource constraints.
+
+## Acknowledgments
+
+This paper is supported by funding from the ScalNext project (number 16ME0687) by the Federal Ministry of Research, Technology and Space (BMFTR). This includes funding by the European Union - NextGenerationEU. Performance results have been obtained on systems in the test environment BEAST (Bavarian Energy Architecture and Software Testbed) at the Leibniz Supercomputing Centre.
+
+## Footnotes
+
+1
+
+mpitofino’s source code is available at https://github.com/erbth/mpitofino
+
+2
+
+## References
+
+[1]
+
+[n. d.]. open-p4studio. https://github.com/p4lang/open-p4studio
+
+[2]
+
+[n. d.]. P4 16 Intel Tofino Native Architecture - Public Version. https://github.com/barefootnetworks/Open-Tofino/blob/master/PUBLIC_Tofino-Native-Arch.pdf
+
+[3]
+
+[n. d.]. P416 Language Specification. https://p4.org/wp-content/uploads/2024/10/P4-16-spec-v1.2.5.html
+
+[4]
+
+2016. OMB (OSU Micro-Benchmarks). https://github.com/forresti/osu-micro-benchmarks
+
+[5]
+
+2025. Intel P4 Studio Software Development Environment. https://github.com/p4lang/open-p4studio
+
+[6]
+
+2025. OpenMPI version 4.1.8 source code. https://github.com/open-mpi/ompi/tree/v4.1.8
+
+[7]
+
+2025. RDMA over Converged Ethernet version 2 (RoCEv2). Protocol specification. https://en.wikipedia.org/wiki/RDMA_over_Converged_Ethernet Runs over UDP/IPv4/IPv6, UDP port 4791.
+
+[8]
+
+Siegfried Cools, Jeffrey Cornelis, Pieter Ghysels, and Wim Vanroose. 2019. Improving strong scaling of the Conjugate Gradient method for solving large linear systems using global reduction pipelining. ArXiv abs/1905.06850 (2019). https://api.semanticscholar.org/CorpusID:155099963
+
+[9]
+
+NVIDIA Corporation. 2025. NVIDIA HPC-X Toolkit. https://developer.nvidia.com/networking/hpc-x.
+
+[10]
+
+Penglai Cui, Heng Pan, Zhenyu Li, Penghao Zhang, Tianhao Miao, Jianer Zhou, Hongtao Guan, and Gaogang Xie. 2022. Enabling In-Network Floating-Point Arithmetic for Efficient Computation Offloading. IEEE Transactions on Parallel and Distributed Systems 33, 12 (2022), 4918–4934.
+
+[11]
+
+Carlos A. de Moura and Carlos S. Kubrusly (Eds.). 2013. The Courant–Friedrichs–Lewy (CFL) Condition: 80 Years After Its Discovery. Birkhäuser Boston, Boston, MA.
+
+[12]
+
+Google. [n. d.]. Protocol Buffers. https://developers.google.com/protocol-buffers/.
+
+[13]
+
+Richard Graham, George Bosilca, Yong Qin, Bradley Settlemyer, Gilad Shainer, Craig Stunkel, Geoffroy Vallee, Brody Williams, Gerardo Cisneros-Stoianowski, Sebastian Ohlmann, and Markus Rampp. 2024. Optimizing Application Performance with BlueField: Accelerating Large-Message Blocking and Nonblocking Collective Operations. In ISC High Performance 2024 Research Paper Proceedings (39th International Conference). 1–12.
+
+[14]
+
+Richard L. Graham, Devendar Bureddy, Pak Lui, Hal Rosenstock, Gilad Shainer, Gil Bloch, Dror Goldenerg, Mike Dubman, Sasha Kotchubievsky, Vladimir Koushnir, Lion Levi, Alex Margolin, Tamir Ronen, Alexander Shpiner, Oded Wertheim, and Eitan Zahavi. 2016. Scalable Hierarchical Aggregation Protocol (SHArP): A Hardware Architecture for Efficient Data Reduction. In 2016 First International Workshop on Communication Optimizations in HPC (COMHPC). 1–10.
+
+[15]
+
+Youhe Jiang, Huaxi Gu, Yunfeng Lu, and Xiaoshan Yu. 2020. 2D-HRA: Two-Dimensional Hierarchical Ring-Based All-Reduce Algorithm in Large-Scale Distributed Machine Learning. IEEE Access 8 (2020), 183488–183494.
+
+[16]
+
+Luo Mai, Lukas Rupprecht, Abdul Alim, Paolo Costa, Matteo Migliavacca, Peter Pietzuch, and Alexander L. Wolf. 2014. NetAgg: Using Middleboxes for Application-specific On-path Aggregation in Data Centres. In Proceedings of the 10th ACM International on Conference on Emerging Networking Experiments and Technologies (Sydney, Australia) (CoNEXT ’14). Association for Computing Machinery, New York, NY, USA, 249–262.
+
+[17]
+
+Message Passing Interface Forum. 2023. MPI: A Message-Passing Interface Standard Version 4.1. https://www.mpi-forum.org/docs/mpi-4.1/mpi41-report.pdf
+
+[18]
+
+NVIDIA Corporation. 2025. NVIDIA Collective Communication Library (NCCL). https://developer.nvidia.com/nccl. Version 2.27.7.
+
+[19]
+
+Giorgos Papastergiou, Gorry Fairhurst, David Ros, Anna Brunstrom, Karl-Johan Grinnemo, Per Hurtig, Naeem Khademi, Michael Tüxen, Michael Welzl, Dragana Damjanovic, and Simone Mangiante. 2017. De-Ossifying the Internet Transport Layer: A Survey and Future Perspectives. IEEE Communications Surveys & Tutorials 19, 1 (2017), 619–639.
+
+[20]
+
+Jelena Pješivac-Grbović, George Bosilca, Graham E. Fagg, Thara Angskun, and Jack J. Dongarra. 2007. Decision Trees and MPI Collective Algorithm Selection Problem. In Euro-Par 2007 Parallel Processing, Anne-Marie Kermarrec, Luc Bougé, and Thierry Priol (Eds.). Springer Berlin Heidelberg, Berlin, Heidelberg, 107–117.
+
+[21]
+
+Amedeo Sapio, Marco Canini, Chen-Yu Ho, Jacob Nelson, Panos Kalnis, Changhoon Kim, Arvind Krishnamurthy, Masoud Moshref, Dan Ports, and Peter Richtarik. 2021. Scaling Distributed Machine Learning with In-Network Aggregation. In 18th USENIX Symposium on Networked Systems Design and Implementation (NSDI 21). USENIX Association, 785–808. https://www.usenix.org/conference/nsdi21/presentation/sapio
+
+[22]
+
+Zhenheng Tang, Shaohuai Shi, Xiaowen Chu, Wei Wang, and Bo Li. 2020. Communication-Efficient Distributed Deep Learning: A Comprehensive Survey. CoRR abs/2003.06307 (2020). arXiv: https://arXiv.org/abs/2003.06307 https://arxiv.org/abs/2003.06307
+
+[23]
+
+Manjunath Gorentla Venkata, Valentine Petrov, Sergey Lebedev, Devendar Bureddy, Ferrol Aderholdt, Joshua Ladd, Gil Bloch, Mike Dubman, and Gilad Shainer. 2024. Unified Collective Communication (UCC): An Unified Library for CPU, GPU, and DPU Collectives. In 2024 IEEE Symposium on High-Performance Interconnects (HOTI). 37–46.
+
+[24]
+
+Qin Yang and Contributors. 2023. DPU Offload Service. https://github.com/yqin/dpu_offload_service. Accessed: 2025-01-24.
+
+## Cited By
+
+AI Generated (2025)Session Summary Podcast: Session 6: EXAMPI: Workshop on Extreme Scale MPIProceedings of the SC '25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis10.1145/3731599.3787528Online publication date: 16-Nov-2025
+
+## Index Terms
+
+MPI Collectives with Programmable Smart Switches
+
+## Recommendations
+
+### SmartFuse: Reconfigurable Smart Switches to Accelerate Fused Collectives in HPC Applications
+
+ICS '24: Proceedings of the 38th ACM International Conference on Supercomputing
+
+Communication switches have sometimes been augmented to process collectives, e.g., in the IBM BlueGene and Mellanox SHArP switches. In this work, we find that there is a great acceleration opportunity through the further augmentation of switches to ...
+
+### Optimizing Multi-core MPI Collectives with SMARTMAP
+
+ICPPW '09: Proceedings of the 2009 International Conference on Parallel Processing Workshops
+
+We recently enhanced a lightweight compute node operating system with a simple page table mapping strategy that allows parallel application processes within a node to share effectively a single address space. This strategy allows for each process to ...
+
+### MPI Collectives for Multi-core Clusters: Optimized Performance of the Hybrid MPI+MPI Parallel Codes
+
+ICPP Workshops '19: Workshop Proceedings of the 48th International Conference on Parallel Processing
+
+The advent of multi-/many-core processors in clusters advocates hybrid parallel programming, which combines Message Passing Interface (MPI) for inter-node parallelism with a shared memory model for on-node parallelism. Compared to the traditional hybrid ...
+
+## Comments
+
+#### Affiliations
+
+Thomas Erbesdobler
+
+Technical University of Munich, Munich, Germany erbesdob@cit.tum.de
+
+Amir Raoofy
+
+Leibniz Supercomputing Centre (LRZ), Garching, Germany Amir.Raoofy@lrz.de
+
+Ehab Saleh
+
+Leibniz Supercomputing Centre (LRZ), Garching, Germany Ehab.Saleh@lrz.de
+
+Josef Weidendorfer
+
+Leibniz Supercomputing Centre (LRZ), Garching b. M., Germany Josef.Weidendorfer@lrz.de
+
+|
+
+View Table of Contents
+
+Your Search Results Download Request
+
+We are preparing your search results for download ...
+
+We will inform you here when the file is ready.
+
+Download now!
+
+Your Search Results Download Request
+
+Your file of search results citations is now ready.
+
+Download now!
+
+Your Search Results Download Request
+
+Your search export query has expired. Please try again.

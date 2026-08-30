@@ -1,0 +1,1103 @@
+### Optimization of Collective Communication Operations in MPICH
+
+Rajeev Thakur∗ Rolf Rabenseifner† William Gropp∗
+
+Abstract
+
+We describe our work on improving the performance of collective communication operations in MPICH for clusters connected by switched networks. For each collective operation, we use multiple algorithms de pending on the message size, with the goal of min imizing latency for short messages and minimizing bandwidth use for long messages. Although we have implemented new algorithms for all MPI collective op erations, because of limited space we describe only the algorithms for allgather, broadcast, all-to-all, reduce scatter, reduce, and allreduce. Performance results on a Myrinet-connected Linux cluster and an IBM SP indicate that, in all cases, the new algorithms signifi cantly outperform the old algorithms used in MPICH on the Myrinet cluster, and, in many cases, they out perform the algorithms used in IBM’s MPI on the SP. We also explore in further detail the optimiza tion of two of the most commonly used collective op erations, allreduce and reduce, particularly for long messages and non-power-of-two numbers of processes. The optimized algorithms for these operations per form several times better than the native algorithms on a Myrinet cluster, IBM SP, and Cray T3E. Our results indicate that to achieve the best performance for a collective communication operation, one needs to use a number of different algorithms and select the right algorithm for a particular message size and num ber of processes.
+
+1 Introduction
+
+Collective communication is an important and fre quently used component of MPI and offers im plementations considerable room for optimization. MPICH [17], although widely used as an MPI imple mentation, has until recently had fairly rudimentary implementations of the collective operations. This
+
+∗Mathematics and Computer Science Division, Argonne Na 
+tional Laboratory, 9700 S. Cass Avenue, Argonne, IL 60439, 
+USA. { thakur, gropp} @mcs.anl.gov 
+†High Performance Computing Center (HLRS), University 
+of Stuttgart, Allmandring 30, D-70550 Stuttgart, Germany. 
+rabenseifner@hlrs.de, www.hlrs.de/people/rabenseifner/ 
+
+paper describes our efforts at improving the perfor mance of collective operations in MPICH. Our ini tial target architecture is one that is very popular among our users, namely, clusters of machines con nected by a switch, such as Myrinet or the IBM SP switch. Our approach has been to identify the best algorithms known in the literature, improve on them or develop new algorithms where necessary, and im plement them efficiently. For each collective opera tion, we use multiple algorithms based on message size: The short-message algorithms aim to minimize latency, and the long-message algorithms aim to min imize bandwidth use. We use experimentally deter mined cutoff points to switch between different algo rithms depending on the message size and number of processes. We have implemented new algorithms in MPICH (MPICH 1.2.6 and MPICH2 0.971) for all the MPI collective operations, namely, scatter, gather, all gather, broadcast, all-to-all, reduce, allreduce, reduce scatter, scan, barrier, and their variants. Because of limited space, however, we describe only the new al gorithms for allgather, broadcast, all-to-all, reduce scatter, reduce, and allreduce. A five-year profiling study of applications running in production mode on the Cray T3E 900 at the Uni versity of Stuttgart revealed that more than 40% of the time spent in MPI functions was spent in the two functions MPI Allreduce and MPI Reduce and that 25% of all execution time was spent on program runs that involved a non-power-of-two number of pro cesses [20]. We therefore investigated in further detail how to optimize allreduce and reduce. We present a detailed study of different ways of optimizing allre duce and reduce, particularly for long messages and non-power-of-two numbers of processes, both of which occur frequently according to the profiling study. The rest of this paper is organized as follows. In Section 2, we describe related work in the area of collective communication. In Section 3, we describe the cost model used to guide the selection of algo rithms. In Section 4, we describe the new algorithms in MPICH and their performance. In Section 5, we investigate in further detail the optimization of reduce and allreduce. In Section 6, we conclude with a brief discussion of future work.
+
+2 Related Work
+
+Early work on collective communication focused on developing optimized algorithms for particular archi tectures, such as hypercube, mesh, or fat tree, with an emphasis on minimizing link contention, node contention, or the distance between communicating nodes [3, 5, 6, 23]. More recently, Vadhiyar et al. have developed automatically tuned collective com munication algorithms [30]. They run experiments to measure the performance of different algorithms for a collective communication operation under different conditions (message size, number of processes) and then use the best algorithm for a given set of condi tions. Researchers in Holland and at Argonne have optimized MPI collective communication for wide area distributed environments [14, 15]. In such en vironments, the goal is to minimize communication over slow wide-area links at the expense of more com munication over faster local-area connections. Re searchers have also developed collective communica tion algorithms for clusters of SMPs [22, 25, 27, 28], where communication within an SMP is done differ ently from communication across a cluster. Some ef forts have focused on using different algorithms for different message sizes, such as the work by Van de Geijn et al. [2, 8, 16, 24], by Rabenseifner on re duce and allreduce [19], and by Kale et al. on all to-all communication [13]. Benson et al. studied the performance of the allgather operation in MPICH on Myrinet and TCP networks and developed a dissem ination allgather based on the dissemination barrier algorithm [4]. Bruck et al. proposed algorithms for all gather and all-to-all that are particularly efficient for short messages [7]. Iannello developed efficient algo rithms for the reduce-scatter operation in the LogGP model [12].
+
+3 Cost Model
+
+We use a simple model to estimate the cost of the collective communication algorithms in terms of la tency and bandwidth use, and to guide the selection of algorithms for a particular collective communica tion operation. This model is similar to the one used by Van de Geijn [2, 16, 24], Hockney [11], and others. Although more sophisticated models such as LogP [9] and LogGP [1] exist, this model is sufficient for our needs. We assume that the time taken to send a message between any two nodes can be modeled as α + nβ, where α is the latency (or startup time) per message, independent of message size, β is the transfer time per byte, and n is the number of bytes transferred. We assume further that the time taken is independent of how many pairs of processes are communicating with each other, independent of the distance between the communicating nodes, and that the communication links are bidirectional (that is, a message can be trans ferred in both directions on the link in the same time as in one direction). The node’s network interface is assumed to be single ported; that is, at most one message can be sent and one message can be received simultaneously. In the case of reduction operations, we assume that γ is the computation cost per byte for performing the reduction operation locally on any process. This cost model assumes that all processes can send and receive one message at the same time, regard less of the source and destination. Although this is a good approximation, many networks are faster if pairs of processes exchange data with each other, rather than if a process sends to and receives from differ ent processes [4]. Therefore, for the further optimiza tion of reduction operations (Section 5), we refine the cost model by defining two costs: α + nβ is the time taken for bidirectional communication between a pair of processes, and αuni + nβuni is the time taken for unidirectional communication from one process to an other. We also define the ratios fα = αuni/α and fβ = βuni/β. These ratios are normally in the range 0.5 (simplex network) to 1.0 (full-duplex network).
+
+4 Algorithms
+
+In this section we describe the new algorithms and their performance. We measured performance by us ing the SKaMPI benchmark [31] on two platforms: a Linux cluster at Argonne connected with Myrinet 2000 and the IBM SP at the San Diego Super computer Center. On the Myrinet cluster we used MPICH-GM and compared the performance of the new algorithms with the old algorithms in MPICH GM. On the IBM SP, we used IBM’s MPI and com pared the performance of the new algorithms with the algorithms used in IBM’s MPI. On both systems, we ran one MPI process per node. We implemented the new algorithms as functions on top of MPI point-to point operations, so that we could compare perfor mance simply by linking or not linking the new func tions.
+
+4.1 Allgather MPI Allgather is a gather operation in which the data contributed by each process is gathered on
+
+P0 P1 P2 P3 P4 P5 P6 P7 
+Step 1 
+Step 2 
+Step 3 
+
+Figure 1: Recursive doubling for allgather all processes, instead of just the root process as in MPI Gather. The old algorithm for allgather in MPICH uses a ring method in which the data from each process is sent around a virtual ring of processes. In the first step, each process i sends its contribution to process i + 1 and receives the contribution from process i − 1 (with wrap-around). From the second step onward each process i forwards to process i + 1 the data it received from process i − 1 in the previ ous step. If p is the number of processes, the entire algorithm takes p − 1 steps. If n is the total amount of data to be gathered on each process, then at ev ery step each process sends and receives n p amount of data. Therefore, the time taken by this algorithm is given by Tring = (p − 1)α + p− 1 p nβ. Note that the bandwidth term cannot be reduced further because each process must receive n p data from p − 1 other processes. The latency term, however, can be reduced by using an algorithm that takes lg p steps. We con sider two such algorithms: recursive doubling and the Bruck algorithm [7].
+
+4.1.1 Recursive Doubling Figure 1 illustrates how recursive doubling works. In the first step, processes that are a distance 1 apart exchange their data. In the second step, processes that are a distance 2 apart exchange their own data as well as the data they received in the previous step. In the third step, processes that are a distance 4 apart exchange their own data as well the data they received in the previous two steps. In this way, for a power-of two number of processes, all processes get all the data in lg p steps. The amount of data exchanged by each process is n p in the first step, 2n p in the second step, and so forth, up to 2 lg p− 1 n p in the last step. Therefore, the total time taken by this algorithm is Trec dbl = lg p α + p− 1 p nβ. Recursive doubling works very well for a power-of two number of processes but is tricky to get right for a non-power-of-two number of processes. We have im plemented the non-power-of-two case as follows. At each step of recursive doubling, if any set of exchang ing processes is not a power of two, we do additional communication in the peer (power-of-two) set in a log arithmic fashion to ensure that all processes get the data they would have gotten had the number of pro cesses been a power of two. This extra communication is necessary for the subsequent steps of recursive dou bling to work correctly. The total number of steps for the non-power-of-two case is bounded by 2b lg pc .
+
+4.1.2 Bruck Algorithm The Bruck algorithm for allgather [7] (referred to as concatenation) is a variant of the dissemination algo rithm for barrier, described in [10]. Both algorithms take d lg pe steps in all cases, even for non-power-of-two numbers of processes. In the dissemination algorithm for barrier, in each step k (0 ≤ k < d lg pe ), process i sends a (zero-byte) message to process (i + 2 k) and receives a (zero-byte) message from process (i − 2 k) (with wrap-around). If the same order were used to perform an allgather, it would require communicat ing noncontiguous data in each step in order to get the right data to the right process (see [4] for details). The Bruck algorithm avoids this problem nicely by a simple modification to the dissemination algorithm in which, in each step k, process i sends data to pro cess (i − 2 k) and receives data from process (i + 2 k), instead of the other way around. The result is that all communication is contiguous, except that at the end, the blocks in the output buffer must be shifted locally to place them in the right order, which is a local memory-copy operation. Figure 2 illustrates the Bruck algorithm for an ex ample with six processes. The algorithm begins by copying the input data on each process to the top of the output buffer. In each step k, process i sends to the destination (i − 2 k) all the data it has so far and stores the data it receives (from rank (i + 2 k)) at the end of the data it currently has. This procedure con tinues for b lg pc steps. If the number of processes is not a power of two, an additional step is needed in which each process sends the first (p − 2b lg pc) blocks from the top of its output buffer to the destination and appends the data it receives to the data it al ready has. Each process now has all the data it needs, but the data is not in the right order in the output buffer: The data on process i is shifted “up” by i blocks. Therefore, a simple local shift of the blocks downwards by i blocks brings the data into the de sired order. The total time taken by this algorithm is Tbruck = d lg pe α + p− 1 p nβ.
+
+4.1.3 Performance The Bruck algorithm has lower latency than recursive doubling for non-power-of-two numbers of processes.
+
+| | P0 | | P1 | | P2 | | P3 | | P4 | | P5 | | P0 | | P1 | | P2 | | P3 | | | P4 | | P5 | | P0 | | | P1 | | P2 | | P3 | | P4 | P5 | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | 0 | | 1 | | 2 | | 3 | | 4 | | 5 | | 0 | | 1 | | 2 | | 3 | | | 4 | | 5 | | 0 | | | 1 | | 2 | | 3 | | 4 | 5 | | | |
+| | | | | | | | | | | | | | 1 | | 2 | | 3 | | 4 | | | 5 | | 0 | | 1 | | | 2 | | 3 | | 4 | | 5 | 0 | | | |
+| | | | | | | | | | | | | | | | | | | | | | | | | | | 2 | | | 3 | | 4 | | 5 | | 0 | 1 | | | |
+| | | | | | | | | | | | | | | | | | | | | | | | | | | 3 | | | 4 | | 5 | | 0 | | 1 | 2 | | | |
+| | | | | | Initial data | | | | | | | | | | | | After step 0 | | | | | | | | | | | | | | After step 1 | | | | | | | | |
+| | P0 | | P1 | | P2 | | P3 | | P4 | | P5 | | P0 | | P1 | | P2 | | P3 | | | P4 | | P5 | | | | | | | | | | | | | | | |
+| | 0 | | 1 | | 2 | | 3 | | 4 | | 5 | | 0 | | 0 | | 0 | | 0 | | | 0 | | 0 | | | | | | | | | | | | | | | |
+| | 1 | | 2 | | 3 | | 4 | | 5 | | 0 | | 1 | | 1 | | 1 | | 1 | | | 1 | | 1 | | | | | | | | | | | | | | | |
+| | 2 | | 3 | | 4 | | 5 | | 0 | | 1 | | 2 | | 2 | | 2 | | 2 | | | 2 | | 2 | | | | | | | | | | | | | | | |
+| | 3 | | 4 | | 5 | | 0 | | 1 | | 2 | | 3 | | 3 | | 3 | | 3 | | | 3 | | 3 | | | | | | | | | | | | | | | |
+| | 4 | | 5 | | 0 | | 1 | | 2 | | 3 | | 4 | | 4 | | 4 | | 4 | | | 4 | | 4 | | | | | | | | | | | | | | | |
+| | 5 | | 0 | | 1 | | 2 | | 3 | | 4 | | 5 | | 5 | | 5 | | 5 | | | 5 | | 5 | | | | | | | | | | | | | | | |
+| | | | | | After step 2 | | | | | | | | | | | After local shift | | | | | | | | | | | | | | | | | | | | | | | |
+
+Figure 2: Bruck allgather
+
+Myrinet Cluster
+
+140
+
+Recursive Doubling Bruck Algorithm
+
+120
+
+100
+
+For power-of-two numbers of processes, however, the Bruck algorithm requires local memory permutation at the end, whereas recursive doubling does not. In practice, we find that the Bruck algorithm is best for short messages and non-power-of-two numbers of processes; recursive doubling is best for power-of-two numbers of processes and short or medium-sized mes sages; and the ring algorithm is best for long messages and any number of processes and also for medium sized messages and non-power-of-two numbers of pro cesses.
+
+80 (m
+
+60 e t im
+
+40
+
+20
+
+0
+
+0 5 10 15 20 25 30 35
+
+Number of processes
+
+Figure 3: Performance of recursive doubling versus Bruck allgather for power-of-two and non-power-of two numbers of processes (message size 16 bytes per process).
+
+Figure 3 shows the advantage of the Bruck al gorithm over recursive doubling for short messages and non-power-of-two numbers of processes because it takes fewer steps. For power-of-two numbers of pro cesses, however, recursive doubling performs better because of the pairwise nature of its communication pattern and because it does not need any memory per mutation. As the message size increases, the Bruck algorithm suffers because of the memory copies. In MPICH, therefore, we use the Bruck algorithm for short messages (< 80 KB total data gathered) and non-power-of-two numbers of processes, and recur sive doubling for power-of-two numbers of processes and short or medium-sized messages (< 512 KB total data gathered). For short messages, the new allgather performs significantly better than the old allgather in MPICH, as shown in Figure 4.
+
+that are much farther apart communicate. To con firm this hypothesis, we used the b eff MPI bench mark [18], which measures the performance of about 48 different communication patterns, and found that, for long messages on both the Myrinet cluster and the IBM SP, some communication patterns (particularly nearest neighbor) achieve more than twice the band width of other communication patterns. In MPICH, therefore, for long messages (≥ 512 KB total data gathered) and any number of processes and also for medium-sized messages (≥ 80 KB and < 512 KB to tal data gathered) and non-power-of-two numbers of processes, we use the ring algorithm.
+
+For long messages, the ring algorithm performs bet ter than recursive doubling (see Figure 5). We believe this is because it uses a nearest-neighbor communica tion pattern, whereas in recursive doubling, processes
+
+0
+
+200
+
+400
+
+600
+
+800
+
+1000
+
+1200
+
+1400
+
+1600
+
+1800
+
+0 1 2 3 4 5 6 7 8
+
+message length (KB)
+
+MPICH Old MPICH New
+
+Figure 4: Performance of allgather for short messages (64 nodes). The size on the x-axis is the total amount of data gathered on each process.
+
+4.2 Broadcast
+
+The old algorithm for broadcast in MPICH is the com monly used binomial tree algorithm. In the first step, the root sends data to process (root + p 2). This pro cess and the root then act as new roots within their own subtrees and recursively continue this algorithm. This communication takes a total of d lg pe steps. The amount of data communicated by a process at any step is n. Therefore, the time taken by this algorithm is Ttree = d lg pe (α + nβ). This algorithm is good for short messages because it has a logarithmic latency term. For long mes sages, however, a better algorithm has been proposed by Van de Geijn et al. that has a lower bandwidth term [2, 24]. In this algorithm, the message to be broadcast is first divided up and scattered among the processes, similar to an MPI Scatter. The scattered data is then collected back to all processes, similar to an MPI Allgather. The time taken by this algorithm is the sum of the times taken by the scatter, which is (lg p α + p− 1 p nβ) for a binomial tree algorithm, and the allgather for which we use either recursive dou bling or the ring algorithm depending on the message size. Therefore, for very long messages where we use the ring allgather, the time taken by the broadcast is
+
+Tvandegeijn = (lg p + p − 1)α + 2 p− 1 p nβ.
+
+Comparing this time with that for the binomial tree algorithm, we see that for long messages (where the latency term can be ignored) and when lg p > 2 (or p > 4), the Van de Geijn algorithm is better than binomial tree. The maximum improvement in per formance that can be expected is (lg p)/2. In other words, the larger the number of processes, the greater the expected improvement in performance. Figure 6
+
+0
+
+20000
+
+40000
+
+60000
+
+80000
+
+100000
+
+120000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+Recursive doubling Ring
+
+0
+
+20000
+
+40000
+
+60000
+
+80000
+
+100000
+
+120000
+
+140000
+
+160000
+
+180000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+IBM SP
+
+Recursive doubling Ring
+
+Figure 5: Ring algorithm versus recursive doubling for long-message allgather (64 nodes). The size on the x-axis is the total amount of data gathered on each process.
+
+shows the performance for long messages of the new algorithm versus the old binomial tree algorithm in MPICH as well as the algorithm used by IBM’s MPI on the SP. In both cases, the new algorithm performs significantly better. In MPICH, therefore, we use the binomial tree algorithm for short messages (< 12 KB) or when the number of processes is less than 8, and the Van de Geijn algorithm otherwise (long messages and number of processes ≥ 8).
+
+4.3 All-to-All
+
+All-to-all communication is a collective operation in which each process has unique data to be sent to ev ery other process. The old algorithm for all-to-all in MPICH does not attempt to schedule communication. Instead, each process posts all the MPI Irecvs in a loop, then all the MPI Isends in a loop, followed by an MPI Waitall. Instead of using the loop index i as the source or destination process for the irecv or
+
+0
+
+50000
+
+100000
+
+150000
+
+200000
+
+250000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+MPICH Old MPICH New
+
+0
+
+20000
+
+40000
+
+60000
+
+80000
+
+100000
+
+120000
+
+140000
+
+160000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+IBM SP
+
+IBM MPI MPICH New
+
+Figure 6: Performance of long-message broadcast (64 nodes)
+
+isend, each process calculates the source or destina tion as (rank + i) % p, which results in a scattering of the sources and destinations among the processes. If the loop index were directly used as the source or tar get rank, all processes would try to communicate with rank 0 first, then with rank 1, and so on, resulting in a bottleneck. The new all-to-all in MPICH uses four different al gorithms depending on the message size. For short messages (≤ 256 bytes per message), we use the index algorithm by Bruck et al. [7]. It is a store-and-forward algorithm that takes d lg pe steps at the expense of some extra data communication ( n 2 lg p β instead of nβ, where n is the total amount of data to be sent or received by any process). Therefore, it is a good algorithm for very short messages where latency is an issue. Figure 7 illustrates the Bruck algorithm for an ex ample with six processes. The algorithm begins by do ing a local copy and “upward” shift of the data blocks from the input buffer to the output buffer such that the data block to be sent by each process to itself is at the top of the output buffer. To achieve this, process i must rotate its data up by i blocks. In each com munication step k (0 ≤ k < d lg pe ), process i sends to rank (i+2 k) (with wrap-around) all those data blocks whose kth bit is 1, receives data from rank (i − 2 k), and stores the incoming data into blocks whose kth bit is 1 (that is, overwriting the data that was just sent). In other words, in step 0, all the data blocks whose least significant bit is 1 are sent and received (blocks 1, 3, and 5 in our example). In step 1, all the data blocks whose second bit is 1 are sent and re ceived, namely, blocks 2 and 3. After a total of d lg pesteps, all the data gets routed to the right destination process, but the data blocks are not in the right order in the output buffer. A final step in which each pro cess does a local inverse shift of the blocks (memory copies) places the data in the right order. The beauty of the Bruck algorithm is that it is a logarithmic algorithm for short-message all-to-all that does not need any extra bookkeeping or control information for routing the right data to the right process—that is taken care of by the mathematics of the algorithm. It does need a memory permutation in the beginning and another at the end, but for short messages, where communication latency dominates, the performance penalty of memory copying is small. If n is the total amount of data a process needs to send to or receive from all other processes, the time taken by the Bruck algorithm can be calculated as follows. If the number of processes is a power of two, each process sends and receives n 2 amount of data in each step, for a total of lg p steps. Therefore, the time taken by the algorithm is Tbruck = lg p α + n 2 lg p β. If the number of processes is not a power of two, in the final step, each process must communicate n p(p − 2b lg pc) data. Therefore, the time taken in the non power-of-two case is Tbruck = d lg pe α+ ( n 2 lg p+ n p(p− 2b lg pc)) β. Figure 8 shows the performance of the Bruck al gorithm versus the old algorithm in MPICH (isend irecv) for short messages. The Bruck algorithm per forms significantly better because of its logarithmic latency term. As the message size is increased, how ever, latency becomes less of an issue, and the ex tra bandwidth cost of the Bruck algorithm begins to show. Beyond a per process message size of about 256 bytes, the isend-irecv algorithm performs better. Therefore, for medium-sized messages (256 bytes to 32 KB per message), we use the irecv-isend algorithm, which works well in this range. For long messages and power-of-two number of pro cesses, we use a pairwise-exchange algorithm, which takes p − 1 steps. In each step k, 1 ≤ k < p, each
+
+04
+
+11
+
+15
+
+22
+
+20 31
+
+33
+
+42
+
+44
+
+53
+
+50 01 12 23 34 45
+
+54 10 21 32 43
+
+00 11 22 33 44 55 50 01 12 23 34 45
+
+30
+
+40
+
+41
+
+51
+
+52
+
+02
+
+03
+
+13
+
+14
+
+24
+
+25
+
+35
+
+00 11 22 33 44 55 50 01 12 23 34 45
+
+30
+
+40
+
+41
+
+51
+
+52
+
+02
+
+03
+
+13
+
+14
+
+24
+
+25
+
+!!! !!! """" ### ### $$$$$$
+
+%%%
+
+%%% &&&&&&'''
+
+''' (((()))
+
+))) ******+++
+
++++ ,,,,---- ... /// /// 000000
+
+111
+
+111
+
+111 222222222
+
+333
+
+333
+
+333 444444
+
+555
+
+555 666666666
+
+777 
+777 
+777 888888 9999 
+
+99 ::::::
+
+;;;
+
+;;; <<<<<<<<<
+
+====== >>>>>> ?????? @@@@@@ AAAAAA
+
+## BBBBBBCCCCCC DDDDDD EEEEEE FFFFFF GGGGGG HHHHHH IIIIII
+
+## JJJJJJKKKKKK LLLLLL MMMMMM NNNNNN OOOOOO PPPPPP QQQQQQ
+
+## RRRRRRSSSSSS TTTTTT
+
+P0 P1 P2 P3 P4 P5
+
+Initial Data
+
+P0 P1 P2 P3 P4 P5 P0 P1 P2 P3 P4 P5
+
+P0 P1 P2 P3 P4 P5
+
+10
+
+55
+
+After local rotation
+
+03
+
+05
+
+01
+
+00 55
+
+02
+
+04
+
+11
+
+13
+
+15
+
+22
+
+24
+
+20 31
+
+33
+
+35 40
+
+42
+
+44
+
+51
+
+53
+
+12
+
+14
+
+10
+
+23
+
+25
+
+21
+
+30
+
+32
+
+34
+
+41
+
+43
+
+45 50
+
+52
+
+54 05
+
+P0 P1 P2 P3 P4 P5
+
+After local inverse rotation
+
+00
+
+12
+
+30
+
+24
+
+42
+
+10
+
+50
+
+20
+
+41
+
+31
+
+02 
+22 
+32 
+52 
+
+03
+
+33
+
+23
+
+13
+
+04
+
+54
+
+44
+
+34
+
+02
+
+03
+
+13
+
+14
+
+24
+
+25
+
+35
+
+30
+
+40
+
+41
+
+51 
+04 
+54 05 
+15 20 
+10 
+31 
+21 
+42 
+32 
+53 
+43 
+After communication step 0 
+
+After communication step 1
+
+P0 P1 P2 P3 P4 P5
+
+After communication step 2
+
+Figure 7: Bruck algorithm for all-to-all. The number ij in each box represents the data to be sent from process i to process j. The shaded boxes indicate the data to be communicated in the next step.
+
+200
+
+300
+
+400
+
+500
+
+600
+
+700
+
+800
+
+900
+
+0 50 100 150 200 250 300
+
+message length (bytes)
+
+Myrinet Cluster, 64 nodes
+
+MPICH Old MPICH New
+
+Figure 8: Performance of Bruck all-to-all versus the old algorithm in MPICH (isend-irecv) for short mes sages. The size on the x-axis is the amount of data sent by each process to every other process.
+
+process calculates its target process as (rank
+
+b
+
+k) (exclusive-or operation) and exchanges data directly with that process. This algorithm, however, does not work if the number of processes is not a power of two. For the non-power-of-two case, we use an al gorithm in which, in step k, each process receives data from rank − k and sends data to rank + k. In both these algorithms, data is directly communi cated from source to destination, with no intermediate steps. The time taken by these algorithms is given by Tlong = (p − 1)α + nβ.
+
+4.4 Reduce-Scatter
+
+Reduce-scatter is a variant of reduce in which the result, instead of being stored at the root, is scat tered among all processes. It is an irregular primi tive: The scatter in it is a scatterv. The old algo rithm in MPICH implements reduce-scatter by do ing a binomial tree reduce to rank 0 followed by a linear scatterv. This algorithm takes lg p + p − 1 steps, and the bandwidth term is (lg p + p− 1 p )nβ. Therefore, the time taken by this algorithm is Told = (lg p + p − 1)α + (lg p + p− 1 p )nβ + n lg p γ.
+
+In our new implementation of reduce-scatter, for short messages, we use different algorithms depending on whether the reduction operation is commutative or noncommutative. The commutative case occurs most commonly because all the predefined reduction oper ations in MPI (such as MPI SUM, MPI MAX) are com mutative. For commutative operations, we use a recursive halving algorithm, which is analogous to the recursive doubling algorithm used for allgather (see Figure 9). In the first step, each process exchanges data with a process that is a distance p
+
+2 away: Each process sends the data needed by all processes in the other half, re ceives the data needed by all processes in its own half, and performs the reduction operation on the received data. The reduction can be done because the oper ation is commutative. In the second step, each pro cess exchanges data with a process that is a distance p 4 away. This procedure continues recursively, halving the data communicated at each step, for a total of lg p
+
+P0 P1 P2 P3 P4 P5 P6 P7
+
+Step 2
+
+Step 1
+
+Step 3
+
+Figure 9: Recursive halving for commutative reduce scatter
+
+steps. Therefore, if p is a power of two, the time taken by this algorithm is Trec half = lg pα+ p− 1 p nβ+ p− 1 p nγ. We use this algorithm for messages up to 512 KB. If p is not a power of two, we first reduce the num ber of processes to the nearest lower power of two by having the first few even-numbered processes send their data to the neighboring odd-numbered process (rank + 1). These odd-numbered processes do a re duce on the received data, compute the result for themselves and their left neighbor during the recur sive halving algorithm, and, at the end, send the re sult back to the left neighbor. Therefore, if p is not a power of two, the time taken by the algorithm is Trec half = (b lg pc + 2)α + 2nβ + n(1 + p− 1 p )γ. This cost is approximate because some imbalance exists in the amount of work each process does, since some pro cesses do the work of their neighbors as well. If the reduction operation is not commutative, re cursive halving will not work (unless the data is per muted suitably [29]). Instead, we use a recursive doubling algorithm similar to the one in allgather. In the first step, pairs of neighboring processes exchange data; in the second step, pairs of processes at distance 2 apart exchange data; in the third step, processes at distance 4 apart exchange data; and so forth. How ever, more data is communicated than in allgather. In step 1, processes exchange all the data except the data needed for their own result (n−
+
+n p); in step 2, processes exchange all data except the data needed by them selves and by the processes they communicated with in the previous step (n −
+
+2n p ); in step 3, it is (n −
+
+4n p ); and so forth. Therefore, the time taken by this algo rithm is Tshort = lg pα+n(lg p− p− 1 p )β+n(lg p− p− 1 p )γ. We use this algorithm for very short messages (< 512 bytes). For long messages (≥ 512 KB in the case of com mutative operations and ≥ 512 bytes in the case of noncommutative operations), we use a pairwise ex change algorithm that takes p− 1 steps. In step i, each process sends data to (rank + i), receives data from (rank− i), and performs the local reduction. The data exchanged is only the data needed for the scattered result on the process ( n p). The time taken by this algo-
+
+0
+
+200
+
+400
+
+600
+
+800
+
+1000
+
+1200
+
+1400
+
+0 1000 2000 3000 4000 5000 6000 7000 8000 9000
+
+message length (bytes)
+
+IBM SP
+
+IBM MPI MPICH New
+
+0
+
+50000
+
+100000
+
+150000
+
+200000
+
+250000
+
+300000
+
+350000
+
+400000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+Myrinet Cluster
+
+MPICH Old MPICH New
+
+Figure 10: Performance of reduce-scatter for short messages on the IBM SP (64 nodes) and for long mes sages on the Myrinet cluster (32 nodes)
+
+rithm is Tlong = (p− 1)α+ p− 1 p nβ + p− 1 p nγ. Note that this algorithm has the same bandwidth requirement as the recursive halving algorithm. Nonetheless, we use this algorithm for long messages because it performs much better than recursive halving (similar to the re sults for recursive doubling versus ring algorithm for long-message allgather). The SKaMPI benchmark, by default, uses a non commutative user-defined reduction operation. Since commutative operations are more commonly used, we modified the benchmark to use a commutative oper ation, namely, MPI SUM. Figure 10 shows the perfor mance of the new algorithm for short messages on the IBM SP and on the Myrinet cluster. The performance is significantly better than that of the algorithm used in IBM’s MPI on the SP and several times better than the old algorithm (reduce + scatterv) used in MPICH on the Myrinet cluster. The above algorithms will also work for irregular reduce-scatter operations, but they are not specifically optimized for that case.
+
+4.5 Reduce and Allreduce MPI Reduce performs a global reduction operation and returns the result to the specified root, whereas MPI Allreduce returns the result on all processes. The old algorithm for reduce in MPICH uses a bi nomial tree, which takes lg p steps, and the data com municated at each step is n. Therefore, the time taken by this algorithm is Ttree = d lg pe (α + nβ + nγ). The old algorithm for allreduce simply does a reduce to rank 0 followed by a broadcast. The binomial tree algorithm for reduce is a good algorithm for short messages because of the lg p num ber of steps. For long messages, however, a better algorithm exists, proposed by Rabenseifner [19]. The principle behind Rabenseifner’s algorithm is similar to that behind Van de Geijn’s algorithm for long-message broadcast. Van de Geijn implements the broadcast as a scatter followed by an allgather, which reduces the n lg pβ bandwidth term in the binomial tree algorithm to a 2nβ term. Rabenseifner’s algorithm implements a long-message reduce effectively as a reduce-scatter followed by a gather to the root, which has the same effect of reducing the bandwidth term from n lg p β to 2nβ. The time taken by Rabenseifner’s algorithm is the sum of the times taken by reduce-scatter (re cursive halving) and gather (binomial tree), which is Trabenseifner = 2 lg p α + 2 p− 1 p nβ + p− 1 p nγ. For reduce, in the case of predefined reduction oper ations, we use Rabenseifner’s algorithm for long mes sages (> 2 KB) and the binomial tree algorithm for short messages (≤ 2 KB). In the case of user-defined reduction operations, we use the binomial tree algo rithm for all message sizes because, unlike with prede fined reduction operations, the user may pass derived datatypes, and breaking up derived datatypes to do the reduce-scatter is tricky. Figure 11 shows the per formance of reduce for long messages on the Myrinet cluster. The new algorithm is more than twice as fast as the old algorithm in some cases. For allreduce, we use a recursive doubling algorithm for short messages and for long messages with user defined reduction operations. This algorithm is sim ilar to the recursive doubling algorithm used in all gather, except that each communication step also in volves a local reduction. The time taken by this algo rithm is Trec− dbl = lg p α + n lg p β + n lg p γ. For long messages and predefined reduction op erations, we use Rabenseifner’s algorithm for allre duce [19], which does a reduce-scatter followed by an allgather. If the number of processes is a power of two, the cost for the reduce-scatter is lg pα+ p− 1 p nβ + p− 1 p nγ. The cost for the allgather is lg p α + p− 1 p nβ.
+
+0
+
+50000
+
+100000
+
+150000
+
+200000
+
+250000
+
+300000
+
+350000
+
+400000
+
+450000
+
+0 1 2 3 4 5 6 7 8
+
+message length (MB)
+
+MPICH Old MPICH New
+
+Figure 11: Performance of reduce (64 nodes)
+
+Therefore, the total cost is Trabenseifner = 2 lg p α + 
+2 p− 1 
+p nβ + p− 1 
+p nγ. 
+
+5 Further Optimization of Allreduce and Reduce
+
+As the profiling study in [20] indicated that allreduce and reduce are the most commonly used collective op erations, we investigated in further detail how to op timize these operations. We consider five different al gorithms for implementing allreduce and reduce. The first two algorithms are binomial tree and recursive doubling, which were explained above. Binomial tree for reduce is well known. For allreduce, it involves doing a binomial-tree reduce to rank 0 followed by a binomial-tree broadcast. Recursive doubling is used for allreduce only. The other three algorithms are re cursive halving and doubling, binary blocks, and ring. For explaining these algorithms, we define the follow ing terms:
+
+• Recursive vector halving: The vector to be reduced is recursively halved in each step. 
+• Recursive vector doubling: Small pieces of the vector scattered across processes are recursively gathered or combined to form the large vector 
+• Recursive distance halving: The distance over which processes communicate is recursively halved at each step ( p 2, p 4, . . . , 1). 
+• Recursive distance doubling: The distance over which processes communicate is recursively doubled at each step (1, 2, 4, . . . , p 2). All algorithms in this section can be implemented without local copying of data, except if user-defined noncommutative operations are used. 
+
+5.1 Vector Halving and Distance Dou bling Algorithm This algorithm is a combination of a reduce-scatter implemented with recursive vector halving and dis tance doubling, followed either by a binomial-tree gather (for reduce) or by an allgather implemented with recursive vector doubling and distance halving (for allreduce). Since these recursive algorithms require a power-of two number of processes, if the number of processes is not a power of two, we first reduce it to the nearest lower power of two (p0 = 2b lg pc) by removing r = p− p0 extra processes as follows. In the first 2r processes (ranks 0 to 2r − 1), all the even ranks send the sec ond half of the input vector to their right neighbor (rank + 1), and all the odd ranks send the first half of the input vector to their left neighbor (rank − 1), as illustrated in Figure 12. The even ranks compute the reduction on the first half of the vector and the odd ranks compute the reduction on the second half. The odd ranks then send the result to their left neigh bors (the even ranks). As a result, the even ranks among the first 2r processes now contain the reduc tion with the input vector on their right neighbors (the odd ranks). These odd ranks do not participate in the rest of the algorithm, which leaves behind a power-of-two number of processes. The first r even ranked processes and the last p− 2r processes are now renumbered from 0 to p0 − 1, p0 being a power of two. Figure 12 illustrates the algorithm for an example on 13 processes. The input vectors and all reduction results are divided into 8 parts (A, B,. . .,H), where 8 is the largest power of two less than 13, and denoted as A–Hranks. After the first reduction, process P0 has computed A–D0− 1, which is the reduction result of the first half (A–D) of the input vector from processes 0 and 1. Similarly, P1 has computed E–H0− 1, P2 has computed A–D2− 3, and so forth. The odd ranks then send their half to the even ranks on their left: P1 sends E–H0− 1 to P0, P3 sends E–H2− 3 to P0, and so forth. This completes the first step, which takes (1 + fα)α+ n 2(1 +fβ)β + n 2γ time. P1, P3, P5, P7, and P9 do not participate in the remainder of the algorithm, and the remaining processes are renumbered from 0–7. The remaining processes now perform a reduce scatter by using recursive vector halving and distance doubling. The even-ranked processes send the sec ond half of their buffer to rank0 + 1 and the odd ranked processes send the first half of their buffer to rank0 − 1. All processes then compute the reduction between the local buffer and the received buffer. In the next lg p0 − 1 steps, the buffers are recursively halved, and the distance is doubled. At the end, each of the p0 processes has 1 p0 of the total reduction result. All these recursive steps take lg p0 α+ ( p0− 1 p0 )(nβ +nγ) time. The next part of the algorithm is either an all gather or gather depending on whether the operation to be implemented is an allreduce or reduce. Allreduce: To implement allreduce, we do an all gather using recursive vector doubling and distance halving. In the first step, process pairs exchange 1 p0 of the buffer to achieve 2 p0 of the result vector, in the next step 2 p0 of the buffer is exchanged to get 4 p0 of the result, and so forth. After lg p0 steps, the p0 processes receive the total reduction result. This allgather part costs lg p0 α + ( p0− 1 p0 )nβ. If the number of processes is not a power of two, the total result vector must be sent to the r processes that were removed in the first step, which results in additional overhead of αuni + nβuni. The total allreduce operation therefore takes the fol lowing time:
+
+• If p is a power of two: Tall,h&d,p=2exp = 2 lg p α + 
+
+2nβ + nγ −
+
+1 p(2nβ + nγ) ' 2 lg p α + 2nβ + nγ • If p is not a power of two: Tall,h&d,p=2 6 exp = (2 lg p0+
+
+1 + 2fα)α + (2 + 1+3fβ 2 )nβ + 3 2nγ −
+
+1 p0 (2nβ + nγ)
+
+' (3 + 2b lg pc )α + 4nβ + 3 2nγ This algorithm is good for long vectors and power of-two numbers of processes. For non-power-of-two numbers of processes, the data transfer overhead is doubled, and the computation overhead is increased by 3 2. The binary blocks algorithm described in Sec tion 5.2 can reduce this overhead in many cases. Reduce: For reduce, a binomial tree gather is per formed by using recursive vector doubling and dis tance halving, which takes lg p0αuni+ p0− 1 p0 nβuni time. In the non-power-of-two case, if the root happens to be one of those odd-ranked processes that would nor mally be removed in the first step, then the role of this process and its partner in the first step are inter changed after the first reduction in the reduce-scatter phase, which causes no additional overhead. The total reduce operation therefore takes the following time:
+
+• If p is a power of two: Tred,h&d,p=2exp = lg p(1 + 
+
+fα)α + (1 + fβ)nβ + nγ −
+
+1 p((1 + fβ)nβ + nγ) '2 lg p α + 2nβ + nγ • If p is a not a power of two: Tred,h&d,p6 =2exp = lg p0(1+fα)α+(1+fα)α+(1+ 1+fbeta 2 +fβ)nβ+ 3 2nγ−1 p0 ((1 + fβ)nβ +nγ) ' (2 + 2b lg pc )α + 3nβ + 3 2nγ
+
+5.2 Binary Blocks Algorithm This algorithm reduces some of the load imbalance in the recursive halving and doubling algorithm when
+
+the number of processes is not a power of two. The algorithm starts with a binary-block decomposition of all processes in blocks with power-of-two numbers of processes (see the example in Figure 13). Each block executes its own reduce-scatter with the recur sive vector halving and distance doubling algorithm described above. Then, starting with the smallest block, the intermediate result (or the input vector in the case of a 2 0 block) is split into the segments of the intermediate result in the next higher block and sent to the processes in that block, and those pro cesses compute the reduction on the segment. This does cause a load imbalance in computation and com munication compared with the execution in the larger blocks. For example, in the third exchange step in the 2 3 block, each process sends one segment, re ceives one segment, and computes the reduction of one segment (P0 sends B, receives A, and computes the reduction on A). The load imbalance is introduced by the smaller blocks 2 2 and 2 0 : In the 2 2 block, each process receives and reduces two segments (for example, A–B on P8), whereas in the 2 0 block (P12), each process has to send as many messages as the ra tio of the two block sizes (here 2 2/2 0). At the end of the first part, the highest block must be recombined with the next smaller block, and the ratio of the block sizes again determines the overhead. We see that the maximum difference between the ratio of two successive blocks, especially in the low range of exponents, determines the load imbalance. Let us define δexpo,max as the maximal difference of two consecutive exponents in the binary represen tation of the number of processes. For example, 100 = 2 6 + 2 5 + 2 2, δexpo,max = max(6 − 5, 5 − 2) = 3. If δexpo,max is small, the binary blocks algorithm can perform well. Allreduce: For allreduce, the second part is an all gather implemented with recursive vector doubling and distance halving in each block. For this purpose, data must be provided to the processes in the smaller blocks with a pair of messages from processes of the next larger block, as shown in Figure 13. Reduce: For reduce, if the root is outside the largest block, then the intermediate result segment of rank 0 is sent to the root, and the root plays the role of rank 0. A binomial tree is used to gather the result segments to the root process. We note that if the number of processes is a power of two, the binary blocks algorithm is identical to the recursive halving and doubling algorithm.
+
+5.3 Ring Algorithm This algorithm uses a pairwise-exchange algorithm for the reduce-scatter phase (see Section 4.4). For allre duce, it uses a ring algorithm to do the allgather, and, for reduce, all processes directly send their result seg ment to the root. This algorithm is good in bandwidth use when the number of processes is not a power of two, but the latency scales with the number of pro cesses. Therefore this algorithm should be used only for small or medium number of processes or for large vectors. The time taken is Tall,ring = 2(p − 1)α +
+
+2nβ + nγ −
+
+1 p(2nβ + nγ) for allreduce and Tred,ring = (p− 1)(α+αuni)+n(β+βuni)+nγ−
+
+1 p(n(β+βuni)+nγ)
+
+for reduce.
+
+5.4 Choosing the Fastest Algorithm Based on the number of processes and the buffer size, the reduction routine must decide which algorithm to use. This decision is not easy and depends on a number of factors. We experimentally determined which algorithm works best for different buffer sizes and number of processes on the Cray T3E 900. The results for allreduce are shown in Figure 14. The fig ure indicates which is the fastest allreduce algorithm for each parameter pair (number of processes, buffer size) and for the operation MPI SUM with datatype MPI DOUBLE. For buffer sizes less than or equal to 32 bytes, recursive doubling is the best; for buffer sizes less than or equal to 1 KB, the vendor’s algo rithm (for power-of-two) and binomial tree (for non power-of-two) are the best, but not much better than recursive doubling; for longer buffer sizes, the ring algorithm is good for some buffer sizes and some number of processes less than 32. In general, on a Cray T3E 900, the binary blocks algorithm is faster if δexpo,max < lg(vector length in bytes)/2.0 − 2.5 and vector size ≥ 16 KB and more than 32 processes are used. In a few cases, for example, 33 processes and less than 32 KB, recursive halving and doubling is the best. Figure 15 shows the bandwidths obtained by the various algorithms for a 32 KB buffer on the T3E. For this buffer size, the new algorithms are clearly better than the vendor’s algorithm (Cray MPT.1.4.0.4) and the binomial tree algorithm for all numbers of pro cesses. We observe that the bandwidth of the binary blocks algorithm depends strongly on δexpo,max and that recursive halving and doubling is faster on 33, 65, 66, 97, 128–131 processes. The ring algorithm is faster on 3, 5, 7, 9–11, and 17 processes.
+
+Figure 12: Allreduce using the recursive halving and doubling algorithm. The intermediate results after each communication step, including the reduction operation in the reduce-scatter phase, are shown. The dotted frames show the additional overhead caused by a non-power-of-two number of processes.
+
+Figure 13: Allreduce using the binary blocks algorithm
+
+5.5 Comparison with Vendor’s MPI
+
+We also ran some experiments to compare the perfor mance of the best of the new algorithms with the algo rithm in the native MPI implementations on the IBM SP at San Diego Supercomputer Center, a Myrinet cluster at the University of Heidelberg, and the Cray T3E. Figures 16–18 show the improvement achieved compared with the allreduce/reduce algorithm in the native (vendor’s) MPI library. Each symbol in these figures indicates how many times faster the best algo rithm is compared with the native vendor’s algorithm. Figure 16 compares the algorithm based on two dif ferent application programming models on a cluster of SMP nodes. The left graph shows that with a pure MPI programming model (1 MPI process per CPU) on the IBM SP, the fastest algorithm performs about 1.5 times better than the vendor’s algorithm for buffer sizes of 8–64 KB and 2–5 times better for larger buffers. In the right graph, a hybrid program ming model comprising one MPI process per SMP node is used, where each MPI process is itself SMP parallelized (with OpenMP, for example) and only the master thread calls MPI functions (the master only style in [21]). The performance is about 1.5–3 times better than the vendor’s MPI for buffer sizes 4–128 KB and more than 4 processes. Figure 17 compares the best of the new algorithms with the old MPICH-1 algorithm on the Heidelberg Myrinet cluster. The new algorithms show a perfor mance benefit of 3–7 times with pure MPI and 2–5 times with the hybrid model. Figure 18 shows that on the T3E, the new algorithms are 3–5 times faster than the vendor’s algorithm for the operation MPI SUM and, because of the very slow implementation of struc tured derived datatypes in Cray’s MPI, up to 100 times faster for MPI MAXLOC. We ran the best-performing algorithms for the us age scenarios indicated by the profiling study in [20] and found that the new algorithms improve the per formance of allreduce by up to 20% and that of reduce by up to 54%, compared to the vendor’s implementa tion on the T3E, as shown in Figure 19.
+
+6 Conclusions and Future Work
+
+Our results demonstrate that optimized algorithms for collective communication can provide substantial performance benefits and, to achieve the best perfor mance, one needs to use a number of different algo rithms and select the right algorithm for a partic ular message size and number of processes. Deter mining the right cutoff points for switching between
+
+2
+
+4
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+512
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+buffersize [bytes]
+
+Fastest Protocol for Allreduce(sum,dbl)
+
+vendor binary tree pairwise + ring halving + doubling recursive doubling binary blocks halving+doubling break-even points : size=1k and 2k and min( (size/256) 9/16, ...)
+
+Figure 14: The fastest algorithm for allreduce (MPI DOUBLE, MPI SUM) on a Cray T3E 900
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+90
+
+100
+
+2 4 8 16 32 64 128 256
+
+number of MPI processes buffersize = 32 kb Allreduce(sum,dbl)
+
+vendor binary tree pairwise + ring halving + doubling binary blocks halving + doubling recursive doubling chosen best
+
+Figure 15: Bandwidth comparison for allreduce (MPI DOUBLE, MPI SUM) with 32 KB vectors on a Cray
+
+T3E 900.
+
+16
+
+32
+
+64
+
+128
+
+256
+
+512
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(sum,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 2 
+4 
+
+8
+
+16
+
+32
+
+64
+
+128
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(sum,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 
+
+Figure 16: Ratio of the bandwidth of the fastest of the new algorithms (not including recursive doubling) and the vendor’s allreduce on the IBM SP at SDSC with 1 MPI process per CPU (left) and per SMP node (right)
+
+4
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+512
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(sum,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 2 
+4 
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(sum,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 
+
+Figure 17: Ratio of the bandwidth of the fastest of the new algorithms (not including recursive doubling) and the old MPICH-1 algorithm on a Myrinet cluster with dual-CPU PCs (HELICS cluster, University of
+
+Heidelberg) and 1 MPI process per CPU (left) and per SMP node (right)
+
+2
+
+4
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(sum,dbl) - ratio := best bandwidth of 5 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 2 
+4 
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Reduce(sum,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 
+2 
+
+4
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Allreduce(maxloc,dbl) - ratio := best bandwidth of 5 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 2 
+4 
+
+8
+
+16
+
+32
+
+64
+
+128
+
+256
+
+8 32 256 1k 8k 32k 256k 1M 8M
+
+P
+
+buffersize [bytes]
+
+Reduce(maxloc,dbl) - ratio := best bandwidth of 4 new algo.s / vendor’s bandwidth
+
+100.<= ratio 
+50. <= ratio <100. 
+20. <= ratio < 50. 
+10. <= ratio < 20. 
+7.0 <= ratio < 10. 
+5.0 <= ratio < 7.0 
+3.0 <= ratio < 5.0 
+2.0 <= ratio < 3.0 
+1.5 <= ratio < 2.0 
+1.1 <= ratio < 1.5 
+0.9 <= ratio < 1.1 
+0.7 <= ratio < 0.9 
+0.0 <= ratio < 0.7 
+
+Figure 18: Ratio of the bandwidth of the fastest of the new algorithms and the vendor’s algorithm for allreduce (left) and reduce (right) with operation MPI SUM (first row) and MPI MAXLOC (second row) on a Cray T3E 900
+
+Figure 19: Benefit of new allreduce and reduce algorithms optimized for long vectors on the Cray T3E
+
+the different algorithms is tricky, however, and they may be different for different machines and networks. At present, we use experimentally determined cutoff points. In the future, we intend to determine the cut off points automatically based on system parameters. MPI also defines irregular (“v”) versions of many of the collectives, where the operation counts may be different on different processes. For these operations, we currently use the same techniques as for the regular versions described in this paper. Further optimization of the irregular collectives is possible, and we plan to optimize them in the future. In this work, we assume a flat communication model in which any pair of processes can communicate at the same cost. Although these algorithms will work even on hierarchical networks, they may not be opti mized for such networks. We plan to extend this work to hierarchical networks and develop algorithms that are optimized for architectures comprising clusters of SMPs and clusters distributed over a wide area, such as the TeraGrid [26]. We also plan to explore the use of one-sided communication to improve the per formance of collective operations. The source code for the algorithms in Section 4 is available in MPICH-1.2.6 and MPICH2 1.0. Both MPICH-1 and MPICH2 can be downloaded from www.mcs.anl.gov/mpi/mpich.
+
+Acknowledgments
+
+This work was supported by the Mathematical, Infor mation, and Computational Sciences Division subpro gram of the Office of Advanced Scientific Computing Research, Office of Science, U.S. Department of En ergy, under Contract W-31-109-ENG-38. The authors would like to acknowledge their colleagues and oth ers who provided suggestions and helpful comments. They would especially like to thank Jesper Larsson Tr¨aff for helpful discussion on optimized reduction al gorithms and Gerhard Wellein, Thomas Ludwig, and Ana Kovatcheva for their benchmarking support. We also thank the reviewers for their detailed comments.
+
+References
+
+[1] Albert Alexandrov, Mihai F. Ionescu, Klaus E. 
+Schauser, and Chris Scheiman. LogGP: Incorporating 
+long messages into the LogP model for parallel com 
+putation. Journal of Parallel and Distributed Com 
+puting, 44(1):71–79, 1997. 
+[2] M. Barnett, S. Gupta, D. Payne, L. Shuler, R. van de 
+Geijn, and J. Watts. Interprocessor collective com 
+
+munication library (InterCom). In Proceedings of Su percomputing ’94, November 1994. [3] M. Barnett, R. Littlefield, D. Payne, and R. van de Geijn. Global combine on mesh architectures with wormhole routing. In Proceedings of the 7th Interna tional Parallel Processing Symposium, April 1993. [4] Gregory D. Benson, Cho-Wai Chu, Qing Huang, and Sadik G. Caglar. A comparison of MPICH all gather algorithms on switched networks. In Jack Don garra, Domenico Laforenza, and Salvatore Orlando, editors, Recent Advances in Parallel Virtual Ma chine and Message Passing Interface, 10th European PVM/MPI Users’ Group Meeting, pages 335–343. Lecture Notes in Computer Science 2840, Springer, September 2003. [5] S. Bokhari. Complete exchange on the iPSC/860. Technical Report 91–4, ICASE, NASA Langley Re search Center, 1991. [6] S. Bokhari and H. Berryman. Complete exchange on a circuit switched mesh. In Proceedings of the Scal able High Performance Computing Conference, pages 300–306, 1992. [7] Jehoshua Bruck, Ching-Tien Ho, Schlomo Kipnis, Eli Upfal, and Derrick Weathersby. Efficient algorithms for all-to-all communications in multiport message passing systems. IEEE Transactions on Parallel and Distributed Systems, 8(11):1143–1156, November 1997. [8] Ernie W. Chan, Marcel F. Heimlich, Avi Pu rakayastha, and Robert A. van de Geijn. On opti mizing collective communication. In Proceedings of the 2004 IEEE International Conference on Cluster Computing, September 2004. [9] David E. Culler, Richard M. Karp, David A. Patter son, Abhijit Sahay, Klaus E. Schauser, Eunice San tos, Ramesh Subramonian, and Thorsten von Eicken. LogP: Towards a realistic model of parallel computa tion. In Principles Practice of Parallel Programming, pages 1–12, 1993. [10] Debra Hensgen, Raphael Finkel, and Udi Manbet. Two algorithms for barrier synchronization. Interna tional Journal of Parallel Programming, 17(1):1–17, 1988. [11] Roger W. Hockney. The communication challenge for mpp: Intel paragon and meiko cs-2. Parallel Comput ing, 20(3):389–398, March 1994. [12] Giulio Iannello. Efficient algorithms for the reduce scatter operation in LogGP. IEEE Transactions on Parallel and Distributed Systems, 8(9):970–982, September 1997. [13] L. V. Kale, Sameer Kumar, and Krishnan Vardara jan. A framework for collective personalized com munication. In Proceedings of the 17th Interna tional Parallel and Distributed Processing Symposium (IPDPS ’03), 2003.
+
+[14] N. Karonis, B. de Supinski, I. Foster, W. Gropp, E. Lusk, and J. Bresnahan. Exploiting hierarchy in parallel computer networks to optimize collective operation performance. In Proceedings of the Four teenth International Parallel and Distributed Process ing Symposium (IPDPS ’00), pages 377–384, 2000. [15] T. Kielmann, R. F. H. Hofman, H. E. Bal, A. Plaat, and R. A. F. Bhoedjang. MagPIe: MPI’s collec tive communication operations for clustered wide area systems. In ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming (PPoPP’99), pages 131–140. ACM, May 1999. [16] P. Mitra, D. Payne, L. Shuler, R. van de Geijn, and J. Watts. Fast collective communication libraries, please. In Proceedings of the Intel Supercomputing Users’ Group Meeting, June 1995. [17] MPICH – A portable implementation of MPI. http://www.mcs.anl.gov/mpi/mpich. [18] Rolf Rabenseifner. Effective bandwidth (b eff) bench mark. http://www.hlrs.de/mpi/b eff. [19] Rolf Rabenseifner. New optimized MPI reduce algo rithm. http://www.hlrs.de/organization/par/ services/models/mpi/myreduce.html. [20] Rolf Rabenseifner. Automatic MPI counter profiling of all users: First results on a CRAY T3E 900-512. In Proceedings of the Message Passing Interface De veloper’s and User’s Conference 1999 (MPIDC ’99), pages 77–85, March 1999. [21] Rolf Rabenseifner and Gerhard Wellein. Communi cation and optimization aspects of parallel program ming models on hybrid architectures. International Journal of High Performance Computing Applica tions, 17(1):49–62, 2003. [22] Peter Sanders and Jesper Larsson Tr¨aff. The hierar chical factor algorithm for all-to-all communication. In B. Monien and R. Feldman, editors, Euro-Par 2002 Parallel Processing, pages 799–803. Lecture Notes in Computer Science 2400, Springer, August 2002. [23] D. Scott. Efficient all-to-all communication patterns in hypercube and mesh topologies. In Proceedings of the 6th Distributed Memory Computing Conference, pages 398–403, 1991. [24] Mohak Shroff and Robert A. van de Geijn. CollMark: MPI collective communication benchmark. Techni cal report, Dept. of Computer Sciences, University of Texas at Austin, December 1999. [25] Steve Sistare, Rolf vandeVaart, and Eugene Loh. Op timization of MPI collectives on clusters of large-scale SMPs. In Proceedings of SC99: High Performance Networking and Computing, November 1999. [26] Teragrid. http://www.teragrid.org. [27] V. Tipparaju, J. Nieplocha, and D. K. Panda. Fast collective operations using shared and remote mem ory access protocols on clusters. In Proceedings of the
+
+17th International Parallel and Distributed Process ing Symposium (IPDPS ’03), 2003. [28] Jesper Larsson Tr¨aff. Improved MPI all-to-all com munication on a Giganet SMP cluster. In Dieter Kranzlmuller, Peter Kacsuk, Jack Dongarra, and Jens Volkert, editors, Recent Advances in Parallel Virtual Machine and Message Passing Interface, 9th European PVM/MPI Users’ Group Meeting, pages 392–400. Lecture Notes in Computer Science 2474, Springer, September 2002. [29] Jesper Larsson Tr¨aff. Personal communication, 2004. [30] Sathish S. Vadhiyar, Graham E. Fagg, and Jack Don garra. Automatically tuned collective communica tions. In Proceedings of SC99: High Performance Networking and Computing, November 1999. [31] Thomas Worsch, Ralf Reussner, and Werner Au gustin. On benchmarking collective MPI operations. In Dieter Kranzlm¨uller, Peter Kacsuk, Jack Don garra, and Jens Volkert, editors, Recent Advances in Parallel Virtual Machine and Message Passing Inter face, 9th European PVM/MPI Users’ Group Meeting, pages 271–279. Lecture Notes in Computer Science 2474, Springer, September 2002.
+

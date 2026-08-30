@@ -1,0 +1,523 @@
+#### LLNL-JRNL-759751
+
+## Failure Recovery for Bulk Synchronous Applications with MPI Stages
+
+### N. Sultana, A. Skjellum, I. Laguna, K. Mohror, M. Rufenacht
+
+### October 12, 2018
+
+##### Parallel Computing
+
+Disclaimer 
+This document was prepared as an account of work sponsored by an agency of the United States 
+government. Neither the United States government nor Lawrence Livermore National Security, LLC, 
+nor any of their employees makes any warranty, expressed or implied, or assumes any legal liability or 
+responsibility for the accuracy, completeness, or usefulness of any information, apparatus, product, or 
+process disclosed, or represents that its use would not infringe privately owned rights. Reference herein 
+to any specific commercial product, process, or service by trade name, trademark, manufacturer, or 
+otherwise does not necessarily constitute or imply its endorsement, recommendation, or favoring by the 
+United States government or Lawrence Livermore National Security, LLC. The views and opinions of 
+authors expressed herein do not necessarily state or reflect those of the United States government or 
+Lawrence Livermore National Security, LLC, and shall not be used for advertising or product 
+endorsement purposes. 
+
+Failure Recovery for Bulk Synchronous Applications with MPI Stages
+
+Nawrin Sultana a,∗, Martin Rufenacht ¨ b, Anthony Skjellum b, Ignacio Laguna c, Kathryn Mohror c aAuburn University, Auburn, AL bUniversity of Tennessee at Chattanooga, Chattanooga, TN cLawrence Livermore National Laboratory, Livermore, CA
+
+Abstract 
+When an MPI program experiences a failure, the most common recovery approach is to restart all processes from a previous 
+checkpoint and to re-queue the entire job. A disadvantage of this method is that, although the failure occurred within the main 
+application loop, live processes must start again from the beginning of the program, along with new replacement processes—this 
+incurs unnecessary overhead for live processes. To avoid such overheads and concomitant delays, we introduce the concept of “MPI 
+Stages.” MPI Stages saves internal MPI state in a separate checkpoint in conjunction with application state. Upon failure, both 
+MPI and application state are recovered, respectively, from their last synchronous checkpoints and continue without restarting the 
+overall MPI job. Live processes roll back only a few iterations within the main loop instead of rolling back to the beginning of the 
+program, while a replacement of failed process restarts and reintegrates, thereby achieving faster failure recovery. This approach 
+integrates well with large-scale, bulk synchronous applications and checkpoint/restart. 
+In this article, we identify requirements for production MPI implementations to support state checkpointing with MPI Stages, 
+which includes capturing and managing internal MPI state and serializing and deserializing user handles to MPI objects. We evalu 
+ate our fault tolerance approach with a proof-of-concept prototype MPI implementation that includes MPI Stages. We demonstrate 
+its functionality and performance using LULESH, CoMD, and microbenchmarks. Our results show that MPI Stages reduces the 
+recovery time for both LULESH and CoMD in comparison to checkpoint/restart and Reinit (a global-restart model). 
+Keywords: Checkpoint/restart, Fault Tolerance, Global-Restart, MPI, Temporal Context 
+
+1. Introduction With each successive generation of large-scale parallel systems, faults and associated failures are becoming more frequent. Based on current knowledge of existing high performance computing (HPC) systems, it is anticipated that failure rates may increase substantially in future exascale sys tems [1]. Long-running scientific applications in such systems will require efficient fault-tolerance support [2]. The Message Passing Interface (MPI) is widely used for data communication in scalable scientific applications. The MPI Standard provides mechanisms for users to handle recoverable errors. However, the standard itself does not provide any mechanism to continue running MPI after a failure. Thus, there is a growing effort in the MPI community to incorporate fault-tolerance constructs into MPI. Several approaches have been proposed for MPI to tolerate failures (e.g., [3, 4, 5, 6, 7, 8, 9, 10]). However, none of these has yet been integrated into the MPI Standard, a cru cial precondition for widespread support and continued pro gram portability.
+
+∗Corresponding author: 345 W. Magnolia Ave, Auburn University, Auburn, AL-36849 Email addresses: nzs0034@auburn.edu (Nawrin Sultana), martin-ruefenacht@utc.edu (Martin Rufenacht), ¨ tony-skjellum@utc.edu (Anthony Skjellum), ilaguna@llnl.gov (Ignacio Laguna), mohror1@llnl.gov (Kathryn Mohror)
+
+According to the current standard, MPI-3.1, MPI programs automatically abort if a process fails [11]. For large-scale bulk synchronous applications, since a failure in a process quickly propagates to other processes [12], these applications typi cally handle failures by periodic, global synchronous check point/restart (CPR). When a failure occurs, the runtime envi ronment kills the entire job and restarts the application from the latest (or penultimate) global checkpoint. While the CPR approach fits the MPI standard, the full job restart time in standard CPR is significant and ejection from the job queue is not an attractive alternative in production settings either. Also, in forthcoming exascale systems, killing the en tire job for a single failure may be infeasible. Recently, the global-restart model was introduced [4, 13] to address these issues. In this model, the state of MPI is globally reinitial ized and cleaned up automatically upon a failure, allowing both live processes (i.e., processes that survived the failure) and new processes (i.e., processes that replace a failed process) to be restarted from the beginning of the program without terminat ing the job. This method enables a number of optimizations that can significantly reduce failure recovery time, including avoiding job/resource allocation time, enabling the reuse of ex isting process connections, and enabling the application to load checkpoints from memory for live processes. While the global-restart method is useful in reducing recov ery time, all processes—whether they are live or new processes
+
+Preprint submitted to Parallel Computing May 25, 2021
+
+(replacing failed ones)—must jump back to the beginning of the program, That is, they must re-enter main(). Ideally, if a failure occurs in the main computation loop where the program spends most of its time, we would want only new processes to start from the program beginning and live processes to remain in the main computation loop, close to where the failure oc curred. This would eliminate the need for the live processes to perform unnecessary initialization steps after entering main() and before entering the main loop. This form of recovery, how ever, is not possible with today’s global-restart approaches and requires advanced MPI functionality to allow new processes to reintegrate with live processes waiting for them later in the computation (i.e., the main loop). In this article, we extend our prior work MPI_Stages [14], a new global-restart model to support fault tolerance in bulk syn chronous MPI applications that addresses the aforementioned issues of the global-restart model. Each stage is a period be tween synchronous checkpoints and provides a temporal con tainment of faults; stages are numbered by a user-visible epoch 1 maintained by MPI and the underlying runtime system. In this model, a checkpoint of the MPI state is saved along with the application state: this MPI state can contain state that is visi ble to the user (e.g., MPI communicators), and MPI state that is only visible to the MPI library (such as network connectivity and queues). MPI Stages allows the runtime system to replace a failed pro cess transparently by restoring its MPI state and application state prior to the failure. Live processes keep the MPI state they had before the failure, which allow them to stay in the main computation loop while the replacement process reinte grates with them. Our approach targets bulk synchronous par allel computing applications, a model that is used in the vast majority of large-scale HPC applications. A fundamental chal lenge with this model is that we must be able to quantify and capture MPI state during normal operation in a meaningful and complete way. In this paper, we extended our previous work by comparing MPI Stages to Reinit [4], a state-of-the-art global restart model, improving MPI_Stages interface, adding functionality to sup port the use of external software libraries with MPI_Stages, evaluating the performance of our model on CoMD, and adding a consensus approach that improves the performance of the syn chronous epoch value computation. We introduce three new API calls for MPI to support state checkpoint: MPIX_Checkpoint_read() to read the saved MPI state for a process, MPIX_Checkpoint_write() to save the current MPI state of a process, MPIX_Get_fault_epoch() to retrieve which checkpoint (last synchronous) to load. We also introduce functionality in MPI to revivify MPI handles after failure. We add an error code MPIX_TRY_RELOAD to let an ap plication know when it should stop normal operation and move to retrieve the checkpoint (and continue execution thereafter).
+
+1This is the “stage” notion of our design. This epoch is not to be confused with MPI RMA epochs. “Epoch” could literally have been named “stage” had we so chosen. In this work, the epoch represents a “temporal context” as com pared to the MPI-internal concept of “spatial contexts” used in MPI communi cators to scope messages.
+
+In summary, our contributions are as follows: 1. We introduce the concept of MPI Stages, a global-restart model to reduce the recovery time of stage-based bulk syn chronous MPI applications. 2. We identify requirements for production MPI implemen tations to support state checkpointing with MPI Stages, which includes capturing and managing internal MPI state, and serializing and deserializing user handles to MPI ob jects. 3. We implement MPI Stages in a proof-of-concept prototype MPI library implementation and demonstrate its function ality and performance on LULESH [15, 16], CoMD [17], and other microbenchmarks. Our results show that MPI Stages reduces the recovery time for both LULESH and CoMD in comparison to Reinit and checkpoint/restart.
+
+2. Background and Related Work The goal of fault tolerance is to return an application to a consistent, error-free state after a failure. Several models have been designed to make MPI applications fault tolerant. These models differ in their design, types of failures they address, im plementation approaches, and underlying protocols. Next, we review related work on providing fault-tolerance abstractions to MPI programs. 2.1. Rollback Recovery Rollback recovery attempts to restart the application from a previously saved state after a failure. The most common in stance of rollback recovery is synchronous checkpoint/restart (CPR). In traditional CPR, the application periodically saves its state, and when a process fails, the job is killed and resub mitted by the user; the application then loads the last check point and continues execution. For large-scale HPC systems, CPR is the fault-tolerance method of choice. Different CPR methods have been studied for HPC systems. Berkeley Lab Checkpoint/Restart (BLCR) [18] is a system-level CPR library where a snapshot of the full-system is saved in a checkpoint. Several MPI implementations, including Open MPI, MPICH, LAM/MPI [19], added BLCR support. System-level check pointing in large scale systems can be impractical because of the checkpointing size. One popular alternative is application level checkpointing where applications explicitly write check points and store only the information necessary for restart. Ap plications can achieve significant performance gains by reduc ing checkpoint overhead with the use of multilevel checkpoint ing (such as with SCR [20], FTI [21]). Another model pro vides automatic recovery via pessimistic message logging [22], which could significantly reduce the overhead of message log ging when no failure occurs. Unfortunately, current automatic CPR techniques might not be realistic in future exascale sys tems. It is anticipated that the Mean Time Between Failure (MTBF) will be smaller than the time required for checkpoint ing and restarting [1]. A quantitative assessment on differ ent fault tolerance protocols shows that automatic checkpoint and message logging will exhibit poor efficiency in extreme scale [23].
+
+2.2. Application-level Recovery An effort to engage application user in failure recovery is FT MPI [6]. It provides different methods of dealing with failure to the application user. Typically, it checks the error code and lets the user rebuild any communicators. Rebuilding a com municator may change the rank of the processes. FT-MPI is not transparent to the application and increases its code complexity. Another proposal, Run-Through Stabilization [7], allows one to continue the application execution even with fail-stop process failure. In order to continue execution, it introduces the abil ity to validate communicators when failure occurs and allows the application to use these communicators. Unfortunately, this introduces implementation complexity and was not adopted in the MPI standard. 2.3. Error-code Dependent Recovery The error-code dependent recovery model returns control to the application and lets the application react to a failure. User Level Failure Mitigation (ULFM) [3], proposed by the Fault Tolerant Working Group of the MPI Forum, is based on this approach. ULFM supports fault tolerance in MPI through a set of interfaces exposed to the user. This approach introduces in-band error codes to notify the application of failures. The application checks the error code returned by MPI routines to receive notification of failures. MPI routines return the error code MPI_ERR_PROC_FAILED to indicate process failure (else where). In case of failure, ULFM creates a new communica tor that excludes the failed processes by calling MPI_COMM_-SHRINK or its non-blocking variant. The failure notification is propagated using MPI_COMM_REVOKE, and MPI_COMM_AGREE is used to perform a global agreement on consistent state. Several models have been proposed using ULFM. Local Failure Local Recovery (LFLR) [9] is one such model that uses spare pro cesses after failure to keep the number of processes constant. Thus, it eliminates the complexities of load balancing across fewer application processes. 2.4. Transactional Resilience Scheme Fault-Aware (FA-MPI) [10] is a transaction-based resilience scheme for MPI. A fundamental building block of this model is a TryBlock, which allows a series of operations to be tried. It commits when all operations succeed and enables an ap plication to roll backward or forward when some operations fail. FA-MPI allows the applications to implement a wide range of fault-tolerant methods. The application can use check point/restart, forward, or backward recovery. A method for communicator recovery with the same number of original pro cesses as prior to the failure is also provided in complement to the TryBlock transactional framework. Finally, FA-MPI is not restricted only to addressing process failure. 2.5. Global-Restart This model supports global, backward, and non-shrinking re covery, the most suitable approach to tolerate failures in bulk synchronous applications. Reinit [4] and Fenix [5] are two im plementations of this model. The goal of the approach is to restore application state automatically after a failure to a previ ously stored state and resume computation without killing the entire MPI job, a key goal for production MPI programs seek ing resilience. In this model, fault detection and propagation is done automatically within the MPI implementation. Thus, the application need not check for faults. In Reinit, upon detecting a fail-stop failure, new processes are used to replace those that have failed, which is typically much more useful than shrink ing a communicator after failure. Then, MPI reinitializes itself; the resulting state is the same as the state after MPI_Init() re turns. It then returns control to an application-specific restart point. The restarted application resumes with the same number of processes as it had prior to the fault. Our Approach. The closest competitor to our approach, MPI Stages, is the global-restart approach. While the global restart approach reduces the recovery time of bulk synchronous applications by eliminating the need of terminating the job upon a failure, processes are restarted from the beginning of the pro gram even though they did not experience a failure. This is re quired to allow the replaced process to build its own MPI state (e.g., communicators and groups), along with the live processes before they reach the point in the computation where the fail ure occurs. The key difference of our approach and the global restart method is that our approach eliminates the need of the live process to participate in rebuilding MPI state—MPI Stages saves a checkpoint of the MPI state, which is then used to fully restore the state of the failed process. The next section describes in detail the MPI Stages approach.
+
+3. MPI Stages In this section, we present our new global-rollback approach, MPI Stages, for transparent resilience support to MPI. We de scribe the motivation and design of our approach. We also dis cuss the prototype implementation of this method at its state of maturity. 3.1. Motivation Bulk synchronous applications typically follow a common programming pattern that comprises two main components: program initialization and a computation loop. At the begin ning of the program, the program initializes program data, then calls MPI_Init() and creates MPI state. Then the program enters the main computation loop and every n iteration in this loop, the program takes a checkpoint of the program state. Motivating Example. Let us consider the case where a pro cess fails during iteration 3. Figure 1 shows the failure recov ery time using different fault tolerance approaches. For tradi tional CPR (approach 1), a process failure triggers an entire job restart. The recovery starts by the user resubmitting the job. The system allocates all the resources again for the MPI job. The program initializes all data and MPI_Init creates all MPI state. Then, the program loads the application checkpoint and starts execution from iteration 3. Thus, recovery time includes a new job submission, delay while the program is selected to run in the queue again, program and MPI state initialization, and loading the program checkpoint.
+
+Figure 1: Overview of recovery time (grey arrows) of a process failure for different fault-tolerance approaches.
+
+Approach 2 in Figure 1, global-restart, reduces recovery time since all processes start from the beginning of the program without a job restart. Global-restart then initializes all program data and reinitializes MPI. Then, the execution starts from it eration 3 by loading the program checkpoint. As shown in Figure 1, the recovery time includes program and MPI state reinitialization and loading the program checkpoint, the sum of which is faster than the traditional CPR. Because the job is not restarted, this method avoids job/resource re-allocation time, enabling the reuse of existing process connections, and enabling the application to load checkpoints from memory (if they exist) for live processes. Our Approach: MPI Stages. In our approach, the goal is to allow all processes to start execution from the main computa tion loop instead of from the main program. We introduce the concept of an MPI state checkpoint to replace a failed process transparently [24, 25]. At the end of n iterations (as defined by the application), we store a checkpoint of MPI state along with the program state. Figure 1 shows that, all processes start from iteration 3 by loading both the program and MPI state, which removes the requirement of program data and MPI state initial ization for the live processes along with the need for job restart. In global-restart, all processes perform the reinitialization in parallel. The initialization phase is application dependent so the recovery time will vary based on it. In MPI Stages, recovery time is independent of the application initialization time since live processes avoid it. At high-level, the benefits from our method are: 1. Reduced Recovery Time: We replace the failed process with a new instance that repairs both the program and MPI state faster than previous approaches as no initialization of state is required. This leads to faster recovery as the new process can quickly continue from where the failed one stopped. 2. Ease of Adoption: As shown in Figure 1, traditional CPR takes a program checkpoint after a certain number of itera tions. Our approach matches the semantics of CPR. It adds an extra checkpoint for MPI state along with that program checkpoint; hence, it is easy to adopt. 3. Complete recovery: The program does not shrink the communicator(s) involved as in other approaches [3], thus allowing the application to continue without complex re configurations (e.g., continuing execution with n − 1 pro cesses).
+
+3.2. Interface Our model introduces only a small number of functions to MPI. Tables 1 and 2 present the new types and functions intro duced in our model, as presently conceived. These are minimal additions at present, and no “giant API” addition is expected even in further elaboration of this approach.
+
+3.3. Fault Model and Terminology Our model considers MPI process failures and node failures (i.e., groups of process failures that occur in the same compute node). An MPI process can be either a first-time start process, a live process, or a relaunched process. When an MPI program first begins, all processes are first-time start processes. Upon a failure, a process is a live process if it survived the failure. A process that replaces a failed process is called a relaunched process. Considerations. Our model primarily targets bulk syn chronous programs (BSP) that use checkpoint/restart as their recovery strategy. Here, we do not discuss the user’s data man agement for application checkpoint; we assume that the appli cation has already managed it as part of CPR and we apply our method on top of it. Our method requires the checkpoints taken at a globally consistent state (no pending requests). In BSP, we reach in a globally consistent state after each iteration (or n iterations) of the simulation. MPI Stages separates the application into two functions— main and main_loop. The main function consists of a “re silient loop” that initializes MPI and calls the main_loop, which executes all of the application code. The main_loop successfully returns when the application is complete, which also means the end of the resilient loop. Finally, the main func tion executes MPI_Finalize and returns. Our model assumes that the failures are due to transient er rors, not permanent hardware failures. However, the resource manager could be used to replace the failed nodes with spares.
+
+Types Description 
+MPIX_TRY_RELOAD Error code returned to an application from the MPI library indicating the need 
+to initiate a checkpoint load. 
+MPIX_Handles Structure that represents the MPI handles used in user program. 
+MPIX_Serialize_handler Function handler type that populates the MPIX_Handles object for serialization. 
+MPIX_Deserialize_handler Function handler type that revivify user MPI handles during recovery from a deserialized 
+MPIX_Handles object. 
+Table 1: Types added by the MPI Stages Interface 
+Functions Description 
+MPIX_Checkpoint_read Load MPI state from a checkpoint and wait in an implicit barrier for all 
+processes to complete the step. 
+MPIX_Checkpoint_write Store MPI state into a checkpoint. 
+MPIX_Get_fault_epoch Returns the last successful checkpoint number. 
+MPIX_Serialize_handles Serializes user MPI handles into MPI checkpoint. 
+MPIX_Deserialize_handles Deserializes user MPI handles from MPI checkpoint. 
+MPIX_Serialize_handler_register Pushes serialize handler in stack. An MPIX_Serialize_handler is passed 
+as argument. 
+MPIX_Deserialize_handler_register Pushes Deserialize handler in stack. An MPIX_Deserialize_handler is 
+passed as argument. 
+
+Table 2: Functions added by the MPI Stages Interface
+
+3.4. Failure Detection and Recovery Failure Detection. In our model, both the runtime system and application take part in failure detection and recovery. We have a failure detector in our MPI runtime system that detects process failures; the runtime system could also detect network failures in future. When a failure is detected, the detector prop agates the failure information proactively among the remaining surviving processes (as opposed to a gossip-based diffusion of such information). Every MPI process registers an error handler after MPI_Init2. Failure Propagation and Recovery. After a process fail ure, the runtime system gets notified by the fault detector. The runtime system replaces the failed process with a new process and relaunches it (hence, a relaunched process). To distinguish between a first-time start process and a relaunched process, we use a new configuration variable that we denote as an “epoch”. All first-time start processes have epoch value of zero. We in crement the value of epoch every time we take a checkpoint. The epoch has meaning both for the application checkpoint and the MPI checkpoint. When MPI_Init is called for all first-time start processes with epoch zero, it initializes all MPI state (e.g., communicators, groups). When we relaunch a process after failure, the epoch gets the value of the last synchronous checkpoint. So, the relaunched process invokes MPI_Init with an epoch greater than zero. In this case, instead of initializing, MPI_Init restores the MPI state from the appropriate MPI checkpoint. Thus, we add over
+
+2In the future, a version of MPI_Init is needed that registers an error han dler without a race condition. This is a gap in the current standard, which is now well understood but not resolved.
+
+loaded meaning to the MPI_Init function based on the value of epoch 3. The runtime system triggers the error handler for the live pro cesses after it detects a failure. The error handler cleans up any pending communication and returns an error code MPIX_TRY_-RELOAD from every MPI function from then on. If there is no pending communication, then the next MPI call will return that error code. The error code tells the application to restore the last synchronous checkpoint for application state. This allows the application to use a structured approach to in-application exception handling without special language support. Note that relaunched processes eventually become live processes after all recovery actions have been taken. Loading Checkpoints. After receiving the error code, the application calls MPIX_Checkpoint_read(). All live pro cesses enter into a quiescent state (implicit barrier) and wait for the relaunched process to synchronize. Once the relaunched process completes loading the MPI checkpoint and joins the barrier, they all load the application checkpoint and continue execution. Any messages in transit across processes are lost and will need to be re-sent. The application will have consis tency on exactly what has and has not been sent prior to the recovery. Before loading the application checkpoint, the appli cation calls MPIX_Get_fault_epoch() which returns the last synchronous checkpoint number to load the application data. Addressing In-Flight Data. A further contribution of our approach is addressing potential in-flight data after a recov ery. The epoch value is also used as part of the implementa tion of transports that support our approach to resilient MPI.
+
+3If this were to be standardized, we might opt for a generalized initialization function that also provides for a non-default error handler as well.
+
+Each epoch represents a unique communication phase for the application. Messages from older epochs will be dropped if re ceived later (after recovery). By propagating the epoch 4 in to the message protocol, we eliminate the potential for inconsis tency from in-flight data. This resolves a significant issue com pared to what ULFM and other systems have had to consider. This epoch approach to versioning the transfers could also be adapted with other fault-tolerant approaches that involve a syn chronization and consensus step at recovery. Here, we only address two-sided MPI operations per epoch. Our current prototype does not handle one-sided (RMA) oper ations, because of the difficulty of invalidating the RMA win dows and handling of in-flight messages. We are exploring fault tolerant models which allow for RMA (e.g.,[26]). Handling Asymmetrical Error Code. During an execution, some processes may detect a failure while some other may con sider the execution was successful. Let’s imagine a ring com munication among 3 processes starting with process 0. Pro cess 0 sends to process 1 and waiting to receive from process 2, which is waiting to receive from process 1, which is waiting to receive from process 0. After process 1 receives from process 0 and sends to process 2, its involvement in the communication has completed. Process 1 can leave the resilient loop and call MPI_Finalize. In the meantime, process 2 has failed, process 2 is relaunched, process 0 is notified; both of them enter into recovery and wait for process 1 to complete the implicit barrier. However, process 1 has already completed the execution. As a result, the processes will be in a deadlock. To resolve the issue, MPI Stages adds an MPI_Barrier be fore returning from main_loop, which ensures that no pro cesses will leave the resilient loop until all of the application code is executed. For the above scenario, process 1 waits in the barrier (inside the resilient loop) instead of calling MPI_-Finalize. When process 2 fails, all of the processes can par ticipate in the recovery. A similar scenario may occur in the barrier or some processes may fail during MPI_Finalize. Our model cannot recover once some processes are outside of the resilient loop. However, in this case, the application has already completed its compu tation. MPI Stages will abort the execution with proper error messages for the user. Alternatively, we can apply other re covery methods such as checkpoint/restart, although the main computation has completed without any failure. Serialization and Deserialization of User MPI handles. MPI Stages periodically serializes the state of MPI in a check point by calling MPIX_Checkpoint_write. This function se rializes the state of communicator (e.g., process groups, context id) and state of transport (e.g., network connectivity). The re launched process restores the state of MPI by deserializing the checkpoint. However, an application may use multiple commu nicators or groups other than MPI_COMM_WORLD. In this case, to restore the user MPI handles after a failure, we need to serialize
+
+4In practice, this currently adds 32 bits to messages (besides the context, source rank, and tag) aiding the matching of messages. If such space is limited, we can make assumptions about the likelihood of wrapping in this field due to many old messages from earlier epochs.
+
+the MPI objects referred by these handles along with the MPI state. In the current form of the model, we use programs that are primarily restricted to using MPI_COMM_WORLD. However, our model supports “re-vivifying” user handles such as other com municators and groups. Because we require that there are no pending requests during the checkpoint—a valid assumption for most bulk synchronous programs that use CPR—we do not need to revivify MPI requests. An MPI application may use supplemental software libraries. Complex library composition requires special design consider ation for any fault tolerant model. To maintain consistency af ter failures, we need to revivify any MPI handles these libraries use. To accomplish this, we introduce callback functions, se rialize/deserialize handlers that application and libraries can register. They can register their handlers using MPIX_-Serialize_handler_register and MPIX_Deserialize_handler_register functions. When an MPI application calls MPIX_Serialize_handles, it invokes the serialize handlers in the order they were regis tered. An MPIX_Handles object is passed as an argument to each handler. The handler populates the MPIX_Handles object with user MPI handles. After executing the handler, MPIX_-Serialize_handles serializes all the MPI resources referred by MPIX_Handles into MPI checkpoint file. A similar funtion, MPIX_Deserialize_handles is used to revivify the user MPI handles after failure. It creates the object MPIX_Handles by deserializing the MPI checkpoint file and calls the deserialize handlers. As described in the MPI Standard, handles can be imple mented using different types (e.g., integers or pointers). Our implementation uses integer types for handles. We guarantee application-level semantics for the handles after an MPI check point is reloaded. More formally, if a handle x refers to the MPI resource y (stores in a checkpoint) before a failure, we guarantee that x refers to the same resource y (restores from the checkpoint) after a failure. 3.5. Sample Fault-Tolerant MPI Program Listing 1 shows a sample bulk synchronous MPI program that uses traditional CPR-based recovery method. The program starts with MPI initialization, then initializes or restores appli cation state, and finally starts MPI communications over a sim ulation loop. After each iteration, application state is saved to a checkpoint. After a fail-stop process failure, the MPI job is restarted, the application initializes MPI, and starts execution by restoring the last application checkpoint. Listing 2 shows the same MPI program as Listing 1 but ap plies MPI Stages. In our model the resilient loop in the main method runs until the application successfully completes or aborts. First, the resilient loop initializes MPI similar to Listing 1. Then it sets an error handler to MPI_ERRORS_RETURN and calls the main_loop to execute the simulation with an epoch number. The epoch is zero for initial execution and greater than zero if a failure occurs. In the main_loop, the applica tion either initializes the state or restores it from a checkpoint.
+
+1 # include < mpi .h > 
+2 int main ( int argc , char ** argv ) { 
+3 /* MPI initialization */ 
+4 MPI_Init (& argc , & argv ) ; 
+5 
+6 /* Initialize or Restore application state 
+*/ 
+7 if ( checkpoint exists ) 
+8 Application_Checkpoint_Read (...) ; 
+9 else 
+10 /* Initialize application state */ 
+11 
+12 /* Main simulation loop */ 
+13 while ( iteration < MAX_ITERATION ) { 
+14 /* MPI communications */ 
+15 ... 
+16 MPI_Allreduce (...) ; 
+17 ... 
+18 /* Save application state */ 
+19 if ( last iteration ) 
+20 MPI_Barrier (...) ; 
+21 else 
+22 Application_Checkpoint_Write (...) ; 
+23 } 
+24 MPI_Finalize () 
+25 return 0; 
+26 } 
+
+Listing 1: Sample Program following Traditional CPR-based Paradigm
+
+At the end of each iteration, we store the application and MPI state in checkpoints. In the simulation loop, we check the re turn error code for each MPI call. When a live process receives error code MPIX_TRY_RELOAD, it returns to the resilient loop and restores its MPI state to the last checkpoint. Note that this error-communication approach avoids language-specific excep tion handling and does not require the use of setjmp/longjmp. In the meantime, the failed process is re-spawned and also re stores its state. Then all processes call the main_loop, restore the application state, and continue execution from the iteration that has failed. When the simulation is successfully completed, it terminates the resilient loop. In summary, our model sets an error handler, stores MPI state in a checkpoint in tandem with application state, and re stores both MPI and application state in upon a failure. All processes initialize their MPI state only once. Only the process that has failed and re-spawned need to call MPI_Init() again. However, in this case, MPI_Init restores the MPI state from a checkpoint instead of through initialization.
+
+3.6. Prototype Implementation Instead of using an existing MPI library—with extremely complex internal state—we implemented a new MPI library. The API of the library is a subset of MPI-3. This allowed us to avoid legacy issues in the code base of existing mature imple mentations as well as to enforce modular design goals through out all functionality. MPI Stages could be implemented in any existing MPI implementation. However, it requires significant engineering effort to capture and manage the internal state of MPI middleware; advance design for this may be crucial. The library was designed to accommodate modules with well-defined internal interfaces. Figure 2 shows the module structure of our new MPI library.
+
+1 # include < mpi .h > 
+2 int main ( int argc , char ** argv ) { 
+3 int code = MPI_SUCCESS ; 
+4 while ( not done or abort ) { // Resilient loop 
+5 switch ( code ) { 
+6 case MPI_SUCCESS : 
+7 /* MPI Initialization */ 
+8 MPI_Init (& argc , & argv ) ; 
+9 /* Set error handler */ 
+10 MPI_Comm_set_errhandler (...) ; 
+11 break ; 
+12 case MPIX_TRY_RELOAD : 
+13 /* Restore MPI state from checkpoint */ 
+14 MPIX_Checkpoint_read () ; 
+15 break ; 
+16 default : 
+17 MPI_Abort (...) ; 
+18 break ; 
+19 } 
+20 /* Get the last synchronous checkpoint # */ 
+21 MPIX_Get_fault_epoch (& epoch ); 
+22 /* Main simulation loop */ 
+23 code = main_loop ( argc , argv , epoch , & done ); 
+24 } 
+25 MPI_Finalize () ; 
+26 return 0; 
+27 } 
+28 
+29 int main_loop ( int argc , char ** argv ,int epoch , 
+int * done ) { 
+30 /* Initialize or restore application state */ 
+31 if ( epoch > 0) 
+32 Application_Checkpoint_Read (...) ; 
+33 else 
+34 /* Initialize application state */ 
+35 
+36 /* Main simulation loop */ 
+37 while ( iteration < MAX_ITERATION ) { 
+38 /* MPI communication */ 
+39 ... 
+40 code = MPI_Allreduce (...) ; 
+41 if ( code != MPI_SUCCESS ) 
+42 return MPIX_TRY_RELOAD ; 
+43 ... 
+44 /* Save application state */ 
+45 Application_Checkpoint_Write (...) ; 
+46 /* Save MPI state */ 
+47 MPIX_Checkpoint_write () ; 
+48 } 
+49 /* All other application related code */ 
+50 ... 
+51 /* Barrier to ensure no processes call 
+52 finalize until the simulation completes */ 
+53 code = MPI_Barrier (...) ; 
+54 if ( code == MPI_SUCCESS ) 
+55 * done = 1; /* Successful completion */ 
+56 return code ; 
+57 } 
+
+Listing 2: Sample Fault-Tolerant Program Following with MPI Stages Paradigm
+
+Our library presently demonstrates functionality. We plan to demonstrate performance soon thereafter since it can use sev eral fast transports, and, will demonstrate what other MPI im plementations must be able to do to handle state checkpointing. Note that it is not our goal to replace other production MPI im plementations, but rather to demonstrate new ways to achieve efficient fault tolerance.
+
+Figure 2: Module structure of MPI implementation
+
+3.6.1. Current Subset of MPI-3 Our implementation supports a subset of MPI-3. In par ticular, we implement the following MPI calls in our library along with the new interface introduced in Tables 2 and 1: MPI_Abort, MPI_Allreduce, MPI_Barrier, MPI_-Bcast, MPI_Comm_dup, MPI_Comm_rank, MPI_Comm_set_errhandler, MPI_Comm_size, MPI_Finalize, MPI_Get_count, MPI_Init5, MPI_Irecv, MPI_Isend, MPI_Recv, MPI_Reduce, MPI_Send, MPI_Sendrecv, MPI_Wait, MPI_Waitall, MPI_Wtime. Our current MPI implementation works with built-in datatypes. The library is written in C++ and the runtime system is based on a Perl script. 3.6.2. Checkpoint/Restart Our prototype has a checkpoint module for writing/reading MPI state to/from a file derived from the current epoch. This module contains two methods—save() and load(). When the application initiates an MPI checkpoint write or read op eration, our library calls the corresponding method from the checkpoint module. The save/load method moves through all modules (e.g., progress, transport) to save or load their corre sponding MPI state to/from the checkpoint file. We write the checkpoints as a binary file per MPI process. To reduce the overhead of checkpointing, we can adopt different techniques used in the Scalable Checkpoint/Restart (SCR) library [20]. We can cache only the latest checkpoint in the local storage of a node and discard older ones. We can also apply the redundancy schemes used in SCR such as period ically copying a cache checkpoint to the parallel file system or storing a copy of it to another node. We can utilize local RAM disk or solid-state drives (SSDs) for storage based on availabil ity. 3.6.3. Progress Our progress module consists of progress engine, error han dler, and memory management. We implemented a fully pro
+
+5With extended semantics for recovery
+
+gressive multithreaded progress engine as part of our architec ture. The error handler gets the failure notification and initiates the cleanup. In our current implementation, the operating sys tem handles memory management. 3.6.4. Transport Our prototype has both stateless (UDP) and stateful (TCP) network for data transmission. Currently, we do not support InfiniBand and shared memory transports. We use (UDP) to test our failure cases and TCP in failure-free cases to verify and test the library. The motivation for choosing UDP is to investi gate network-related faults and to recover therefrom using our library. UDP is a stand-in for other transports that will also be connectionless, notably Portals. Future protocols and networks may also support such notions and fault-tolerant RDMA. Note that this emphasis is only to unlock the potential for explorations of network recovery to consistent states, when considered in conjunction with use of the epoch value in our transports. Fully stateful transports with large device drivers and API sets have huge internal state that would distract from this exploration. Furthermore, if there is no way to resolve a network error without resetting the entire set of adapters and switches, recovery other than checkpoint restart becomes chal lenging. In that sense, our work motivates the value of sim pler high-performance infrastructures that can be put back in consistent states after network failures. Such systems are ob viously possible, such as hardware based on Portals APIs, and the earlier Myrinet system that had minimal internal state, and supported recovery modes. In the future, we plan to evaluate using the OpenFabrics In terfaces (OFI) libfabric [27] as a network layer abstraction. The libfabric API is agnostic of the underlying network protocols as well as the implementation of network devices. It supports different hardware-specific implementation including TCP and UDP. 3.6.5. Runtime System Our runtime system comprises an MPI job-launch dæmon (MPI server process) and a job execution initiator (mpirun— runtime process). The dæmon must run on each node that may launch MPI tasks. The MPI server then waits for the execution command from mpirun. The runtime process initiates the job execution by sending the binary executable to all server pro cesses and waits for notification of completion. Each server process then forks and launches the MPI process with the spec ified binary using the system() call and maintains communi cation with the parent server process using a pipe. When an MPI process exits abnormally, the parent process gets the sta tus and communicates it with the runtime process. Then, the runtime process sends a command to the specific server process to relaunch the binary executable. The server process spawns a new MPI process to relaunch the executable. The current runtime system serves as a proof of concept to allow for MPI Stages. In the future, we will implement a multi fault tolerant runtime system adhering to the MPI standard with mpiexec as a job execution initiator. The system will be sched uler agnostic by utilizing a secondary fault dæmon between the
+
+scheduler dæmon and the MPI application. In addition it will support faults within the dæmons themselves and recovery from multiple faults. Agreement on epoch. In MPI Stages, the epoch indicates the last successful checkpoint. After detecting a failure, run time launches a new process to replace the failed one. This re launched process loads its MPI state from a checkpoint during MPI initialization. So, the relaunched process needs an epoch that is synchronized among all processes to load the MPI check point. To accomplish this, we use a consensus algorithm that de termines the last synchronous epoch value for all processes. This epoch is also used to load application checkpoint. A con sensus algorithm plays an important role in fault tolerant ap plications [28]. Different algorithms have been introduced for distributed consensus (e.g., two-phase consensus [29]). In our model, we use a agree/commit approach of consensus. Figure 3 illustrates the agreement algorithm used in MPI Stages. The runtime process acts as the coordinator in the agreement process. It starts the agreement by sending the epoch of the failed process to all server processes along with the notification of failure. Server processes propagate the error information my notifying the live MPI processes. The live MPI processes send an out-of-band notification to the server and invoke their error handler. Each server process now gathers the epoch value of the MPI processes it launched and compares it with the epoch of the failed process. If all MPI processes have the same epoch as the failed process, the server sends the decision “agree” to runtime. If any MPI process has a different epoch, server sends that epoch to runtime along with “disagree”. The coordinator gathers all decisions. If the result is unanimous, the coordinator commits the epoch of the failed process to all server. Otherwise, it calculates the lowest common epoch and commits the new value. Finally, the server launches the new process with the updated epoch to replace the failed process. Server also updates the epoch configuration for the live processes. A call to MPIX_-Get_fault_epoch will return the synchronized epoch value. 4. Evaluation In this section, we consider our test environment and use cases in turn.
+
+4.1. Test Environment Here, we describe each aspect of the test environment in turn: Application. We use LULESH (Livermore Unstructured Lagrangian Explicit Shock Hydrodynamics) and CoMD (Co design Molecular Dynamics) proxy applications as a represen tative target bulk synchronous application along with other mi crobenchmarks. We apply MPI Stages to LULESH, CoMD and a microbenchmark for matrix multiplication. Recovery Models. We present the performance of our model by comparing it with checkpoint/restart and a global-restart model, Reinit. Checkpoint/restart. For CPR, in case of process failure, we kill all the MPI processes and execute the MPI application again in the same job allocation.
+
+Reinit. We implement a prototype of the global-restart model, Reinit [4], in our MPI implementation. In the proto type, we only implement the MPI_Reinit function which is the key component of the Reinit interface. We modified both of the test applications, LULESH and CoMD to use Reinit model for recovery. The resilient version of these applications invoke MPI_-Reinit right after MPI_Init. They pass a restart handler to MPI_Reinit which is the start point of the program. MPI_-Reinit sets up the resilient environment and invokes the restart handler. During the reinitialization of live processes, it uses the internal code of MPI_Finalize to cleanup MPI resources and MPI_Init to initialize MPI again. The runtime of Reinit spawns a new process after detecting a process failure. However, no agreement is needed before re launching the new process like MPI Stages (see Section 3). In Reinit, instead of cleaning up and returning an error code to the application, all live processes jump to the restart point. To jump to the restart point from any point in the execution, we use setjmp/longjmp semantics. Systems. To evaluate our implementation, we use the Quartz cluster with Intel (Xeon E5-2695) 36-core 2.1 Ghz nodes, 128 GB of memory per node, Omni-Path interconnect and the Cat alyst cluster with Intel (Xeon E5-2695) 24-core 2.4 Ghz nodes, 128 GB of memory per node, Infiniband QDR interconnect at the Lawrence Livermore National Laboratory (LLNL). The Quartz system has 2, 634 user-available nodes with 36 cores per node. The Catalyst system consists of 324 nodes with 24 cores per node. File System. Both MPI Stages and CPR need to save and load checkpoints. To evaluate the performance of multiple CPR approaches (e.g., local storage versus parallel file system stor age), we evaluated multiple different file systems to store the checkpoint files, and analyze the time required to read or write a checkpoint file in those systems. We used different temporary file systems, the local memory of a node (/tmp), and a Linux parallel file system—Lustre (/p/lscratch#) with a capacity of 5 PB and a bandwidth of 90 GB/sec. We also used the NFS mounted home directories (slower than local memory and par allel file systems) to save our checkpoints. Running MPI Applications. We used “salloc” to obtain a Slurm job allocation in the cluster. Then, we used “pdsh” to execute the MPI server dæmon in parallel across the allocated nodes. Finally, we ran the MPI application using mpirun from a login node. To test CPR, we use the same job allocation granted by salloc. We kill all MPI processes in case of any process failure and start the MPI application again without requeueing the job.
+
+4.2. Use Case: LULESH LULESH [15, 16, 30] is a simplified proxy application, used to solve a simple Sedov blast problem. However, it represents the program pattern of a real bulk synchronous scientific appli cations. We used our prototype MPI library to test LULESH (version 2.0.3) in failure-free mode. Then, we applied MPI Stages on it to recover from process failures. We modified
+
+!"#$%"&'() * +,-.'/.01#$% #'-2/2(1-2'#
+
+345""%'5% 
+$26145""%72-)% 
+"&'() 
+
+8''5$2#1-'5%9:,#-2;"%<5'("66= !"5>"5%<5'("66
+
+?'-2/@
+
+A<B%<5'("66
+
+CD E"-"(-%F12G,5"
+
+HD I1-)"5%9$"(262'#= JD B/%$26145""K%(1G(,G1-"% #"7%"&'()
+
+LD 8';;2-
+
+CD <5'&141-"%M55'5
+
+HD I1-)"5%9"&'()= JD !"#$%9$"(262'#=
+
+LD N&$1-"%G'4%/2G"%/'5% 
+G2>"%&5'("66"6 
+OD :"G1,#()%/12G"$% 
+&5'("66%72-)%#"7% 
+"&'() 
+
+CD M55'5%P1#$G"5
+
+HD N&$1-"%"&'()
+
+!"#$%#"7% "&'()
+
+Figure 3: Illustration of agree/commit consensus algorithm (epoch∗ is the last successful epoch of failed process).
+
+!"#$ #%&'&()&*('&+%
+
+", -..)&/('&+% #%&'&()&*('&+%
+
+0 1' 23/)45 6&74$8'4.
+
+9 %: 23/)45 6&74$8'4.
+
+;$;$; < '= 23/)45 6&74$8'4.
+
+!"#$ #%&'&()&*('&+% "0 -..)&/('&+% #%&'&()&*('&+%
+
+0 1' 23/)45 6&74$8'4.
+
+9 %: 23/)45 
+6&74$8'4. 
+;$;$; 
+< '= 23/)45 
+6&74$8'4. 
+
+!"#$ #%&'&()&*('&+%
+
+">?0 -..)&/('&+% #%&'&()&*('&+%
+
+0 1' 23/)45 6&74$8'4.
+
+9 %: 23/)45 
+6&74$8'4. 
+;$;$; 
+< '= 23/)45 
+6&74$8'4. 
+
+8&7@)('&+%$)++.$1'(A'1
+
+!"#B#%&'$C)+(:1$!"#$2=4/D.+&%'E ",%4F 9 %: 23/)45 6&74$8'4. ;$;$; < '= 23/)45 6&74$8'4.
+
+8&7@)('&+%$/+%'&%@41$GA+7$ 9 %: 23/)456&74$8'4.
+
+HA&'4$2=4/D.+&%' I4(:$2=4/D.+&%' s
+
+Figure 4: Process P0 fails during second cycle/time step of simulation loop the main method of LULESH by adding a “resilient loop” and by moving the main simulation loop into a separate method “main loop” as mentioned in Section 3. Figure 4 shows a sample simulation of a bulk synchronous application using MPI_Stages. Here, N MPI processes (con figured as a logical perfect cube of processes as required by LULESH) are participating in a simulation over X iterations. LULESH only uses MPI_COMM_WORLD for communication. In MPI initialization, each process initializes its MPI states. In the application initialization phase, each process sets up the mesh and decomposes, builds and initializes the main data structure (Domain), and initiate the domain boundary communication. Then the main simulation loop starts. After the 1 stcycle, all processes save their application and MPI state in a checkpoint and then start the next cycle. In the middle of the 2 ndcycle, P0 fails. The runtime system detects the failure, spawns a new process P0new to replace P0. It also triggers the error handler of all the live processes (P1 to PN− 1). The live processes discard all pending requests and rollback to the last checkpoint. In the mean-time, P0new completes MPI_-Init by loading the last synchronous MPI state checkpoint. Finally, all processes load their application state from the last checkpoint and continues the simulation from the 2 ndcycle.
+
+!
+
+!"#
+
+$
+
+$"#
+
+% &' () $&#
+
+12
+
+894:+/1-;1</-,+==+=
+
+> ? :;9
+
+EF+G"&($H(I&$#"22"2 !",-.4$+"(-*&"#3$&'5 !",-./0/12#&,3#4-5 !",-./3+05 6&*3"./0/12#&,3#4-5 6&*3"./3+05
+
+Figure 7: Application checkpoint time of LULESH using different file systems
+
+We ran LULESH with a problem size of 38 3 per domain.
+
+Here, we demonstrate the result for strong scaling. For this size, the application checkpoint size is 15MB and the MPI check point size ranges from 544B to 1.3KB. The MPI checkpoint size is significantly smaller than the application checkpoint.
+
+The time required to read/write an MPI checkpoint is negligible compared to the application checkpoint.
+
+Figure 7 represents the application checkpoint time for dif ferent file systems. As expected, the parallel and temporary file systems significantly reduce the checkpoint time compared to
+
+the home directory.
+
+Figure 8 compares the recovery and checkpoint time for our method. The recovery time is almost always lower than the checkpoint time. In our prototype, we save the checkpoint af ter each iteration. However, we can trivially reduce this over head by taking a checkpoint after a certain number of iterations.
+
+There are different models to determine the optimal checkpoint interval. It can be derived using a fixed failure rate [31] or using any distribution of time between failures [32]. We can utilize these models to determine the optimal frequency of our check
+
+point.
+
+We isolated the time taken by individual functions of MPI
+
+Stages interface in LULESH and presented it in Figure 9.
+
+Here, MPI_Init (First-time) presents the average time to ini tialize MPI for all first-time start (epoch 0) processes. The
+
+MPI_Init for a relaunched process is the time needed to read
+
+!
+
+!"!# !"$ !"$# !"%
+
+& %' () $%#
+
+* + , -.
+
+/ 0
+
+1
+
+2
+
+3 -4
+
+56
+
+2 -7 .
+
+2
+
+8
+
+9
+
+:;6<2=->?-+=>823323
+
+@28>A2=B-4562 @20C7DEDF38=0/8GC9 @20C7D/6E9 H=5/27DEDF38=0/8GC9 H=5/27D/6E9
+
+Figure 8: Comparison of times for MPI Stages
+
+* $) (& ,-./012342513607707
+
+859:;<=06>?3@AB;C1@B0
+
+859:;<=06>?3@AB;10DE2FG@H0I
+
+859;9A@B2FJ0KD-A6=0EI
+
+859;9A@B2FL@17BMB@.0I
+
+Figure 9: Time taken by individual MPI Stages interface functions (LULESH strong scaling with 383)
+
+the MPI state from a checkpoint. Figure 9 shows that the ini tialization of the MPI state takes more time than loading it from a checkpoint. The MPIX_Checkpoint_read time indicates the average time spent by live processes to synchronize with the re launched process (waiting time of live processes). Finally, we show the average time to write a MPI checkpoint. We exclude
+
+MPIX_Get_fault_epoch as it only performs local access, so
+
+the time is negligible.
+
+4.3. Use Case: CoMD
+
+CoMD is a proxy application created by Exascale Co-design
+
+Center for Materials in Extreme Environments (ExMatEx) [17].
+
+It is a reference implementation of classical molecular dynam ics algorithms and workloads. It provides implementations for calculating simple Lennard-Jones (LJ) and Embedded Atom
+
+Method (EAM) potentials. It implements a simple geometric domain decomposition to divide the total problem space into domains, which are owned by MPI ranks. Each domain is a single-program multiple data (SPMD) partition of a larger prob lem. CoMD uses a single communicator (MPI_COMM_WORLD)
+
+for the entire job.
+
+The main program of CoMD consists of three blocks— prolog, main loop, and epilog, which is the typical pattern of bulk synchronous applications. The job of prolog is to validate the input and initialize the simulation. Then main loop updates the particle positions in a time step simulation by computing
+
+!
+
+!"# !"$ !"% !"&
+
+'
+
+' # $ & '%
+
+6728)-/+9/:-+*);;);
+
+<:=/4>?@); ()1A1> BC)*DE+1A>F();>?->
+
+Figure 10: Recovery time of MPI Stages, Reinit, and CPR for a single process failure for CoMD with a problem size of 4000 atoms for processes 1 to 8 (strong scaling) and 64000 atoms for 16 processes
+
+forces and communicating atoms between ranks. Finally, the epilog handles validation and clean up of memory. We modified the main program of CoMD to incorporate MPI Stages as shown in Section 3. CoMD follows the same simula tion pattern shown in Figure 4. However, the N MPI processes are configured as a multiple of the ranks in x, y,z direction. In our simulation, all processes save their MPI and application state in a checkpoint after 10 time steps (one iteration). We applied MPI Stages, Reinit, and CPR to recover form the single process failure (see Figure 4). The recovery time using these models is shown in Figure 10. The recovery time ex cludes the time to read an application checkpoint. MPI_Stages reduces the recovery time by at least 8× compared to CPR. We executed CoMD for a short run of 100 time steps. In the run, we used the many-body Embedded-Atom Model (EAM) potential as force model. The performance of MPI_Stages and Reinit is very close for processes 1 to 8. For processes 1 to 8, we used a very small problem size (only 4, 000 atoms). So, the application initialization time was comparatively small. For 16 processes, we used a problem size of 64, 000 (4, 000 atoms per task). Here, as we increase the problem size, the application initialization time of CoMD increases. So, the recovery time of Reinit increases as well. Since, MPI_Stages recovery avoids application initialization so it reduces the recovery time by 5× . 4.4. Use Case: Matrix Multiplication Library We used a micro-benchmark, matrix multiplication (MM), as a use case to demonstrate the use of supplemental software li braries in an MPI application. In this example, we developed a library that multiplies two matrices in parallel using MPI and returns the result to the application. Our MPI application in vokes the multiplication function of the library over N itera tions. At the end of each iteration, it updates the input matrices with the multiplication result and stores its state in a checkpoint. Then, it starts the next iteration with the updated input matrices. The library creates its own communicator (mm comm) by duplicating the communicator passed from the application. The application does not have access to the internal MPI handles (newly created communicator) of the library. However, MPI_-Stages requires the application to revivify this handle during recovery from a failure. We used the serialization/deserializa tion functionality (see Section 3) to revivify the user handle of MPI object. Listing 3 presents the API extensions of MPI added by MPI_Stages for serialization/deserialization. Listing 4 shows the interface of the matrix multiplication (MM) library. It uses MM library callback register method to register the serialize/deserialize handler (s handler and d han dler). The matrix multiplication library is not stateful, so we do not need to save any library states other than the MPI handles. Listing 5 shows the pseudocode of the application that uses the matrix multiplication (MM) library. Here, we only show the main loop. Application initializes MPI, sets the error handler to MPI_-ERRORS_RETURN and invokes main loop. In the main loop, it initializes the matrix multiplication library and lets the library register its serialization/deserialization handlers. The applica tion can also add its own handlers. At the end of each or N iteration of the simulation, it saves application and MPI state in separate checkpoints. Then, it calls the MPIX_Serialize_handles function that invokes the pre viously registered serialize handler (s handler) of the matrix multiplication library and passes MPIX_Handles as parameter. The MM library adds its MPI handles (in this case communi cator handle) to MPIX_Handles. Finally, MPIX_Serialize_handles serializes the MPI object referred by the handle into the MPI checkpoint. During iteration X, an MPI process fails while multiplying the matrices in the library. The runtime spawns a new process to replace the failed one and the live processes calls their error handler. The error handler cleans up the pending requests and all subsequent MPI calls return MPIX_TRY_RELOAD error code. Library writer could check the error code and return immedi ately to the application. However, we do not require the exter nal libraries to check this error code. In MPI_Stages, applica tion check the error code of each MPI calls. So, the first MPI call after MM library multiply will check the error code and re turn to the “resilient loop” (see Section 3). The relaunched pro cess deserializes its handles during recovery by calling MPIX_-Deserialize_handles. This function deserializes the MPI object from MPI checkpoint and creates an MPIX_Handles ob ject. Then, it calls the deserialize handler of matrix multipli cation library (d handler) which revivifies the communicator handle of the library. Finally, all processes loads their applica tion checkpoint and continue execution.
+
+##### 5. Future work
+
+5.1. MPI subsets for Resilient Large-Scale Applications One of the upshots of this work is that real applications often use only a subset of MPI functionality. For instance, LULESH, serving as a stand-in for a real application, is quite capable of being used with a small subset of MPI-3.1. While MPI im plementations are monoliths now, future MPI support might be constructed dynamically as part of configuration of a large scale application in a setting where fault-tolerance is needed.
+
+| | 3 | MPI_Comm * communicators | ; | | | | | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | 4 | int comm_size ; | | | | | | | | | | | |
+| | 5 | MPI_Group * groups ; | | | | | | | | | | | |
+| | 6 | int group_size ; | | | | | | | | | | | |
+
+1 /* ************* MPI API ************* */ 
+2 typedef struct { 
+3 MPI_Comm * communicators ; 
+4 int comm_size ; 
+5 MPI_Group * groups ; 
+6 int group_size ; 
+7 } MPIX_Handles ; 
+8 typedef void (* MPIX_Serialize_handler ) ( MPIX_Handles * handles ) ; 
+9 typedef void (* MPIX_Deserialize_handler ) ( MPIX_Handles handles ); 
+10 
+11 int MPIX_Serialize_handles () ; 
+12 int MPIX_Deserialize_handles () ; 
+13 int MPIX_Serialize_handler_register ( const MPIX_Serialize_handler handler ); 
+14 int MPIX_Deserialize_handler_register ( const MPIX_Deserialize_handler handler ); 
+
+Listing 3: MPI API for serialization/deserializaion
+
+1 int main_loop (int argc , char ** argv , int epoch , 
+int * done ) { 
+2 MM_library_init ( MPI_COMM_WORLD ); 
+3 MM_library_callback_register () ; 
+4 if ( recovery ) 
+5 /* Deserialize all MPI handles ( both 
+application and libraries ) */ 
+6 MPIX_Deserailize_handles () ; 
+7 Application_Checkpoint_Read (...) ; 
+8 
+9 else 
+10 // Initialize application state 
+11 
+12 while ( iteration < MAX_ITERATION ) { 
+13 MM_library_multiply (...) ; 
+14 ... 
+15 Application_Checkpoint_Write (...) ; 
+16 MPIX_Checkpoint_write () ; 
+17 /* Serialize all MPI handles ( both 
+application and libraries ) */ 
+18 MPIX_Serialize_handles () ; 
+19 } 
+20 ... 
+21 } 
+1 /* ********* MM Library API ********* */ 
+2 void MM_library_init ( MPI_Comm comm ); 
+3 void MM_library_finalize () ; 
+4 void MM_library_multiply ( Matrix matA , Matrix 
+matB , Matrix * result ); 
+5 void MM_library_callback_register () ; 
+6 
+7 /* ********* Implementation ********* */ 
+8 void MM_library_callback_register () { 
+9 MPIX_Serialize_handler_register ( s_handler ); 
+10 MPIX_Deserialize_handler_register ( d_handler ); 
+11 } 
+12 
+13 void s_handler ( MPIX_Handles * handles ) { 
+14 /* Allocate memory for handles */ 
+15 . . . 
+16 MPI_Comm * comms = handles -> communicators ; 
+17 *( comms ++) = mm_comm ; 
+18 handles -> comm_size ++; 
+19 . . . 
+20 } 
+21 void d_handler ( MPIX_handles handles ) { 
+22 . . . 
+23 mm_comm = handles - > communicators [ handles - > 
+comm_size - 1]; 
+24 handles -> comm_size - -; 
+25 . . . 
+26 } 
+
+Listing 5: Sample Fault-Tolerant Program with MPI handles serialization/deserialization
+
+Listing 4: API of matrix multiplication library
+
+5.2. Limiting the Scope of Failure Most fault tolerant approaches consider ‘process’ as a scope of a failure. If a failure happens, the entire process is considered to be broken. However, the impact of a failure might be limited to a smaller scope. Some failures might only affect a particular function call but not break MPI’s ability to respond correctly to future function calls. In this case, the scope of faults is only lim ited to the function. If the impact of a fault can be isolated, then the mitigation mechanism could be applied only on the affected scope. Our current MPI Stages model considers ‘process’ as an affected scope of a failure. However, it has the opportunity to consider and reason about a failure scope smaller than ‘process’ (e.g., object, module).
+
+Stages transparently replaces a failed process by loading its MPI state along with its application state from a saved check point. This allows surviving (live) processes to stay within the main computation loop—close lexically to where failures occurred—while only relaunched processes restart from the be ginning of the program. We demonstrated the performance of our method in a prototype MPI implementation and presented the requirements to implement this fault tolerance model in a production MPI implementation. In our evaluation with a sin gle process failure, MPI Stages reduces the recovery time by 13× for LULESH and 8× for CoMD in comparison to tradi tional checkpoint/restart. It also demonstrates a reduction in recovery time compared to the global-restart model, Reinit. Importantly, the results of this work will create middle-out requirements both on networking infrastructure for recoverabil ity from faults, and on the structure of the MPI middleware itself. Through our test implementation, we are able to cap ture and manage MPI state, something that existing production middleware (such as MPICH and Open MPI) have not had to manage and book-keep carefully. A potential outcome of this work will be specific design requirements for next-generation
+
+##### 6. Conclusions
+
+We presented a new approach for fault tolerance in MPI, MPI Stages, that significantly reduces the recovery time of bulk synchronous applications that use checkpoint/restart. MPI
+
+production MPI middleware that is conscious of state as well as networking infrastructure (device drivers and networks) that enable return to a consistent state after faults and failures. Acknowledgements This work was performed under the auspices of the U.S. De partment of Energy by Lawrence Livermore National Labora tory under contract DE-AC52-07NA27344. Lawrence Liver more National National Security, LLC (LLNL-JRNL-759751) and partial support from the National Science Foundation un der Grants Nos. CCF-1562659, CCF-1562306, CCF-1617690, CCF-1822191, CCF-1821431. Any opinions, findings, and conclusions or recommendations expressed in this material are those of the authors and do not necessarily reflect the views of the National Science Foundation or Lawrence Livermore Na tional Laboratory. References
+
+References [1] F. Cappello, A. Geist, B. Gropp, L. Kale, B. Kramer, M. Snir, Toward exascale resilience, The International Journal of High Performance Com puting Applications 23 (4) (2009) 374–388. [2] F. Cappello, Fault tolerance in petascale/exascale systems: Current knowledge, challenges and research opportunities, The International Jour nal of High Performance Computing Applications 23 (3) (2009) 212–226. [3] W. Bland, A. Bouteiller, T. Herault, G. Bosilca, J. Dongarra, Post-failure recovery of MPI communication capability: Design and rationale, The In ternational Journal of High Performance Computing Applications 27 (3) (2013) 244–254. [4] I. Laguna, D. F. Richards, T. Gamblin, M. Schulz, B. R. de Supinski, K. Mohror, H. Pritchard, Evaluating and extending user-level fault toler ance in MPI applications, The International Journal of High Performance Computing Applications 30 (3) (2016) 305–319. [5] M. Gamell, D. S. Katz, H. Kolla, J. Chen, S. Klasky, M. Parashar, Ex ploring automatic, online failure recovery for scientific applications at extreme scales, in: Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, IEEE Press, 2014, pp. 895–906. [6] G. E. Fagg, J. J. Dongarra, FT-MPI: Fault tolerant MPI, supporting dy namic applications in a dynamic world, in: European Parallel Virtual Ma chine/Message Passing Interface Users’ Group Meeting, Springer, 2000, pp. 346–353. [7] J. Hursey, R. L. Graham, G. Bronevetsky, D. Buntinas, H. Pritchard, D. G. Solt, Run-through stabilization: An MPI proposal for process fault tol erance, in: European MPI Users’ Group Meeting, Springer, 2011, pp. 329–332. [8] G. Bosilca, A. Bouteiller, F. Cappello, S. Djilali, G. Fedak, C. Germain, T. Herault, P. Lemarinier, O. Lodygensky, F. Magniette, et al., MPICH-V: Toward a scalable fault tolerant MPI for volatile nodes, in: Supercomput ing, ACM/IEEE 2002 Conference, IEEE, 2002, pp. 29–29. [9] K. Teranishi, M. A. Heroux, Toward local failure local recovery resilience model using MPI-ULFM, in: Proceedings of the 21st European MPI Users’ Group Meeting, ACM, 2014, p. 51. [10] A. Hassani, A. Skjellum, R. Brightwell, Design and evaluation of FA MPI, a transactional resilience scheme for non-blocking MPI, in: De pendable Systems and Networks (DSN), 2014 44th Annual IEEE/IFIP International Conference on, IEEE, 2014, pp. 750–755. [11] M. P. I. Forum, MPI: A Message-passing Interface Standard, Version 3.1 ; June 4, 2015, High-Performance Computing Center Stuttgart, University of Stuttgart, 2015. URL https://books.google.com/books?id=Fbv7jwEACAAJ [12] I. Laguna, D. F. Richards, T. Gamblin, M. Schulz, B. R. de Supin ski, Evaluating User-Level Fault Tolerance for MPI Applications, in: Proceedings of the 21st European MPI Users’ Group Meeting, Eu roMPI/ASIA ’14, ACM, New York, NY, USA, 2014, pp. 57:57–57:62. doi:10.1145/2642769.2642775. URL http://doi.acm.org/10.1145/2642769.2642775
+
+[13] M. Gamell, D. S. Katz, H. Kolla, J. Chen, S. Klasky, M. Parashar, Ex ploring Automatic, Online Failure Recovery for Scientific Applications at Extreme Scales, Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (2014) 895– 906. [14] N. Sultana, A. Skjellum, I. Laguna, M. S. Farmer, K. Mohror, M. Emani, MPI Stages: Checkpointing MPI State for Bulk Synchronous Applica tions, in: Proceedings of the 25th European MPI Users’ Group Meeting, ACM, 2018, p. 13. [15] I. Karlin, J. Keasler, J. Neely, Lulesh 2.0 updates and changes, Tech. rep., Lawrence Livermore National Lab.(LLNL), Livermore, CA (United States) (2013). [16] I. Karlin, A. Bhatele, J. Keasler, B. L. Chamberlain, J. Cohen, Z. DeVito, R. Haque, D. Laney, E. Luke, F. Wang, D. Richards, M. Schulz, C. Still, Exploring Traditional and Emerging Parallel Programming Models using a Proxy Application, in: 27th IEEE International Parallel & Distributed Processing Symposium (IEEE IPDPS 2013), Boston, USA, 2013. [17] J. Mohd-Yusof, S. Swaminarayan, T. Germann, Co-Design for Molecular Dynamics: An Exascale Proxy Application, Los Alamos National Labo ratory, Tech. Rep. LA-UR (2013) 13–20839. [18] P. H. Hargrove, J. C. Duell, Berkeley lab checkpoint/restart (blcr) for linux clusters, in: Journal of Physics: Conference Series, Vol. 46, IOP Publish ing, 2006, p. 494. [19] S. Sankaran, J. M. Squyres, B. Barrett, V. Sahay, A. Lumsdaine, J. Du ell, P. Hargrove, E. Roman, The LAM/MPI checkpoint/restart framework: System-initiated checkpointing, The International Journal of High Perfor mance Computing Applications 19 (4) (2005) 479–493. [20] A. Moody, G. Bronevetsky, K. Mohror, B. R. d. Supinski, Design, model ing, and evaluation of a scalable multi-level checkpointing system, in: Proceedings of the 2010 ACM/IEEE international conference for high performance computing, networking, storage and analysis, IEEE Com puter Society, 2010, pp. 1–11. [21] L. Bautista-Gomez, S. Tsuboi, D. Komatitsch, F. Cappello, N. Maruyama, S. Matsuoka, FTI: high performance fault tolerance interface for hybrid systems, in: High Performance Computing, Networking, Storage and Analysis (SC), 2011 International Conference for, IEEE, 2011, pp. 1–12. [22] A. Bouteiller, G. Bosilca, J. Dongarra, Redesigning the message logging model for high performance, Concurrency and Computation: Practice and Experience 22 (16) (2010) 2196–2211. [23] G. Bosilca, A. Bouteiller, E. Brunet, F. Cappello, J. Dongarra, A. Guer mouche, T. Herault, Y. Robert, F. Vivien, D. Zaidouni, Unified model for assessing checkpointing protocols at extreme-scale, Concurrency and Computation: Practice and Experience 26 (17) (2014) 2772–2791. [24] M. Emani, I. Laguna, K. Mohror, N. Sultana, A. Skjellum, Check pointable MPI: A Transparent Fault-Tolerance Approach for MPI, Tech. rep., Lawrence Livermore National Lab.(LLNL), Livermore, CA (United States) (2017). [25] N. Sultana, S. Farmer, A. Skjellum, I. Laguna, K. Mohror, M. Emani, De signing a reinitializable and Fault Tolerant MPI Library, poster presented at EuroMPI/USA 2017, Chicago, IL (2017). [26] M. Besta, T. Hoefler, Fault tolerance for remote memory access program ming models, in: Proceedings of the 23rd International Symposium on High-performance Parallel and Distributed Computing, HPDC ’14, ACM, New York, NY, USA, 2014, pp. 37–48. doi:10.1145/2600212.2600224. URL http://doi.acm.org/10.1145/2600212.2600224 [27] P. Grun, S. Hefty, S. Sur, D. Goodell, R. D. Russell, H. Pritchard, J. M. Squyres, A brief introduction to the openfabrics interfaces-a new network api for maximizing high performance application efficiency, in: High Performance Interconnects (HOTI), 2015 IEEE 23rd Annual Symposium on, IEEE, 2015, pp. 34–39. [28] J. Hursey, T. Naughton, G. Vallee, R. L. Graham, A log-scaling fault tol erant agreement algorithm for a fault tolerant MPI, in: European MPI Users’ Group Meeting, Springer, 2011, pp. 255–263. [29] M. Barborak, A. Dahbura, M. Malek, The consensus problem in fault tolerant computing, ACM Computing Surveys (CSur) 25 (2) (1993) 171– 220. [30] R. Hornung, J. Keasler, M. Gokhale, Hydrodynamics Challenge Problem, Lawrence Livermore National Laboratory, Tech. Rep. LLNL-TR-490254. [31] J. Daly, A model for predicting the optimum checkpoint interval for restart dumps, in: International Conference on Computational Science, Springer, 2003, pp. 3–12.
+
+[32] Y. Liu, R. Nassar, C. Leangsuksun, N. Naksinehaboon, M. Paun, S. L. Scott, An optimal checkpoint/restart model for a large scale high perfor mance computing system, in: Parallel and Distributed Processing, 2008. IPDPS 2008. IEEE International Symposium on, IEEE, 2008, pp. 1–9.
+

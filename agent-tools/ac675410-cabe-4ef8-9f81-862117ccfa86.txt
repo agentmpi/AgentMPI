@@ -1,0 +1,489 @@
+## Improving MapReduce Performance in Heterogeneous Environments
+
+Matei Zaharia Andrew Konwinski Anthony D. Joseph Randy H. Katz Ion Stoica
+
+#### Electrical Engineering and Computer Sciences University of California at Berkeley
+
+Technical Report No. UCB/EECS-2008-99 http://www.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-99.html
+
+#### August 19, 2008
+
+Copyright 2008, by the author(s). All rights reserved. Permission to make digital or hard copies of all or part of this work for personal or classroom use is granted without fee provided that copies are not made or distributed for profit or commercial advantage and that copies bear this notice and the full citation on the first page. To copy otherwise, to republish, to post on servers or to redistribute to lists, requires prior specific permission.
+
+Acknowledgement We would like to thank Michael Armbrust, Rodrigo Fonseca, George Porter, David Patterson and Armando Fox, as well as our industrial contacts at Yahoo!, Facebook and Amazon, for their help with this work. This research was supported by California MICRO, California Discovery, the Natural Sciences and Engineering Research Council of Canada, as well as the following Berkeley Reliable Adaptive Distributed systems lab sponsors: Sun, Google, Microsoft, HP, Cisco, Oracle, IBM, NetApp, Fujitsu, Siemens, and VMWare.
+
+### Improving MapReduce Performance in Heterogeneous Environments
+
+Matei Zaharia Andy Konwinski Anthony D. Joseph UC Berkeley
+
+Randy Katz Ion Stoica
+
+##### Abstract
+
+MapReduce is emerging as an important programming model for large-scale data-parallel applications such as web indexing, data mining, and scientific simulation. Hadoop is an open-source implementation of MapRe duce enjoying wide adoption and is often used for short jobs where low response time is critical. Hadoop’s per formance is closely tied to its task scheduler, which im plicitly assumes that cluster nodes are homogeneous and tasks make progress linearly, and uses these assumptions to decide when to speculatively re-execute tasks that ap pear to be stragglers. In practice, the homogeneity as sumptions do not always hold. An especially compelling setting where this occurs is a virtualized data center, such as Amazon’s Elastic Compute Cloud (EC2). We show that Hadoop’s scheduler can cause severe performance degradation in heterogeneous environments. We design a new scheduling algorithm, Longest Approximate Time to End (LATE), that is both simple and highly robust to heterogeneity. LATE can improve Hadoop response times by a factor of 2 in 200-node clusters on EC2.
+
+##### 1 Introduction
+
+Today’s most popular computer applications are Internet services with millions of users. The sheer volume of data that these services process has led to interest in parallel processing on commodity clusters. The leading exam ple is Google, which uses its MapReduce framework to process 20 petabytes of data per day [1]. Other Inter net services, such as e-commerce sites, social networks, communication services and content providers, also cope with enormous volumes of data. These services generate clickstream data from millions of users every day, which is a potential gold mine for understanding access patterns and increasing ad revenue. Furthermore, for each user interaction, a web application generates one or two or ders of magnitude more data in system logs, which are the main tool that developers and operators have for di agnosing problems with the system. The MapReduce model popularized by Google pro vides a very attractive framework for ad-hoc parallel pro cessing on arbitrary data. MapReduce breaks a com putation into small tasks that run in parallel on differ ent machines, and scales easily to very large clusters of inexpensive commodity computers. Its popular open source implementation, Hadoop [4], was developed pri marily by Yahoo, where it processes hundreds of ter abytes of data on at least 10,000 cores [11], and is now used by other companies, including Facebook, Amazon, and Last.fm, and the New York Times [10]. Research groups at Cornell, Carnegie Mellon, University of Mary land and PARC are also starting to use Hadoop for both web data and non-data-mining applications, like seismic simulation and natural language processing [10, 12]. A key benefit of MapReduce is that it automatically handles failures, hiding the complexity of fault-tolerance from the programmer. If a node crashes, MapReduce re runs its tasks on a different machine. Equally impor tantly, if a node is available but is performing poorly, a condition that we call a straggler, MapReduce runs a speculative copy of its task (also called a “backup task”) on another machine to finish the computation faster. Without this mechanism of speculative execution 1, a job would be as slow as its slowest sub-task. Stragglers can arise for many reasons, including faulty hardware and misconfiguration. Google has noted that speculative ex ecution can improve job response times by 44% [1]. In this work, we address the problem of how to ro bustly perform speculative execution to maximize per formance. Hadoop’s scheduler starts speculative tasks based on a simple heuristic comparing each task’s progress to the average progress. Although this heuristic works well in homogeneous environments where strag glers are obvious, we show that it can lead to severe
+
+1Not to be confused with speculative execution at the OS or hard ware level such as in Speculator [20].
+
+performance degradation when its underlying assump tions are broken. An especially compelling environment where Hadoop’s scheduler is inadequate is a virtualized data center. Virtualized “utility computing” environ ments, such as Amazon’s Elastic Compute Cloud (EC2) [2], are becoming an important element in an organiza tion’s data processing toolbox because large numbers of virtual machines can be rented by the hour at lower costs than managing a data center year-round (EC2’s current cost is $0.10 per CPU hour). For example, the New York Times rented 100 virtual machines over a day to convert 11 million scanned articles to PDFs [13]. These environ ments offer an economic advantage – the ability to own large amounts of compute power only when needed – but they come with the caveat of having to run on virtualized resources with potentially uncontrollable variance. Fur thermore, we expect heterogeneous environments to be come the common case even in private data centers as or ganizations often use multiple generations of hardware. Also, private data centers are starting to use virtualization to simplify administration, consolidate servers, and pro vide more efficient scheduling and resource utilization. We have observed that Hadoop’s assumptions of homo geneity lead to incorrect and often excessive speculative execution in heterogeneous environments, and can even degrade performance below that obtained without specu lative execution. Sometimes as many as 80% of tasks are speculatively executed, and throughput is 50% less than that of a system with speculative execution disabled. Na¨ıvely, one might expect speculative execution to be a simple matter of duplicating tasks that are sufficiently slow. In reality, it is a complex issue for several reasons. First, speculative tasks are not free – they compete for certain resources, such as the network, with other run ning tasks. Second, choosing a node on which to launch a speculative task is as important as choosing which task to launch. Third, in a heterogeneous environment, it may be difficult to differentiate between nodes that are slightly slower than the mean and stragglers. Starting from first principles, we design a simple al gorithm for speculative execution that is robust to het erogeneity and highly effective in practice. We call our algorithm LATE for Longest Approximate Time to End. LATE is based on three principles: prioritizing tasks to speculate, selecting fast nodes to run on, and capping speculative tasks to prevent thrashing. We show that our scheduler can improve response time of MapReduce jobs by a factor of 2 in large clusters on EC2. The rest of the paper is organized as follows. Section 2 describes Hadoop’s current scheduler and the assump tions it makes. Section 3 shows how these assumptions break in heterogeneous environments. Section 4 intro duces our new scheduler, LATE, and explains how it ad dresses these issues. Section 5 validates our claims about
+
+Figure 1: A MapReduce computation. Image from [14].
+
+heterogeneity in virtualized environments through mea surements of EC2 and evaluates the gain from LATE in a variety of experiments. Section 7 presents related work. Finally, we conclude in Section 8.
+
+##### 2 Background: Scheduling in Hadoop
+
+In this section we describe the mechanism used in Hadoop to distribute work across a cluster. We identify assumptions made by the scheduler that hinder its perfor mance. These motivate our LATE scheduler, which can outperform Hadoop’s by a factor of 2. Hadoop’s implementation of MapReduce closely re sembles Google’s [1]. There is a single master control ling a number of slaves. The input file, which resides on a distributed filesystem throughout the cluster, is broken into even sized chunks. Hadoop divides each MapRe duce job into a series of tasks. Each chunk of input is first processed by a map task, which outputs a series of key-value pairs generated by a user-defined map func tion. Map outputs are split into buckets based on key. When all maps have finished, reduce tasks apply a re duce function to the map outputs for each key. Figure 1 shows a diagram of a MapReduce computation. Hadoop runs several maps and reduces concurrently on each slave – two of each by default – to overlap com putation and I/O. Each slave tells the master when it has an empty task slot. The scheduler then assigns it a task. The goal of speculative execution is to minimize a job’s response time. Response time is most important for short jobs where a user wants an answer quickly, such as queries on log data for debugging, monitoring and business intelligence. Short jobs are a major use of MapReduce. For example, the average MapReduce job at Google in September 2007 was 395 seconds long [1]. Systems designed for SQL-like queries on top of
+
+MapReduce, such as Sawzall [15] and Pig [16], under line the importance of MapReduce for query processing. Response time is also clearly important in a pay-by-the hour environment such as EC2. Speculative execution is less useful in long jobs, because only the last wave of tasks is affected, and may be inappropriate for batched jobs if throughput is the only metric of interest, because speculative tasks imply wasted work. In our work, we focus on short jobs.
+
+##### 2.1 Hadoop’s Scheduling Algorithm
+
+When a node has an empty task slot, Hadoop chooses a task for it from one of three categories. First, if any task has failed, it is given highest priority. This is done to detect when a task fails repeatedly due to a bug and stop the job. Second, unscheduled tasks are considered. For maps, tasks with data local to the node are chosen first. Finally, Hadoop looks for a task to speculate on. To select speculative tasks, Hadoop monitors task progress using a progress score, which is a number from 0 to 1. For a map, the score is the fraction of input data read. For a reduce task, the execution is divided into three phases, each of which accounts for 1/3 of the score:
+
+• The copy phase, when the task is copying outputs of all maps. In this phase, the score is the percent of maps that output has been copied from. 
+• The sort phase, when map outputs are sorted by key. Here the score is the percent of data merged. 
+• The reduce phase, when a user-defined function is applied to the map outputs. Here the score is the percent of data passed through the reduce function. For example, a task halfway through the copy phase has a score of 1/2 × 1/3 = 1/6. A task halfway through the reduce phase scores 1/3 + 1/3 + (1/2 × 1/3) = 5/6. 
+
+Hadoop looks at the average progress of each cate gory of tasks (maps and reduces) to define a threshold for speculative execution: When a task’s progress is less than the average for its category minus 0.2, and the task has run for at least one minute, it is marked as a straggler. All tasks beyond the threshold are considered “equally slow,” and ties between them are broken by data locality. The scheduler also ensures that at most one speculative copy of each task is running at a time. Although a metric like progress rate would make more sense than absolute progress for identifying stragglers, the threshold in Hadoop works reasonably well in ho mogenous environments because tasks tend to start and finish in “waves” at roughly the same times and because speculation only starts when the last wave is running. Finally, when running multiple jobs, Hadoop uses a FIFO system where the earliest submitted job is asked for a task to execute, then the second, etc. There is also a pri ority system for putting jobs into higher-priority queues.
+
+##### 2.2 Assumptions in Hadoop’s Scheduler
+
+Hadoop’s scheduler makes several implicit assumptions: 
+1. Nodes can perform work at roughly the same rate. 
+2. Tasks progress at a constant rate throughout time. 
+3. There is no cost to launching a speculative task on a 
+node that would otherwise have an idle slot. 
+4. A task’s progress score is roughly equal to the frac 
+tion of its total work that it has done. Specifically, 
+in a reduce task, the copy, reduce and merge phases 
+each take 1/3 of the total time. 
+5. Tasks tend to finish in waves, so a task with a low 
+progress score is likely a slow task. 
+6. Different tasks of the same category (map or reduce) 
+require roughly the same amount of work. 
+As we shall see, assumptions 1 and 2 break down in 
+a virtual cluster due to heterogeneity. Assumptions 3, 4 
+and 5 can actually break down in a homogeneous cluster 
+as well, and may cause Hadoop’s scheduler to perform 
+poorly in in non-virtualized clusters too. In fact, Yahoo! 
+disables speculative execution on some jobs because it 
+degrades performance, and monitors machines through 
+other means. Facebook disables speculation for reduce 
+tasks [26]. 
+Assumption 6 is inherent in the MapReduce paradigm, 
+so we do not address it in this paper. Tasks in MapReduce 
+should be small, otherwise a single large task will slow 
+down the entire job. In a well-behaved MapReduce job, 
+the separation of input into equal chunks and the division 
+of the key space among reducers ensures roughly equal 
+amounts of work. If this is not the case, launching a few 
+more speculative tasks is not harmful as long as obvious 
+stragglers are also detected. 
+
+##### 3 How the Assumptions Break Down
+
+##### 3.1 Heterogeneity
+
+The first two assumptions in Section 2.2 are about ho mogeneity: Hadoop assumes that any sufficiently slow node is a straggler. However, nodes can be heteroge neous for other reasons. In a non-virtualized data cen ter, there may be multiple generations of hardware. As organizations expand their data centers, this is a grow ing concern. In a virtualized data center where multi ple virtual machines run on each physical host, such as Amazon EC2, co-location of virtual machines may cause
+
+heterogeneity. Although virtualization isolates CPU and memory performance, VMs compete for disk and net work bandwidth. For example, in EC2, instances use the maximum bandwidth when there is no contention and share bandwidth fairly when there is contention [22]. Contention can come both from other users’ virtual ma chines, in which case it may be transient, and from one’s own virtual machines if several share the same physical host, especially if they do similar work, as in Hadoop. In Section 5.1, we measured performance differences of 2.5x caused by contention. Note that EC2’s bandwidth sharing policy is not inherently harmful – it means that I/O bandwidth can be fully utilized when some VMs do not use it – but it causes a problem in Hadoop. Heterogeneity seriously impacts Hadoop’s scheduler. Because the scheduler uses a fixed threshold for select ing tasks to speculate, too many speculative tasks may be launched, taking away resources from useful tasks (assumption 3 is also false). Also, because the sched uler ranks candidates by locality, the wrong tasks may be chosen for speculation first. For example, if the average progress was 70% and there was a 1.4x slower task at 50% progress and a 10x slower task at 7% progress, then the 1.4x slower task might be speculated before the 10x slower task if its data is closer to an idle node. We note that EC2 also provides “large” and “extra large” VM sizes that have lower variance in I/O perfor mance than the default “small” VMs, possibly because they own a full disk. However, small VMs can achieve higher I/O performance per dollar because they use all available bandwidth when no other VMs on the host are using it. Larger VMs also still compete for network bandwidth. Therefore, we focus on optimizing Hadoop on “small” VMs to get the best performance per dollar.
+
+##### 3.2 Other Assumptions
+
+Assumptions 3, 4 and 5 in Section 2.2 are broken on both homogeneous and heterogeneous clusters, and can lead to a variety of failure modes for the scheduler. Assumption 4, that a task’s progress score is roughly equal to its percent completion, can cause incorrect spec ulation of reducers. In a typical MapReduce job, the copy phase of reduce tasks is the slowest, because it in volves all-pairs communication over the network. Tasks quickly complete the other two phases once they have all the map outputs. However, the reduce phase counts as 1/3 of the total progress score, while the other phases count as 2/3. Thus, when the first few reducers in a job finish the copy phase, their progress goes from 1/3 to 1, greatly increasing the average progress. As soon as about 30% of reducers finish, the average progress is roughly 0.3 × 1 + 0.7 × 1/3 ≈ 53%, and now all reducers still in the copy phase will be 0.2 behind the average, and an arbitrary set will be speculated upon causing task slots to fill up, and true stragglers to never be speculated. The problem is worse in a heterogeneous environment. If a large fraction of reducers to stay in the copy phase for longer than average, then these reducers will all be spec ulated upon, potentially overloading the network. We have observed this in 900-node runs on EC2, where 80% of reduce tasks were speculated. Assumption 4 also means that when a task reaches 80% progress, it can never be speculated upon, even if it slows down, because the average progress is always less than 100%. Assumption 5, that tasks start at roughly the same time and so progress score is a good proxy for progress rate, can also be wrong. In a MapReduce job, there are typi cally one or two reducers per node so they can start copy ing data over the network right away, so the assumption holds for reducers. However, there are potentially tens of mappers per host, one for each data chunk. These tend to finish in waves. Even in a homogenous environment, the waves get more spread out as more mappers run due to variance adding up, so in a long enough job, tasks from different generations will be executing concurrently. In this case, Hadoop will speculate on newer, faster tasks ahead of older, slow tasks that have more total progress. Lastly, assumption 3 – that speculating tasks on idle nodes is free – breaks down when resources are shared. For example, the network is a bottleneck shared resource in large MapReduce jobs. Also, speculative tasks may compete for disk I/O’s in disk I/O-bound jobs. Finally, in a series of jobs, needless speculation reduces through put without improving response time by occupying nodes that could be running the next job.
+
+##### 4 The LATE Scheduler
+
+We have designed a new speculative task scheduler by starting from first principles and adding features needed to correctly schedule tasks in a real environment. The primary insight behind our scheduler is the fol lowing: We always speculatively execute the task that we think will finish farthest into the future, because this task provides the greatest opportunity for a speculative task to overtake the original and save a significant amount of time. We explain how we calculate a task’s remaining time based on current progress below. We call our strat egy LATE, for Longest Approximate Time to End. Intu itively, this greedy policy would be optimal if nodes ran at consistent speeds and if there were no costs associated with launching a speculative task on an otherwise idle node. Different methods of estimating time left can be plugged into LATE. We currently use a simple heuris tic that we found works well in practice: We estimate the
+
+progress rate for each task as (progress score) / (execu tion time), and then estimate the time left as (1 - progress) / (progress rate). This assumes that tasks make progress at a roughly uniform rate, but also works well when the earlier phases of the task take longer than the last phases. There are cases where this heuristic can fail, which we describe later, but it is effective in typical Hadoop jobs. To really get the best chance of beating the original task with the speculative task, we should only launch speculative tasks on fast nodes, so as to avoid stragglers. We do this through a simple heuristic – don’t launch speculative tasks on nodes that are below some thresh old, SlowNodeThreshold, of total work performed (sum of progress scores for all succeeded and in-progress tasks on the node). This heuristic leads to better scheduling decisions than assigning a speculative task to any idle node. Another option would be to support more than one speculative copy of each task, but this wastes resources needlessly. Finally, to handle the fact that speculative tasks cost resources, we augment the algorithm with two heuristics:
+
+• A cap on the number of speculative tasks that can be running at once, which we denote SpeculativeCap. 
+• A SlowTaskThreshold that a task’s progress rate is compared against to determine whether it is “slow enough” to be launched speculatively. 
+• If a task slot becomes available and there are less than SpeculativeCap speculative tasks running: – Ignore the request if the node’s total progress is below SlowNodeThreshold. – Rank currently running, non-speculatively ex ecuted tasks by estimated time left. – Launch a copy of the highest-ranked task with progress rate below SlowTaskThreshold. 
+
+In summary, the LATE algorithm works as follows: Like Hadoop’s scheduler, we also wait until a task has run for 1 minute before evaluating it for speculation. In practice, we have found that a good choice for the three parameters to LATE are to set the SpeculativeCap to 10% of available task slots and set the SlowNode Threshold and SlowTaskThreshold to the 25th percentile of node progress and task progress rates respectively. We use these settings in our evaluation. Finally, we note that unlike Hadoop’s scheduler, LATE does not take into account data locality for launching speculative map tasks, though this is a potential exten sion. We assume that because most maps are data-local, network utilization during the map phase is low, so it is fine to launch a speculative task on a fast node that does not have a local copy of the data. Locality statistics avail able in Hadoop validate this assumption.
+
+##### 4.1 Advantages of LATE
+
+The LATE algorithm has several advantages. First, it is agnostic to node heterogeneity, because it will relaunch only a small number of the slowest tasks. LATE priori tizes among the slow tasks to ensure that only the slow est get speculatively executed. LATE also caps the num ber of speculative tasks to limit contention for shared re sources and avoid thrashing. In contrast, Hadoop’s na tive scheduler has a fixed threshold, beyond which all tasks that are “slow enough” have an equal chance of be ing launched. This fixed threshold can cause excessively many speculative tasks to be launched. Second, LATE also takes into account node hetero geneity when deciding where to run a speculative task. In contrast, the native scheduler in Hadoop assumes that any node that finishes a task and has a free slot is likely to be a fast node (i.e., that slow nodes will almost never fin ish tasks), so it schedules tasks on all idle nodes without discriminating on any property except data locality. Third, a task’s progress score is no longer assumed to be linearly correlated with its percent completion. We do use progress rate in estimating time late, but we always choose the tasks with the lowest progress rate, rather than all tasks with a progress rate below some threshold. This also means that tasks are allowed to slow down occasion ally and make progress sporadically. LATE also allows alternative methods of estimating task completion type to be employed if they perform better. Fourth, because LATE uses estimated time left rather than heuristics based on fixed thresholds, means, and ab solute progress scores, it is immune to the failure modes caused by assumptions 4 and 5 in Hadoop’s scheduler. In general, LATE is more robust than algorithms based on thresholds, because it uses a cap on speculative tasks as well as percentile-based thresholds for identifying slow nodes and slow tasks. As a concrete example of how LATE improves over Hadoop’s scheduler, consider the reduce example in Sec tion 3.2, where assumption 4 (that progress score repre sents percent complete) is violated and all reducers still in the copy phase fall below the speculation threshold as soon as a few reducers finish their work. Hadoop’s na tive scheduler would speculate arbitrary reduces, missing true stragglers and potentially starting too many specula tive tasks if many reducers stay slow for a period of time. In contrast, LATE would first start speculating the reduc ers with the slowest copy phase, which are probably the true stragglers, and would stop speculating new reducers once it has reached the SpeculativeCap, ensuring that the network does not get overloaded.
+
+Time (s)
+
+0 20 40 60
+
+25 %
+
+50 %
+
+75 %
+
+100 %
+
+T1
+
+T2
+
+Current progress 
+Estimated future 
+progress 
+True future 
+progress 
+
+Figure 2: A scenario where LATE estimates finish orders incorrectly.
+
+##### 4.2 Estimating Finish Times
+
+At the beginning of Section 4, we said that we estimate the time left for a task based on the progress score pro vided by Hadoop, as (1 - progress) / (progress rate). Al though this heuristic works well in practice, we wish to point out that there are situations in which it can backfire, and this heuristic might estimate that a task that has made more progress than another identical task which will fin ish later. Because this situation does not occur in typi cal MapReduce jobs (as motivated below), we have used this progress rate heuristic for our evaluation of LATE in this paper. We explain this misestimation here because it is an interesting and subtle factor in scheduling based on rate of progress. In future work, we plan to evaluate more sophisticated methods of estimating finish times. To see how the progress rate heuristic might backfire, consider a task T that has two phases in which it runs at different rates. Suppose the task makes progress at 5% points per second in the first phase, up to a total progress score of 50%, and then slows down to 1% per second in the second phase. Thus the task spends 10 seconds in the first phase and 50 seconds in the second phase, or 60s in total. Now suppose that we launch two copies of task T, say T1 and T2, one at time 0 and one at time 10, and that we check their progress rates at time 20. Figure 2 illustrates this scenario. At time 20, T1 will have finished its first phase and be one fifth through its second phase, so its total progress score will be 60%, and its progress rate will be 60%/20s = 3%/s. Meanwhile, T2 will have just finished its first rate, and its progress rate will be 50%/10s = 5%/s. The estimated time left for T1 will be (100%− 60%)/(3%/s) = 13.3s. The estimated time left for T2 will be (100% − 50%)/(5%/s) = 10s. Therefore our heuristic will say that T1 will finish after T2, while in reality T2 will finish last. This situation arises because the task’s progress rate slows down throughout its lifetime and is not linearly re lated to actual progress. In fact, if the task sped up in its second phase instead of slowing down, there would be no problem – we would correctly estimate that tasks in their first phase have a longer amount of time left, so the estimated order of finish times would be correct, but we would be wrong about the exact amount of time left. The problem in this example is that the task slows down in its second phase, so “younger” tasks seem faster. Fortunately, this situation does not arise in typical MapReduce jobs in Hadoop. Map tasks’ progress is based on the number of records they have processed, so it is always linearly related to running time. Reduce tasks are typically slowest in their first phase – the copy phase, where they must read all map outputs over the network – so they fall into the “speeding up” category above. How ever, if there is a MapReduce job where some of the later phases of a reduce task are slower than the first, it would be possible to design a more complex heuristic that looks at a task’s progress rate in the current phase and com pares it with other tasks. We have not done this yet to keep our algorithm simple. We plan to investigate finish time estimation more carefully in future work.
+
+##### 5 Evaluation
+
+We began our evaluation by measuring the effect of con tention on performance in EC2, to validate our claims that contention causes heterogeneity. We then ran a suite of experiments evaluating the LATE scheduler in two en vironments: large clusters on EC2, and a local virtualized testbed. Although we began our EC2 tests by measuring het erogeneity in the production environment on EC2, we were assigned by Amazon to a separate test cluster when we ran our scheduling tests. Amazon moved us to this test cluster because our tests were exposing a scalability problem in the network virtualization software on their production cluster that was causing connections between our instances to fail intermittently. The test cluster had a patch for this problem. Although fewer clients were contending on the test cluster, we simulated heterogene ity there by occupying almost all the virtual machines in one location – 106 physical hosts, on which we placed 7 or 8 VMs each – and creating contention by using several VMs from each physical host. We chose the distributions of VMs per host to match those observed in the produc tion cluster. In summary, although our results are from a test cluster, they simulate the contention levels seen in production while letting us operate in a more controlled environment. The EC2 results are also consistent with those from our local testbed.
+
+##### 5.1 Measuring Heterogenity on EC2
+
+Virtualization technology can isolate CPU and memory performance effectively between VMs. However, as ex
+
+plained in Section 3.1, heterogeneity can still arise be cause I/O devices (disk and network) are shared between VMs. On EC2, virtual machines get the full available bandwidth when there is no contention, but are reduced to fair sharing when other VMs on the physical host are doing I/O [22]. We measured the effect of contention on raw disk I/O performance as well as application per formance in Hadoop. We saw a difference of 2.5-2.7x between loaded and unloaded machines. We note that our examples of the effect of load are in some sense extreme, because in practice, EC2 seems to try to place a user’s virtual machines on different physi cal hosts. For example, when we allocated 200 or fewer virtual machines, they were all placed on different phys ical hosts. Our results are also inapplicable to CPU and memory-bound workloads. However, the results are rel evant to users running Hadoop at large scales on EC2, because these users will likely have co-located VMs (as we did) and Hadoop is an I/O-intensive workload.
+
+5.1.1 I/O Performance Heterogeneity In the first test, we started a dd command that wrote 5000 MB of zeroes from /dev/zero to a file in parallel on 871 virtual machines in EC2’s production cluster. Be cause EC2 exhibits a “cold start” phenomenon when a block is first written to – possibly due to expanding a VM’s disk allocation and clearing existing data on the disk – we first “cleared” 5000 MB of space on each ma chine by running dd and deleting its output. We captured the timing of each dd command. We used a traceroute from each virtual machine to an external URL to figure out which physical machine the VM was on – the first hop from a Xen virtual machine is always the dom0 or supervisor process for that physi cal host. Our 871 VMs ranged from 202 that were alone on their physical host up to a packing of 7 VMs per phys ical host. Table 1 shows our results. We see that average write performance ranged from 62 MB/s for the isolated VMs to 25 MB/s for the VMs that shared a physical host with other VMs. To validate that the performance was tied to contention for disk resources due to multiple VMs writing on the same host, also tried performing dd’s in a smaller EC2 allocation where 200 VMs were assigned to 200 separate physical hosts. In this environment, dd performance was between 51 and 72 MB/s for all but three VMs. These achieved 44, 36 and 17 MB/s respectively. We do not know the exact cause of these stragglers. The nodes with 44 and 36 MB/s could be explained by contention with other users’ VMs given our previous measurements, but the node with 17 MB/s might be a truly faulty straggler. From these results, we conclude that background load is an important factor in virtual machine I/O performance
+
+Load Level VMs Write Perf (MB/s) 1 VMs/host 202 61.8 2 VMs/host 264 56.5 3 VMs/host 201 53.6 4 VMs/host 140 46.4 5 VMs/host 45 34.2 6 VMs/host 12 25.4 7 VMs/host 7 24.8 Table 1: EC2 Disk Performance versus VM co location: Average write performance versus number of VMs per physical host on EC2. The second column shows how many VMs fell into each load level in our 871-node test.
+
+on EC2, and can reduce I/O performance by a factor of 2.5. We have also observed that stragglers can occur “in the wild” on EC2. We also measured dd throughput on “large” and “extra-large” EC2 VMs. These VMs have two and four virtual disks respectively, which appear to have inde pendent performance. They achieve 50-60 MB/s perfor mance on each disk. However, a large VM costs 4x more than a small one, and an extra-large costs 8x more. Thus the I/O performance per dollar is comparable to, and of ten less than, that of small VMs.
+
+5.1.2 Impact of Contention at the Application Level We also evaluated the hypothesis that background load degrades performance in Hadoop itself. For this pur pose, we ran two tests with 100 virtual machines: one where each virtual machine was on a separate physical host that was doing no other work, and one where all 100 machines were packed onto 13 physical hosts, with 7 machines per host. To ensure that the physical ma chines in the first case were doing no other work, we allocated 800 machines in the EC2 test cluster, which we saw fell on 106 physical hosts, and we chose one VM from each of 100 physical hosts. With both sets of ma chines, we sorted 100 GB of random data using Hadoop’s sort benchmark with speculative execution disabled (this setting achieved the best performance). With isolated vir tual machines, the job completed in 408s, whereas with machines packed densely onto physical hosts, it took 1094s. Therefore there is a 2.7x difference in Hadoop performance with a cluster of isolated virtual machines versus a cluster of colocated virtual machines. Also note that in this test, some of the contention may have been for network I/O rather than disk I/O, explaining why the difference is larger than for dd.
+
+| 5.2 EC2 Scheduling | Experiments | | | | | Load | | Level | | Hosts | | | VMs | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | | | | | | 1 | VMs/host | | | | 40 | | | 40 | | | |
+| For each measurement in | this section we performed | sev | | | | | | | | | | | | | | | |
+| | | | | | | 2 | VMs/host | | | | 20 | | | 40 | | | |
+| eral runs on EC2. Due | to the environment’s variability | | | | | | | | | | | | | | | | |
+| | | | | | | 3 | VMs/host | | | | 15 | | | 45 | | | |
+| and contention, there are | some runs with high variance | | | | | | | | | | | | | | | | |
+| | | | | | | 4 | VMs/host | | | | 10 | | | 40 | | | |
+| in the results. To address | this issue, we used a local clus | | | | | | | | | | | | | | | | |
+| ter where we ran more experiments | and had full control | | | | | 5 | VMs/host | | | | 8 | | | 40 | | | |
+| over the environment. | | | | | | 6 | VMs/host | | | | 4 | | | 24 | | | |
+| We evaluated various | scheduling strategies in Hadoop | | | | | 7 | VMs/host | | | | 2 | | | 14 | | | |
+| in two environments: a large | number of virtual machines | | | | | | Total | | | | 99 | | | 243 | | | |
+| on Amazon EC2, and a small | testbed of virtual machines | | | | | | | | | | | | | | | | |
+| | | | Table | 2: | Load | | level | mix | in | our | | heterogeneous | | | | cluster. | |
+| on 10 physical hosts in one | of our department’s clusters. | | | | | | | | | | | | | | | | |
+
+1.4 e
+
+1.2
+
+0.8
+
+0.6
+
+No Specula:on Hadoop Na:ve LATE Scheduler
+
+0.4 rm
+
+N o
+
+0.2
+
+0
+
+Worst Best Average
+
+For each measurement in this section we performed sev eral runs on EC2. Due to the environment’s variability and contention, there are some runs with high variance in the results. To address this issue, we used a local clus ter where we ran more experiments and had full control over the environment. We evaluated various scheduling strategies in Hadoop in two environments: a large number of virtual machines on Amazon EC2, and a small testbed of virtual machines on 10 physical hosts in one of our department’s clusters. The EC2 machines are all “small”-size instances each of which has 1.7 GB of memory, 1 virtual core with “the equivalent of a 1.0-1.2 GHz 2007 Opteron or Xeon pro cessor,” and 160 GB of space on a hard disk which is potentially shared with at most one other VM co-located on the same physical host [22]. Instead of running in the production EC2 environment, they are in a separate test cluster of 106 physical machines that we had nearly full control over, as described at the beginning of sec tion 5. We allocated 800 virtual machines on this cluster – nearly the full capacity, since each physical machine seems to support at most 8 virtual machines – and used a subset of them for each test. In all tests, we configured the Hadoop Distributed File System to maintain two replicas of each block, and we configured each machine to run up to 2 mappers and 2 reducers simultaneously (the Hadoop default). We chose the data input sizes for our jobs so that each job would last approximately 5 minutes in order simulate shorter, more interactive job-types as are common for MapRe duce style applications [1]. In our first set of experiments, we compared three schedulers – Hadoop’s native scheduler, our LATE scheduler, and no speculative execution – in two settings: Heterogeneous but non-faulty virtual machines, chosen by assigning a varying number of VMs to each physical host, and an environment with stragglers. For our workload, we used primarily the Sort bench mark in the Hadoop distribution, but we also evaluated to other workloads. Sorting is the main benchmark used for evaluating Hadoop optimizations at Yahoo! [26]. Google also uses sort as one of the only two performance bench marks in [1]. In addition, there are a number of features of sorting which make it a desirable benchmark [25]. To validate our findings, we reproduced these exper iments in a scaled-down virtual data center on our own cluster in Section 5.3. 5.3.4.
+
+Figure 3: Running times in heterogeneous cluster: Worst, best and average-case performance of LATE against Hadoop’s scheduler and no speculation.
+
+Amazon EC2 test cluster. The cluster had 106 physical machines, each of which hosted 7 or 8 of our virtual ma chines. We used 1 to 7 virtual machines on each host, for a total of 243 virtual machines. Table 2 shows the num ber of virtual machines at each load level. We chose this mix to resemble the allocation we saw for 900 nodes in the production EC2 cluster in Section 5.1. As our workload, we used a Sort job on a data set of 128 MB per host, or 30 GB of total data. As in all our experiments, the data was stored with 2 repli cas per each block in Hadoop’s Distributed File Sys tem. Each job had 486 map tasks and 437 reduce tasks (Hadoop leaves some reduce capacity free for speculative and failed tasks). We repeated the experiment 6 times. Figure 3 compares the response time achieved by each scheduler. Our graphs throughout the Evaluation section show normalized performance against that of Hadoop’s native scheduler. We show the worst-case and best-case gain from LATE to give an idea of the range involved. On average, in this heterogeneous cluster experiment, LATE finished jobs about 27% shorter than Hadoop’s native scheduler and 31% faster than no speculative execution. We also evaluated throughput by starting three copies of the Sort job simultaneously and measuring the time to
+
+5.2.1 Scheduling in a Heterogeneous Cluster For our first set of experiments, we purposefully created a heterogeneous cluster by assigning different numbers of virtual machines to physical hosts within a segregated
+
+0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1
+
+1.2
+
+Worst Best Average
+
+No Specula:on Hadoop Na:ve LATE Scheduler
+
+Figure 4: Throughput in heterogeneous cluster: Worst, best and average-case throughput (jobs/s) of LATE against Hadoop’s scheduler and no speculation.
+
+finish all three. The results are shown in Figure 4. We see that LATE performed 5.1% better than Hadoop’s sched uler and 18% better than no speculation. As explained in Section 2, as more jobs are submitted to a cluster, no speculation is the best policy for increasing throughput, because it wastes no time at all with speculative task. However, the stragglers in this heterogeneous environ ment were slow enough that there was still a gain from speculation for three Sort jobs.
+
+5.2.2 Effect of Stragglers To evaluate the scheduling algorithms in a more interest ing and realistic environment, we manually slowed down eight virtual machines in a cluster of 100 VMs to simu late stragglers. The other machines were assigned be tween 1 and 8 VMs per host, with about 10 in each load level. The stragglers were created by running four CPU intensive processes (tight loops modifying values in 800 KB arrays) and four disk-intensive processes (dd tasks creating large files in a loop) on each of the 8 machines chosen to simulate stragglers. The load was significant enough that disabling speculative tasks caused the clus ter to perform 2 to 4 times slower than it did with the LATE scheduler, but not so significant as to render the straggler machines completely unusable. For each run, we sorted 256 MB of data per host, for a total of 25 GB. Figure 5 shows the results from 4 experiments. On average, LATE finished jobs 58% faster than Hadoop’s native scheduler and 220% faster than Hadoop with spec ulative execution disabled. The gain over native specula tive execution could be as high as 93%. We observe that in some runs, the schedulers’ relative performance was similar. There is an element of “luck” involved in these tests that can explain this – if a block’s two replicas both happen to be placed on stragglers, then no scheduling algorithm can perform very well because
+
+0.0
+
+0.5
+
+1.0
+
+1.5
+
+2.0
+
+2.5
+
+Worst Best Average
+
+No Specula8on Hadoop Na8ve LATE Scheduler
+
+Figure 5: Running times with stragglers: Worst, best and average-case performance of LATE against Hadoop’s scheduler and no speculation.
+
+these blocks will be slow to serve. Nonetheless, LATE performs better than the alternatives in all tests.
+
+5.2.3 Differences Across Workloads To validate our use of the Sort benchmark, we also ran two other workloads, Grep and WordCount, on a hetero geneous cluster with laggards. Grep and WordCount are sample programs in the Hadoop distribution. We used a 204-node cluster with 1 to 8 VMs per physical host. We created eight stragglers using the same combination of CPU and disk-intensive tasks as above. Grep searches for a regular expression in a text file and creates a file with matches. It then launches a second MapReduce job to sort the matches. We only measured performance of the search job because the sort job was too short for speculative execution to activate (it took less than a minute) and would have resembled our sort benchmarks had it been larger. We applied Grep to 43 GB of text data (repeated copies of Shakespeare’s plays), or about 200 MB per host. We searched for the regular expression “the”. We repeated the experiment 5 times. The performance results are shown in Figure 6. On aver age, LATE finished jobs 36% faster than Hadoop’s native scheduler and 57% faster than no speculation. WordCount counts the number of occurrences of each word in a file. We applied WordCount to a smaller data set of 21 GB, or about 100 MB per host. The perfor mance results are shown in Figure 7. We repeated the ex periment 5 times. On average, LATE finished jobs 8.5% faster than Hadoop’s native scheduler and 179% faster than no speculation. We observe that the gain from both LATE is smaller in WordCount than in Grep and Sort. This is explained by looking at the workload. Sort and Grep write a sig nificant amount of data over the network and to disk.
+
+1.4 e
+
+1
+
+0.8
+
+R u n n
+
+Load Level VMs Write Perf. (MB/s) Std. 1 VMs/host 5 52.1 13.7 2 VMs/host 6 20.9 2.7 4 VMs/host 4 10.1 1.1 Table 3: Local Cluster Disk Performance: Average write performance and Standard Deviation vs. number of VMs per physical host on our local cluster. The sec ond column shows how many VMs fell into each load level in our local experiments.
+
+0.6
+
+No Specula:on Hadoop Na:ve LATE Scheduler
+
+0.4 rm
+
+N o
+
+0.2
+
+0
+
+Worst Best Average
+
+| | | | | | | | | Load | Level | | Hosts | | | VMs | | | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Figure | | 6: Grep running times | with stragglers: | Worst, | | | | 1 VMs/host | | | 5 | | | | 5 | | | | | |
+| best | and | average-case performance | of LATE | against | | | | 2 VMs/host | | | 3 | | | | 6 | | | | | |
+| Hadoop’s | | scheduler and no | speculation. | | | | | 4 VMs/host | | | 1 | | | | 4 | | | | | |
+| | | | | | | | | Total | | | 9 | | | | 15 | | | | | |
+
+Table 4: Load level mix in heterogeneous local cluster.
+
+3 e
+
+2
+
+R u n n
+
+1.5
+
+No Specula9on Hadoop Na9ve LATE Scheduler
+
+1 rm
+
+Our machines were dual-processor, dual-core 2.2 GHz Opteron processors with 4 GB of memory and a single 250GB SATA drive. On each physical machine, we ran one to four virtual machines using Xen, giving each vir tual machine 768 MB of memory. While this environ ment is different from EC2, this appeared to be the most natural way of splitting up the available computing re sources among up to four virtual machines per host.
+
+0.5
+
+N o
+
+0
+
+Worst Best Average
+
+Figure 7: WordCount running times with stragglers: Worst, best and average-case performance of LATE against Hadoop’s scheduler and no speculation.
+
+5.3.1 Local Performance Heterogeneity We first performed a local version of the experiment de scribed in 5.1.1. We started a dd command in parallel on each virtual machine which wrote 1GB of zeroes from /dev/zero to a file. We captured the timing of each dd command and show the averaged results of 10 runs in table 3. We see that average write performance ranged from 52.1 MB/s for the isolated VMs to 10.1 MB/s for the 4 VMs that shared a single physical host. We witnessed worse disk I/O performance in our local cluster than on EC2 for the co-located virtual machines because our local nodes each have only a single hard disk, thus the machine on which 4 VMs were co-located experienced 4-way disk contention, whereas in the worst case on EC2 8 VMs were contending for 4 hard disks.
+
+On the other hand, WordCount only sends a small num ber of bytes to each reducer – a count for each word. Once the maps in WordCount finish, the reducers fin ish quickly, so its performance is bound by the map pers. The slowest mappers will be those which read data whose only replicas are on straggler nodes, and therefore they will be equally slow with LATE and native specula tion. In contrast, in jobs where reducers do a significant amount of work, maps are a smaller fraction of the to tal time, and LATE has more opportunity to outperform Hadoop’s scheduler by speculating reducers more effec tively. Nonetheless, in all workloads, we demonstrate that speculation is necessary to mitigate stragglers.
+
+##### 5.3 Local Scheduling Experiments
+
+5.3.2 Local Heterogeneous Cluster We next configured the local cluster in a heterogeneous fashion to mimic a VM-to-physical-host mapping one might see in a virtualized environment such as EC2. We chose the number of Virtual Machines per physical host to be appropriate for the size of the hardware we were
+
+In order to validate our results from EC2 in a more tightly controlled environment, we also ran a local cluster of 9 physical hosts running Xen virtualization software [21].
+
+1.2
+
+1.8 e e
+
+1 im im
+
+1.6
+
+T
+
+T
+
+0.8
+
+1.2
+
+R u n n
+
+R u n n
+
+0.6
+
+1
+
+No Specula:on Hadoop Na:ve LATE Scheduler
+
+No Specula:on Hadoop Na:ve LATE Scheduler
+
+0.4
+
+0.6 rm rm
+
+0.4 o o
+
+0.2
+
+N
+
+N
+
+0.2
+
+0
+
+0
+
+Worst Best Average
+
+Worst Best Average
+
+Figure 8: Running time with heterogeneity: results of sort benchmark with no speculative execution, Hadoop’s native scheduler, and LATE in local heterogeneous clus ter.
+
+Figure 9: Running time with stragglers: results of sort benchmark with: (1) No speculative execution, (2) Hadoop’s native scheduler, and (3) LATE in a local het erogeneous cluster with a synthetic straggler.
+
+2.5 e im
+
+2
+
+T g in n
+
+1.5 n u
+
+R
+
+No Specula8on Hadoop Na8ve LATE Scheduler
+
+using, assigning three classes of machines. As Table 4 shows, 5 physical hosts were running a single VM each (one of these machines served as the Hadoop master), two physical hosts were running two VMs each, and one physical host was running 4 VMs. Each virtual ma chine was configured to operate with 768MB of memory. We then ran our MapReduce sort benchmark, generating 64MB per job, and running each job 5 times. Figure 8 shows the averaged results of 5 runs of the sort bench mark. On average, LATE finished jobs 162% faster than Hadoop’s native scheduler and 104% faster than Hadoop with speculative execution disabled. The gain over native speculative execution could be as high as 261%.
+
+rm
+
+0.5 o
+
+N
+
+| mark. | On | average, LATE | finished jobs 162% | faster | than | | | 0 | | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Hadoop’s | | native scheduler | and 104% faster | than | Hadoop | | | Best Worst | Average | | | | |
+| with | speculative | execution | disabled. The gain | over | native | | | | | | | | |
+
+Figure 10: WordCount running times with no specu lative execution, Hadoop’s native scheduler, and LATE scheduling with stragglers.
+
+##### 5.3.3 Local Stragglers
+
+EC2, the gain in WordCount is less due to the nature of the workload.
+
+In order to simulate stragglers in our local control envi ronment, we ran a disk-intensive process (as in section 5.2.2, dd tasks creating large files in a loop) on two co located virtual machines to simulate a poorly performing node. Figure 9 shows the average running times and ad ditionally the worst case and best case performance for LATE. On average, under these simulated straggler con ditions, LATE finished jobs 53% faster than Hadoop’s native scheduler and 121% faster than Hadoop with spec ulative execution disabled. The gain over native specula tive execution could be as high as 100%.
+
+##### 6 Discussion
+
+##### 5.3.4 Differences Across Workloads
+
+Our work is motivated in part by the decreasing cost of commodity computers and by the availability of open source parallelization frameworks, such as Hadoop, which simplify the task of running distributed applica tions on thousands of nodes, making it an option for even small organizations. Having a private cluster offers an organization com plete control, but it is also incurs a significant capital and operational cost and provides finite computing re sources. In a private cluster, the goal is to engineer so lutions that maximize the utilization of the available fi nite cluster resources and minimize application response times (wall clock running times). Since a private clus ter usually evolves over time, it will often contain two
+
+Like in our EC2 experiments, we also ran WordCount on our heterogeneous local cluster with synthetically in duced stragglers. The results for the normalized perfor mance of no speculative execution, Hadoop native spec ulative execution, and LATE for WordCount are shown in Figure 10. We see that LATE consistently performs better than the competition, although as in the tests on
+
+or more generations of hardware. The organization may choose to treat the different generations as separate re sources, or they may combine them together. The orga nization may also choose to use virtualization. However, to execute larger and larger tasks, the various physical (and virtual) resources will likely be combined, introduc ing exactly the types of heterogenity challenges that our results show are addressed by LATE. If instead, an organization shifts to using a commer cial virtualized data center, then they will give up some measure of control and will incur a higher degree of re source heterogeneity and the associated variance. How ever, computing resources (i.e., compute hours) are no longer a sunk cost (they are now available at an hourly rate) and scale is no longer limited by a local hard cap (the limit is the rate at which organizations like EC2 can grow). Unlike a private cluster, the ultimate lim iting factor on scale becomes engineering limitations, such as limited bisection bandwidth in shared nothing parallel computing environments [24]. Instead of simply maximizing finite capacity while minimizing completion time, the organization can now focus on finding the right scale to run a job at in order to satisfy both price and time constraints. An added challenge is that while the average performance in such environments is excellent, there will likely be stragglers that introduce significant performance anomalies. As our results show, by using LATE we are able to effectively leverage speculative ex ecution to mitigate the effects of laggards and resource heterogenity on response time. We believe that to capitalize on the many benefits that virtualization have to offer–such as simplifying clus ter partitioning, sharing, and management–the implica tions of heterogeneity on distributed applications must be thoroughly understood. Through our experiences with Hadoop in both EC2 and Xen on our local cluster, we have gained a substantial insight into the challenges in this space. While working on scheduling and speculative execu tion in heterogeneous environments, we observed three recurring themes that led to improved performance:
+
+• Tasks are not equal. If there are multiple slow tasks, then whenever possible a best guess should be made to estimate which task will finish farthest in the future, and that task should be speculatively re-assigned to another node. 
+• Compute nodes are not equal. Whenever possible, speculative tasks should be assigned to fast nodes. 
+• Resources are precious. Thresholds should be used to prevent overloading the system by execut ing too many speculative tasks. 
+
+##### 6.1 Future Work
+
+We have identified several other areas for improving Hadoop’s performance in heterogeneous environments. For example, block placement in HDFS currently tries to balance blocks accross nodes, and could be made more intelligent by taking into account each node’s disk and network I/O performance. Also, we have begun work on measuring the benefits of prioritizing the allocation of disk and network resources between map and reduce tasks on each MapReduce/HDFS slave, based on prelim inary observations that reducers can sometimes compete with mappers and create an effect similar to priority in version where a few maps finish late and slow down the entire job because most reducers are waiting on them. In an initial exploration, we performed dynamic anal ysis of the performance of slaves in the cluster using sev eral machine learning classification algorithms. Given knowledge about the individual capabilities of each slave in the cluster, the scheduler could be more intelligent when deciding how many tasks to simultaneously assign to each slave, and also which nodes to use for assigning speculative tasks. We believe that there would be benefits even with a simple scheduler algorithm that attempts to adapt to the differing capabilities of each slave by using an adaptive task assignment algorithm similar to TCP’s slow-start, congestion control and backoff policies. In Section 4, we define the SlowNodeThreshold, Slow TaskThreshold and SpeculativeCap. One weakness of any hard threshold is that for a mostly homogenous workload, we are likely to misidentify nodes whose per formance is only slightly worse than the mean as strag glers and speculative re-execute them. We plan to im prove upon this simple heuristic by using a variance threshold instead of a percentile threshold (i.e., a task will be re-executed if its performance is statistically iden tified as an outlier). We also wish to measure sensitivity of LATE’s performance to these thresholds. In Section 4, we briefly mention that for speculative execution, Hadoop’s current scheduler accounts for a node’s proximity to data when choosing which node to assign a map task to. However, LATE does not currently account for data proximity. Because the maximum size of such a copy will be one block of the input data (the default is 64MB in both Hadoop and Google’s MapRe duce), we do not believe that this will have a significant impact on performance. However, all other factors being equal, accounting for such locality in a future revision of LATE may yield a small reduction in running time.
+
+##### 7 Related Work
+
+Much work has been done on the problem of schedul ing policies for task assignment to hosts in distributed
+
+systems [17] [18]. While our work shares much in com mon with this work, previous work is focused on inde pendent tasks, while MapReduce tasks are dependent on co-completion. As a result of assuming task indepen dence this class of work does not have to deal with strag glers (i.e. some tasks being slowed down by others who are taking an unusually longer to complete slowing) and thus also does not have to address scheduling specula tive re-execution, which is a core element of our con tribution. Also, while this work focuses on distributed computing to support backend services in a server client oriented setting (such as a distributed Web server), the required level of distribution and scale is much smaller than that of many Hadoop installations. Because of our use of EC2 and our focus on Hadoop, the scale at which we are testing the effects of heterogeneity–at sizes up to 900 virtual machines on over 400 physical hosts–is larger than any other distributed scheduling work we are aware of. Finally, while this related work discusses in detail the problem of highly variable (i.e. “heavy tailed”) workload sizes, we focus instead on highly variable node perfor mance within the cluster. Our work has some things in common with multi processor task scheduling, both with processor hetero geneity [19] and with task duplication when using de pendency graphs [29]. Our work differs significantly from such work because we focus on independent tasks, non-shared memory, and a heterogeneous network, while multiprocessor task scheduling work focuses on process ing with high intertask communication and a homoge neous network. Our work also shares some ideas in common with work on “speculative execution” in distributed file sys tems [20], information gathering [27], and configuration management [28]. However, while this work is focused on guessing along decision branches, speculative execu tion in Hadoop is focused on guessing the expected exe cution time for task assignments in a distributed system. The Google File System and MapReduce were de scribed architecturally and evaluated for end-to-end per formance in [3] and [1]. However, [1] only briefly dis cusses speculative execution and does not explore the al gorithms involved in speculative execution nor the im plications of highly variable node performance. Our work provides a detailed look at the speculative execu tion scheduling mechanism. DataSynapse, Inc. currently holds a patent [23] which details speculative execution for scheduling in a dis tributed computing platform. The patent references sim ple statistics similar to those we have discussed for use in the scheduling of speculative tasks. The statistics they use include mean, normalized mean, standard deviation, and a fraction or percentage of waiting vs. pending tasks associated with each active job.
+
+##### 8 Conclusion
+
+We have analyzed the current speculative execution scheduler in the Hadoop MapReduce framework and identified five primary assumptions upon which it is built that assume homogeneity. We have observed and mea sured he implications of virtualization in distributed sys tems both at very large scales in Amazon EC2 and in a more controlled local virtual environment. Through such measurements, we have s hown how virtualized environ ments introduce heterogeneity that violates the assump tions of Hadoop’s current speculative execution sched uler. Based on our findings, we proposed a simple, ro bust scheduling algorithm, LATE, which performs well in a variety of settings.
+
+##### 9 Acknowledgments
+
+We would like to thank Michael Armbrust, Rodrigo Fon seca, George Porter, David Patterson and Armando Fox, as well as our industrial contacts at Yahoo!, Facebook and Amazon, for their help with this work. This research was supported by California MICRO, California Dis covery, the Natural Sciences and Engineering Research Council of Canada, as well as the following Berkeley Re liable Adaptive Distributed systems lab sponsors: Sun, Google, Microsoft, HP, Cisco, Oracle, IBM, NetApp, Fu jitsu, Siemens, and VMWare.
+
+References [1] Jeffrey Dean and Sanjay Ghemawat. MapReduce: Simplified Data Processing on Large Clusters. In Communications of the ACM, Volume 51, Issue 1, pp. 107-113, 2008. [2] Amazon Elastic Compute Cloud: http: //www.amazon.com/gp/browse.html? node=201590011 [3] Sanjay Ghemawat, Howard Gobioff, and Shun-Tak Leung. The Google file system. In Proceedings of 19th Symposium on Operating Systems Principles, pp. 29-43, 2003. [4] Hadoop: http://lucene.apache.org/ hadoop [5] Rodrigo Fonseca, George Porter, Randy H. Katz, Scott Shenker, and Ion Stoica. X-Trace: A Perva sive Network Tracing Framework. In Proceedings of 4th USENIX Symposium on Networked Sys tems Design & Implementation, pp. 271-284, 2007. [6] Nutch: http://lucene.apache.org/ nutch
+
+[7] Matthew L. Massie, Brent N. Chun and David E. 
+Culler. The Ganglia Distributed Monitoring Sys 
+tem: Design, Implementation, and Experience. Par 
+allel Computing, Vol. 30, Issue 7, July, 2004. 
+[8] F.D. Sacerdoti, M.J. Katz, M.L. Massie, and D.E. 
+Culler. Wide area cluster monitoring with Ganglia. 
+In Proceedings of the 2003 IEEE International Con 
+ference on Cluster Computing, pp. 289-298, De 
+cember 2003. 
+[9] Hadoop On Demand: http://hadoop. 
+apache.org/core/docs/r0.16.3/hod. 
+html 
+[10] Applications powered by Hadoop: http:// 
+wiki.apache.org/hadoop/PoweredBy 
+[11] Yahoo! Launches World’s Largest Hadoop 
+Production Application, Yahoo! Devel 
+oper Network, http://developer. 
+yahoo.com/blogs/hadoop/2008/02/ 
+yahoo-worlds-largest-production-hadoop. 
+html 
+[12] Presentations by Steve Schlosser and 
+Jimmy Lin at the 2008 Hadoop Summit. 
+http://developer.yahoo.com/hadoop/ 
+summit/. 
+[13] D. Gottfrid, Self-service, Prorated Su 
+per Computing Fun, The New York 
+Times Blog, http://open.nytimes. 
+com/2007/11/01/self-service 
+prorated-super-computing-fun/ 
+[14] Figure from slide deck on MapReduce from Google 
+cluster computing and MapReduce course, http: 
+//code.google.com/edu/submissions/ 
+mapreduce-minilecture/ 
+lec2-mapred.ppt. Available under Cre 
+ative Commons Attribution 2.5 License. 
+[15] R. Pike, S. Dorward, R. Griesemer, S. Quinlan. In 
+terpreting the Data: Parallel Analysis with Sawzall 
+Scientific Programming Journal, Vol. 13, No. 4, pp. 
+227-298, Oct. 2005. 
+[16] C. Olston, B. Reed, U. Srivastava, R. Kumar and A. 
+Tomkins. Pig Latin: A Not-So-Foreign Language 
+for Data Processing. To appear in ACM SIGMOD 
+2008, June 2008. 
+[17] Mor Harchol-Balter, Task Assignment with Un 
+known Duration. Journal of the ACM , Vol. 49, 
+No. 2, March 2002, pp. 260-288. 
+
+[18] M.Crovella, M.Harchol-Balter, and C.D. Murta. Task assignment in a distributed system: Improv ing performance by unbalancing load. In Measure ment and Modeling of Computer Systems, pages 268269, 1998. [19] B.Ucar, C.Aykanat, K.Kaya, and M.Ikinci. Task assignment in heterogeneous computing systems. Journal of Parallel and Distributed Computing, 66(1):3246, January 2006. [20] E.B. Nightingale, P.M. Chen, and J.Flinn. Specula tive execution in a distributed file system. ACM Trans. Comput. Syst., 24(4):361392, November 2006. [21] B.Dragovic, K.Fraser, S.Hand, T.Harris, A.Ho, I.Pratt, A.Warfield, P.Barham, and R.Neugebauer. Xen and the art of virtualization. In Proceedings of the ACM Symposium on Operating Systems Prin ciples, October 2003. [22] Amazon EC2 Instance Types, http://www. amazon.com/Instances-EC2-AWS/b? ie=UTF8&node=370375011 [23] James Bernardin, Peter Lee, James Lewis, DataSy napse, Inc. Using Execution statistics to select tasks for redundant assignment in a distributed comput ing platform Patent number: 7093004, filed Nov 27, 2002, issued Aug 15, 2006 [24] D.Dewitt and J.Gray. Parallel database systems: The future of database processing or a passing fad. ACM SIGMOD Record, Special Issue on Direc tions for Future Database Research and Develop ment, 19(4), 1990. [25] G. E. Blelloch, L. Dagum, S. J. Smith, K. Thear ling, M. Zagha An evaluation of sorting as a super computer benchmark. Nasa Technical Reports, Jan. 29, 1993 [26] Personal communication with the Yahoo! Hadoop team and Joydeep Sen Sarma (Facebook). [27] G. Barish. Speculative plan execution for informa tion agents. PhD dissertation, University of South ernt California. Dec. 2003 [28] Y. Su, M. Attariyan, J. Flinn AutoBash: improv ing configuration management with operating sys tem causality analysis. Proceedings of twenty-first ACM SIGOPS symposium on Operating systems principles, pp. 237-250,2007. [29] S.Manoharan. Effect of task duplication on the as signment of dependency graphs. Parallel Comput., 27(3):257268, 2001.
+

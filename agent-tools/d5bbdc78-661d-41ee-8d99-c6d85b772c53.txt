@@ -1,0 +1,400 @@
+PICO: Performance Insights forCollective Operations
+
+arXiv is now an independent nonprofit! Learn more×
+
+# PICO: Performance Insights for Collective Operations
+
+Saverio Pasqualoni1,2, Tommaso Bonato3, Lorenzo Piarulli1 Torsten Hoefler3, Marco Canini2, Daniele De Sensi1 Affiliation: 1Sapienza University of Rome 2KAUST 3ETH Zurich Affiliation: Affiliation: {saverio.pasqualoni,marco}@kaust.edu.sa, {piarulli,desensi}@di.uniroma1.it, {tommaso.bonato,torsten.hoefler}@inf.ethz.ch
+
+###### Abstract
+
+Collective operations are cornerstones of both HPC applications and large-scale AI training and inference, yet benchmarking them in a systematic and reproducible way remains difficult on modern systems due to the complexity of their hardware and software stacks. Existing suites primarily report end-to-end timings and offer limited support for controlled algorithm and configuration selection, fine-grained profiling, and capturing the runtime environment. We present PICO (Performance Insights for Collective Operations), an open-source framework that decouples portable experiment setup from platform execution, provides a backend-adaptive parameter selection interface across MPI and NCCL, supplies plain-MPI reference collective implementations, optionally instrumentable, and records the system configuration for reproducible comparisons. Evaluated on three major supercomputers, PICO shows that default collective algorithms and transport settings can be up to $5\times$ slower than the best available choice. It provides diagnostic evidence by isolating topology sensitive algorithmic choices and, through instrumentation, reveals detailed algorithmic breakdowns. To assess end-to-end effects of benchmark-informed tuning and evaluate application-level impacts, we replay open-source LLM training traces in ATLAHS simulator with optimized collective profiles identified by PICO, achieving reductions in training times of up to $44\%$ .
+
+###### Index Terms:
+
+High performance computing, Performance analysis, Computer networks, Message passing, Software Tools
+
+## I Introduction
+
+While recent High Performance Computing (HPC) systems have surpassed exascale performance [34, 58], the growing disparity between the available computational resources and data movement capabilities remains a critical obstacle. Processor performance continues to improve at a faster pace than memory and interconnect technologies, increasing the relative cost of communication. As HPC systems scale to ever-larger sizes, the efficiency of data transfers increasingly determines both application performance and overall system scalability [35, 38, 37].
+
+Collective operations, being among the most communication-sensitive components of distributed-memory applications, are particularly affected by this trend and face increasing performance challenges on large-scale HPC clusters [26]. Together with point-to-point communication, they form the backbone of traditional HPC workloads as well as AI training and inference tasks [64]. At large scale, the cost of collective communication often dominates application runtime [33, 64, 4], making the design and optimization of efficient collective algorithms a key priority [49, 51, 7, 6, 46, 36].
+
+Understanding and optimizing collective communication performance is difficult because collectives intertwine computation, memory movement, and network transfer, making it non-trivial to attribute bottlenecks to a specific subsystem [24, 66]. This attribution problem is amplified by today’s heterogeneous environments: systems combine scale-up and scale-out fabrics with diverse topologies, multiple user-level communication libraries (e.g., MPI implementations and *CCL [41, 1, 17, 64, 15]), and evolving network software stacks and APIs such as OFI and UCX/UCC [63, 57, 44]. Moreover, performance is shaped by time-varying runtime conditions, such as congestion [67], load-balancing [8] allocation policies [45], and task-to-node mappings [32], which introduce variance that is hard to predict, reproduce, or control.
+
+Crucially, each collective operation can be implemented by multiple different algorithms, each one optimal for different combinations of node count and message sizes [54, 15]: libraries often select among their available implementations with predetermined general heuristics. Moreover, performance gaps between different communication libraries, namely here GPU-aware MPI and *CCL libraries, can invert depending on runtime conditions, with one library outperforming the other depending on message size and node count [15]. As a result, fair evaluation and reproducible characterization of collective algorithms require benchmarking methods that capture both system context and algorithm-level behavior.
+
+Existing benchmarking tools such as OMB [55], NCCL Tests [40], Intel IMB [27], ReproMPI [47], and CommBench [18] are effective for reporting end-to-end collective performance, but they only partially address the needs of modern systems. They generally lack fine-grained phase/step profiling and do not support straightforward, controlled comparisons of similar algorithms across different libraries. They also do not systematically record experimental conditions, such as node allocations, environment variables, software stack versions, and relevant hardware configuration, which complicates rigorous, reproducible evaluation.
+
+For these reasons, we introduce PICO (Performance Insights for Collective Operations), an open-source11 1 https://github.com/HLC-Lab/pico, modular, and extensible framework for benchmarking and diagnosing the performance of collective operations across multiple communication libraries. PICO contributes with (i) step-level instrumentation to attribute time to algorithmic phases, (ii) metadata-rich run capture to enable reproducibility and regression diagnosis, and (iii) backend-neutral reference collectives to isolate algorithmic differences from backend effects in a (iv) unified experiment specification spanning diverse backends (e.g., MPI and NCCL) for portable benchmarking.
+
+We use PICO to analyze collective performance on different supercomputers: LUMI [69], Leonardo [61] and MareNostrum 5 [5]. We find that default collective algorithm selections can be $30$ – $40\%$ slower than the best available alternative, and in the worst case deliver only $0.2\times$ of optimal performance. We leverage PICO’s comprehensive metadata capture to support a post-mortem analysis and identify root causes of diverging scaling behaviors of similar Broadcast algorithms, with the slower variant exhibiting a $2.5\times$ slowdown. Using PICO’s fine-grained instrumentation, we localize performance losses to different algorithmic phases, separating network-limited regimes from reduction and memory-movement limits.
+
+Finally, to quantify end-to-end application impact, we replay open-source traces from LLaMA 7B and Mistral MoE using the ATLAHS simulator [52] with optimized collective profiles informed by PICO, achieving projected runtime reductions of up to $44\%$ .
+
+## II Motivation and Requirements
+
+Systematic, fair, and reproducible measurement of collective operations performance across modern HPC systems is increasingly difficult due to the tight coupling of the structured heterogeneity of hardware environments and the growing complexity of software stacks. The main challenges faced are:
+
+C1
+
+On the hardware side, modern platforms are typically built from multi-GPU nodes connected by high-bandwidth scale-up fabrics (e.g., NVLink [39], InfinityFabric [48], UALink [2], UnifiedBuffer [68], or Scale-Up Ethernet (SUE) [9]), whose bandwidth can exceed the scale-out interconnect by up to an order of magnitude [15]. At the same time, the size of scale-up domains is rapidly expanding (e.g., up to 72 GPUs in NVL72 [42] and even larger domains up to 384 GPUs [68]). GPUs across nodes communicate over scale-out networks such as InfiniBand [10], Slingshot [13], or UltraEthernet [21], frequently deployed with tapered topologies (e.g., Dragonfly/Dragonfly+ [31, 69, 3, 13, 61, 53] or tapered fat-trees [5, 16, 50]). Thus effective bandwidth and latency depends on whether communicating endpoints share the same scale-up domain and, for scale-out, whether they are within the same local switch domain or traverse oversubscribed global links [15, 13]. Such non-uniform communication costs violate the homogeneous-link assumptions behind many traditional collective designs and motivate hierarchical and topology-aware collectives that explicitly exploit intra-node vs inter-node structure [14, 7, 30, 60].
+
+C2
+
+On the software side, as illustrated in Fig. 1, collective execution spans multiple layers (MPI implementations and *CCL libraries, as well as network stacks such as OFI/libfabric and UCX [44, 57]), each with tunable parameters and evolving behavior across versions. End-to-end timings include costs from network transfer, memory staging/movement, and reduction/computation, each dependent on one or more layer of the software stack. Moreover, results are sensitive to time-varying runtime conditions (e.g., congestion [67], allocation policies [45], and task-to-node mappings [32]) as well as version/parameter changes across layers, which complicates reproducibility and regression diagnosis.
+
+C3
+
+Beyond system heterogeneity, measurement methodology itself is a source of systematic biases in collective benchmarking [20]: precise process synchronization methods are required to ensure accurate results, but achieving this precision is a non-trivial task. A common approach is the use of barriers, but such constructs don’t ensure that every single process enters the measured portion of the code at the same time: a process may exit the barrier before others, distorting measured runtimes [25]. In this regard the choice of barrier algorithm is important: some algorithms cause more skewing than others, with linear approaches (e.g. ring) being the worst due to their long propagation delay. An alternative approach to the use of barriers is represented by window-based schemes, where processes agree on a future start time. Those methods can reduce some barrier-induced artifacts, but they shift the problem to clock synchronization and drift [20, 25].
+
+Fig. 1: Simplified software stack hierarchy. Applications interface with high-level communication libraries (MPI, *CCL), while the high-level library typically relies on middleware layers, such as UCX or libfabric to access transport layer interfaces. Legacy versions of MPI and some *CCL libraries access directly the transport layer interfaces without relying on middleware APIs.
+
+Fig. 2: End-to-end benchmarks report a single latency for a collective (left), but execution decomposes into phases, rounds, and steps that mix communication, reduction/computation, and data movement (right). PICO targets this gap by enabling optional phase/step attribution and controlled baselines.
+
+### II-A State-of-the-Art Analysis
+
+Standard benchmark suites, including OSU-MicroBenchmark (OMB) [55], Intel MPI Benchmark (IMB) [27], and NCCL Tests [40], are effective at reporting end-to-end latency/bandwidth, but they are not designed for controlled, reproducible diagnosis. In particular, they provide limited support for (i) portable algorithm selection and cross-library baselining (often relying on manual environment-variable configuration), (ii) per step/phase measurements beyond aggregate timings, and (iii) lack mechanisms to record and store system’s information and ensure reproducibility of the experiments.
+
+This growing need for communication observability is also reflected in industry efforts. NVIDIA recently introduced NCCL Inspector [12], a profiler-plugin that provides low-overhead, always-on, per-communicator and per-collective performance and metadata logging during real distributed AI workload runs, explicitly to help diagnose issues such as congestion and to correlate dips in compute throughput with collective performance. While valuable, such tooling is library-specific (NCCL-focused) and targets in-workload monitoring rather than portable, controlled benchmarking and backend-neutral baselining across stacks.
+
+ReproMPI [47] is a micro-benchmarking framework whose primary goal is correctness of measurements. It offers multiple synchronization methods and provides reference implementations of different collective algorithms but unfortunately it does not track the state of the system nor it aims to provide cross-stack compatibility and per step/phase measurements.
+
+CommBench [18] takes a significant step toward portability by introducing a library-agnostic API spanning MPI and *CCL collectives, but it does not target the same diagnostic and reproducibility objectives: it does not provide fine-grained observability of collective behaviours, metadata logging to track the state of the system is relatively minimal, and its usage model often requires writing low-level benchmarking logic, increasing manual effort for exploratory evaluation [18].
+
+Netgauge [19] introduces a modular benchmarking design that decouples benchmark “patterns” from communication “modules,” enabling extensible, comparable network/protocol measurements; however it is not designed for collective communications benchmarking.
+
+Table I summarizes this comparison, distinguishing capabilities that are natively supported as part of a tool’s integrated workflow ( $\checkmark$ ) from those that are achievable only through external scripting, or ad hoc modifications ( $\circleddash$ ) and those that are not supported at all ( $\times$ ).
+
+TABLE I: Qualitative coverage of requirements (Sec. II-B). $\checkmark$ : built-in; $\circleddash$ : partial/manual; $\times$ : not targeted.
+
+| | OMB | IMB | NCCL-T/I | CommBench | NetGauge | ReproMPI | PICO |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| R1 Fine grained profiling | $\circleddash$ | $\times$ | $\checkmark$ | $\times$ | $\times$ | $\circleddash$ | $\checkmark$ |
+| R2 Backend-neutral references | $\times$ | $\times$ | $\times$ | $\times$ | $\times$ | $\checkmark$ | $\checkmark$ |
+| R3 Portable spec & control | $\circleddash$ | $\circleddash$ | $\times$ | $\checkmark$ | $\checkmark$ | $\circleddash$ | $\checkmark$ |
+| R4 Automation & amm. usability | $\circleddash$ | $\circleddash$ | $\circleddash$ | $\checkmark$ | $\checkmark$ | $\checkmark$ | $\checkmark$ |
+| R5 Metadata-rich reproducibility | $\times$ | $\times$ | $\times$ | $\times$ | $\circleddash$ | $\circleddash$ | $\checkmark$ |
+| R6 Extensibility across stacks | $\circleddash$ | $\times$ | $\times$ | $\checkmark$ | $\circleddash$ | $\times$ | $\checkmark$ |
+
+### II-B Design requirements
+
+The central challenge in modern collective benchmarking is moving from end-to-end reporting to diagnosis: controlled experiments that can explain why a collective is underperforming and which algorithmic step or subsystem dominates. Fig. 2 illustrates this gap: many microbenchmarks typically report a single end-to-end latency, while the collective’s execution decomposes into phases, rounds, and steps (where a round is an iteration within a phase, and a step is a sub-operation within a round) that mix communication, reduction/computation, and data movement. Accordingly, our primary objective is fine-grained profiling (R1), enabled by backend-neutral, instrumentable baselines (R2) and a portable experiment specification (R3). The remaining requirements (R4–R6) ensure reproducibility and practicality at scale.
+
+R1
+
+The framework must support fine-grained profiling at the granularity of algorithm phases, rounds and steps, enabling attribution of time to network transfer, memory movement/staging, and reduction/computation where applicable. Collective implementations must therefore be able to delineate regions of interest via explicit annotations that map measurements to semantically meaningful regions of the collective. Instrumentation must be optional and impose no measurable overhead, within experimental noise, when disabled.
+
+R2
+
+To enable controlled comparisons and meaningful attribution, the framework must include backend-neutral reference collectives (e.g., plain-MPI implementations ported from major libraries) that isolate algorithmic differences from backend/transport effects (Sec. IV-B) and can be instrumented at fine boundaries, providing consistent portable references for profiling without requiring modifications to implementation-specific internal code.
+
+R3
+
+The framework must provide a portable, declarative specification for experiments (e.g., collective type, message sizes, scale, algorithm choice, and relevant backend parameters) so that the same experiment can be executed and compared across platforms and stacks with minimal platform-specific modifications. The specification must serve as a stable control interface that (i) selects among internal algorithm choices exposed by a given stack and (ii) exposes a set of relevant configuration parameters (Sec. IV-A), enabling controlled baselining across libraries without the need for specific per-experiment scripts.
+
+R4
+
+The framework must support large-scale benchmarking campaigns while providing structured bookkeeping and post-processing. It must front-load complexity into an infrequent platform-setup step (e.g., module/environment configuration, backend discovery, scheduler integration), after which experiments can be executed from a portable specification. The system must automatically apply requested algorithm/knob settings, submit and manage jobs, collect results, and produce outputs in a standardized schema that support systematic comparison across runs, enabling recurring workflows such as tuning studies and regression checks.
+
+R5
+
+Each run must capture sufficient metadata to reproduce and audit results and to diagnose regressions, including software stack versions (and build identifiers), selected backends/transports, relevant environment variables, hardware details (e.g., GPU/NIC model), and allocation/mapping context (e.g., node list and rank placement). Without this context, performance differences across runs, hardware or software updates are difficult to interpret. To keep large campaigns practical, the framework should support configurable metadata verbosity so that per-test metadata volume can be reduced when only minimal context is needed.
+
+R6
+
+The framework must accommodate evolving communication stacks by providing a clear extension interface for adding new backends (MPI implementations or *CCL libraries) and new collectives/algorithms: extensions to the framework should preserve a consistent end-to-end workflow. Moreover when a backend does not support a feature (e.g., algorithm selection or exposure to network layer parameters), the framework should degrade gracefully and still execute the experiment with a well-defined subset of functionality, without requiring all backends to implement the same sets of features.
+
+### II-C Workflows and Usability
+
+We selected these requirements to address the needs of three types of users. First, researchers and collective algorithm developers require backend-neutral baselines and fine-grained instrumentation capabilities (R1–R3) to directly evaluate algorithmic differences and optimizations while ensuring reproducibility (R5). Second, application developers and users require automated exploration and structured result management to make tuning campaigns feasible and repeatable (R4), together with sufficient metadata to interpret variability across allocations and software stacks (R5–R6). Third, system administrators require a repeatable workflow for regression testing across upgrades and configuration changes (R4–R5).
+
+## III Architecture
+
+PICO’s core design principle is to decouple what to run (a portable experiment description) from how to run it on a given platform (reusable environment descriptors), while producing outputs that are both comparable and diagnosable. The resulting end-to-end workflow, as shown in Fig. 3, follows a simple pipeline: test and environment specifications are defined via descriptive files ( and ), an orchestrator script () sets up the environment according to the test description and launches instances of a benchmarking core program () responsible for executing test instances and store performance data and metadata () in a structured format. Post processing and visualization tools () are used to analyze the data itself. The benchmarking core can optionally use a library () containing reference implementations and instrumentation primitives.
+
+Fig. 3: High-level PICO workflow. Users define experiments via a portable test descriptor (test.json) paired with a platform environment descriptor (env.json). The benchmark orchestrator resolves the descriptors, builds and launches pico_core (and optional libpico baselines), and collects standardized results and metadata for post-processing and diagnosis.
+
+Fig. 4: PICO terminal user interface (TUI) for interactive experiment specification. The TUI exposes available backends, collectives, algorithms, and supported control parameters for the current platform descriptor, and produces validated test.json files that can be executed by the orchestrator.
+
+### III-A Experiment specification and control plane
+
+PICO’s control plane provides a stable, portable interface for defining experiments and expressing backend control (algorithm choice and relevant parameters) through declarative descriptors. The framework translates this intent to backend-specific mechanisms without requiring per-experiment scripting. A platform descriptor (env.json; Fig. 3) records platform-specific capabilities and control mappings, while a portable test descriptor (test.json; Fig. 3) records experiment intent. Together, they realize R3 by making experiments executable and comparable across platforms with minimal intervention, and they enable R4 by allowing the orchestrator (Fig. 3) to execute large campaigns directly from descriptors.
+
+To improve usability, set up configuration complexity is front-loaded into the infrequent creation of env.json descriptors. Those files define the local environment: available communication stacks (MPI implementations and selected *CCL libraries), module/environment setup, scheduler and launcher templates (e.g., SLURM defaults), and backend-specific control mappings (e.g., which algorithm selectors and transport knobs are exposed and how to apply them). Given this platform context, users define a test.json that specifies the experiment in a backend-agnostic form (collective, message sizes, scale, and requested algorithm/parameter settings). Crucially, test.json does not encode cluster-dependent scripts; instead it encodes control intent (e.g., “use algorithm X”, “set parameter Y”) that PICO resolves using env.json.
+
+PICO provides both a terminal user interface (TUI; Fig. 3) and a command-line interface (CLI; Fig. 3) as front-ends to the same specification model. PICO’s TUI, shown in Fig. 4, is designed to guide the user into the discovery of available libraries and parameters: it presents what controls are available for the selected backend, applies defaults and validation, and outputs a self-contained test.json with the desired test configuration.
+
+### III-B Execution engine and backend adapters
+
+PICO’s execution engine, PICO core (Fig. 3), runs on compute nodes inside the allocated job. PICO core is responsible for the timing-critical portion of benchmarking: initializing the communication context, applying requested controls when supported, executing the target collective(s) over the specified message sizes and scales, and emitting measurements and metadata in the standardized output format, using PICO’s internal barrier synchronization for timing alignment [24].
+
+PICO supports heterogeneous communication stacks (R6) through a uniform backend adapter interface, with backend availability selected at compile time (e.g., #ifdef NCCL/CUDA to support for GPU collectives). Each compiled-in adapter implements: (i) context initialization, (ii) mapping of abstract controls from test.json to backend-specific knobs when exposed, and (iii) collective execution and timing.
+
+### III-C Backend-neutral baselines
+
+libpico (Fig. 3) is a user-space library that provides reference implementations of collective algorithms. In the current version, libpico focuses on MPI: it provides plain-MPI implementations (built on point-to-point primitives and adapted from Open MPI and MPICH) so algorithmic choices can be evaluated without, necessarily, relying on library internal collectives. This enables controlled, backend-independent comparisons of algorithmic behavior under identical experimental conditions. Sec. IV-B will demonstrate the practical value of stable reference baseline to isolate algorithmic effects.
+
+Importantly, libpico was designed to be extensible and allow developer to write and test directly new algorithms. It can be extended to support other communication libraries by implementing the corresponding backend signature and registering the implementation within pico_core.
+
+Fig. 5: Pseudo-code fragment illustrating tag-based fine-grained attribution in an instrumented Allreduce implementation: nested PICO_TAG_BEGIN/END markers annotate memory movement, algorithm phases, and per-step operations for fine-grained timing breakdowns.
+
+int allreduce(const void *sbuf, void *rbuf, int count,
+
+MPI_Datatype dt, MPI_Op op, MPI_Comm comm) {
+
+PICO_TAG_BEGIN(”init:mem-move”);
+
+/* staging, temporary buffers allocations and copies */
+
+PICO_TAG_END(”init:mem-move”);
+
+PICO_TAG_BEGIN(”phase:redscat”);
+
+for (int step = 0; step < steps; step++) {
+
+PICO_TAG_BEGIN(”redscat:comm”, step);
+
+err = MPI_Sendrecv(…);
+
+PICO_TAG_END(”redscat:comm”, step);
+
+PICO_TAG_BEGIN(”redscat:reduction”, step);
+
+err = MPI_Reduce_local(…);
+
+PICO_TAG_END(”redscat:reduction”, step);
+
+}
+
+PICO_TAG_END(”phase:redscat”);
+
+PICO_TAG_BEGIN(”phase:allgather”);
+
+for (int step = steps-1; step >= 0; step–) {
+
+PICO_TAG_BEGIN(”allgather:comm”, steps-1-step);
+
+err = MPI_Sendrecv(…);
+
+PICO_TAG_END(”allgather:comm”, steps-1-step);
+
+}
+
+PICO_TAG_END(”phase:allgather”);
+
+return MPI_SUCCESS;
+
+}
+
+### III-D Tag-based instrumentation for fine-grained attribution
+
+To move beyond aggregate end-to-end timings, PICO supports optional, tag-based instrumentation (R1) for collectives implemented in libpico (including user-defined collectives). Tags delineate semantically meaningful regions of an implementation, such as data staging, algorithmic phases, and per-step communication/reduction, enabling fine-grained attribution of where time is spent. Because instrumentation lives in libpico, PICO provides this breakdown without modifying vendor communication stacks.
+
+Instrumentation is expressed through lightweight macros (PICO_TAG_BEGIN(...) and PICO_TAG_END(...)), which can be used either flat or nested to capture hierarchical structure. The probes are optional, user-controlled, and inserted only at selected regions of interest. When enabled, PICO records timings for tagged regions and emits them using the same structured output model as other measurements; when disabled, the tag macros compile out to empty statements, preserving the behavior of standard benchmarking and leaving end-to-end tuning sweeps unaffected. The added cost per timing invocation was measured to be negligible (less than 100 ns per tagged region). Fig. 5 illustrates the instrumentation of an Allreduce, in particular: (i) a memory initialization region (lines 5–5), (ii) the two phase structure with Reduce-Scatter and Allgather of the algorithm (lines 5–5 and 5–5), and (iii) per-step regions inside each phase denoting communication and reductions (lines 5–5, 5–5, and 5–5).
+
+Fig. 6: Median best-to-default latency ratio $r$ over the algorithm choices exposed by the communication library. In particular $r=\frac{t_{best}}{t_{def}}$ where $t_{def}$ is the algorithm automatically selected by the library and $t_{best}$ is the best performing algorithm not selected by default. Values $\tilde{r}<1$ indicate suboptimal choices.
+
+(a) Leonardo (Open MPI 4.1.6)
+
+(b) LUMI (Cray MPICH 8.1.29)
+
+(c) MareNostrum 5 (Open MPI 4.1.5)
+
+TABLE II: Result data granularity modes supported by PICO.
+
+| Mode | Description |
+| --- | --- |
+| Full | Stores all measurements for each rank and each iteration. |
+| Statistics | For each iteration, stores aggregated statistics across ranks. |
+| Minimal | Records only the maximum value per iteration. |
+| Summary | Stores a single set of statistical aggregates over the iterations for the test point. |
+| None | Only stdout output with no values stored. |
+
+### III-E Standardized results and metadata capture
+
+To satisfy R5, PICO emits performance measurements and execution context in a standardized, human-readable output suitable for both large campaigns and post hoc diagnosis. Each campaign stores per-test measurements under a run directory, snapshots the resolved experiment specification (including the effective control settings applied to the backend), and maintains a lightweight index to support automated traversal, aggregation, and comparison across runs.
+
+Each test point (collective type, message size, scale, backend, and control settings) is a separate record containing also timing data and identifiers; the schema is backend-agnostic and encodes both the requested configuration (from test.json) and the effective configuration after platform resolution (via env.json), preserving comparability even when controls are unsupported or mapped differently across stacks. To balance diagnostic depth and campaign scale, PICO supports configurable result granularity.
+
+In addition, PICO records run context alongside performance data, including software stack versions/build identifiers, selected backends/transports, relevant environment variables and tuning knobs, hardware characteristics (e.g., GPU/NIC model), and allocation/mapping context (e.g., node list and rank placement). Metadata capture supports configurable verbosity so users can retain minimal context for broad sweeps while enabling richer capture for focused diagnostic runs.
+
+### III-F Analysis and diagnosis toolkit
+
+To help interpret collective performance on tapered, non-uniform interconnects, PICO provides a lightweight network traffic tracer that estimates how traffic is distributed across the cluster’s different topology domains (e.g., Dragonfly groups). The tracer takes as input (i) allocation and rank-placement metadata captured per run (e.g., node list and rank mapping; R5) and (ii) a topology description for the target system (e.g., node to switch-group membership and link hierarchy). It separates pairs of communicating ranks into categories based on their physical allocation (e.g., intra-node, intra-switch and inter-group) and returns an estimate of the utilization of network links by different collective algorithms. These estimates enable users to correlate observed performance with expected link congestion when comparing algorithms that trade local aggregation for reduced global traffic, or when diagnosing performance shifts caused by placement changes or topology-aware transport settings. It provides a topology-level estimate only, not a packet-accurate simulation of congestion, adaptive routing, or protocol behavior.
+
+For convenience and amortized usability (R4), PICO provides scripts that generate standard plots directly from the result schema, including heatmaps (e.g., message size vs. scale), line plots, and box/bar summaries across algorithms or backends. Because plots are derived from the same indexed schema used for campaign execution, visualization remains consistent across runs and can be integrated into automated tuning and regression pipelines.
+
+## IV Evaluation
+
+This section evaluates PICO through a set of case studies designed to validate the requirements in Section II and to demonstrate practical utility beyond end-to-end benchmarking. We organize the evaluation around four questions.
+
+1.
+
+How often does the library’s algorithm selection deviate from the best-performing choice for a given message size and process topology, and can PICO orchestrate controlled tuning campaigns? (Sec. IV-A)
+
+2.
+
+Can libpico reference implementations isolate algorithmic effects and explain cross-platform differences? (Sec. IV-B)
+
+3.
+
+Can a more detailed instrumentation of a collective algorithm reveal actionable bottlenecks that are opaque under aggregate timings? (Sec. IV-C)
+
+4.
+
+Do benchmark-informed choices translate into application-level implications under realistic communication traces? (Sec. IV-D)
+
+1. References
+
+Each case study shows what PICO makes possible because it was designed around the design goals described in Sec. II-B.
+
+### IV-A Collective Tuning
+
+Using PICO we conducted systematic sweeps of MPI_Allreduce across three major European supercomputers, Leonardo (Open MPI 4.1.6), LUMI (Cray MPICH 8.1.29), and MareNostrum 5 (Open MPI 4.1.5), varying only the collective algorithm choice exposed by each communication stack while keeping all other settings fixed. Fig. 6 summarizes the outcome of these sweeps using the best-to-default latency ratio $r=\frac{t_{\text{best}}}{t_{\text{def}}}$ , where $t_{\text{def}}$ is the median runtime obtained under the backend default algorithm and $t_{\text{best}}$ is the minimum median runtime among the non-default algorithms exposed by the backend for the same test point (message size, scale, and stack). Thus, $r<1$ indicates that the default choice is suboptimal (a faster non-default alternative exists), while $r>1$ indicates that the default is best among the exposed choices. Across all three systems, the heatmaps exhibit structured regions, often at larger scales and for specific message sizes, where defaults fall short of the best alternative by roughly $30$ – $40\%$ , and in the most pronounced case achieving only $20\%$ of the optimal performance.
+
+Default selection heuristics are typically engineered to be conservative and broadly portable; as a result, they may fail to capture the platform-specific characteristics that matter in practice. This motivates systematic tuning of collective communication algorithms and their selection parameters. PICO’s outputs can be used as empirical basis to tune libraries algorithmic choices: Open MPI supports overriding algorithm selection using coll_tuned dynamic decision files [56], and analogous mechanisms exist across other MPI implementations and *CCL libraries (via configuration files or environment variables).
+
+Additionally, sub-optimality is not limited to algorithm choice: performance can change dramatically with backend/transport parameters that are easy to overlook if they are not made explicit in the experiment specification. To illustrate this sensitivity, we fix the MPI_Allreduce algorithm to Ring on Leonardo at 32 nodes (removing algorithmic variability) and vary only UCX_MAX_RNDV_RAILS, a UCX parameter that caps the number of network rails used by the rendezvous protocol for large-message transfers. Fig. 7 reports execution times normalized to the default UCX_MAX_RNDV_RAILS=2. For large messages in the rendezvous regime, increasing the rail limit to 4 reduces runtime up to $10\%$ , whereas smaller messages (typically in the eager regime) are largely unaffected.
+
+This result reinforces two practical points. First, meaningful tuning requires dealing with both algorithm selection and backend configuration (R3): even a strong algorithm can appear weak under an unfavorable transport setting. Second, reproducibility and regression diagnosis depend on recording the effective configuration used in each run (R5). PICO captures both requested settings and platform configuration defaults, making it straightforward to rerun controlled A/B tests in which only a single knob changes and to interpret performance differences.
+
+Fig. 7: Ring MPI_Allreduce on Leonardo (32 nodes; Open MPI 4.1.6; UCX 1.15.0). Latency normalized to the default UCX_MAX_RNDV_RAILS=2 (lower is better). Setting UCX_MAX_RNDV_RAILS=4 (orange) yields up to a $10\%$ improvement over the default (blue).
+
+Fig. 8: Binomial-tree broadcast schedules with different partner ordering: (a) distance-halving vs. (b) distance-doubling. Both complete in $\log_{2}(p)$ rounds and transmit the same total volume, but differ in how communication distance evolves across steps. In particular, the distance halving approach maximizes communication locality at later communication rounds, when the overall communication volume is greater.
+
+(a) Distance-Halving Binomial Tree
+
+(b) Distance-Doubling Binomial Tree
+
+Fig. 9: Network volume estimates of distance-halving and distance-doubling broadcast on a 128 nodes allocation on Leonardo. Distance-halving broadcast induces only $29\%$ of total communication volume to across-group (external) links, while distance-doubling $96\%$ .
+
+### IV-B Algorithmic differences
+
+Performance models are an essential tool for understanding collective behavior: they provide analytic guidance on how step count, overall communication volume, and reduction costs scale with process count and vector size. As discussed in Sec. II, modern hierarchical systems can exhibit strong topology-dependent bottlenecks. Accurate performance prediction therefore benefits from refinements that track traffic flow and link saturation [62, 67]. Our goal is not to argue against modeling, but to show why microbenchmarking remains a practical necessity: even when two algorithms are equivalent under a cost-model, their performance can differ substantially on different topologies and allocations.
+
+We illustrate this by comparing two broadcast algorithms on Leonardo: distance-doubling binomial tree broadcast (Open MPI’s binomial broadcast implementation [43]) and distance-halving binomial tree broadcast (MPICH binomial tree implementation). The two communication schedules, illustrated in Fig. 9, appear indistinguishable under a classic $\alpha$ – $\beta$ modeling: both complete in $\log_{2}(p)$ rounds and transmit the same total communication volume. However, distance-doubling keeps communication local in the early rounds and defers longer-distance exchanges to later rounds. By contrast, distance-halving performs longer-distance exchanges earlier and becomes progressively more local in later rounds. On a topology with non-uniform link costs or tapered global bandwidth, this ordering can shift how many exchanges traverse local versus global links at each step, and thus where congestion pressure concentrates [49].
+
+To quantify this effect, PICO’s network tracer reveals (Fig. 9) that, for the same 128 nodes allocation on Leonardo’s Dragonfly network, distance-doubling algorithm sends nearly all volume inter-group (external 122 $\cdot$ n, internal 5 $\cdot$ n, where n is the size of the send buffer in Bytes), whereas distance-halving keeps 90 $\cdot$ n Bytes intra-group, reducing inter-group traffic to 37 $\cdot$ n. This effect arises naturally from the interaction of rank placement and algorithm’s communication schedule, illustrating why topology- and placement-aware diagnosis is valuable in realistic runs. Fig. 10 reports the measured execution times of the two algorithms. The curves are nearly identical for small messages (up to 16 KiB), but diverge sharply once large-message transfers dominate. At 512 MiB, the distance-doubling algorithm is $\times 2.5$ slower at 757 ms compared to 304 ms of the distance-halving one. Moreover, we can notice how the Open MPI internal Binomial algorithm appears to be almost one order of magnitude slower at $1.9$ s, indicating inefficiencies in its implementation regardless of the algorithm of choice.
+
+Thus, cost models capture step/volume trade-offs, but they may not distinguish between algorithms that are equivalent in those metrics unless topology and placement effects are explicitly modeled. PICO complements modeling by enabling backend-neutral comparisons (R2) while also providing placement-aware diagnosis thanks to its rich metadata gathering (R5). In practice, these capabilities make it possible to identify when a default algorithm over-stresses links on hierarchical networks and to justify an alternative schedule with both structural evidence (tracer) and measured performance.
+
+Fig. 10: Distance-doubling and distance-halving MPI_Bcast on Leonardo, Open MPI (4.1.6). Latency vs. message size for 128 nodes, 4 processes per node (log–log axes); 512MiB: libpico 757ms (doubling) vs. 304ms (halving). Open MPI (doubling) 1,9s is one order of magnitude slower.
+
+Fig. 11: Instrumented Rabenseifner Allreduce on 8 nodes (Leonardo, Open MPI 4.1.6; libpico implementation). (a) Absolute runtime breakdown into tagged components: Communication (network transfer), Reduction (compute), Data Movement (staging/copies to work buffers), and residual Other overhead. (b) Same data expressed as percentage shares, highlighting the shift from communication-dominated behavior at small messages to substantial data-movement and reduction contributions at larger messages.
+
+(a) Absolute time breakdown (log–log).
+
+(b) Relative (percentage) breakdown.
+
+### IV-C Fine grained instrumentation
+
+Collective communications are composed of multiple algorithmic steps, each one stressing different hardware resources (NIC/fabric, caches/DRAM and CPU/GPU arithmetic units). Crucially, the different performance characteristics of these resources shape how the cost of each step scales with message size and node count, meaning that the aggregate end-to-end timing of a collective can hide where inefficiencies originate.
+
+An instrumented benchmark run of the libpico reference Rabenseifner implementation on an 8-node allocation on Leonardo (Fig. 11) reveals several non-obvious behaviors. Fig. 11a shows the aggregate runtime (blue) together with the tagged components—network communication (orange), reduction computation (green), and intra-node data movement (red; e.g., staging and copies to working buffers), while Fig. 11b reports their relative weight.
+
+We first consider the overall trend in Fig. 11a. For small message sizes (up to 128 KiB), the communication curve is nearly indistinguishable from the aggregate curve, suggesting that end-to-end performance is dominated by network communication. In particular, for message sizes up to 2 KiB the total runtime is nearly constant (10 $\mu$ s at 32 B, 11 $\mu$ s at 256 B, and 10 $\mu$ s at 2 KiB), consistent with a latency-dominated regime where fixed network startup costs outweigh bandwidth effects. However, the tagged breakdown shows that this “communication-dominated” interpretation does not hold uniformly as message size grows. After 128 KiB, Fig. 11b shows that the relative cost of communication drops sharply (from nearly $95\%$ to $35\%$ ) before increasing again to $56\%$ at 64 MiB and 512 MiB. This non-monotonic trend indicates that the scaling driver of the collective changes with message size: once per-message latency is amortized, the overall runtime is no longer governed by network transfer alone. The missing fraction is largely absorbed by intra-node data movement and reduction. As message size grows into the MiB range, the data-movement component rises substantially (staging and copies to work buffers), and reduction becomes a first-class contributor as more bytes must be combined at each step.
+
+This breakdown can be interpreted through the intuition of the roofline model [65]: performance is limited by whichever resource is currently most constraining. While strictly speaking a collective communication is not a single kernel, its components can be interpreted as kernels with different limiting resources. The communication component is primarily limited by network latency for small messages and bandwidth for large ones, whereas the staging and reduction components are limited by local memory bandwidth and compute throughput (we assume local memory latency to be negligible). From this perspective, the non-monotonic behavior observed in Fig. 11a–11b can be explained as follows: as message size grows, the dominant limiter shifts from network-latency to local data movement and reduction, effectively moving the collective onto a memory-bandwidth roof even though the operation is “communication-heavy” at a high level. At very large messages, the network bandwidth becomes the dominant limit, but the persistent contribution of data movement and reduction indicates that local memory bandwidth and compute throughput still cap end-to-end gains.
+
+The crossover points at which this shift occurs, as well as the magnitude of the shift, depend on the machine’s hardware characteristics. Consequently, the same end-to-end Allreduce curve can hide different underlying bottlenecks on different systems, reinforcing the need for fine grained profiling when tuning or diagnosing performance. Thus, PICO’s instrumentation (R1) on backend-neutral baselines (R2) exposes hidden bottleneck shifts that are opaque under end-to-end timing.
+
+Fig. 12: ATLAHS-based trace analysis and replay for AI training workloads. Left/center: collective mix and message-size distributions extracted from NCCL traces. Right: projected per-iteration time after substituting collective algorithms/protocols while preserving the original invocation sequence and message sizes. PICO-derived profiles reduce per-iteration time of up to $44\%$ .
+
+### IV-D Simulation results with ATLAHS
+
+We evaluate PICO on real AI workloads using trace replay to translate microbenchmark-level effects into end-to-end performance changes. Specifically, we use the ATLAHS [52], a recently published toolchain that can trace NCCL executions and replay them via GOAL traces [22] running on a number of network simulators. ATLAHS can generate different replayable traces from the same raw NCCL logs, allowing us to swap collective algorithms and protocol choice while preserving original invocation sequence and message sizes. This enables controlled what-if analysis without needing to re-run the actual workload. Additionally, this capability allows us to test collective algorithms that might not be already implemented in NCCL by simply implementing new translation units in the simulator toolchain. The choice of application traces was intentionally geared toward AI workloads, as they feature large, repeated collectives for which algorithm, protocol, and transport decisions are more likely to produce observable end-to-end effects. Similar sensitivity can also arise in traditional HPC applications with communication-heavy phases, such as those based on 3D FFTs and their associated all-to-all exchanges [11]; however, such traces were not available among the open-source traces considered in this study.
+
+The traces we consider are collected with NCCL 2.22, a version that provides Ring and Tree implementations for AllReduce (i.e., Distance-Halving Reduce followed by Distance-Doubling Broadcast), but crucially only a Ring algorithm for ReduceScatter and AllGather. Newer NCCL releases have since added an additional algorithm, PAT [28], which is a Binomial Butterfly. During tracing, both the collective algorithm and protocol were recorded for each invocation, alongside several other key pieces of information such as the collective size and details about the communicator and GPU streams. While the algorithm controls the overall schedule of the collective, the protocol controls the low-level transfer/synchronization strategy; available NCCL protocols are Simple, which favors large-message bandwidth, and LL, which reduces small-message latency via flag-based synchronization [23].
+
+Our chosen workloads are LLaMA 7B [59], run on 16 and 128 GPUs, and a Mistral MoE (Mixture-of-Experts) [29] on 64 GPUs: for clarity of exposition we will refer to those traces as L16, L128 and MoE. Analyzing number and types of collective invocations present in the raw traces we notice that (Fig. 12; left) for both L16, and L128 the overall majority of those collective are AllGather Ring Simple (L16 48.3%, L128 45.9%), and ReduceScatter Ring Simple (L16 48.3%, L128 45.9%), while the Allreduce Tree LL and ReduceScatter Ring LL accounted for a small minority of invocations (L16 1-3%, L128 3-6%). In the MoE trace we notice an overall lower number of invocations almost equally distributed between Allreduce Tree LL, ReduceScatter Ring Simple and Allgather Ring Simple. Taking into consideration size distribution (Fig. 12; center) it appears that: (i) Allreduce invocations were all of relatively small size (i.e., $<1$ KiB), (ii) AllGather and ReduceScatter invocations had a median size of 3-6 MiB (L16) and 7-14 MiB (L128), while (iii) a significantly higher size of 33-67 MiB in the MoE trace. We note that for this analysis we purposely ignored point-to-point sends to focus purely on the collective operations.
+
+Using PICO, we identified candidate collective profiles (algorithm/protocol choices) for the observed communicator and message-size distributions. In particular, for the L16 and L128 traces we identified a profile consisting of AllGather and ReduceScatter Binomial Butterfly algorithm with Simple protocol, and Allreduce Tree algorithm with LL protocol.
+
+Fig. 12 (right) reports the resulting simulated end-to-end runtimes, reported over a single training iteration: the PICO-optimized profiles improve over native NCCL by $21\%$ on L16 and $44\%$ on L128. On the other hand, the optimized profile found for the MoE model reported no measurable improvements, indicating that a good profile was already in use when the trace was instrumented. This is likely because MoE has larger collectives on average, which tend to perform better with Ring implementations. For completeness, alternative suboptimal profiles were played alongside the optimal one, confirming runtime variation across algorithm/protocol choices, thus further highlighting the workload sensitivity to collective configurations.
+
+Due to PICO’s extensible design (R6), we are able to evaluate NCCL algorithms and conduct a systematic evaluation campaign (R4) across both algorithms selection and protocol configuration (R3), observing end-to-end runtime improvements of real world applications.
+
+## V Conclusions
+
+We presented PICO, a lightweight and extensible framework for benchmarking collective communication operations across heterogeneous HPC and AI systems. Unlike existing tools, PICO integrates fine-grained profiling, rich metadata collection, and automated orchestration to support reproducible, system-aware performance analysis. Through its modular architecture, PICO enables portable comparisons across MPI, *CCL, and user-defined algorithms, while its integrated post-processing tools facilitate both high-level performance summaries and detailed algorithmic phase breakdowns.
+
+Our case studies demonstrated how PICO can reveal suboptimal default algorithm selections and guide library tuning, highlight subtle performance trade-offs between closely related algorithms, quantify the impact of backend parameters, and identify hidden bottlenecks thanks to its reference backend-neutral implementations and instrumentation capabilities. Finally, we demonstrated that PICO tuned collective configurations can translate to real world end-to-end improvements.
+
+These examples underscore PICO’s utility for algorithm designers, application developers, and system administrators alike. By bridging systematic benchmarking with actionable insights, PICO aims to become a foundational tool for advancing the reproducible performance analysis of collective communications in next-generation computing systems.
+
+## VI Acknowledgments
+
+This work is supported by the European Union’s Horizon Europe under grant 101175702 (NET4EXA), by Sapienza University Grants ADAGIO and D2QNeT (Bando per la ricerca di Ateneo 2023 and 2024), and by a research grant from Microsoft Azure. The research was also conducted as part of the FastTrackAI project at the Singapore-ETH Centre, which was established collaboratively between ETH Zurich and the National Research Foundation, Singapore. Additionally, this research is supported by the National Research Foundation, Singapore (NRF), and the Ministry of Digital Development and Information (MDDI) under the AI Visiting Professorship (Award No. AIVP-2025-005). We acknowledge ISCRA for awarding this project access to the LEONARDO supercomputer, owned by the EuroHPC Joint Undertaking, hosted by CINECA (Italy). We acknowledge the EuroHPC Joint Undertaking, the LUMI consortium, and BSC for granting access to the LUMI and MareNostrum 5 supercomputers. These resources, hosted by CSC (Finland) and the Barcelona Supercomputing Center (Spain), were provided through the EuroHPC Regular Access program.
+
+## References
+
+- [1] Advanced Micro Devices, Inc. (2025) ROCm Communication Collectives Library (RCCL) Documentation, v2.22.3. Note: Online documentationAccessed Jul. 23, 2025 External Links: Link Cited by: §I.
+- [2] J. Ames and R. Lowman (2025) How Ultra Ethernet and UALink Enable High-Performance, Scalable AI Networks. Note: Synopsys BlogAccessed Aug. 11, 2025 External Links: Link Cited by: item C1.
+- [3] S. Atchley, C. Zimmer, J. Lange, D. Bernholdt, V. Melesse Vergara, T. Beck, M. Brim, R. Budiardja, S. Chandrasekaran, M. Eisenbach, T. Evans, M. Ezell, N. Frontiere, A. Georgiadou, J. Glenski, P. Grete, S. Hamilton, J. Holmen, A. Huebl, D. Jacobson, W. Joubert, K. Mcmahon, E. Merzari, S. Moore, A. Myers, S. Nichols, S. Oral, T. Papatheodore, D. Perez, D. M. Rogers, E. Schneider, J. Vay, and P. K. Yeung (2023) Frontier: exploring exascale. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC ’23, New York, NY, USA. External Links: ISBN 9798400701092, Link, Document Cited by: item C1.
+- [4] P. Balaji, D. Buntinas, D. Goodell, W. Gropp, S. Kumar, E. Lusk, R. Thakur, and J. L. Träff (2009) MPI on a million processors. In Proceedings of the 16th European PVM/MPI Users’ Group Meeting on Recent Advances in Parallel Virtual Machine and Message Passing Interface, Berlin, Heidelberg, pp. 20–30. External Links: ISBN 9783642037696, Link, Document Cited by: §I.
+- [5] F. Banchelli, M. Garcia-Gasulla, F. Mantovani, J. Vinyals, J. Pocurull, D. Vicente, B. Eguzkitza, F. C. C. Galeazzo, M. C. Acosta, and S. Girona (2025) Introducing marenostrum5: a european pre-exascale energy-efficient system designed to serve a broad spectrum of scientific workloads. External Links: 2503.09917, Link Cited by: §I, item C1.
+- [6] P. Basu, L. Zhao, J. Fantl, S. Pal, A. Krishnamurthy, and J. Khoury (2024) Efficient all-to-all collective communication schedules for direct-connect topologies. External Links: 2309.13541, Link Cited by: §I.
+- [7] A. Bienz, S. Gautam, and A. Kharel (2022) A locality-aware bruck allgather. External Links: 2206.03564, Link Cited by: §I, item C1.
+- [8] T. Bonato, A. Kabbani, A. Ghalayini, M. Papamichael, M. Dohadwala, L. Gianinazzi, M. Khalilov, E. Achermann, D. D. Sensi, and T. Hoefler (2025) REPS: recycled entropy packet spraying for adaptive load balancing and failure mitigation. External Links: 2407.21625, Link Cited by: §I.
+- [9] Broadcom Inc. (2025) Scale-Up Ethernet (SUE) Framework Specification. Note: Technical specification (PDF)Accessed Aug. 11, 2025 External Links: Link Cited by: item C1.
+- [10] R. Buyya, T. Cortes, and H. Jin (2002) An introduction to the infiniband architecture. In High Performance Mass Storage and Parallel I/O: Technologies and Applications, Vol. , pp. 616–632. External Links: Document Cited by: item C1.
+- [11] L. Dalcin, M. Mortensen, and D. E. Keyes (2018) Fast parallel multidimensional fft using advanced mpi. External Links: 1804.09536, Link Cited by: §IV-D.
+- [12] S. Das, J. Sewall, G. Congiu, P. Shamis, and G. Prasad (2025) Enhancing communication observability of ai workloads with nccl inspector. Note: https://developer.nvidia.com/blog/enhancing-communication-observability-of-ai-workloads-with-nccl-inspector/ NVIDIA Developer Blog Cited by: §II-A.
+- [13] D. De Sensi, S. Di Girolamo, K. H. McMahon, D. Roweth, and T. Hoefler (2020) An in-depth analysis of the slingshot interconnect. In SC20: International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–14. External Links: Link, Document Cited by: item C1.
+- [14] D. De Sensi, S. Pasqualoni, L. Piarulli, T. Bonato, S. Ba, M. Turisini, J. Domke, and T. Hoefler (2025) Bine trees: enhancing collective operations by optimizing communication locality. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC’25), External Links: Document Cited by: item C1.
+- [15] D. De Sensi, L. Pichetti, F. Vella, T. De Matteis, Z. Ren, L. Fusco, M. Turisini, D. Cesarini, K. Lust, A. Trivedi, D. Roweth, F. Spiga, S. Di Girolamo, and T. Hoefler (2024) Exploring gpu-to-gpu communication: insights into supercomputer interconnects. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC’24), External Links: Document Cited by: §I, §I, item C1.
+- [16] Forschungszentrum Jülich, Jülich Supercomputing Centre (2025) JUPITER Technical Overview. Note: Technical overview pageLast modified Jan 7, 2025; accessed Aug 11, 2025 External Links: Link Cited by: item C1.
+- [17] Z. He, D. Parravicini, L. Petrica, K. O’Brien, G. Alonso, and M. Blott (2021) ACCL: fpga-accelerated collectives over 100 gbps tcp-ip. In 2021 IEEE/ACM International Workshop on Heterogeneous High-performance Reconfigurable Computing (H2RC), pp. 33–43. External Links: Document Cited by: §I.
+- [18] M. Hidayetoglu, S. G. De Gonzalo, E. Slaughter, Y. Li, C. Zimmer, T. Bicer, B. Ren, W. Gropp, W. Hwu, and A. Aiken (2024) CommBench: micro-benchmarking hierarchical networks with multi-gpu, multi-nic nodes. In Proceedings of the 38th ACM International Conference on Supercomputing, pp. 426–436. Cited by: §I, §II-A.
+- [19] T. Hoefler, T. Mehlan, A. Lumsdaine, and W. Rehm (2007) Netgauge: a network performance measurement framework. In International Conference on High Performance Computing and Communications, pp. 659–671. Cited by: §II-A.
+- [20] T. Hoefler, T. Schneider, and A. Lumsdaine (2010) Accurately Measuring Overhead, Communication Time and Progression of Blocking and Nonblocking Collective Operations at Massive Scale. International Journal of Parallel, Emergent and Distributed Systems 25 (4), pp. 241–258. External Links: ISSN 1744-5779 Cited by: item C3.
+- [21] T. Hoefler, K. Schramm, E. Spada, K. Underwood, C. Alexander, B. Alverson, P. Bottorff, A. Caulfield, M. Handley, C. Huang, C. Raiciu, A. Kabbani, E. Opsasnick, R. Pan, A. Ran, and R. Sohan (2025) Ultra ethernet’s design principles and architectural innovations. External Links: 2508.08906, Link Cited by: item C1.
+- [22] T. Hoefler, C. Siebert, and A. Lumsdaine (2009) Group operation assembly language - a flexible way to express collective communication. In 2009 International Conference on Parallel Processing, Vol. , pp. 574–581. External Links: Document Cited by: §IV-D.
+- [23] Z. Hu, S. Shen, T. Bonato, S. Jeaugey, C. Alexander, E. Spada, J. Dinan, J. Hammond, and T. Hoefler (2025) Demystifying nccl: an in-depth analysis of gpu communication protocols and algorithms. External Links: 2507.04786, Link Cited by: §IV-D.
+- [24] S. Hunold, A. Carpen-Amarie, and J. L. Träff (2014) Reproducible mpi micro-benchmarking isn’t as easy as you think. In Proceedings of the 21st European MPI Users’ Group Meeting, EuroMPI/ASIA ’14, New York, NY, USA, pp. 69–76. External Links: ISBN 9781450328753, Link, Document Cited by: §I, §III-B.
+- [25] S. Hunold and A. Carpen-Amarie (2015) On the impact of synchronizing clocks and processes on benchmarking mpi collectives. In Proceedings of the 22nd European MPI Users’ Group Meeting, pp. 1–10. Cited by: item C3.
+- [26] K. Hwang and Z. Xu (1998) Scalable parallel computing: technology, architecture, programming. Computer engineering series, WCB/McGraw-Hill. External Links: ISBN 9780070317987, LCCN 97041663, Link Cited by: §I.
+- [27] Intel Corporation (2021) Intel® MPI Benchmarks User Guide, version 2021.2. Note: OnlineAccessed Jul. 21, 2025 External Links: Link Cited by: §I, §II-A.
+- [28] S. Jeaugey (2025) PAT: a new algorithm for all-gather and reduce-scatter operations at scale. External Links: 2506.20252, Link Cited by: §IV-D.
+- [29] A. Q. Jiang, A. Sablayrolles, A. Roux, A. Mensch, B. Savary, C. Bamford, D. S. Chaplot, D. de las Casas, E. B. Hanna, F. Bressand, G. Lengyel, G. Bour, G. Lample, L. R. Lavaud, L. Saulnier, M. Lachaux, P. Stock, S. Subramanian, S. Yang, S. Antoniak, T. L. Scao, T. Gervet, T. Lavril, T. Wang, T. Lacroix, and W. E. Sayed (2024) Mixtral of experts. External Links: 2401.04088, Link Cited by: §IV-D.
+- [30] K. Kandalla, H. Subramoni, G. Santhanaraman, M. Koop, and D. K. Panda (2009) Designing multi-leader-based allgather algorithms for multi-core clusters. In 2009 IEEE International Symposium on Parallel & Distributed Processing, Vol. , pp. 1–8. External Links: Document Cited by: item C1.
+- [31] J. Kim, W. Dally, S. Scott, and D. Abts (2008) Technology-driven, highly-scalable dragonfly topology. Vol. 36, pp. 77–88. External Links: ISBN 978-0-7695-3174-8, Document Cited by: item C1.
+- [32] A. Kovalov, E. Lobe, A. Gerndt, and D. Lüdtke (2017) Task-node mapping in an arbitrary computer network using smt solver. In Integrated Formal Methods, N. Polikarpova and S. Schneider (Eds.), Cham, pp. 177–191. External Links: ISBN 978-3-319-66845-1 Cited by: §I, item C2.
+- [33] I. Laguna, R. Marshall, K. Mohror, M. Ruefenacht, A. Skjellum, and N. Sultana (2019) A large-scale study of mpi usage in open-source hpc applications. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC ’19, New York, NY, USA. External Links: ISBN 9781450362290, Link, Document Cited by: §I.
+- [34] Lawrence Livermore National Laboratory (2025) Lawrence Livermore National Laboratory’s El Capitan verified as world’s fastest supercomputer. Note: Press release External Links: Link Cited by: §I.
+- [35] X. Liao, K. Lu, C. Yang, J. Li, Y. Yuan, M. Lai, L. Huang, P. Lu, J. Fang, J. Ren, and J. Shen (2018) Moving from exascale to zettascale computing: challenges and techniques. Frontiers of Information Technology & Electronic Engineering 19 (10), pp. 1236–1244. External Links: Document, Link, ISSN 2095-9230 Cited by: §I.
+- [36] D. Lim and J. Kim (2025) TidalMesh: topology-driven allreduce collective communication for mesh topology. In 2025 IEEE International Symposium on High Performance Computer Architecture (HPCA), Vol. , pp. 1526–1540. External Links: Document Cited by: §I.
+- [37] P. Lu, M. Lai, and J. Chang (2022) A survey of high-performance interconnection networks in high-performance computer systems. Electronics 11 (9). External Links: Link, ISSN 2079-9292, Document Cited by: §I.
+- [38] R. Lucas, J. Ang, K. Bergman, S. Borkar, W. Carlson, L. Carrington, G. Chiu, R. Colwell, W. Dally, J. Dongarra, A. Geist, R. Haring, J. Hittinger, A. Hoisie, D. M. Klein, P. Kogge, R. Lethin, V. Sarkar, R. Schreiber, J. Shalf, T. Sterling, R. Stevens, J. Bashor, R. Brightwell, P. Coteus, E. Debenedictus, J. Hiller, K. H. Kim, H. Langston, R. M. Murphy, C. Webster, S. Wild, G. Grider, R. Ross, S. Leyffer, and J. Laros III (2014) DOE advanced scientific computing advisory subcommittee (ascac) report: top ten exascale research challenges. Report U.S. Department of Energy, ASCR. External Links: Document Cited by: §I.
+- [39] R. Merritt (2023) What is nvlink?. Note: NVIDIA Official BlogAccessed August 8, 2025 External Links: Link Cited by: item C1.
+- [40] NVIDIA Corporation NCCL-Tests: performance and correctness micro-benchmarks for nvidia nccl. Note: GitHub repositoryAccessed Jul. 21, 2025 External Links: Link Cited by: §I, §II-A.
+- [41] NVIDIA Corporation (2025) NVIDIA Collective Communication Library (NCCL) Documentation. Note: Online documentationAccessed July 23, 2025 External Links: Link Cited by: §I.
+- [42] NVIDIA Corporation (2025) NVIDIA GB200 NVL72 (Grace + Blackwell) – Rack-Scale AI System. Note: Product web pageAccessed Aug. 11, 2025 External Links: Link Cited by: item C1.
+- [43] Open MPI Project (2025) ompi/mca/coll/base/coll_base_bcast.c. Note: https://github.com/open-mpi/ompi/blob/dd6a7a3ad0c37dde58da7ccabe2c54da8f51d130/ompi/mca/coll/base/coll_base_bcast.c Commit dd6a7a3ad0c37dde58da7ccabe2c54da8f51d130, line 343. Accessed 2025-12-16 Cited by: §IV-B.
+- [44] OpenFabrics Interfaces Working Group (OFIWG) (2025) libfabric: open fabric interfaces framework for high-performance networking. Note: GitHub repositoryAccessed Jul. 23, 2025 External Links: Link Cited by: §I, item C2.
+- [45] M. S. Qureshi, M. B. Qureshi, M. Fayaz, W. K. Mashwani, S. B. Belhaouari, S. Hassan, and A. Shah (2020) A comparative analysis of resource allocation schemes for real-time services in high-performance computing systems. International Journal of Distributed Sensor Networks 16 (8), pp. 1550147720932750. External Links: Document, Link, https://doi.org/10.1177/1550147720932750 Cited by: §I, item C2.
+- [46] P. Sack and W. Gropp (2015) Collective algorithms for multiported torus networks. ACM Trans. Parallel Comput. 1 (2). External Links: ISSN 2329-4949, Link, Document Cited by: §I.
+- [47] H. Sascha (2025) ReproMPI benchmark for mpi collective. Note: https://github.com/hunsa/reprompi GitHub repository. Accessed: 2025-12-19. Cited by: §I, §II-A.
+- [48] D. Schor (2018) ISSCC 2018: AMD’s Zeppelin; Multi-chip routing and packaging. Note: WikiChip Fuse blogAccessed Aug. 11, 2025 External Links: Link Cited by: item C1.
+- [49] D. D. Sensi, T. Bonato, D. Saam, and T. Hoefler (2024) Swing: short-cutting rings for higher bandwidth allreduce. External Links: 2401.09356, Link Cited by: §I, §IV-B.
+- [50] D. D. Sensi, T. D. Matteis, K. Taranov, S. D. Girolamo, T. Rahn, and T. Hoefler (2022) Noise in the clouds: influence of network performance variability on application scalability. External Links: 2210.15315, Link Cited by: item C1.
+- [51] A. Sewell, K. Fan, A. R. Shovon, L. Dyken, S. Kumar, and S. Petruzza (2024) Bruck algorithm performance analysis for multi-gpu all-to-all communication. In Proceedings of the International Conference on High Performance Computing in Asia-Pacific Region, HPCAsia ’24, New York, NY, USA, pp. 127–133. External Links: ISBN 9798400708893, Link, Document Cited by: §I.
+- [52] S. Shen, T. Bonato, Z. Hu, P. Jordan, T. Chen, and T. Hoefler (2025) ATLAHS: an application-centric network simulator toolchain for ai, hpc, and distributed storage. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC ’25, New York, NY, USA, pp. 349–367. External Links: ISBN 9798400714665, Link, Document Cited by: §I, §IV-D.
+- [53] A. Shpiner, Z. Haramaty, S. Eliad, V. Zdornov, B. Gafni, and E. Zahavi (2017) Dragonfly+: low cost topology for scaling datacenters. pp. . External Links: Document Cited by: item C1.
+- [54] R. Thakur, R. Rabenseifner, and W. Gropp (2005) Optimization of collective communication operations in mpich. The International Journal of High Performance Computing Applications 19 (1), pp. 49–66. Cited by: §I.
+- [55] The Ohio State University OSU Micro-Benchmarks (OMB). Note: OnlineAccessed Jul. 21, 2025 External Links: Link Cited by: §I, §II-A.
+- [56] The Open MPI Community (2025) Open MPI 5.0: 11.10. Tuning Collectives (coll-tuned). Note: Online documentationLast updated Jul. 31, 2025; accessed Aug. 11, 2025 External Links: Link Cited by: §IV-A.
+- [57] The Unified Communication X Library. Note: http://www.openucx.org Cited by: §I, item C2.
+- [58] TOP500 Project (2025) TOP500 List – June 2025. Note: https://top500.org/lists/top500/2025/06/ Accessed: Jul. 18, 2025 Cited by: §I.
+- [59] H. Touvron, T. Lavril, G. Izacard, X. Martinet, M. Lachaux, T. Lacroix, B. Rozière, N. Goyal, E. Hambro, F. Azhar, A. Rodriguez, A. Joulin, E. Grave, and G. Lample (2023) LLaMA: open and efficient foundation language models. External Links: 2302.13971, Link Cited by: §IV-D.
+- [60] J. L. Träff (2006) Efficient allgather for regular smp-clusters. In Recent Advances in Parallel Virtual Machine and Message Passing Interface, B. Mohr, J. L. Träff, J. Worringen, and J. Dongarra (Eds.), Berlin, Heidelberg, pp. 58–65. External Links: ISBN 978-3-540-39112-8 Cited by: item C1.
+- [61] M. Turisini, G. Amati, and M. Cestari (2023) LEONARDO: a pan-european pre-exascale supercomputer for hpc and ai applications. External Links: 2307.16885, Link Cited by: §I, item C1.
+- [62] R. Uma-Vaideswaran, J. Romero, D. L. Dotson, D. Appelhans, and P. K. Yeung (2025) A peak performance model for all-to-all on hierarchical systems and its applications. In Proceedings of the SC ’25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC Workshops ’25, New York, NY, USA, pp. 1442–1451. External Links: ISBN 9798400718717, Link, Document Cited by: §IV-B.
+- [63] M. G. Venkata, V. Petrov, S. Lebedev, D. Bureddy, F. Aderholdt, J. Ladd, G. Bloch, M. Dubman, and G. Shainer (2024) Unified collective communication (UCC): an unified library for cpu, gpu, and DPU collectives. In IEEE Symposium on High-Performance Interconnects, HOTI 2024, Albuquerque, NM, USA, August 21-23, 2024, pp. 37–46. External Links: Link, Document Cited by: §I.
+- [64] A. Weingram, Y. Li, H. Qi, D. Ng, L. Dai, and X. Lu (2023) xCCL: A Survey of Industry-Led Collective Communication Libraries for Deep Learning. Journal of Computer Science and Technology 38 (1), pp. 166–195. External Links: Document, Link, ISSN 1860-4749 Cited by: §I, §I.
+- [65] S. Williams, A. Waterman, and D. Patterson (2009) Roofline: an insightful visual performance model for multicore architectures. Communications of the ACM 52 (4), pp. 65–76. Cited by: §IV-C.
+- [66] Y. Wu, Y. Xu, J. Chen, Z. Wang, Y. Zhang, M. Lentz, and D. Zhuo (2024) MCCS: a service-based approach to collective communication for multi-tenant cloud. In Proceedings of the ACM SIGCOMM 2024 Conference, ACM SIGCOMM ’24, New York, NY, USA, pp. 679–690. External Links: ISBN 9798400706141, Link, Document Cited by: §I.
+- [67] Y. Zhang, T. Groves, B. Cook, N. J. Wright, and A. K. Coskun (2020) Quantifying the impact of network congestion on application performance and network metrics. In 2020 IEEE International Conference on Cluster Computing (CLUSTER), Vol. , pp. 162–168. External Links: Document Cited by: §I, item C2, §IV-B.
+- [68] P. Zuo, H. Lin, J. Deng, N. Zou, X. Yang, Y. Diao, W. Gao, K. Xu, Z. Chen, S. Lu, Z. Qiu, P. Li, X. Chang, Z. Yu, F. Miao, J. Zheng, Y. Li, Y. Feng, B. Wang, Z. Zong, M. Zhou, W. Zhou, H. Chen, X. Liao, Y. Li, W. Zhang, P. Zhu, Y. Wang, C. Xiao, D. Liang, D. Cao, J. Liu, Y. Yang, X. Bai, Y. Li, H. Xie, H. Wu, Z. Yu, L. Chen, H. Liu, Y. Ding, H. Zhu, J. Xia, Y. Xiong, Z. Yu, and H. Liao (2025) Serving large language models on huawei cloudmatrix384. External Links: 2506.12708, Link Cited by: item C1.
+- [69] T. Zwinger, J. Heikonen, and P. Manninen (2023) LUMI supercomputer for european researchers. In Galileo Conference: Solid Earth and Geohazards in the Exascale Era, Barcelona, Spain, pp. GC11–solidearth–25. External Links: Document, Link Cited by: §I, item C1.

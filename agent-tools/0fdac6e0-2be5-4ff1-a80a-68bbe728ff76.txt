@@ -1,0 +1,1633 @@
+CoAgent: Concurrency Control for Multi-Agent
+Systems
+Hongtao Lyu
+Shanghai Jiao Tong University
+China
+hongtaolyu@sjtu.edu.cn
+Dingyan Zhang
+Shanghai Jiao Tong University
+China
+healthcliff-ding@sjtu.edu.cn
+Mingyu Wu
+Shanghai Jiao Tong University
+China
+mingyuwu@sjtu.edu.cn
+Xingda Wei
+Shanghai Jiao Tong University
+China
+wxdwfc@sjtu.edu.cn
+Haibo Chen
+Shanghai Jiao Tong University
+China
+haibochen@sjtu.edu.cn
+Abstract
+Multi-agent LLM systems—coding agents, devops agents,
+document agents—now routinely run several agents in
+parallel against the same git tree, Kubernetes cluster, or
+document. As soon as two of them mutate shared state,
+they enter the regime classical concurrency control has
+studied for decades, but classical mechanisms fit LLM
+agents poorly. A single agent transaction spans minutes
+of inference, read sets are broad and opaque rather than
+statically inferable, and the live state agents act on admits
+neither fork nor buffer, so writes take effect the moment
+they execute. Locks block long inference intervals; OCC
+abort-and-retry discards minutes of work on every conflict.
+This paper builds concurrency control on a capability
+classical transactions lack: the LLM inside each agent
+can judge whether a conflicting write actually invali-
+dates its plan, and can repair exactly the operations that
+depended on it. Control therefore turns advisory: the
+runtime informs, the agent repairs. Our protocol, MTPO
+(Monotonic Trajectory Pre-Order), fixes a serialization
+order at launch, serves each read the order-filtered value,
+and applies writes speculatively in place; a one-way
+notification asks an affected reader to re-judge and patch
+its plan, while the framework mechanically undoes and
+reorders misplaced writes through the saga-style inverse
+each tool registers in advance. At quiescence the run is
+serializable in the pre-decided order. We realize MTPO as
+CoAgent, toolcall middleware whose privileged ToolSmith
+grows footprint-declared, undoable tools online. On ten
+contended workloads, CoAgent stays within 5% of serial
+correctness at a 1.4× speedup and near-serial token cost,
+where 2PL and OCC surrender nearly all concurrency
+gains; on a bash-only target system, it grows a 25-tool
+library online and lifts the task pass rate from 45/71 to
+63/71 at 0.80× the time and 0.86× the cost.
+1 Introduction
+LLM-powered agents, which take actions based on LLM
+outputs, have revolutionized the artificial intelligence
+landscape, enabling end-to-end goal achievement on
+tasks like writing and debugging code [2, 3], research
+automation [24], and deep research [4], just to name a
+few [52]. A single agent, however, can be inefficient due
+to sequential generation of LLM outputs and incapable
+of complex tasks and may hit a structural ceiling due to
+context limitations [32]. Modern systems therefore decom-
+pose the task and run multiple sub-agents concurrently,
+and the multi-agent paradigm has accordingly become a
+key pillar of modern agentic systems: Claude Code ships
+parallel sub-agent teams [1–3], OpenAI Codex and Cursor
+run background agents on parallel tasks [5, 34], and Kimi
+Agent Swarm coordinates up to a hundred agents on one
+job [32].
+Running multiple sub-agents concurrently revives a clas-
+sical problem. Each sub-agent action reads or writes shared
+state—a file on disk, a page on the web, the configuration
+of a Kubernetes (K8S) cluster. Thus, like traditional concur-
+rent programs, the interleaving of reads and writes can eas-
+ily lead to anomalies. Such failures are already documented
+at scale: a recent audit of over 200 multi-agent traces at-
+tributes more than a third of all failures to inter-agent mis-
+alignment, including agents acting on the same resource un-
+aware of each other [10]. Consider a concrete instance that
+we measured on a live K8S cluster, where two agents oper-
+ate concurrently. Agent A handles a remediation task from
+AIOpsLab [12]: a faulty rollout has left several deployments
+running a wrong container image, and A must find and re-
+pair every affected deployment. Agent B prepares a canary
+release for one service: it reads the service’s current image
+and creates a canary deployment mirroring that image. In
+this run, A scans the cluster before the canary exists, so its
+repair misses the canary; B reads the image before A repairs
+it, so the canary is built on the bad image. Both agents faith-
+fully complete their tasks and report success, yet the cluster
+ends with a canary on the known-bad image, silently wait-
+ing to take live traffic. Neither agent erred in its own rea-
+soning; the fault lies in the interleaving of their reads and
+1
+arXiv:2606.15376v1 [cs.DC] 13 Jun 2026
+
+writes, and the final cluster state matches no serial execu-
+tion of the two agents. §2.2 walks through the trace step by
+step.
+This paper studies how to provide concurrency control
+for multi-agent systems. Current systems (§2.3) either run
+one agent at a time [15, 23, 39, 50], statically partition the
+agents’ write sets so that no two agents touch the same
+state [1], or fork the shared state per agent and merge the
+forks once every agent finishes [5, 13, 41]. None of these
+is ideal. Running one agent at a time loses the concurrency
+benefits of multiple agents; static write partitioning requires
+the write set to be known in advance, which is often impos-
+sible for agents whose plans emerge during execution; and
+fork-and-merge offers only weak isolation akin to read com-
+mitted in databases [6], so it cannot prevent anomalies like
+the one described above (detailed in §2.2).
+The ideal property to enforce on a multi-agent system is
+therefore serializability [6], which guarantees that any con-
+current execution is equivalent to some serial order of the
+agents. Unfortunately, the two classical protocols that real-
+ize it—two-phase locking (2PL) and optimistic concurrency
+control (OCC)—both fall short in the agent setting, due to
+two agent-related gaps (§3):
+The first is a
+functionality gap
+. Classical protocols assume
+the shared state is plain data such as database rows—data
+that the system can read, buffer, and overwrite at will.
+Agents, however, also act on logical state whose effects
+exist only in the external world: a kubectl apply in our
+K8S example must be executed against the cluster to take
+effect, and the agent must observe that effect to continue
+debugging. This breaks OCC’s staging discipline, which
+requires modifications to remain in a private buffer until
+commit. 2PL hits the same wall when it resolves a deadlock:
+the victim’s writes have already taken effect on the external
+world, and the system has no way to roll them back (§3.4).
+The second is a performance gap. Classical protocols
+were designed for transactions that finish quickly. Agents,
+in contrast, may run for hours, or even days [3]. At this
+timescale, 2PL forces an agent to hold its locks for the entire
+task, blocking every other agent that touches overlapping
+state. OCC instead pays at re-execution time: even setting
+the functionality gap aside, a single conflict at validation
+discards the agent’s entire work.
+To close these gaps, our key insight is that the backbone
+of an agent—the LLM—has semantic understanding of the
+task and the state it is operating on, and that understanding
+supplies the remedies classical CC lacks. First, the LLM
+can separate real conflicts from semantically irrelevant
+read–write interference: most overlaps on an agent’s broad
+read set invalidate no premise its plan relies on (a peer
+appending a log line to a file the agent scanned changes
+nothing it depends on), and the agent can dismiss them
+with no work lost. Second, on a real conflict, the LLM can
+choose the most efficient repair path in place of OCC’s
+all-or-nothing restart: it inspects its own read/write history,
+identifies the few actions premised on the now-stale value,
+and re-executes only those. For the conflicts such repair
+cannot dissolve—a write already applied to the external
+world but now in the wrong order—the framework falls
+back to saga-style compensation [20]: every write registers
+an inverse before executing (a kubectl apply is reversed
+by re-applying the manifest it displaced), so the frame-
+work mechanically undoes and reorders misplaced writes
+without consulting the LLM.
+Based on this insight, we propose CoAgent (CoAgent), an
+optimistic concurrency-control framework for multi-agent
+systems. CoAgent builds on optimism to unleash concur-
+rent execution: agents execute without being blocked by
+concurrent agents. To detect and fix anomalies during ex-
+ecution, we propose a notification mechanism that notifies
+each agent of concurrent actions that may break its isolation.
+The notified agent judges whether the change invalidates its
+premises and patches only the affected actions; writes that
+landed in the wrong order are undone and reapplied by the
+framework itself, using the inverses those writes registered.
+CoAgent guarantees serializability as long as agents fol-
+low the protocol’s mechanical rules and, when notified, cor-
+rectly judge which of their premises and pending actions
+the conflicting write affects; §5.1 states both as explicit as-
+sumptions of our formal model. These tasks are simple for
+frontier LLMs: even on a budget-friendly model (DeepSeek
+v4 flash), our evaluation observed a notified agent misjudg-
+ing a notification’s relevance in only 5% of trials (§7). By
+keeping execution concurrent and recovery selective, CoA-
+gent also significantly improves both efficiency and func-
+tionality on multi-agent workloads compared with existing
+concurrency control approaches: it passes all ten contended
+workloads with correctness within 5% of serial execution,
+at a 1.4× speedup and near-serial token cost (1.15×). Un-
+der the same contention, 2PL deadlocks 0.81 times per trial
+and recovers almost no speedup (1.04×), while OCC aborts
+0.95 times per trial, runs slower than serial (0.93×), and pays
+1.83× token cost; uncoordinated execution is fast but passes
+only 13% of trials. Beyond the contended workloads, on a
+target system exposing only bash and no tool table, CoA-
+gent grows a 25-tool library online and lifts the task pass
+rate from 45/71 to 63/71, at 0.80× the time and 0.86× the cost
+of the bash baseline (§7.4).
+2 Background & Motivation
+2.1 Background: LLM-powered Multi-Agent
+Systems
+The classical literature defines an agent as a software entity
+that perceives an environment through observations, delib-
+erates over those observations against some goal, and acts
+back on the environment [42, 49]. Modern LLM-powered
+agent systems instantiate this abstraction by using a
+2
+
+large language model (LLM) as the deliberation engine
+and explicit tool calls for observations and actions. This
+long-running, tool-centric architecture has emerged as the
+dominant implementation pattern for contemporary coding
+and workflow agents [2, 51, 52]. The execution model of
+such agents is characterized by three key properties:
+Append-only context. Each agent maintains a private
+context for the current session—system prompts, user in-
+structions, tool calls, execution results, and model outputs.
+The context is designed as an append-only structure, where
+every LLM inference step appends new contents to the exist-
+ing history. This structural design effectively leverages op-
+timizations such as prefix KV caching [27, 53], significantly
+improving LLM inference efficiency.
+Shared external state and tool-call boundary. Be-
+yond the private context, the system involves external
+states that can be shared across multiple agents (e.g., files,
+database tables, Kubernetes objects, collaborative docu-
+ments, and external API endpoints)—in practice, named
+resources mutated through a small verb set, the interface
+REST canonizes [18]. Agents rely on LLM inference to
+generate tool calls—the sole channel through which an
+agent observes or mutates these states.
+We distinguish two kinds of tool call. A
+read
+yields an
+immutable perception: once returned, the value is recorded
+in the agent’s context as a fixed premise. A write mutates
+the external state in one of two ways. A blind write sets the
+state to a value independent of what it replaces: overwrit-
+ing a configuration key, deleting an entry (REST’s PUT and
+DELETE
+). A
+read–modify–write
+(RMW) produces an effect
+that composes with the prior state: appending to a collec-
+tion, creating an entry under a server-assigned id (REST’s
+POST). Idempotence is the observable criterion that sepa-
+rates the two [18]: replaying a blind write is harmless; re-
+playing an RMW write is not—two POSTs create two en-
+tries.
+1
+The difference is invisible to a single agent; under
+concurrency it decides whether a misordered write can be
+repaired after the fact (§5).
+Agent view. The agent’s accumulated perceptions form
+its view of the external world—the sole basis for any subse-
+quent reasoning or tool call. Once a read returns, its value is
+recorded in the context unchanged: an agent that reads state
+X and obtains v0 will treat v0 as the value of X on every later
+inference, even after X has been mutated externally to v1. The
+runtime must either trigger a re-read or push a change mes-
+sage for the view to catch up; without one of those, every
+action premised on the now-stale v0
+may be wrong. Closing
+this stale-view gap is the central concern of this paper.
+1
+Idempotent RMW writes exist—a merge-style partial update (PATCH) re-
+applies cleanly—and we conservatively treat them as RMW.
+2.2 The Multi-Agent Consistency Problem
+To improve system efficiency and throughput, it is common
+to adopt a multi-agent architecture that leverages multiple
+agents to process tasks concurrently. However, multi-agent
+concurrency issues arise whenever multiple agents operate
+over the same shared state.
+Figure 1 shows how two agents, operating concurrently
+on a live Kubernetes cluster, produce a textbook concur-
+rency anomaly despite neither making an individual reason-
+ing error; the trace is a measured run of the case study that
+§7.3 replays under four coordination protocols. Agent A is
+given a remediation task taken verbatim from AIOpsLab:
+a rollout has left an unknown subset of deployments on a
+wrong image, and A must locate every affected deployment
+and restore its image to the canonical one (three here: geo,
+profile, reservation). Agent B is independently tasked
+with preparing a canary release for geo: read geo’s current
+image, then create a zero-replica deployment geo-canary
+mirroring that image, to take a small share of live traffic
+at the next release window. The anomaly arises due to in-
+terleaved reads. Agent A lists the cluster before the canary
+exists, so its audit scope is fixed at the three mismatched ser-
+vices; Agent B reads geo’s image before A repairs it, so the
+canary is built on the bad image. Both agents then finish and
+report success: B has mirrored what it read, and A’s closing
+check even lists the new canary but judges it outside the in-
+cident it was asked to fix. Yet the final state is one no serial
+order produces: run A first and the canary mirrors the re-
+paired image; run B first and A’s sweep catches the canary
+as a fourth mismatch; either way the canary ends on the
+canonical image. The failure is also silent: the zero-replica
+canary raises no alarm until the release window routes live
+traffic onto the known-bad image. The trace also exercises
+both write classes of §2.1: Agent A’s image restorations are
+blind overwrites, while Agent B’s canary creation is a read–
+modify–write; the distinction returns in §5.
+2.3 Existing Isolation Mechanisms for Multi-Agent
+Existing agent systems handle these consistency issues
+through three broad strategies, all with significant draw-
+backs.
+Sequential execution. The simplest strategy prevents
+stale views by prohibiting concurrent execution entirely;
+during agent handoffs, consistency is preserved either by
+inheriting the fully updated context [50] or by clearing the
+context to force a fresh state re-read [15, 23, 39]. This is safe
+but falls back to serial execution: multiple agents serve only
+to improve task success rates, not to reduce job completion
+time.
+Write partitioning. A second strategy statically parti-
+tions the agents’ write sets, ensuring no two agents con-
+currently modify the same object. In coding scenarios, sys-
+tems like Claude Code Agent Teams [1] explicitly prompt
+3
+
+t(s) Action Shared - state change A 's view B 's view
+
+---
+
+0 ( faulty rollout ) geo . image = bad --- ---
+3.9 A: list deployments scope = { geo , +2}
+4.5 B: read geo . image geo . image = bad
+6.1 B: create geo - canary canary . image := bad scope ( stale ): misses canary . image = bad
+mirroring the image it read the new canary
+8.2 A: fix the three mismatches geo . image := good ,+2 geo . image = bad ( stale )
+
+---
+
+Figure 1. The canary anomaly, measured on an AIOpsLab-derived workload and replayed in the case study of §7.3: both agents faithfully
+execute their assigned tasks, yet their interleaved reads and writes leave a wrong final state.
+agents to operate on mutually exclusive file sets. The ca-
+nary trace already obeys this discipline (A repairs existing
+deployments, B only creates new objects), yet the anomaly
+stands: disjoint write sets address neither of the two rele-
+vant ACID properties. Isolation (I) still fails because each
+agent’s reads span the entire shared state: Agent B reads
+geo’s image while Agent A is mid-repair—exactly the stale-
+read symptom §2.1 warned of.
+Consistency (C) then fails
+as a downstream effect: the final state breaks a global in-
+variant spanning both agents’ writes—“the canary mirrors
+live geo”—because B’s write to geo-canary was premised
+on an obsolete value of geo’s image. Partitioning constrains
+writes; the bug is in reads.
+Fork and merge. A third strategy gives each agent its
+own copy of the state and merges the copies once each agent
+finishes, either via physical workspace forks reconciled by
+Git, human reviewers, or another LLM[5, 13, 41], or via al-
+gebraic merges using predefined state reducers [28]. Three
+problems limit this approach. First, the merge itself is hard.
+A line-level merge (e.g., git merge) catches textual conflicts
+but nothing beyond—the merged code can fail to even com-
+pile, much less preserve each agent’s original intent. LLM-
+based review can in principle catch what git misses, but typ-
+ically fails: the reviewer must reconstruct each authoring
+agent’s intent (e.g., why a specific workaround was used)
+from the merged code alone, and usually cannot. Second,
+algebraic merges have narrow applicability. The CRDT fam-
+ily [43] only handles operations that commute; most busi-
+ness logic does not, and invariants spanning multiple state
+items lie outside the model entirely. Third, much of the live
+state agents interact with—production databases, active Ku-
+bernetes clusters—cannot be forked at all, making the ap-
+proach inapplicable.
+3 The Goal, and the Gap of Classic
+Concurrency Control
+3.1 Ideal Goal: Serializability
+The correctness property this paper targets is what classical
+transaction theory has long called serializability [8, 17]: a
+concurrent run of several peer agents (not a parent’s sub-
+agents) over shared state is correct iff its outcome is equiva-
+lent to some serial order of those same agents, in two senses.
+(i) each agent’s perceived view at every read matches what
+it would have seen at its serial position; (ii) the final state
+of every object matches what that serial order would have
+produced.
+Applied to the settings of §2.2: a coding session that fires
+several agents in parallel should leave the repository as if
+the requests had run one after another, and two agents re-
+pairing independent cluster failures should leave the clus-
+ter as if a single operator had handled both, sequentially.
+The canary anomaly violates both senses: Agent B’s read-
+ing of geo’s image is not what a serial execution would have
+shown it (violating (i)), and the final state, its canary on the
+bad image, is not the serial outcome (violating (ii)).
+3.2 A Recap of Classical Concurrency Control
+Classical concurrency control distinguishes three operation
+dependencies between transactions on shared objects [8]:
+a read-from (wr) where one transaction reads a value
+another wrote; a write-order (ww) where two transac-
+tions write the same object; and an antidependency (rw)
+where one transaction writes an object another already
+read. Reasoning directly about serializability is hard, as
+it quantifies over all serial orders and read-from chains,
+so classical CC narrows to a graph-checkable subclass: a
+schedule is conflict-serializable iff its precedence graph—a
+node per transaction, an edge for each dependency—is
+acyclic, and conflict serializability is strictly stronger than
+serializability, hence sufficient. Two classical protocols
+enforce that acyclicity in opposite ways.
+2PL (two-phase locking): each transaction takes a
+shared lock before reading and an exclusive lock before
+writing, holds all locks until commit; conflicting operations
+block, and the resulting schedule is conflict-serializable
+by lock-point order [17].
+OCC (optimistic concurrency
+control): transactions run without locks—reads track the
+live state into a read set and writes go to a private buffer;
+at commit the runtime validates that no read has been
+overwritten by a concurrently committed transaction, then
+atomically installs the buffer or aborts and retries the whole
+transaction [26].
+Because an agent’s externally visible execution is still a
+sequence of read and write events on shared objects, both
+protocols remain correct in the agent setting. What does
+not carry over are the two assumptions classical CC silently
+4
+
+makes: that retry is cheap (§3.3) and that the framework of-
+fers fork-and-merge semantics (§3.4).
+3.3 Performance Gap
+Long inference makes classical CC cost-prohibitive.
+Agent transactions are dominated by LLM inference and
+last seconds to minutes—orders of magnitude longer than
+a millisecond-scale database transaction. Classical CC
+was designed under the assumption that transactions and
+retries are both cheap; in agentic scenarios, neither holds.
+Long lock hold (2PL). Locks that held for milliseconds
+in databases now hold for minutes. While one agent infers
+for several minutes after reading a shared object, every
+other agent waiting on that object blocks. The lock-wait-
+graph fills up quickly, and deadlocks become routine rather
+than exceptional.
+Costly re-execution (OCC). A failed validation triggers
+a full re-execution—all prior LLM inference, all prior tool
+calls, and all intermediate artifacts are thrown away. OCC
+was designed for cheap transactions where redo is cheap;
+neither premise holds for agents.
+Broad read sets. A third factor amplifies the previous
+two. LLM agents read aggressively: they grep entire repos-
+itories, list whole namespaces, fetch surrounding context,
+so the read set is broad. Under 2PL the locked-object set ex-
+plodes; under OCC the validated-object set explodes; in both
+cases the failure probability rises with the read-set size.
+The three factors together turn the agent-CC trade-off
+sharply against classical protocols. In our benchmarks un-
+der contention, 2PL deadlocks fire at 0.81 per trial and its
+mean speedup over serial execution degrades to 1.04×; OCC
+aborts at 0.95 per trial, falls below serial speed (0.93×), and
+pays 1.83× token cost on retries (§7.2).
+3.4 Functionality Gap
+Live state cannot be forked and merged. Most classical
+concurrency-control protocols reach serializability by
+keeping an in-progress transaction’s writes separable from
+the published state—either by staging writes in a private
+buffer and installing them at commit (OCC, snapshot
+isolation, Spanner [14]), or by writing in place and rolling
+them back on abort (2PL during deadlock recovery). Both
+routes assume the framework offers fork-and-merge
+semantics: an uncommitted write can be installed into
+the shared state at commit, or rolled back out of it on
+abort. OCC’s commit path needs install (its abort path is
+cheap—the buffer was never published, so the framework
+merely discards it); 2PL’s abort path needs rollback (writes
+have already gone live, so the framework must undo them).
+Either way the framework must support at least one of
+these two state-manipulation operations.
+For many agentic workloads this precondition does not
+hold: the framework offers no fork-and-merge semantics, so
+neither OCC’s install nor 2PL’s rollback is implementable.
+Take the operations setting of §2.2: a Kubernetes cluster
+under debugging is a single live system behind a unique
+URL—it cannot be meaningfully forked, and “installing a
+buffered deployment into a running cluster” or “rolling
+back a deployed process that has already had side effects”
+cannot even be defined: side effects are not reversible
+by the framework alone. The same applies to production
+databases with direct writes, third-party APIs with side
+effects, and any other live framework: each is a single live
+system whose fork and merge are not part of the contract.
+The two gaps push toward two requirements on any agen-
+tic CC protocol. (R1) Optimistic: neither pessimistic block-
+ing nor whole-task retry is affordable (§3.3). (R2) Writes
+take effect immediately: live state offers no private buffer
+or fork (§3.4). §4 shows how agent capabilities make both re-
+alizable, and what mechanism does the reconciliation.
+4 Insights and Our Approach
+4.1 Notify, Do Not Lock or Abort
+What enables a concurrency control beyond lock and abort
+is the agent itself: an LLM-powered agent has three capa-
+bilities that classical CC’s transaction model cannot exploit.
+(i) Faced with the broad read sets of §3.3, the agent can judge
+whether a conflicting write actually invalidates the premises
+of its plan. Many such writes do not: a peer appending a
+one-line log entry to CLAUDE.md touches an object the agent
+read but disturbs no premise it relies on. Classical CC can-
+not make this distinction and blocks or aborts either way.
+(ii) On a real conflict, the agent does not need whole-task
+redo: of the operations it just generated, only the few that
+depended on the now-stale value need rewriting, and the
+LLM can pinpoint them. When Agent B of §2.2 learns that
+the repair has replaced geo’s image, it need not redo the ca-
+nary task: only the canary’s image field rests on the stale
+read, and one set_image repairs it, keeping the rest of the
+deployment unchanged. (iii) Even on a live framework with
+no fork-and-merge semantics, the agent can produce an in-
+verse action for almost every external write it issues—a saga-
+style undo generated from the same context as the original
+write [11]—so writes that took effect immediately can be
+reconciled after the fact. On Kubernetes, a kubectl scale
+is inverted by scaling back to the prior replica count, and
+a kubectl apply by re-applying the manifest it displaced
+(§6.3). Capabilities (i) and (ii) make the optimistic posture
+required by (R1) affordable, and capability (iii) makes the
+in-place writes required by (R2) recoverable.
+Insight. Classical CC, pessimistic or optimistic, is
+mandatory: the runtime imposes the remedy for every
+conflict, by blocking the conflicting operation (2PL) or by
+aborting and retrying the transaction (OCC). It has no
+alternative, because a classical transaction cannot heal
+itself: application code can neither judge whether a conflict
+matters nor repair its own effects, so the only remedies that
+5
+
+work from outside are to delay it or to discard it. The three
+capabilities above are precisely what classical CC lacked: a
+limited but real form of self-healing. The agent can dismiss
+a conflict that invalidates no premise (i), regenerate the few
+operations that a real conflict taints (ii), and undo writes
+that should not have landed (iii). A concurrency control
+that exploits self-healing must therefore be advisory rather
+than mandatory: the runtime only informs the affected
+agent that a conflict may exist, and the remedy is delegated
+to the agent itself. The mechanism that carries the advice
+is notification: it replaces the lock and the abort as the
+load-bearing primitive.
+4.2 Overview: Our Approach
+The insight translates into an optimistic execution disci-
+pline; §5 develops it into a protocol with a serializability
+proof, and §6 into a framework. The framework fixes a
+serial order over the agents at launch and tracks each
+toolcall’s declared read/write footprint. Every read is fil-
+tered (§5.3): it returns the value the reader’s serial position
+should see, so far as the writes issued by then allow (writes
+of agents ordered before the reader are visible, writes
+of agents ordered after are screened out). Whether that
+value is final cannot be known at read time, since an agent
+ordered earlier may still write the same object; the agent
+does not wait to find out: it adopts the value as a premise
+and proceeds with its task, optimistically.
+Such optimistic execution is reconciled afterwards
+through two repair channels, split by who decides. When
+a write lands that may invalidate a premise some agent
+has already adopted, the framework appends a notification
+to that agent’s context describing what changed; in its
+next inference the LLM judges whether the change is
+real for its plan and, when it is, issues corrective reads
+and writes that patch exactly the affected operations, or
+a no-op when nothing it relies on is disturbed. When a
+write has landed in the wrong serial position (a write of
+lower serial order arrives after it), the speculation itself
+has misfired; no semantic judgment is needed, and the
+framework acts alone: it invokes the saga-style inverses
+the writes registered, unwinds the misordered writes, and
+reapplies them in serial order.
+This sketch leaves three design questions. Q1. When and
+to whom should the framework deliver a notification?
+(§5.3).
+Q2. How should an agent process a notification
+once it arrives? (§5.3). Q3. How must the framework
+cooperate? (§6).
+5 Detailed Design: the Protocol
+The approach of §4.2 left three questions—when the frame-
+work notifies, how an agent responds, and how the frame-
+work cooperates. We answer them with one protocol, MTPO
+(Monotonic Trajectory Pre-Order), on a rigorous model: §3.1
+named the correctness goal in prose, and stating MTPO’s
+guarantee—let alone proving it—requires mathematical pre-
+cision.
+5.1 System Model and Correctness
+Objects and operations. The model partitions the shared
+external state of §2.1 into objects, the units over which reads,
+writes, and conflicts are defined: a file, a database row, a Ku-
+bernetes deployment, or an abstract grouping of these (§6.1);
+𝒪 denotes the object set. What the protocol must know of
+each tool call 𝜏 is its footprint: the objects it reads, 𝑅(𝜏 ), and
+writes, 𝑊 (𝜏 ). The framework cannot derive the footprint
+from the call itself—a call’s effects can exceed the arguments
+it names (a kubectl apply ripples through a reconcile loop),
+and a general program does not split into a read set and a
+write set the way a SQL statement does—so the footprint en-
+ters the system by declaration: whoever turns an intent into
+a registered tool states its footprint alongside (§6.4), each
+write carrying its class, blind or RMW (§2.1), and, when
+reversible, an inverse (§6.3). We call this the latent object
+schema assumption. The framework totally orders the tool
+calls it mediates by physical execution time, written ≺
+𝑡
+, and
+lets each take effect atomically; two calls conflict on footprint
+when one’s write set intersects the other’s footprint.
+Two orders, and notification. Two total orders must
+stay distinct: the commit order ≺
+𝜎
+, the serial order each
+agent’s run is judged equivalent to, and the physical
+execution time ≺
+𝑡
+at which its tool calls actually reach the
+framework. ≺
+𝜎
+needs a carrier of its own: per object, the
+write trajectory
+𝑇 (𝑜)
+lists the writes on
+𝑜
+in
+𝜎
+order, and
+its materialization—applying each write, in that order, to
+𝑜’s initial state (a true composition: an RMW write’s effect
+depends on the value before it, §2.1)—is exactly what the
+≺
+𝜎
+-serial execution would leave on 𝑜. Call 𝑇 (𝑜) 𝜎-monotone
+when its writes arrive in 𝜎 order: the live copy then equals
+the materialization by construction, and nothing needs
+repair. But on a single copy the write overlay cannot
+be buffered (§3.4)—a write lands in place the moment it
+executes—and nothing forces arrivals to respect 𝜎. To repair
+the reads this breaks, the framework fires a notification—a
+read-only tool call 𝜈
+𝑖→𝑗
+(𝑜) that hands agent 𝑗 a value written
+by agent 𝑖, occupying a ≺
+𝑡
+position and updating only 𝑗’s
+read view.
+Agent assumptions. We assume three things of the
+agent, A1–A3, in increasing novelty. A1 (individual
+success): run alone from a state satisfying its premises,
+the agent terminates with its intent met. This is trans-
+action theory’s standing premise of individually correct
+programs [8], with success in place of correctness for a
+stochastic executor. A1’s precondition is owed by the task
+layer: the launched tasks must be well-posed, every serial
+order leaving each agent a premise-satisfying start; else
+a failure is one of specification, not of concurrency. A2
+(well-formedness): every action on shared state goes
+6
+
+through a registered tool, inside its declared footprint, and
+a delivered notification is consumed before the agent’s next
+action. The agent thus follows the protocol, generalizing
+the well-formed transaction of locking theory [17]. A3
+(self-healing): a notified agent heals correctly. It recog-
+nizes whether the footprint conflict is a premise conflict,
+one whose changed value invalidates a premise its plan
+relies on, and rewrites exactly the pending operations that
+depended on it. A2 alone drives the serialization-graph
+argument; A3 enters where notification perturbs a run
+(next); §7 measures both.
+Notified serializability. Because a notification per-
+turbs an agent’s run, we certify correctness through two
+equivalence relations. Notified equivalence (≅
+𝑁
+): a run
+with notifications produces the same observable behavior
+as the interleaving in which every read directly returned
+its ≺
+𝜎
+-correct value—the notification mechanism merely
+realizes that interleaving on a stale-prone single copy. The
+relation exists only because of A3: self-healing is precisely
+the ability to fold a late-arriving value into the plan as if
+it had been read in place. Serialization equivalence (≅
+𝑆
+):
+an interleaving is equivalent to a serial run, the textbook
+relation. Notified serializability composes the two: the
+run is ≅
+𝑁
+an interleaving that is ≅
+𝑆
+a serial order in ≺
+𝜎
+.
+5.2 Notification Alone Is Not Enough
+Notification by itself does not yield serializability. The proto-
+col it most naturally suggests is unconditional broadcast: ev-
+ery agent writes the single live copy directly, the framework
+notifies every agent whose footprint the write touches, and
+each notified agent heals, rewriting whatever the changed
+value invalidates (A3). This is write-update snoopy cache co-
+herence [21] transplanted to agents.
+However, unconditional broadcast can run into a livelock,
+worse than a serializability violation (Figure 2). The cause is
+a missing precedence. The framework orders neither agent
+before the other, so notifications flow in both directions.
+The two antidependency (rw) edges then close a cycle in
+the precedence graph, ruling out every conflict-serializable
+schedule; worse, each agent’s view is overturned by the
+other’s next write. The classical mechanisms that would
+impose a precedence are all unavailable on a single live
+copy: there is no buffer to stage writes, no fork to isolate
+readers, and no room for locks that an agent would hold
+across minutes of inference (§3.3). Without a precedence,
+no agent ever holds a stable view to serve as its premises
+(§5.3).
+5.3 Our Protocol: Monotonic Trajectory Pre-Order
+Key idea: pre-order. Supplying the missing precedence
+constructs the stable view as premise, and it is fixed
+before agent execution: ≺
+𝜎
+becomes a pre-order, assigning
+each agent a rank 𝜎
+𝑗
+at launch rather than at commit. A
+fixed precedence orients every conflict. Notifications flow
+
+# initial: x = 1, y = 1
+
+# A1's task: x ← y/2 A2's task: y ← x/2
+
+# serial outcomes: (x,y) = (0.5, 0.25) or (0.25, 0.5)
+
+t1 A1: read y = 1
+t2 A2: read x = 1
+t3 A1: write x = 0.5 → notify A2 (x changed)
+t4 A2: write y = 0.5 → notify A1 (y changed)
+t5 A1: heal: write x = 0.25 → notify A2
+t6 A2: heal: write y = 0.25 → notify A1
+t7 A1: heal: write x = 0.125 → notify A2
+... # x → 0, y → 0: livelock
+Figure 2. Unconditional broadcast on the task pair 𝑥 ← 𝑦/2 ∥
+𝑦 ← 𝑥/2. Every write invalidates the other agent’s premise and
+every heal issues a new write: the run never terminates, although
+either serial order would succeed.
+Figure 3. MTPO’s three actions: a filtered read returns only
+lower-𝜎 values (left); a subscribed notification reports a
+newer legal value, and the reader decides whether to repair
+(middle); a write that would break an object’s 𝜎 order first
+undoes the misapplied writes, then applies (right).
+strictly from low 𝜎 to high, so the dependency graph is
+a 𝜎-monotone DAG and no cycle can form. Each agent
+thereby holds the stable view the broadcast design lacked:
+the state of all writers with 𝜎 < 𝜎
+𝑗
+, which no higher-𝜎 agent
+can disturb; absent any notification, that view is already
+the framework state at 𝑗’s ≺
+𝜎
+-serial start, supplying the
+equivalence ≅
+𝑁
+builds on. On the example of Figure 2, the
+lower rank halves once; the higher rank, notified, halves
+the new value once more and stops: the serial outcome,
+reached concurrently. What remains is the machinery.
+Classical MVTO would keep one version slot per writer and
+let reads pick by timestamp [7, 40]; but a slot is a value, so
+that machinery silently assumes every write is blind. RMW
+writes (§2.1) force the version store to compose: the write
+trajectory of §5.1 replaces the slots, and inserting a version
+into it becomes a physical act. The two mechanisms give
+the protocol its name, MTPO; it maintains one invariant
+through three rules, stated next.
+The protocol. An agent is quiescent on an object 𝑜 when
+it has no further write on 𝑜 to issue, and quiescent when
+this holds for every object and all delivered notifications are
+consumed (a later notification may re-open it). GlobalQuiet
+is the run state in which every agent is quiescent and no
+notification is in flight.
+MTPO’s invariant: at GlobalQuiet, every object’s live
+copy equals the materialization of its trajectory, i.e., live
+7
+
+state and ≺
+𝜎
+-serial state coincide. Figure 3 illustrates the
+three rules.
+Reads pull from the trajectory (wr). A filtered read is
+a synchronous pull: FilteredRead(𝑗, 𝑜) = 𝑀(𝑜, 𝜎
+𝑗
+), the value
+left on 𝑜 by the entries of 𝑇 (𝑜) with 𝜎 ≤ 𝜎
+𝑗
+. When those en-
+tries end in a blind write, this is simply the 𝜎-greatest ver-
+sion at or below 𝜎
+𝑗
+; an RMW entry, however, composes with
+everything before it, so in general the whole prefix must be
+materialized.
+Writes apply speculatively (ww). R2 (§3.4) admits no
+buffer, so a write takes effect in place at its ≺
+𝑡
+position and
+joins 𝑇 (𝑜) at its rank 𝜎
+𝑗
+. Since nothing forces the two orders
+to agree, a write 𝑤 may be late: some entry 𝑤
+′
+of 𝑇 (𝑜) sat-
+isfies 𝑤
+′
+≺
+𝑡
+𝑤 but 𝑤 ≺
+𝜎
+𝑤
+′
+. Three mechanisms make a late
+write take effect at its 𝜎 rank, not at its arrival rank, and with
+it the invariant holds. If a blind entry above 𝜎
+𝑗
+shadows 𝑤,
+the framework records 𝑤 in the trajectory and never replays
+it onto the live copy, similar to the Thomas write rule [46].
+Readers ranked between the two are served from the trajec-
+tory. Otherwise the framework applies 𝑤 after undoing the
+suffix above 𝜎
+𝑗
+in descending 𝜎, using the inverse each write
+carries (§6.3). Last, a write whose tool admits no inverse is
+held until every agent with 𝜎 < 𝜎
+𝑗
+has committed (§6.3): it
+never speculates, hence is never late.
+Notifications push to readers (rw). When a lower-𝜎
+writer touches an object some higher-𝜎 agent already read,
+the framework delivers 𝜈
+𝑖→𝑗
+(𝑜), carrying the refreshed
+𝑀(𝑜, 𝜎
+𝑗
+), at the receiver’s next inference. A quiescent
+receiver is re-opened. 𝐴
+𝑗
+may keep, rewrite, or retract its
+pending operations (A3). Classical MVTO would abort
+the reader here; MTPO instead refreshes it, trading the
+abort for a reorder [33]. The pull/push division mirrors the
+two dependencies of §3.2. A read-from (wr) edge needs a
+lower-𝜎 value, and only the pull can select one: no push
+can stop an agent from seeing the too-new value already on
+the live copy. An antidependency (rw) edge runs the other
+way, from lower-𝜎 writer to higher-𝜎 reader, exactly the
+direction the push travels. A two-way notification would
+reintroduce the cycle of §5.2.
+Correctness. We sketch a proof that the three rules de-
+liver notified serializability by constructing the interleaving
+that ≅
+𝑁
+refers to and then showing its precedence graph
+acyclic.
+Proposition (notified serializability). Assume A1–A3
+and the MTPO rules. At GlobalQuiet, the run is notified-
+serializable in ≺
+𝜎
+order, and every object’s final state is what
+the ≺
+𝜎
+-serial execution leaves.
+Proof sketch. Step 1 (construct the schedule by ≅
+𝑁
+). A
+precedence graph is defined over a schedule [8], but a run
+under MTPO is not a schedule: the framework undoes
+writes to keep each trajectory 𝜎-monotone and notifies
+agents to refresh their views, while a schedule contains
+agent operations only. Let 𝐼 be the interleaving in which
+every read and write takes effect exactly once, at its 𝜎
+rank, and every read returns 𝑀(𝑜, 𝜎
+𝑗
+) of the trajectory at
+GlobalQuiet. The run is ≅
+𝑁
+-equivalent to 𝐼 in two ways.
+Writes match exactly by the invariant, since the framework
+removes the 𝜎-backward ww edges. Reads match because
+the notified agent rewrites exactly the operations that
+depended on the changed value, behaving as if it had read
+the value in place, which resolves the 𝜎-backward rw edges.
+Step 2 (conflict-serializable by ≅
+𝑆
+). In 𝐼 every operation sits
+at its agent’s 𝜎 rank, so every wr, ww, and rw edge of the
+precedence graph points 𝜎-forward and the graph is a DAG:
+𝐼 is conflict-serializable, with 𝜎 itself the serial order [8].
+6 The Framework
+We realize MTPO as CoAgent, a single layer of toolcall
+middleware between the agent framework and the
+target system. Every Worker toolcall passes through it:
+the middleware injects the caller’s pending notifications,
+dispatches the call, and returns the result with any raised
+during dispatch; notifications can ride on returns because
+the protocol requires only arrival before the receiver’s next
+inference (§5.1). The middleware ships as a plug-in and
+requires three capabilities from the host, each matching
+one protocol need: custom tool registration (to interpose),
+a commit hook (to hold commit until pending notifications
+drain, the GlobalQuiet premise of §5.3), and an A2A channel
+(§6.4); all three are standard in LangGraph, OpenAI Agents,
+Claude Code, and the MCP/A2A specifications [2, 28, 35].
+The section follows what the rules consume: the objects
+reads and writes range over (§6.1), the toolcalls held to their
+declared footprints(§6.1), the three routes that serve a read
+in 𝜎 order (§6.2), the structure that makes writes undoable
+(§6.3), and the usability problem the discipline creates (§6.4).
+6.1 The Object Tree and Constrained Tools
+The protocol’s rules range over objects, so the system must
+first fix what an object is. Objects are organized as a tree,
+containing two kinds of nodes: Natural objects are units the
+target system already names: a file, a directory. Abstract ob-
+jects are units the agent reasons about but no single arti-
+fact embodies: a Spark instance, a cluster. Nodes instantiate
+lazily, on first mention by a toolcall, keep a stable identity
+for the session, and carry the object’s write trajectory (§5.3):
+its writes in 𝜎 order.
+Every toolcall declares the objects it reads and writes:
+each tool registers as a structured call whose designated
+parameters carry object ids, so the middleware reads 𝑅(𝜏 )
+and 𝑊 (𝜏 ) off the invocation. The declaration must also hold
+at execution; enforcement follows the operation class. The
+Worker never writes the request itself: it fills the named
+slots of a structured header, a fixed envelope per tool, and
+the framework assembles the wire payload, binding each
+slot to its declared object id.
+8
+
+6.2 Reads in 𝜎 Order: Snapshot or Undo
+MTPO requires each read to return the 𝜎-correct value,
+the materialization of the trajectory prefix at or below the
+reader’s 𝜎 (§5.3); the live copy does not honor 𝜎, since a
+higher-𝜎 write may land before a lower-𝜎 read arrives. The
+middleware serves such a read by the cheapest of three
+routes that applies.
+Replay on a materialization. When state is cheap to
+copy (files, key-value records, versioned documents), the
+middleware retains a materialization after every write, and
+a late read executes against the 𝜎-legal copy: an analysis
+script runs over the historical files as if no later write
+existed, and the higher-𝜎 writer is never touched.
+Record the result. Some state cannot be copied, but its
+read results can: a running container list has no file to copy,
+so the middleware records the docker ps output after every
+write under that object, and a late docker ps returns the last
+𝜎-legal recording. The cost is one read per write; the higher-
+𝜎 container is never rolled back.
+Live access, backed by undo. What remains must run
+live: an arbitrary SQL query can only run on the database
+itself (copying it after every write is prohibitive), and a read–
+modify–write must compose with the writes before it (§2.1),
+since an increment computed on a historical copy does not
+transplant onto the current state. For both, the middleware
+brings the live object to the caller’s 𝜎 position: it undoes,
+in descending 𝜎, every write above that position, lets the
+call execute, and notifies each undone agent, which decides
+whether to retry (§5.3). This route presupposes that every
+write can be undone; the next subsection makes that hold.
+6.3 Undoability: Three-Phase Toolcalls
+The undo of §6.2 needs an inverse for every write it may
+revoke, and synthesizing one after the fact is often impos-
+sible: the write destroys the information the inverse needs,
+and nothing reconstructs DROP DATABASE foo once it has
+run. Undoability is therefore established when the tool is
+built, before any conflict can arise. Every tool is written in
+three segments: prepare runs immediately before exec in
+a framework-allocated tmp directory and captures every-
+thing the inverse will need (for the DROP: a dump of schema
+and rows); exec carries the tool’s intent and modifies the
+target system; reverse is a self-contained script the frame-
+work may invoke at any time to restore the pre-exec state.
+The tmp directory is cleared at the owning session’s commit,
+since commit means no further undo.
+A few operations admit no reverse at any cost: sending
+external mail, executing a payment. Such a tool is tagged
+unrecoverable at registration; the middleware refuses its
+calls until every lower-𝜎 agent has committed, then pushes
+an unlock notification. Concurrency is lost only where no
+cheaper resolution exists.
+Figure 4. On request, the ToolSmith builds binding-carrying
+tools on the fly; Worker reads and writes go only through them,
+under framework control.
+6.4 Generality: The ToolSmith
+The discipline above creates a usability problem. Agents are
+effortless to deploy because one bash covers most of the
+computing world; bash tracks no read or write set, so this
+system cannot admit it, and reimplementing every action
+by hand as a declared three-phase toolcall would cost more
+than the concurrency it buys. Nor can the Worker build its
+own tools: exploration happens precisely where no regis-
+tered tool exists yet, so those accesses carry no footprint;
+an untracked read plants a premise the protocol cannot pro-
+tect, an untracked write changes state without notifying its
+readers.
+The way out is an asymmetry the protocol itself supplies:
+every conflict in §5 is caused by a write, so an agent that
+never writes the target system invalidates no premise and
+needs no concurrency control at all. The framework there-
+fore hands tool supply to a privileged tool-building agent,
+the CoAgent ToolSmith, unconstrained in reading the target
+system and forbidden to mutate it.
+The ToolSmith works in two phases (Figure 4): on first
+contact with a new target system, a bootstrap skill drives
+discovery (list CRDs, namespaces, and verbs on Kubernetes;
+fetch the schema and probe the RPC surface on MCP) and
+seeds the object tree and a base tool set from templates (a
+declarative interface accepts definitions supplied ahead of
+time); it then stays resident, co-running with the Workers.
+When a Worker hits a need no registered tool covers, it sub-
+mits a synthesis request over A2A, in natural language or,
+more precisely, as the bash command it wants to run. The
+ToolSmith synthesizes from the description or audits the
+command: it marks the read and write sets, registers objects
+the tree lacks, attaches prepare and reverse, and returns
+a constrained tool, complete or as a template whose hole
+the Worker fills. The Worker keeps bash-level reach, yet ev-
+ery write it issues flows through a footprint-bound tool. The
+ToolSmith’s context carries every registered tool, so similar
+requests deduplicate to an existing one; at steady state most
+9
+
+requests hit the table and the overhead amortizes toward
+zero. The latent object schema of §5.1 is grown exactly this
+way: seeded at first contact, extended per request at run-
+time.
+7 Evaluation
+This section answers three questions. (Q1) Does MTPO
+resolve the concurrent-state-access problem at a cost-
+performance point better than 2PL and OCC?
+(Q2)
+What
+does a concurrency anomaly look like under a real run,
+and how do 2PL, OCC, and MTPO each respond to it? (Q3)
+When a target system ships no tool table at all, can the
+framework grow one online, and at what cost?
+7.1 Setup
+Environment. All experiments run on one dual-socket In-
+tel Xeon E5-2650 v4 server (24 physical cores / 48 threads,
+2.20 GHz; 125 GiB DDR4; 1.8 TB NVMe SSD; Ubuntu 22.04).
+The K8s scenarios run against a single-node kind cluster on
+the same host.
+Models. Worker agents use deepseek-v4-flash
+through the OpenRouter endpoint. A token-rate audit
+watches for throttling, reconnects, and queueing; any trial
+that trips one of these is discarded and rerun, so reported
+wall-clocks are not polluted by supply-side jitter.
+Benchmarks. WorkBench [44] is a simulated office au-
+tomation harness over five domains (CRM, calendar, email,
+analytics, project management), driving an agent through
+natural-language business tasks. AIOpsLab [12], from
+Microsoft Research, supplies live microservice incident
+investigation and remediation tasks (port misconfigura-
+tion, image rollback, permission revocation, and the like)
+and operates a real K8s cluster through bash. Neither
+benchmark was designed for concurrent agents: tasks
+in each suite are mutually independent and never race
+for the same object. We therefore pick five tasks from
+each suite as the agent-1 workload and hand-construct a
+matching agent-2 for each, chosen so the pair exhibits a
+textbook concurrency anomaly. Each cell ships with a set
+of hand-written invariants: any concurrent execution must
+be equivalent to either agent-1 ⋅ agent-2 or agent-2 ⋅ agent-1;
+a run satisfying neither is recorded as a violation.
+Protocols. Five protocols are tested on the same mid-
+dleware (§6).
+serial runs the two agents back-to-back and
+sets the correctness and wall-clock-upper-bound reference.
+naive runs them concurrently with no coordination, the
+“probably correct” lower bound. 2PL reuses the declarative
+bindings to acquire read and write locks; a deadlock detec-
+tor picks a victim and the saga reverse of §6.3 unwinds
+it, with the victim’s context cleared before it restarts.
+OCC reuses the same bindings under eager validation; the
+first rw/ww conflict commits the trigger and aborts the
+conflicting agent, which restarts. MTPO is the protocol of
+§5–§6.
+Metrics. For every (cell, protocol) pair we run 𝑁 =10 tri-
+als and report correctness (the fraction of trials satisfying
+the invariant), wall-clock mean (relative to serial), and to-
+tal token-cost mean (relative to serial). 2PL and OCC can
+livelock, so we cap retries at five: any trial whose victim is
+aborted five times in a row is terminated and counted as a
+correctness failure.
+7.2 End-to-End Results
+Figure 5 reports the five protocols on the ten cells across four
+panels: correctness, speedup over serial, token cost over se-
+rial, and the cost-versus-speedup Pareto front.
+Serial and naive. Serial is the cost and correctness opti-
+mum: the model spends no attention on coordination and no
+tokens reasoning about other agents. Naive is the wall-clock
+floor; it ignores every dependency and runs the two tasks in
+parallel. The achieved speedup sits around 1.5× rather than
+2× because per-task latency varies, and a pair’s wall-clock
+is bounded by the slower task. Naive’s token cost stays near
+serial (neither agent does extra reasoning), but on these con-
+tended cells its correctness collapses, as expected of a proto-
+col with no coordination at all.
+2PL and OCC. Both lift correctness sharply but recover
+almost no speedup over serial, and add substantial token
+cost. Trace analysis shows why. Under 2PL, deadlocks fire
+at a rate of 0.81 per trial: the victim’s progress is reversed
+and re-driven, collapsing the run back to serial-like latency.
+The cause is structural: agents read broadly at start-up and
+take many shared read locks; the moment either tries to
+upgrade to a write lock the other holds, the cycle closes.
+OCC fares worse: abort rate 0.95 per trial, mean token cost
+1.83× serial, peaking at 2.33× on the worst case, each abort
+billing the discarded work a second time. This is the classical
+heavy-contention regime where pessimistic locking edges
+optimistic out; agent workloads, with their read amplifica-
+tion (§3.3), sit firmly in that regime.
+MTPO MTPO clears every cell at a correctness, wall-
+clock, and cost point materially better than 2PL and OCC.
+The pre-order rules out 2PL deadlock and OCC livelock by
+construction (§5.3): notifications travel only low-to-high,
+the dependency graph is a 𝜎-monotone DAG, and no two
+agents can wait on each other. Notification then preserves
+work that the conflict does not actually invalidate: a notified
+reader rewrites only the affected fragment of its plan (§4.1),
+and semantically benign syntactic conflicts pass without
+disturbing the LLM (§4.1). Both effects show up in token
+cost, which sits within noise of serial. Correctness is ≈ 5%
+below serial: in five of one hundred trials the notification
+was delivered but the receiver misjudged its relevance to
+its own task. This residual is an A3 (self-healing) gap (§5.1),
+independent of the protocol; we expect it to shrink with
+10
+
+serial
+naive
+2PL-saga
+OCC-saga
+MTPO
+0
+50
+100
+Invariant-OK (%)
+
+98
+13
+96
+93 93
+(a) Correctness
+serial
+naive
+2PL-saga
+OCC-saga
+MTPO
+0.5
+1.0
+1.5
+Speedup vs serial
+1.00
+1.54
+1.04
+0.93
+1.43
+(b) Speed
+serial
+naive
+2PL-saga
+OCC-saga
+MTPO
+0.5
+1.0
+1.5
+2.0
+Cost vs serial
+1.00
+1.06
+1.45
+1.83
+1.15
+(c) Cost
+1.0 1.5
+Speedup vs serial
+1.0
+1.5
+2.0
+Cost vs serial
+
+better
+(d) Cost vs speed
+serial
+naive
+(unsafe)
+2PL-saga
+OCC-saga
+MTPO
+serial naive 2PL-saga OCC-saga MTPO
+Figure 5. Five protocols on ten contended cells: correctness, speedup, token cost, and Pareto front, all normalized to serial.
+A
+B
+(a) naive 32 s
+A
+B
+deadlock
+wait
+write lock
+wait
+read lock
+redo B
+(b) 2PL 53 s
+A
+B
+redo B
+(c) OCC 64 s
+0 5 10 15 20 25 30 35 40
+wall-clock time (s)
+A
+B
+notify
+repair
+(d) MTPO (ours) 33 s
+read
+write
+commit
+lock-blocked
+deadlock/abort
+lock wait
+rw conflict
+notification
+repair
+Figure 6. The same contended cell under four protocols.
+stronger frontier models or targeted finetuning, and leave
+that to future work.
+7.3 Case Study
+To answer Q2, Figure 6 takes one of the ten cells and plots
+the same workload, run under each protocol, on a shared
+time axis. The cell is the canary case of §2.2: Agent A (the re-
+pair) and Agent B (the canary) couple on geo’s image, which
+B reads as a build premise while A overwrites it, and B’s new
+canary in turn falls within A’s audit scope. The serial base-
+line is 50.2 s, and the invariant is the common end state of
+both serial orders: the canary ends on the canonical image,
+fully configured.
+naive (31.8 s, 7). This run is the trace of Figure 1: B builds
+the canary from geo’s pre-fix image, while A’s range scan
+precedes the canary and misses it. The two rw antidependen-
+cies run in opposite directions and cross into a cycle (the two
+red edges), leaving a non-serializable end state. Every step is
+correct at the instant it executes: each read returns the then-
+current state, and each write’s premise still holds when is-
+sued. No stronger model would act differently; the fault sits
+in the interleaving itself, the same anomaly databases solve
+with concurrency control. naive is the fastest precisely be-
+cause it omits coordination, deferring the cost to the release
+window.
+2PL (53.1 s, 3). The same two antidependencies surface
+as lock waits. Both agents read broadly at start-up and hold
+shared read locks; B’s write-lock request for the new canary
+falls inside A’s range read lock, while A’s upgrade of geo
+from a read to a write lock is blocked by B’s read lock. The
+wait cycle closes at 𝑡 ≈ 16 s: a deadlock. The detector selects
+B as the victim: B aborts and releases all its locks, A’s pend-
+ing write lock is granted at that same instant, and A writes
+geo and its two other fixes. B then restarts, and its first read
+hits A’s write lock, now held until commit, and blocks a sec-
+ond time until A commits and releases; B redoes all its work
+from scratch. B is suspended for about 21 s and its first exe-
+cution is discarded entirely, so its wall-clock matches serial
+and the concurrency gain is zero.
+OCC (63.7 s, 3). Optimistic execution lets both agents
+run to completion unimpeded, but B’s opening cluster-wide
+audit pulls the whole namespace into its read set, so each of
+A’s three fixes hits it (the three red edges converge on B’s
+single audit at the left). A commits first and validates; B then
+fails validation at commit and aborts in full, though every
+write it issued was correct when issued. The abort carries
+no localizing information, so B can only re-audit, re-read,
+and rebuild from scratch, discarding about 32 s of first-pass
+work.
+MTPO (32.8 s, 3). The first 15 s are identical to naive. At
+𝑡 = 15.7 s, the moment A’s write to geo lands, the runtime
+follows the rw antidependency to B (an in-flight reader that
+has read geo’s image) and delivers a one-way notification
+naming the object and its new value (the blue arrow); nei-
+ther agent stops. At its next decision point B re-reads geo,
+confirms the premise has changed, judges for itself that the
+only affected element is the canary’s image, and repairs it in
+place with a single set_image (the green arc). The canary
+deployment, its label, and its routing entry all stay valid;
+11
+
+10 20 30 40 50 60 70
+task processing step (random order)
+0
+10
+20
+30
+cum. tool count
+11
+2
+12
+(a) Online tool-library growth
+snapshot read
+live read
+mixed RW
+total
+pass rate wall time cost
+0.0
+0.5
+1.0
+1.5
+2.0
+norm. to Bash = 1
+45/71
+63/71
+102m
+82m
+$0.75
+$0.64
+51m
+31m
+$0.43
+$0.22
+(b) Bash agent vs CoAgent ToolSmith Worker
+bash agent
+CoAgent Worker
+CoAgent ToolSmith
+Figure 7. (a) Online tool growth; (b) bash agent vs CoAgent
+ToolSmith–Worker.
+nothing is discarded and no time is spent waiting. From
+A’s triggering write to B’s completed repair is 6.4 s, against
+about 29 s for OCC’s abort-and-redo. MTPO runs 1.5× faster
+than serial at 1.20× its token cost.
+7.4 Growing the Tool Table Online
+Every comparison so far presupposes a populated tool ta-
+ble. For WorkBench the presupposition is free: its baseline
+tools already carry categories and signatures, and a one-
+time rewrite enrolls them in the registration. AIOpsLab is
+the opposite kind of environment: its native agent drives a
+real K8s cluster with free bash, and no tool table exists at all.
+Onboarding it therefore depends entirely on the CoAgent
+ToolSmith of §6.4. This subsection measures that path with
+one cold-start experiment: whether the table grows on de-
+mand, what shape it converges to, and what the ToolSmith–
+Worker split does to success rate, time, and cost.
+Setup. The workload is 71 AIOpsLab tasks in random
+order, spanning three application stacks (HotelReservation,
+SocialNetwork, Astronomy Shop) and four task types (detec-
+tion, localization, root-cause analysis, mitigation); the tool
+library starts empty.
+2
+The full suite is harder than the con-
+tended cells of §7.1: v4-flash solves those, so here both
+agents run deepseek-v4-pro and every task is capped at
+40 rounds. Before the task starts, a long-lived ToolSmith
+(one session across all 71 tasks) probes the cluster with read-
+only bash, registers tools and objects under the prepared-
+statement discipline, and assigns the task’s initial tool list;
+a Worker that finds its tools insufficient mid-task sends the
+ToolSmith a natural-language request, and the new tool is
+2
+AIOpsLab contains 79 problem instances; we exclude eight cases whose
+fault injection requires Chaos Mesh, which our single-node kind cluster
+does not run.
+hot-inserted at its next step. The baseline is a pure-bash
+agent with the same model, task order, and round cap.
+The library converges. After 71 tasks the library holds
+25 tools: 11 snapshot reads, 2 live reads (logs and events re-
+lated, which no snapshot can reconstruct), and 12 undoable
+writes (Figure 7a). Growth is front-loaded: half the final li-
+brary exists after 13 tasks (18% of the stream). ToolSmith
+time follows the same curve, from 37 s per task over the first
+half to 16 s over the second, by which point initialization has
+degenerated into catalog reuse. All 12 write tools found an
+executable reverse: scale_deployment.
+Constraint improves correctness. The CoAgent
+Worker passes 63 of 71 tasks; the bash agent passes 45
+(Figure 7b). Traces attribute the gap to direction rather
+than capability. The bash agent has no prior knowledge:
+it probes the open command space until the cap. The
+accumulated tool table provide such prior knowledge of
+history faults: e.g. the existence of
+list_service_ports
+suggests comparing ports. With such a checklist, the
+Worker resolves the tasks with fewer rounds and with
+larger success rate.
+Time and cost. CoAgent finishes the test within 4910 s
+against the baseline’s 6118 s (0.80×). Log analysis reveals
+that the primary speedup stems from CoAgent’s structured
+tool-call list, which enables the agent to complete tasks with
+fewer rounds. Cost also lands at $0.64 against $0.75 (0.86×),
+split $0.43 Worker and $0.22 ToolSmith.
+8 Related Work
+Concurrency control for LLM agents. A wave of recent
+systems brings concurrency control to LLM-agent shared
+state. In the taxonomy of §4.1 all of them are mandatory:
+the runtime imposes the remedy, and none proves a
+correctness property at agent granularity. One route tracks
+read sets at the tool surface and validates at commit: S-
+Bus [25] rebuilds per-agent read sets from HTTP traffic and
+machine-checks a partial isolation property, yet measures
+74% of reads on its SWE-bench workload as invisible to that
+surface; STORM [30] validates file-version snapshots at
+write time. A second route ports one classical mechanism:
+conservative 2PL [9], adaptive locking for SQL agents [54],
+CRDTs [38], MESI invalidation [36]. Atomix [31] wraps
+tool calls in progress-aware transactions at the tool bound-
+ary; its measurements reproduce the lock and OCC cost
+inversion of §3.3. It settles per resource without proof
+at single-phase granularity, and leaves context-carried
+premises and agent-level serializability out of scope.
+SagaLLM [11] wraps sequential planning pipelines in saga
+compensation and asserts serial-order equivalence for one
+single agent; but provide no mechanism or proof enforces
+multi-agent serializability. Our protocol tracks the read
+view over delivered premises, repairs through notification,
+and proves serializability there.
+12
+
+Classical foundations. 2PL, OCC, serializability the-
+ory, and weak-isolation definitions [6, 8, 17, 26] ground this
+paper; our protocol inherits their provability and changes
+the remedy: classical CC blocks or aborts, ours notifies
+and lets the agent repair (§4.1). MTPO itself descends
+from multiversion timestamp ordering [7, 40] and Calvin’s
+deterministic pre-ordering [47]. Semantic CC [19, 29, 48]
+extracts concurrency from operation semantics but requires
+static annotation; our semantic judgment is generated at
+runtime by the LLM. The optimistic posture with inverse
+actions follows sagas [20] and Herlihy’s type-specific
+compensation [22]; GoEX [37] argued for undo in LLM run-
+times, and MTPO adds the 𝜎-monotonicity rule that decides
+when to compensate. Collaborative replication [16, 43, 45]
+shares our structure of a local view, pending operations,
+and external updates, but reconciles by algebraic transform
+or application-supplied merge; ours reconciles through the
+LLM, and the broadcast protocol certifies joint invariants
+at quiescence, which convergence alone cannot.
+9 Conclusion
+LLM agents increasingly share mutable state, while classical
+blocking and abort-based concurrency control wastes the
+long inference work that makes agents expensive. This pa-
+per presents a protocol named MTPO, which handles agents’
+shared-state access conflicts through targeted repair rather
+than blocking or aborting, while preserving serializability
+at quiescence. Implemented as CoAgent, this approach pre-
+serves near-serial correctness and token cost while recover-
+ing meaningful concurrency on contended workloads.
+References
+[1] Anthropic. 2024. Claude Code: Sub-agents and Agent Teams. https:
+//docs.anthropic.com/en/docs/claude-code/sub-agents.
+[2] Anthropic. 2025. Claude Code: Agentic Coding Documentation.
+https://docs.anthropic.com/en/docs/claude-code.
+[3] Anthropic. 2026. Building a C Compiler with a Team of Par-
+allel Claudes. https://www.anthropic.com/engineering/building-c-
+compiler.
+[4] Anthropic. 2026. How We Built Our Multi-Agent Research Sys-
+tem.
+https://www.anthropic.com/engineering/multi-agent-research-
+system
+.
+[5] Anysphere. 2025. Cursor Docs: Worktrees—Run Parallel Agents
+in Isolated Copies of the Codebase. https://cursor.com/docs/
+configuration/worktrees.
+[6] Hal Berenson, Philip A. Bernstein, Jim Gray, Jim Melton, Elizabeth J.
+O’Neil, and Patrick E. O’Neil. 1995. A Critique of ANSI SQL Isolation
+Levels. In Proceedings of the 1995 ACM SIGMOD International Confer-
+ence on Management of Data. ACM Press, 1–10. doi:
+10.1145/223784.
+223785
+[7] Philip A. Bernstein and Nathan Goodman. 1983. Multiversion Con-
+currency Control—Theory and Algorithms. ACM Transactions on
+Database Systems 8, 4 (1983).
+[8] Philip A. Bernstein, Vassos Hadzilacos, and Nathan Goodman. 1987.
+Concurrency Control and Recovery in Database Systems. Addison-
+Wesley.
+[9] Umut Çalıkyılmaz, Nitin Nayak, Jinghua Groppe, and Sven
+Groppe. 2025. OptiMA: A Transaction-Based Framework with
+Throughput Optimization for Very Complex Multi-Agent Systems.
+arXiv:2511.03761 [cs.MA]
+[10] Mert Cemri, Melissa Z. Pan, Shuyi Yang, Lakshya A. Agrawal, Bhavya
+Chopra, Rishabh Tiwari, Kurt Keutzer, Aditya Parameswaran, Dan
+Klein, Kannan Ramchandran, Matei Zaharia, Joseph E. Gonzalez, and
+Ion Stoica. 2025. Why Do Multi-Agent LLM Systems Fail?. In Ad-
+vances in Neural Information Processing Systems (NeurIPS), Datasets
+and Benchmarks Track.
+[11] Edward Y. Chang and Longling Geng. 2025. SagaLLM: Context Man-
+agement, Validation, and Transaction Guarantees for Multi-Agent
+LLM Planning. Proceedings of the VLDB Endowment 18, 12 (2025),
+4874–4886.
+[12] Yinfang Chen, Manish Shetty, Gagan Somashekar, Minghua Ma, Yo-
+gesh Simmhan, Jonathan Mace, Chetan Bansal, Rujia Wang, and Sara-
+van Rajmohan. 2025. AIOpsLab: A Holistic Framework to Evaluate AI
+Agents for Enabling Autonomous Clouds. arXiv:2501.06706 [cs.SE]
+[13] Cognition. 2024. Introducing Devin, the First AI Software Engineer.
+https://cognition.ai/blog/introducing-devin.
+[14] James C. Corbett, Jeffrey Dean, Michael Epstein, Andrew Fikes,
+Christopher Frost, J. J. Furman, Sanjay Ghemawat, Andrey Gubarev,
+Christopher Heiser, Peter Hochschild, et al. 2013. Spanner: Google’s
+Globally Distributed Database. ACM Transactions on Computer Sys-
+tems 31, 3 (2013), 8:1–8:22.
+[15] crewAI. 2024. crewAI: Framework for Orchestrating Role-Playing,
+Autonomous AI Agents. https://github.com/crewAIInc/crewAI.
+[16] Clarence A. Ellis and Simon J. Gibbs. 1989. Concurrency Control in
+Groupware Systems. In Proceedings of the 1989 ACM SIGMOD Inter-
+national Conference on Management of Data. 399–407.
+[17] Kapali P. Eswaran, Jim N. Gray, Raymond A. Lorie, and Irving L.
+Traiger. 1976. The Notions of Consistency and Predicate Locks in
+a Database System. Commun. ACM 19, 11 (1976), 624–633.
+[18] Roy T. Fielding and Julian Reschke. 2014. Hypertext Transfer Protocol
+(HTTP/1.1): Semantics and Content. RFC 7231. doi:10.17487/RFC7231
+[19] Hector Garcia-Molina. 1983. Using Semantic Knowledge for Trans-
+action Processing in a Distributed Database. ACM Transactions on
+Database Systems 8, 2 (1983), 186–213.
+[20] Hector Garcia-Molina and Kenneth Salem. 1987. Sagas. In Proceedings
+of the 1987 ACM SIGMOD International Conference on Management of
+Data. 249–259.
+[21] John L. Hennessy and David A. Patterson. 2019. Computer Architec-
+ture: A Quantitative Approach (6th ed.). Morgan Kaufmann.
+[22] Maurice Herlihy. 1990. Apologizing Versus Asking Permission: Opti-
+mistic Concurrency Control for Abstract Data Types. ACM Transac-
+tions on Database Systems 15, 1 (1990), 96–124.
+[23] Sirui Hong, Mingchen Zhuge, Jonathan Chen, Xiawu Zheng, Yuheng
+Cheng, Ceyao Zhang, Jinlin Wang, Zili Wang, Steven Ka Shing Yau,
+Zijuan Lin, Liyang Zhou, Chenyu Ran, Lingfeng Xiao, Chenglin Wu,
+and Jürgen Schmidhuber. 2024. MetaGPT: Meta Programming for a
+Multi-Agent Collaborative Framework. In ICLR.
+[24] Andrej Karpathy. 2026. autoresearch. https://github.com/karpathy/
+autoresearch.
+[25] Sajjad Khan. 2026. S-Bus: Automatic Read-Set Reconstruction for
+Multi-Agent LLM State Coordination. arXiv:2605.17076 [cs.LG]
+[26] H. T. Kung and John T. Robinson. 1981. On Optimistic Methods for
+Concurrency Control. ACM Transactions on Database Systems 6, 2
+(1981).
+[27] Woosuk Kwon, Zhuohan Li, Siyuan Zhuang, Ying Sheng, Lianmin
+Zheng, Cody Hao Yu, Joseph E. Gonzalez, Hao Zhang, and Ion Sto-
+ica. 2023. Efficient Memory Management for Large Language Model
+Serving with PagedAttention. In SOSP.
+[28] LangChain. 2024. LangGraph: Stateful, Multi-Actor Applications
+with LLMs. https://github.com/langchain-ai/langgraph.
+13
+
+[29] Cheng Li, Daniel Porto, Allen Clement, Johannes Gehrke, Nuno
+Preguiça, and Rodrigo Rodrigues. 2012. Making Geo-Replicated Sys-
+tems Fast as Possible, Consistent when Necessary. In OSDI.
+[30] Mengyang Liu, Taozhi Chen, Zhenhua Xu, Xue Jiang, and Yihong
+Dong. 2026. Multi-agent Collaboration with State Management.
+arXiv:2605.20563 [cs.MA]
+[31] Bardia Mohammadi, Nearchos Potamitis, Lars Klein, Akhil Arora, and
+Laurent Bindschaedler. 2026. Atomix: Timely, Transactional Tool Use
+for Reliable Agentic Workflows. arXiv:2602.14849 [cs.LG]
+[32] Moonshot AI. 2026. Kimi Introduces Agent Swarm: Let 100 AI Agents
+Work for You. https://www.kimi.com/blog/agent-swarm.
+[33] Shuai Mu, Yang Cui, Yang Zhang, Wyatt Lloyd, and Jinyang Li. 2014.
+Extracting More Concurrency from Distributed Transactions. In 11th
+USENIX Symposium on Operating Systems Design and Implementation
+(OSDI ’14). 479–494.
+[34] OpenAI. 2025. Introducing Codex: A Cloud-Based Software Engi-
+neering Agent That Can Work on Many Tasks in Parallel. https:
+//openai.com/index/introducing-codex/.
+[35] OpenAI. 2025. OpenAI Agents SDK. https://openai.github.io/openai-
+agents-python/.
+[36] Vladyslav Parakhin. 2026. Token Coherence: Adapting MESI Cache
+Protocols to Minimize Synchronization Overhead in Multi-Agent
+LLM Systems. arXiv:2603.15183 [cs.DC]
+[37] Shishir G. Patil, Tianjun Zhang, Vivian Fang, Noppapon C.,
+Roy Huang, Aaron Hao, Martin Casado, Joseph E. Gonzalez,
+Raluca Ada Popa, and Ion Stoica. 2024. GoEX: Perspectives and
+Designs Towards a Runtime for Autonomous LLM Applications.
+arXiv:2404.06921 [cs.SE]
+[38] Sergey Pugachev. 2025. CodeCRDT: Observation-Driven
+Coordination for Multi-Agent LLM Code Generation.
+arXiv:2510.18893 [cs.DC]
+[39] Chen Qian, Wei Liu, Hongzhang Liu, Nuo Chen, Yufan Dang, Jiahao
+Li, Cheng Yang, Weize Chen, Yusheng Su, Xin Cong, Juyuan Xu, Da-
+hai Li, Zhiyuan Liu, and Maosong Sun. 2024. ChatDev: Communica-
+tive Agents for Software Development. In ACL.
+[40] David P. Reed. 1978. Naming and Synchronization in a Decentral-
+ized Computer System. Ph. D. Dissertation. Massachusetts Institute
+of Technology.
+[41] Replit. 2026. Introducing Replit Agent 4: Built for Creativity. https:
+//blog.replit.com/introducing-agent-4-built-for-creativity
+.
+[42] Stuart Russell and Peter Norvig. 2021. Artificial Intelligence: A Modern
+Approach (4th ed.). Pearson.
+[43] Marc Shapiro, Nuno Preguiça, Carlos Baquero, and Marek Zawirski.
+2011. Conflict-Free Replicated Data Types. In SSS.
+[44] Olly Styles, Sam Miller, Patricio Cerda-Mardini, Tanaya Guha, Victor
+Sanchez, and Bertie Vidgen. 2024. WorkBench: A Benchmark Dataset
+for Agents in a Realistic Workplace Setting. arXiv:2405.00823 [cs.AI]
+[45] Douglas B. Terry, Marvin M. Theimer, Karin Petersen, Alan J. Demers,
+Mike J. Spreitzer, and Carl H. Hauser. 1995. Managing Update Con-
+flicts in Bayou, a Weakly Connected Replicated Storage System. In
+SOSP.
+[46] Robert H. Thomas. 1979. A Majority Consensus Approach to Con-
+currency Control for Multiple Copy Databases. ACM Transactions on
+Database Systems 4, 2 (1979), 180–209. doi:10.1145/320071.320076
+[47] Alexander Thomson, Thaddeus Diamond, Shu-Chun Weng, Kun Ren,
+Philip Shao, and Daniel J. Abadi. 2012. Calvin: Fast Distributed Trans-
+actions for Partitioned Database Systems. In Proceedings of the 2012
+ACM SIGMOD International Conference on Management of Data. 1–12.
+[48] William E. Weihl. 1988. Commutativity-Based Concurrency Control
+for Abstract Data Types. IEEE Trans. Comput. 37, 12 (1988), 1488–
+1505.
+[49] Michael Wooldridge. 2009. An Introduction to MultiAgent Systems
+(2nd ed.). John Wiley & Sons.
+[50] Qingyun Wu, Gagan Bansal, Jieyu Zhang, Yiran Wu, Beibin Li,
+Erkang Zhu, Li Jiang, Xiaoyun Zhang, Shaokun Zhang, Jiale Liu,
+Ahmed Hassan Awadallah, Ryen W. White, Doug Burger, and Chi
+Wang. 2023. AutoGen: Enabling Next-Gen LLM Applications via
+Multi-Agent Conversation. arXiv:2308.08155 [cs.AI]
+[51] John Yang, Carlos E. Jimenez, Alexander Wettig, Kilian Lieret, Shunyu
+Yao, Karthik Narasimhan, and Ofir Press. 2024. SWE-agent: Agent-
+Computer Interfaces Enable Automated Software Engineering. In
+NeurIPS.
+[52] Shunyu Yao, Jeffrey Zhao, Dian Yu, Nan Du, Izhak Shafran, Karthik R.
+Narasimhan, and Yuan Cao. 2023. ReAct: Synergizing Reasoning and
+Acting in Language Models. In The Eleventh International Conference
+on Learning Representations, ICLR 2023, Kigali, Rwanda, May 1-5, 2023.
+OpenReview.net. https://openreview.net/forum?id=WE_vluYUL-X
+[53] Lianmin Zheng, Liangsheng Yin, Zhiqiang Xie, Chuyue Sun, Jeff
+Huang, Cody Hao Yu, Shiyi Cao, Christos Kozyrakis, Ion Stoica,
+Joseph E. Gonzalez, Clark Barrett, and Ying Sheng. 2024. SGLang: Effi-
+cient Execution of Structured Language Model Programs. In NeurIPS.
+[54] Weixing Zhou, Zhiyou Wang, Zeshun Peng, Hetian Chen, Yanfeng
+Zhang, and Ge Yu. 2026. ATCC: Adaptive Concurrency Control for
+Unforeseen Agentic Transactions. arXiv:2603.13906 [cs.DB]
+14

@@ -1,0 +1,550 @@
+## Algorithms for Scalable Synchronization on
+
+Shared-Memory Multiprocessors .J ohn M. :\IIellor-Cnumney' Michael L. Scott!
+
+April 1990
+
+Abstract
+
+Busy-wait techniques are heavily used for mutual exclusion and barrier synchroni?;ation in 
+shared-memory parallel programs. Cnfortunatcly, typical implementations of busy-waiting 
+tend to produce large aIIlounts of memory and interconnect contention, introducing perf(H"- 
+IIl<-1IlCe bottlenecks that become markedly more pronounced <-1,,-: applications scale. \:Ve argue 
+in this paper that this problem is not fundamental, and tha.t one can in fad construct bUi:>Y 
+wait synchroni7';ation algorithms that induce no memory or interconnect contention. The 
+key to these algorithms is for every processor to spin on a separate location in local memory, 
+and for some other processor to terminate the spin \vith a single remote \vrite operation 
+at an appropriate time. Locations on \vhich to spin may be local as a result of coherent 
+caching, or by virtue of static allocation in the local portion of phYi:>ically dii:>tributed i:>hared 
+memory. 
+'Ve present a new scalable algorithm for spin locks that generates 0(1) remote references 
+per lock acquisition, independent of the number of processors attempting to acquire the 
+lock. Our algorithm provides rea ..;;onable latency in the absence of contention, requires only 
+a constant amount of i:>pace per lock, and requirei:> no harchvare support other than a i:>\vap 
+with-memory instruction. 'ile ali:>o prei:>ent a nev,,! i:>calable barrier algorithm that generates 
+0(1) remote references per processor reaching the barrier, and observe that two previously 
+knmvn barriers can likewise be cast in a form that spins only on local locations. Kone of 
+these barrier algorithms requires hardware support beyond the usual atomicity of memory 
+reads and \vrites. 
+'ile compare the performance of our scalable algorithms with other software approaches to 
+busy-wait synchroniz;ation on both a Sequent Symmetry and a BBN Butterfly. Our principal 
+conclusion is that contention due to s;qnchronization need not be a problem in large-scale 
+8han;rl-meTrwTY mnltiprnce88oT8. The existence of scalable algorithms greatly weakens the 
+ca.':>e for costly special-purpose harchvare i:>upport for i:>ynchronization, and provides a case 
+against so-called "dance hall" architecturei:>, in which shared memory locations are equally 
+far from all processors. 
+
+Center for Research on Para.llel Computation, Rice University, P.O. Box 1892, Houston, TX 77251-1892. Internet address: johnmc@rice,edu. Supported in part by the Kational Science Foundation under research grant CCR 8809615. Computer Science Department, University of Rochester, Rochester, Ny" 14627. Internet address: scott@cs.rochester.edu. Supported in part by the National Science Foundation under Institutional Infrastruc ture grant CDA-8822724.
+
+#### 1 Introduction
+
+Techniques for efficiently coordinating parallel computation on MIMD, shared-memory multiproces 
+son; arc of growing interest and inlportancc a.s the scale of parallel nlachincs increases. On sharcd 
+rnernory rnachines, processors cOlnrnnnicate by sharing data HtructureH. To 8nHllre the COIlHistency of 
+shared data structures, processors perform simple operations by using hardware-supported atomic 
+prirnitiv8H and coordinate cOlnplex operations by llsing synchronization COIlHtructs and conventions 
+to protect against overlap of conflicting operations. 
+Two of the most widely used synchroni,ation constructs are busy wait spin locks and barriers. 
+Spin locks provide a Incans for achieving rnutual exclusion (ensuring that only one processor can ac 
+cess a particular shared data structure at a tirne) and are a baRic building block for synchronization 
+constructs with richer semantics, such as semaphores and monitors. Spin locks are ubiquitously 
+used in the irnplernentation of parallel operating HYHterIls and in application prograrIls. BarI"ien; 
+provide a means of ensuring that no processes advance beyond a particular point in a computation 
+until all have arrived at that point. They are typically used to separate "phases" of an application 
+prograrn. A barrier Inight guarantee, for exarnple, that all processes have finished initializing the 
+values in a shared matrix before any processes use the values as input. 
+The performance of locks and barriers is a topic of great importance. Spin locks are generally 
+elnployed to protect very sInall critical sections, and Inay be executed an enOrInous IllIInber of 
+times in the course of a computation. I3arriers, likewise, are frequently used between brief phases 
+of data-parallel algorithms (c.g., successive relaxation), and may be a major contributor to run 
+tiTne. MinirIlizing the cost of synchronization Illechanislns is Illore cmnplicated than siIIlply short 
+ening code paths. Performance may improve, for example, if one re-writes code to allow part of a 
+release~ock operation to overlap execution of an acquire_lock operation on another procetitior, 
+even if the total nUlnber of instructions executed on each processor increa..seH. More irIlportant, by 
+reducing the frequency with which synchroni,ation variables are accessed by more than one pro 
+cetitior, one Illay greatly reduce Inenlory and interconnect contention, which tilows down execution. 
+On Inachines with coherent caches, it is particularly irIlportant to reduce the IllIInber of writes to 
+shared locations, because these induce interconnect traffic for invalidations and subsequent cache 
+line reloadH. Reduced contention Hpeeds up not only the Hynchronization priInitiveH thernselveH, but 
+also any concurrent activity on the machine that requires bandwidth from conflicting portions of 
+rIIernory or the interconnect. 
+The execution overhead a.ssociated with synchronization in rIIultiprocessor tiytiterns ha.s been 
+widely regarded as a serions performance problem [1, 5, 13, 11, 36, 38]. As part of a larger 
+study, Agarwal and Cherian [1] investigated the impact of synchroni,ation on overall program 
+peri'()rInance. Their silnulations of benchrIlarkH on a cache-coherent rIlultiprocessor indicate that 
+memory references due to synchroni,ation cause cache line invalidations much more often than 
+non-synchronization referenceti. In sirIIulations of the benchrnarks on a 64-processor "dance hall" 
+rIlachine (in which each acceHH to a shared variable traverses the processor-rIlernory interconnection 
+network), they observed that synchroni,ation accounted for as much as 49% of total network traffic. 
+In response to performance concerns, the history of synchroni,ation techniques has displayed 
+a trend toward increaHing hardware HUppOrt. Early algorithrns a..ssurIled only the ability to read 
+and write individual memory locations atomically. They tended to be subtle, and costly in time 
+and space, requiring both a large number of shared variables and a large number of operations 
+to coordinate concurrent invocationH of synchronization prirnitiveH [12, 23, 29J. Modern rIlulti 
+processors generally include more sophisticated atomic operations, permitting simpler and faster 
+coordination strategies. Particularly COlIInlon are various fetch_and_ = P childpointer[2J = &nodes[2*i+2J .parentsense, or &dummy if 2*i+2 >= P initially childnotready = have child and parent sense = false
+
+procedure tree_barrier with nodes [vpidJ do repeat until childnotready childnotready := havechild parentpointer~ := false II if not root, wait until my if vpid != a
+
+{false, false, false, false} II prepare for next barrier II let parent know I'm ready parent signals wakeup
+
+repeat until parent sense = sense II signal children in wakeup tree childpointers[OJ~ := sense childpointers[lJ~ := sense sense := not sense
+
+Algorithm 9: A "ealable, di"tributed, tree-based barrier with only local "pinning.
+
+lower overhead than fetch_and_add. and are supported on all shared-memory multiproces sors, while fetch_and_add is not .
+
+• Our algorithIIlrequires O(P) space, rather than O(PlogP) . 
+• Our algorithm reduces the number of remote memory operations that processors must per fonn to coordinate their arrival at the barrier. A barrier count inlplcrllcntcd using software 
+
+cornbining treeH with fan-in k requires L~~S P-l P/ki = (:-=-\)k fetch_and_add operations to deterIIline that all processors have reached the barrier, and a IIlininlllIIl of (P-i)(~+2) other ac cesses to shared and potentially remote locations to allow them to proceed again,u Our tree barrier algorithrll requires only P - 1 rcrnotc write operations to dctcrrninc that all processors have reached the barrier, and P - 1 rerIlote writes to allow theln to proceed again.
+
+Our tree barrier achieves the theoretical lower bound on the number of remote operations needed to achieve a barrier on machines that lack broadcast and that distinguish between local and remote rnernory. At least P - 1 processors IIlllst Hignal their arrival to Borne other processor, requiring P - 1 remote operations, and must then be informed of wakeup, requiring another P - 1 remote operations. The length of the critical path in our algorithm is proportional to rlog4 Pl + rlog2 Pl· The first terrn is the tirne to propagate arrival up to the root, and the H8cond terrn if) the tirne to propagate wakeup back down to all of the leaves. On a machine with coherent caches and unlimited replication, we could replace the wakeup phase of our algorithm with a spin on a global flag. We explore this alternative on the Sequent in section 4.4.
+
+Tournament Barriers
+
+Hensgen, Finkel, and Manber [17] and Lubachevsky [26] have devised tree-style "tournament" 
+barriers. Conceptually, to achieve a barrier llsing theRe tonrnarnent algorithnlH, processors Htart 
+at the leaves of a binary tree, as in a combining tree barrier with fan-in two. One processor from 
+each node continucti up the tree to the next "round" of the tournarncnt. The "winning" processor 
+is statically deterrnined in a tonrnarnent barrier, however, and a..s in our tree-based barrier there if) 
+no need for atomic fetch_and_ rne is a very different qnantity fi'orn the latency rneasnred on one processor; significant amounts of computation in acquire_lock prior to actual acquisition, and in release_lock after actual release, may be overlapped with work on other processors. When P is 2 or 3, T may represent either latency or passing tirne, depending on the relative arnonnts of overlapped and non overlapped computation.12 Moreover, in several cases (Anderson's lock, the MCS lock, and the locks incorporating backoff) the actual series of instructions executed for small values of P depends on how rnany other processors are cOlnpeting f< __ u' the lock, and which operations they have so far performed.
+
+12Since T may represent either latency or pa...,>sing time \vhen more than one processor is competing for a lock. it is difficult to factor out overhead due to the timing loop for timing tests 1,vith more than one processor. For consistency, we included loop overhead in all of the average times reported,
+
+550
+
+500
+
+450
+
+400
+
+350
+
+Tirne 300 (1"8ec) 250
+
+200
+
+150
+
+100
+
+50
+
+0
+
+0
+
+~test & set 
+0-0-(3 8tickct 
+[J-[;]-[;J-[;]test & set, linear backoff 
+
+G-G-G-otest & set, expo backoff ~ticket., prop. backo!f
+
+-----.. IIlCS
+
+10 20 30 40 50 Processors
+
+60 70 80
+
+Figure 4: Performance of spin locks on t.he But.t.erfly (empt.y crit.ical sect.ion).
+
+Unless otherwise noted, all rneaHurernents on the Butterfly were perf'< __ u'rned with interrupts disabled. Similarly, on the Sequent, the tmp_affinityO system call was used to bind processes to procctition; for the duration of our cxpcrirncnts. These nwa.,:.;nrcs were taken to provide repeatable tirning reHlllts.
+
+##### 4.3 Spin Locks
+
+Figure 4 shows the performance on the Butterfly of the spin lock algorithms described in section 2. 
+The top curve is a sirnple test_and_set lock, and diHplays the pooreHt scaling behaviorY~ As ex 
+pected, the ticket lock is slightly faster, due to polling with a simple read instead of a fetch_and_<P. 
+We would expect a test-and-test-and_set lock to perform similarly. A linear least squares regres 
+sion on the tirnings shows that the tirne to acquire and relea..qe the sirnple lock increases 7.4 lIS per 
+additional processor. The time for a ticket lock increases 7.0 ItS per processor. 
+By analogy with the exponential backoff scheme described in section 2, we investigated the effect 
+of having each prOC8HHor delay between polling operationH for a period of tirne directly proportional 
+to the number of unsuccessful test-and_set operations. This change reduces the slope of the simple 
+lock graph to 5.0 11,,5 per processor, but performance degradation is still linear in the number of 
+cOlnpeting proeeHHorH. 
+13\Ve implement tesLand_set using the harchvare primitive fetch_and_cleaLthen_add "\vith a mask that specifies 
+to dear the lowest hitj and an addend of 1. This operation returns the old value of the lock and leaves the lowest bit 
+in the lock set. 
+
+The time to acquire and release the simple lock, the ticket lock, and the simple lock with linear 
+backoff docs not actually incrca.sc linearly a.s Inore proccsson; cornpctc for the lock~ but rather in a 
+piecewiH8 linear fashion. This behavior is a function of the interconnection network topology and 
+the order in which we add processors to the test. For the tests shown in figure 4, our I3utterfly was 
+configured as an 80 processor nlachinc with 5 switch cards in the first colurnn of the interconnection 
+network, Hupporting 16 prOC8HHOI'H each. Processors were added to the test in a round robin faHhion, 
+one from each card. The breaks in the performance graph occur as each group of 20 processors is 
+added to the test. These arc the points at which we have included an additional 4 processors from 
+each switch card, leading to the use of one more 4-input, 4-output switch node on each canl. What 
+we see in the performance graphs is that the additional node causes behavior that is qualitatively 
+different from that obtained by including another processor attached to a switch node already in 
+use. This difference is likely related to the fact that additional processors attached to a switch 
+node already in usc add contention in the first level of the interconnection network. An additional 
+switch node adds contention in the second level of the network. In a fully configured machine with 
+256 processors attached to 16 switch cards in the first column of the interconnection network, we 
+would expect the breaks in spin lock performance to occur every 64 processors. 
+Figure 5 provides an expanded view of perf'< __ u"rnance results for the IIlor8 scalable algorithrns, 
+whose curves are grouped together near the bottom of figure 4. In this expanded graph, it is 
+apparent that the tirnc to acquire and rclca.')c the lock in the single processor ca.')c is often nUH.:h 
+larger t.han t.he t.he time required when multiple processors are competing f(lr the lock. As not.ed 
+above, parts of each acquire/release protocol can execute in parallel when multiple processors 
+conlpete. What we are nlCa.':mring in our trials with lnany processors is not the tillle to execute 
+an acquire/release pair from start. to finish, but rat.her t.he length of time between a pair of lock 
+acquisitions. Complicating matters is that the time required to release an MCS lock depends on 
+whether another processor is waiting. 
+The top curve in figure 5 shows the performance of Anderson's array-based queueing algorithm, 
+modified to scatter the slots of the queue across the available processor nodes. This modification 
+distributes traffic evenly in the interconnection network, by allowing each processor to spin on a 
+location in a different memory bank. I3ecause the I3utterfly lacks coherent caches, however, and 
+because processors spin on statically unpredictable locations, it is not in general possible with 
+Anderson's lock to spin on local locations. Linear regression yields a slope for the perfonnance 
+graph of 0.4 ItS per processor. 
+Three algorithms-the simple lock with exponential backoff, the ticket lock with proportional 
+backoff, and the MCS lock all scale extremely well. Ignoring the dat.a points below 10 processors 
+(which helps us separate throughput under heavy competition from latency under light competi 
+tion), we find slopes for these graphs of 0.025, 0.021, and 0.00025 11,,5 per processor, respectively. 
+Since perforrnance does not degrade appreciably for any of these locks within the range of our tests, 
+we would expect them to perform well even with thousands of processors competing. 
+Figure 6 shows performance results for several spin lock algorithms on the Sequent. We adjusted 
+data structures in rninor ways to avoid the unnecessary invalidations that would result froIll placing 
+unrelated data items in the same cache line. The test-and-test-and_set algorithm showed the 
+poorest scaling behavior, with the tirne to acquire and relea..qe the lock increasing drarnatically even 
+over this small range of processors. A simple test-and_set would perform even worse. 
+Because the atomic add instruction docs not return the old value of its target location, im 
+plementation of t.he ticket lock is not. possible on the Sequent, nor is it possible t.o implement 
+Anderson's lock directly. In his implementation [4], Anderson (who worked on a Sequent) intro 
+
+90
+
+~~~ test & set, expo backoff ~ticket, prop. backoff
+
+| | 80 | ~ticket, prop. backoff | |
+| --- | --- | --- | --- |
+| | 70 | | |
+| | 60 | | |
+
+Tirne 50 (1"8ec)
+
+40
+
+30
+
+20
+
+10
+
+0
+
+60 70 80
+
+0
+
+10 20 30 40 50 Processors
+
+Figure 5: Perforrnance of selected spin locks on the Butterfly (ernpty critical section).
+
+duced an outer test-and_set lock with randomi7.ed backoff to protect the state of his queue.'; 
+This strategy is reasonable when the critical section protected by the outer lock (narnely, acquisi 
+tion or release of the inner lock) is substantially smaller than the critical section protected by the 
+inner lock. This was not the case in our initial test, so the graph in figure 6 actually results from 
+processors contending for the outer lock, instead of the inner, queue-based lock. To eliminate this 
+anOlnaly~ we repeated our tests with a non-crnpty critical section, a.s shown in figure 7. With a 
+sufficiently long critical section (6.48 fl.8 in our tests), processors have a chance to queue up on the 
+inner lock, eliminating competition for the outer lock, and allowing the inner lock to eliminate bus 
+transactions due to spinning. The time spent in the critical section has been factored out of the 
+tirningH. 
+In addition to Anderson's lock, our experiments indicate that the MCS lock and the simple 
+lock with exponential backoff also scale extremely well. All three of the scalable algorithms have 
+cOlnparable absolute perf'< __ u"rnance. Anderson's lock has a srnall edge for non-ernpty critical sections, 
+but requires statically-allocated space per lock linear in the number of processors. The other two 
+algorithms need only constant space, and do not require coherent caches to work well. The simple 
+lock with exponential backoff shows a slight increasing trend, and might not do as well as the others 
+on a very large machine. 
+The peak in the cost of the MCS lock on two processors reflects the lack of compare_and_swap. 
+HGiven that he required the outer lock in any case, Anderson also replaced the next slot index variable with a 
+pointer, to save time on address arithmetic. 
+
+30-,--------------------------------------, ~test & test & set
+
+27
+
+b--A--A--8andertion
+
+24 0 0 0 otest & set, expo backolf
+
+---------- nICS
+
+21
+
+18
+
+Tirne 
+15 (1"8ec) 
+12 0 0 Q 0 .. 0 --Q -- -Q-- 
+--Q --Q 
+.Q 
+
+.0 g- .
+
+9
+
+6
+
+3
+
+0
+
+2 4 6 8 10 12 14 16 18 Processors Figure 6: Perfonnance of spin loch; 011 the Sequent (ernpty critical section).
+
+| | | | | test-and_set | ticket | Anderson MCS | |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| | Butterfly | | | 29.8 /1.8 | 38.611-8 | 71.3 /1.8 65.7 !l.8 | |
+| | Sequent | | | 7.011-8 | NA | 10.6 !l.8 9.211-8 | |
+
+Table 1: Time for an acquire/release pair in the single processor case.
+
+Some fraction of the time, a processor releasing the lock finds that its next variable is nil but then discovers that it has a successor after all when it performs its fetch_and_store on the lock's tail pointer. Entering thiH tirHing window neeessitateH an additional fetch_and_store to restore the state of the qucuc~ with a consequent drop in pcrfornlancc. The non-crnpty critical sections of figure 7 reduce the likelihood of hitting the window, thereby reducing the size of the two-processor peak. With compare_and_swap that peak would disappear altogether.
+
+Latency and Impact on Other Operations
+
+In addition to performance in the presence of many competing processors, an important criterion for any lock is the time it takes to acquire and release it in the absence of competition. Table 1 shows this measure I'lr representative locks on both the Butterfly and the Sequent. Times for the simple lock are without backoff of any kind; times for the ticket lock are with code in place for proportional backoff. The simple lock is cheapest on both machines in the single processor case;
+
+TirHe (1"8ec)
+
+30-,--------------------------------------, ~test & test & set
+
+27
+
+o 0 0 otest & set, expo backoff 24 --------- IIlCS b--A--A--8andertion
+
+21
+
+18
+
+15
+
+12
+
+9 __ Q __ Q ---9-- Q-- Q-- ~- Q
+
+6
+
+3
+
+O~___,----,___----,----___,_----,___--_,___--__,----,__--__1 2 4 6 8 10 12 14 16 18 Processors Figure 7: Performance of spin locks on t.he Sequent. (small crit.ical sect.ion).
+
+it has the shortest code path. On the I3utterfly, the ticket lock, Anderson's lock, and the MCS 
+lock arc 1.29, 2.20, and 2.39 times as costly, respectively. On the Sequent, Anderson's lock and the 
+MCS lock are 1.51 and 1.31 t.imes as cost.ly as t.he simple lock. 
+Several factors skew the absolute numbers on the I3utterfly, making them somewhat misleading. 
+First., our simple lock is implement.ed complet.ely in line, while t.he ot.her locks are complicat.ed 
+enough to warrant subroutine calls. Ideally, the ticket lock with proportional backoff would call 
+a subroutine only when backoff is required. Difficulties with our compiler made this approach 
+impractical, but. we expect. t.hat. it. would have reduced t.he lat.ency of t.he t.icket. lock t.o nearly t.he 
+same as the simple lock (an empty subroutine call on the I3utterfly takes almost 10 1"8). Second, 
+the atonlic opcratiOllti on the Butterfly arc inordinately cxpclltiivc in cornparit;on to their nOll 
+at.omic count.erpart.s. Most. of t.he lat.ency of each of t.he locks is due t.o t.he cost. of set.t.ing up a 
+parameter block and executing an atomic operation. This affects the performance of the MCS lock 
+in particular, since it requires at lca.')t two fetch_and_store operations (one to acquire the lock and 
+anot.her t.o release it.) , and possibly a t.hird (if we hit. t.he t.iming window). Third, t.he 16-bit. at.omic 
+primitives on the I3utterfly cannot manipulate 24-bit pointers atomically. To implement the MCS 
+algorit.hm, we were j()rced t.o replace t.he point.ers wit.h indices int.o a replicat.ed, st.at.ically-allocat.ed 
+array of pointers to qlink records. 
+Absolute performance for all the algorithms is much better on the Sequent than on the Butterfly. 
+The Sequent's dock runs twice aH fa..st, and its caches rnake rnernory in general appear significantly 
+faster. The differences between algorithms are also smaller on the Sequent, mainly because of the 
+lower difference in cost between atOlnic and non-atOlnic instructions~ and also because the Sequent '8 
+
+at rest tesLand_set ticket ticket w / tesLand_set w/ Anderson MCS prop. backoff expo backoff
+
+14.6 ItS 251 fi8 184 fi8 25 fiS 39 ItS 27 fiS 15 ItS
+
+Table 2: MeaRurement of bURy-waiting impact on network load.
+
+32-bit fetch_and_store instruction allows the MCS lock to use pointers. A final irnportant rneaHllre of spin lock perf'< __ u'rnance is the arIlonnt of interconnection network traffic cauRed by bURy-waiting proceRRorR, and the impact of thiR traffic on other activity on the machine. We used BBN's "probe" utility on the Butterfly to obtain an indirect measure of these quantities. Every three seconds, probe accesses memory through the switch interface of every proceRRor in the machine, and reportR the total time required. Individual reportR are not particularly rneaningflll, but the ratim; of reports obtained at different tirnes are a good indication of the relative level of load on the network. In table 2 we compare the "at rest" probe value with the values obtained when 75 processors arc cOlnpcting for each of several types of lock. With no uscr prograrns active, an average over 109 reportH by the probe conunand showed a probe of each processor's Hwitch interface to take 14.6 118 with a standard deviation of 1.4 IlS. Since the MCS locking algorithm uses no network bandwidth for bURY waiting, it iR no RurpriRe that with 75 proceRRorR uRing the algorithm to COlnpete f< __ u' a lock, our Inea..sured value f< __ u' the probe tirHe is within one standard deviation of the at reRt value. In contrast, uRing the Rimple and ticket loch without backoff, the probe time increased by factors of 17 and 12.6, respectively. Probe times for the remaining algorithms (the ticket lock with proportional backoff, the simple lock with exponential backoff, and Anderson's lock), increased by fact am of 1.7, 2.7, and 1.9, reRpectivcly. One defficiency of the probe utility iR that it provides no indication aH to whether contention iH llnif()rrn, or iHolated to a relatively HInall number of "hot" memory modules and switch nodes.
+
+Discussion and Recommendations
+
+Spin lock algorithnlH can be evaluated on the ba..siH of Heveral criteria:
+
+• scalability and induced net.work load 
+• one-processor latency 
+• Hpaee requirernentH 
+• fairness/sensitivity to preemption 
+• irnpleInentability with given atoInie operationH 
+
+The MCS lock and, on cache-coherent machines, t.he Anderson lock are the most scalable algorithms we studied. The simple and ticket locks also scale well with appropriate backoff, but induce more network load. The Rimplc and ticket loch have the 10weRt Ringle-pnlceRRor latency, but. with good implementat.ions of fetch_and_ instructions the MCS and Anderson locks are reasonable as well (on the Sequent, the single-processor latency of the M CS lock is only 31 % higher than that of the RimplcRt tesLand_set lock). The Rpace needR of AnderRim'R lock are likely to be
+
+prohibitive when a large number of locks is needed-in the internals of an operating system, for 
+cxanlplc. 
+The ticket lock, Anderson's lock, and the MCS lock all guarantee that processors attempting to 
+acquire a lock will succeed in FIFO order. This guarantee of fairness is likely to be considered an 
+advantage in many environments, but will be a distinct disadvantage if spinning processes may be 
+preempted. A simple lock with exponential backo!f will allow latecomers to acquire the lock when 
+processes that arrived earlier are not running, and may therefore be preferred. In any event, it may 
+be important to introduce mechanisms to ensure that a process is not preempted while actually 
+holding a lock [34, 39]. 
+All of the spin lock algorithms we have considered require some sort offetch_and_  8. 
+Below the rnaxirIlllrn Illlrnber of processors in OUI' tests, the fastest barrier on the Sequent used 
+a centralized counter with a sense-reversing wakeup flag (from algorithm 7). P bus transactions are 
+required to tally arrivab, 1 to toggle the RenRe-reveming flag (invalidating all the cached copieR), and 
+P -1 to efl'ect the subsequent re-loads. Our tree barrier generates 2P - 2 writes to flag variables on 
+which other processors are waiting, necessitating an additional 2P - 2 re-loads. I3y using a central 
+RenRe-reveming flag for wakeup (inRtead of the wakeup tree), we can eliminate half of thiR overhead. 
+The resulting algorithm is identified as "arrival tree" in figure 10. Though the arrival tree barrier 
+has a larger startup cost, its P - 1 writes are cheaper than the P read-modify-write operations of 
+the centrali7.ed barrier, RO itR Rlope iR lower, For large valueR of P, the arrival tree with wakeup flag 
+is the best performing barrier, and should become clearly so on larger machines. 
+The tournament barrier on the Sequent uses a central wakeup flag. It roughly matches the 
+perf(mnance of the arrival tree barrier for P = 2', but is limited by the length of the execution 
+path of the tournament champion, which grows suddenly by one each time that P exceeds a power 
+of 2. 
+
+Discussion and Recommendations
+
+The dissernination barrier appean; to be the rnost suitable algorithrn f< __ u" diHtribllted rnerIlory rna 
+chines without broadcast. It has a shorter critical path than the tree and tournament barriers (by a 
+constant factor), and is therefore fa.stcr. The da.s.') of rnachincs for which the disscnlination barrier 
+should out.perform all ot.her algorit.hms indudes t.he BBN But.t.erfly [8], t.he IBM RP3 [30], Cedar 
+[37], the I3I3N Monarch [32], the NYU Ultracomputer [16], and proposed large-scale multiprocessors 
+with directory-based cache coherence [2]. Our tree-based barrier will also perform well on these 
+rnaehin8s. It induceR leHH network load, and requires total space proportional to P, rather than 
+P log P, but its critical path is longer by a factor of about 1.5. 
+Our tree-based barrier with wakeup flag should be the fastest algorithm on large-scale multi 
+processors that use broadcaHt to rnaintain cache coherence (either in snoopy cache protocols [14] or 
+in directory-based protocols with broadcast [7]). It requires only O(P) updates to shared variables 
+in order t.o t.ally arrivals, compared t.o O(P log P) for t.he disseminat.ion barrier. Its updat.es are 
+simple writes, which are cheaper than the read-modify-write operations of a centrali"ed counter 
+based barrier. Its space needs arc lower than those of the tournament barrier (O(P) instead of 
+O(PlogP)), it.s code is simpler, and it. performs slight.ly less local work when P is not. a power of 
+2. Our results are consistent with those of Hensgen, Finkel, and Manber [17], who showed their 
+tournarncnt barrier to be fa.stcr than their disscnlination barrier on the Sequent Balance rllulti 
+processor. They did not corn pare their algorithnlH againHt a centralized barrier becauHe the lack 
+of a hardware atomic increment instruction on the I3alance precludes efficient atomic update of a 
+counter. 
+
+4.5 Architectural Implications
+
+Many different shared memory architectures have been proposed. From the point of view of syn 
+chronization, the two relevant issues seem to be (1) whether shared memory can be accessed locally 
+by Horne proceHHor (inHtead of through the interconnection network), and (2) whether broadcaHt iH 
+available for cache coherency. The first issue is crucial; it determines whether busy waiting can be 
+clirninated a,.,) a cause of rnernory and interconnect contention. The second issue deterrnines whether 
+barrier algorithrnH can efficiently ernploy a centralized flag for wakeup. 
+The most scalable synchroni"ation algorithms (the MCS spin lock and the tree, bidirectional 
+tournarnent, and dissellrination barriers) are designed in such a way that each processor spins 
+on st.at.ically-det.ermined locat.ion(s) on which no ot.her processor spins. On a dist.ribut.ed shared 
+memory machine, variables can be located explicitly at the processor that spins on them. On 
+a cache-coherent. machine, t.hey migrat.e t.o t.he correct. locat.ion aut.omat.ically, provided t.hat. flag 
+variables used for busy-waiting by different processors are in separate cache lines. In either case, 
+rellrote operations are used only to update a location on which sorne processor is waiting. For 
+t.he MCS spin lock t.he nmnber of remot.e operat.ions per lock acquisit.ion is const.ant.. For t.he t.ree 
+and tournament barriers, the number of remote operations per barrier is linear in the number of 
+processors involved. For the dissernination barrier, the nUllrber ofrernote operations is O(P log P), 
+but O(log P) on the critical path. No rernote operations are due to spinning, so interconnect 
+contention is not a problem. 
+On "dance hall" llrachines, in which shared rnernory nUlst always be accessed through a shared 
+processor-rnerIlory interconnect, there is no way to elirninate synchronization-related interconnect 
+contention. Nevertheless, the algorithms we have described are useful since they minimi"e memory 
+contention and hot spots caused by synchronization. The structure of these algorithms makes it 
+
+at rest tree barrier diHHernination barrier w / local polling I w / network polling w / local polling I w / network polling 14.5 flB 15 fl,B I 32.9 118 14.4 118 I 32.5 fl8
+
+Table 3: Effect of barrier algorithms on network load, with and without local access to shared rnernory.
+
+ea...;;y to assign each proceHHor~s busy-wait Hag variableH to a different rnernory bank so that the 
+load induced by spinning will be distributed evenly throughout memory and the interconnect, 
+rather than being concentrated in a Hingle spot. Unfortunately, on dance hall rnachines the load 
+will still consume interconnect bandwidth, degrading the performance not only of synchroni,ation 
+opcratiOllti but altio of all other activity on the nlachinc, severely constraining scalability. 
+Dance hall machines include bus-based multiprocessors without coherent caches, and multistage 
+network architectures such as Cedar [37], the BBN Monarch [32], and the NYU Ultracomputer [16]. 
+Both Cedar and the Ultracomputer include processor-local memory, but only f(lr private code and 
+data. The Monarch provides a small amount of local memory as a "poor man's instruction cache." 
+In none of these machines can local memory be modified remotely. We consider the lack of local 
+shared memory to be a significant architectural shortcoming; the inability to take full advantage of 
+techniques such as those described in this paper is a strong argurllcnt against the construction of 
+dance hall rnachineH. 
+To assess the inlportancc of local shared rllcnlory, we used our Butterfly 1 to sirnulatc a nlachinc 
+in which all shared rnernory iH accessed through the interconnection network. By Hipping a bit in 
+the segment register for the synchroni,ation variables on which a processor spins, we can cause the 
+processor to go out through the network to reach these variables (even though they arc in its own 
+memory), without going through the network to reach code and private data. This trick effectively 
+flattens the two-level shared memory hierarchy of the Butterfly into a single level organi7.ation 
+similar to that of Cedar, the Monarch, or the Ultracompllter. 
+Figure 11 COlllpares the perforlllance of the disselllination and tree barrier algorithrlls for one 
+and two level rnernory hierarchieH. All tirning rneaHurernents in the graph were rnade with interrupts 
+disabled, to eliminate any effects due to timer interrupts or scheduler activity. The bottom two 
+curves are the sallre a.s in figures 8 and 9. The top two curves show the corresponding perforlllance 
+figureH when all accesses to Hhared rnernory are forced to go through the interconnection network. 
+When busy-waiting accesses traverse the interconnect, the time to achieve a barrier using the tree 
+and dissernination algorithrns increa..qeH linearly with the nurnber of processors participating. A 
+least squares fit shows the additional cost per processor to be 27.8 ItS and 9.4 I"B, respectively. For 
+an 84-processor barrier, the lack of local spinning increases the cost of the tree and dissemination 
+barriers by factors of ll.S and 6.S, respectively. 
+In a related experirllent~ we llrea.':mred the illlpact on network latency of executing the disserll 
+ination or tree barriers with and without local acceHH to shared rnerIlory. The reHults appear in 
+table 3. As in table 2, we used the I3utterfly "probe" utility to compare network latency at rest 
+with latency during a barrier. We find that network latency is virtually unaffected when processors 
+are able to spin on shared locations without going through the interconnect. With only rerIlote 
+access to shared rnelllory, latency rllore than doubles. 
+Studies by Pfister and Norton [31] show that hot-spot contention can lead to tree saturation 
+in multistage interconnection networks with blocking nodes and distributed routing control, inde 
+
+Tilne (I',,,,,c)
+
+2500-,---------------------------------------------,
+
+2250 -
+
+2000 -
+
+1750 -
+
+1500 -
+
+1250 -
+
+1000 -
+
+750 -
+
+500 -
+
+8-8-A-Atrcc~ rcnlotc
+
+• -. -• • dissernination, rerIlote b-b-A-8tree, local --------. dititicrnination, local 
+
+., ... ... 
+
+ ... ... ... 
+ ... ••••• 
+
+.. ' ... ... 
+
+ ... 250 -, ... "",,,,,,,,,,,,,,,M, ~!:;:;;: o:e:;::::::: ::::;;;:::::: ::::::: :::::::::::: ::::,., ... , ... O~----,-I---,-I---,I-----I,----,-I---,-I---,-I---,I~ o 10 20 30 40 50 60 70 80 Processors Figure 11: Performance of tree and dissemination barriers with and without local access to shared rncrllory.
+
+pendent of the network topology. A study by Kumar and Pfister [21] shows the onset of hot-spot 
+contention to be rapid. Pfister and Norton argue for hardware message combining in interconnec 
+tion networks to reduce the impact of hot spots. They base their argument primarily on anticipated 
+contention for locks, noting that they know of no quantitative evidence to support or deny the value 
+of combining for general memory traffic. Our results indicate that the cost of synchroni,ation in a 
+system without combining, and the impact that synchroni7.ation activity will have on overall system 
+perf'< __ u'rnanc8, is rnuch leHH than previollsly thought (provided that the architecture incorporates a 
+shared memory hierarchy of two or more levels). Although the scalable algorithms presented in this 
+paper are unlikely to match the performance of hardware combining, they will come dose enough 
+to provide an extremely attractive alternative to complex, expensive hardware. 16 
+Other researchers have suggested building special-purpose hardware mechanisms solely for syn 
+chronization, including synchronization variables in the switching nodes of rnultistagc intercon 
+nection networks [19] and lock queueing mechanisms in the cache controllers of cache-coherent 
+multiprocessors [13, 24, 28]. Our results suggest that simple exploitation of a multi-level memory 
+hierarchy, in software, provides a Illore cost-effective rneans of avoiding lock-ba..sed contention. 
+The algorithms we present in this paper require no hardware support for synchroni,ation other 
+than cOlnnlonly-availablc atornic instructions. The scalable barrier algorithnls rely only on atonlic 
+read and write. The MCS spin lock algorithm uses fetch_and_store and maybe compare_and_- 
+
+Hipfister and I\orton estimate that message combining 1,vill increase the size and possibly the cost of an intercon nection nehvork 6- to 32-fold. Gottlieb [15] indicates that combining nehvorks are difficult to hit-slice.
+
+swap. Anderson's lock benefits from fetch_and_increment, and the ticket lock requires it. All of these instructions have uses other than the construction of busy-wait locks. 17 Because of their gen eral utility, they are Hulmtantially 11101'8 attractive than special-purpose Hynchronization prirnitiv8H. Future designs for shared memory machines should include a full set of fetch_and_

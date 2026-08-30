@@ -1,0 +1,283 @@
+Implementing True MPI Sessions and Evaluating MPI Initialization Scalability
+
+11institutetext: Argonne National Laboratory, Lemont IL 60439, USA 11email: hzhou321,raffenet,wilkins,yguo,thakur@anl.gov
+
+# Implementing True MPI Sessions and Evaluating MPI Initialization Scalability
+
+Hui Zhou Kenneth Raffenetti Yanfei Guo Michael Wilkins Rajeev Thakur
+
+###### Abstract
+
+Sessions is one of the major features introduced in the MPI-4 standard. It offers an alternative to the traditional world communicator model by allowing applications to construct communicators from process sets, thereby eliminating the dependency on MPI_COMM_WORLD. The Sessions model was proposed as a more scalable solution for exascale systems, where MPI_COMM_WORLD was viewed as a potential scalability bottleneck. However, supporting Sessions is a significant challenge for established codebases like MPICH due to the deep integration of the world model in traditional MPI implementations. Although MPICH added support for the MPI-4 standard upon its release, it still internally relied on a global world communicator. This approach enabled applications written using the Sessions model to function, but it did not fulfill the full design intent of Sessions, which meant to decouple MPI from MPI_COMM_WORLD. We describe MPICH’s effort to support “true” MPI Sessions, including a major internal refactoring. We describe the architectural changes required to support true Sessions and evaluate the resulting implementation’s scalability. Our results demonstrate that true Sessions can offer significant scalability benefits by adopting explicit hierarchical designs.
+
+## 1 Introduction
+
+The MPI Forum released Version 4 of the Message Passing Interface (MPI) Standard in 2021 [15], introducing several major features, most notably MPI Sessions [13]. The MPI Sessions model offers an alternative to the traditional MPI paradigm by enabling applications to construct communicators from locally defined process sets, rather than relying on the default global communicator, MPI_COMM_WORLD, and deriving all others from it.
+
+The primary motivation behind MPI Sessions was to remove the dependency on MPI_COMM_WORLD, which was anticipated to be a major scalability barrier to exascale computing. However, concerns over the scalability of MPI_COMM_WORLD appear to have been overstated. Since the petascale era, MPI has proven its ability to scale to over a million processes [5], while the anticipated billion-process scale has yet to materialize. In practice, exascale computing has been successfully achieved, largely due to advancements like massively parallel accelerators (e.g., GPUs), without the need to eliminate MPI_COMM_WORLD. In fact, a primary objective for exascale facilities has been to achieve a 50× performance improvement over previous systems without necessitating substantial code modifications in existing applications [3]. Empirical evidence suggests that MPI_COMM_WORLD has not posed a fundamental limitation to scalability.
+
+Another motivation for introducing MPI Sessions was to address MPI’s limited support for dynamic behavior. Various software components can initialize separate MPI Sessions independently without coordination. This includes non-overlapping Sessions, effectively enabling MPI to be initialized and finalized multiple times within a single application. Such capability is particularly beneficial for workflow-oriented applications that orchestrate multiple independent tasks, each potentially using MPI [22]. Second, the MPI Sessions functionality includes an info argument in MPI_Session_init, allowing customization of each session with parameters that are typically global, such as MPI thread levels. Third, the dynamic nature of MPI Sessions enables innovative solutions for fault tolerance and resource management, including the ability to shrink or grow the number of participating processes during an application’s execution.
+
+The inclusion of MPI Sessions in MPI 4.0 has reignited interest and spurred research into addressing some long-standing challenges. Active areas of exploration include resource management [8, 9], fault tolerance [18], and job malleability [19]. However, to date, there have been limited evaluations of the scalability of MPI Sessions.
+
+MPICH [10] has played a critical role in MPI’s evolution. It was the first widely adopted implementation and served as a prototyping platform during the development of MPI-1. During MPI-2, MPICH supported the standardization process through early implementations of features like ROMIO for MPI-IO [20]. Although this implementation-driven standardization model weakened during MPI-3, MPICH still became the first full implementation of the MPI-3 standard. Continuing this tradition, MPICH released full support for MPI-4—including MPI Sessions—in the same month the standard was published.
+
+However, MPICH’s initial MPI Sessions implementation relies on an internal world communicator behind the scenes. Therefore, while MPICH provides the MPI Sessions interface, it is limited to standard-defined process sets, namely, mpi://WORLD and mpi://SELF. Such limited support is permitted by the MPI specification but is not in line with the “true” spirit of the MPI Sessions proposal that saw a world communicator as optional. Developers who wished to explore the possibilities of MPI Sessions either had to build their own solution or look to other MPI libraries with more full-featured support.
+
+Implementing a true MPI Sessions model in MPICH presents significant challenges for two main reasons. First, MPI was originally designed around MPI_COMM_WORLD, which abstracted away the need for applications to manage process identities beyond simple integer ranks. This design choice simplified the application interface and allowed implementations internal flexibility. MPICH, in particular, uses a device-dependent model with internal, implementation-specific process-addressing schemes. However, a true Sessions model demands a device-independent, standardized process-addressing mechanism, which requires major architectural changes in MPICH.
+
+Second, MPICH’s design philosophy clearly separates performance-critical runtime paths from less performance-critical initialization stages. It avoids dynamic mechanisms in favor of a structured, two-phase model consisting of an initialization phase followed by a runtime phase. The true MPI Sessions model breaks the long standing assumption that a single, global initialization phase always occurs—an assumption that MPICH relies on for efficient global setup. This shift necessitates a significant redesign of MPICH’s initialization and resource-management infrastructure.
+
+However, there are also strong motivations for MPICH to support true MPI Sessions. Beyond enabling ongoing research efforts and accommodating next-generation HPC applications that embrace more dynamic designs, implementing a device-independent infrastructure for process sets and MPI groups has the potential to simplify MPICH’s device layer and promote more sustainable development and maintenance. Furthermore, the effort to support true MPI Sessions aligns with MPICH’s broader goal of strengthening support for dynamic processes, which already serve a sizable user base.
+
+To this end, we recently performed a substantial code restructuring in MPICH to enable support for true MPI Sessions. Following this work, we evaluated the scalability of initialization across three MPI implementations: (1) the newly refactored MPICH with true MPI Sessions support, (2) MPICH version 4.3.0, which still relies on an internal world communicator, and (3) Open MPI version 5.0.7, which also includes support for true MPI Sessions. These evaluations were conducted on Aurora, the new exascale system at the Argonne Leadership Computing Facility (ALCF). Our findings indicate that MPI Sessions provide comparable initialization scalability across all three implementations on this system. Notably, true MPI Sessions enable the construction of a sparsely connected world communication pattern, which may reduce resource usage during initialization, albeit modestly.
+
+## 2 Background
+
+We begin with some essential background, including an overview of MPICH’s architecture, the Process Management Interface (PMI), and key considerations for efficient MPI startup.
+
+### 2.1 MPICH Architecture
+
+MPICH adopts an architectural design that facilitates vendor adoption, as illustrated in Figure 1. The key abstraction is the ADI (Abstract Device Interface), which separates the codebase into two primary layers: the MPIR (MPI Runtime) layer and the MPID (MPI Device) layer. An additional binding layer sits above the MPIR layer, handling parameter validation and conversions [24].
+
+The architectural design allows the MPICH project to focus on MPI semantics, implementation strategies, and high-level algorithms, while enabling MPI vendors to concentrate on hardware-specific performance optimizations. Broadly, the MPIR layer is responsible for hardware-independent functionality, while the MPID layer handles hardware-specific implementations. However, this separation is not absolute. In most communication routines, after the binding layer completes parameter checks and conversions, control is passed quickly to the corresponding ADI routine in the device layer. This design allows the device layer to take the full control of performance-critical code paths, ensuring no optimization opportunities are lost [11].
+
+Figure 1: MPICH architecture. The binding layer handles parameter checking and converts MPI object handles to internal structure pointers. The MPIR layer provides device-independent utilities, while the device layer implements hardware-specific functionality. MPICH maintains CH3 and CH4 as reference device implementations. Vendors may adopt CH3/CH4 or implement their own devices that conform to the ADI interface.
+
+MPI ApplicationMPI InterfaceBinding LayerImpl InterfaceMPIR LayerADI InterfaceMPID LayerCH3 (legacy)CH4libfabricucxVendor Device
+
+The ADI design introduces some complexity, particularly during the initialization stage. Subcomponents within both the MPIR and device layers require initialization and may depend on one another, requiring a carefully coordinated initialization order. As a result, MPICH adopts a roughly three-stage initialization process, illustrated in the following pseudocode:
+
+⬇
+
+void MPIR_Init() {
+
+MPIR_Pre_Init(); /* dev-independent init */
+
+MPID_Init(); /* dev-dependent init */
+
+MPIR_Post_Init(); /* dev-dependent MPIR-layer init */
+
+}
+
+However, this initialization process mixes local and collective steps. A local initialization step does not involve communication or synchronization with other processes. In contrast, a collective initialization step involves coordination across processes, often requiring data exchange and execution barriers. In the pseudocode above, MPIR_Pre_Init is entirely local, but both MPID_Init and MPIR_Post_Init may contain a mix of local and collective components. This interleaving poses a major challenge in the context of MPI Sessions, because MPI_Session_Init is defined by the MPI standard as a strictly local-only routine. Isolating local-only initialization from this tightly coupled structure requires significant restructuring across layers (vertically) and components (horizontally). Furthermore, MPI Sessions do not assume the presence of a global, world-level collective initialization stage. As a result, any initialization logic that previously relied on this assumption must be redesigned. Collective components must now operate under weaker assumptions, increasing complexity and implementation effort.
+
+### 2.2 Process Management Interface (PMI)
+
+The MPI specification omits an important detail: how processes are launched and how they exchange wire-up information to bootstrap a communicator. To fill this gap, MPICH introduced the Process Management Interface (PMI) [4]. The original version, known as PMI-1, is distributed with MPICH as a header file, pmi.h, and is widely adopted by most MPI implementations and process managers, including Slurm [23] and Flux [1]. MPICH also provides its own PMI implementation in its upstream releases, including a job launcher, hydra [4].
+
+PMI does not define the process launch mechanism itself. For illustrative purposes, we refer to a common setup shown in Figure 2. In this example, mpiexec is used to launch 9 MPI processes across 3 nodes. mpiexec acts as the PMI server, launching one PMI proxy per node, which in turn launches the MPI processes on that node. The PMI server maintains connections with the PMI proxies, typically using TCP, while each PMI proxy communicates with its local MPI processes using Unix pipes. Together, the PMI server, proxies, and MPI processes form a spanning tree that enables data exchange among all MPI processes.
+
+Figure 2: A common process launch mechanism in MPI. The PMI server (e.g., mpiexec) launches PMI proxies (usually one per compute node), and each proxy launches the MPI processes for its node.
+
+PMI Server (mpiexec)PMI ProxyPMI ProxyPMI ProxyP0P1P2P3P4P5P6P7P8
+
+Figure 3 illustrates a typical implementation of data exchange between two MPI processes using PMI_Put, PMI_Barrier, and PMI_Get. In this design, each PMI proxy maintains its own key/value store (KVS), and synchronization is achieved during the collective PMI_Barrier. Both PMI_Put and PMI_Get are local operations that communicate only with the PMI proxy on the same node. PMI_Barrier is a global collective that requires participation from all MPI processes. This approach is efficient in scenarios where all processes are collectively exchanging data—only a single PMI_Barrier is needed to propagate all key/value pairs across the system.
+
+An alternative design may keep a single copy of KVS in the PMI server, requiring each PMI_Put and PMI_Get to traverse to the server. While this eliminates the need for a global barrier, it introduces a scalability issue: completing an all-to-all exchange would require $O(P^{2})$ point-to-point traversals, where $P$ is the number of processes. Furthermore, a PMI_Get call may block if the corresponding PMI_Put has not yet been completed by the sender.
+
+Figure 3: An example of data exchange using PMI. (1) P0 use PMI_Put to send data to its PMI proxy. (2) All MPI processes call PMI_Barrier, during which proxies synchronize local data to the PMI server, and the PMI server propagates the data to other proxies. (3) P6 calls PMI_Get to retrieve the data from its local proxy.
+
+PMI Server (mpiexec)PMI ProxyPMI ProxyPMI ProxyP0P1P2P3P4P5P6P7P8123
+
+The PMI-1 interface is relatively simple. In 2010, PMI-2 was proposed to improve scalability. It introduced two key features. First, PMI-2 supports an optional node scope for its key-value store, allowing intra-node Put and Get operations to bypass global synchronization and avoid the use of barriers. This made intra-node data exchange significantly more efficient by avoiding the need for inter-proxy synchronization. Second, PMI-2 allows concurrent PMI operations from multiple threads, potentially improving performance for MPI $+$ threads applications. However, PMI-2 redefined the PMI interface rather than evolving it incrementally from PMI-1, creating adoption challenges. While MPICH supports both PMI-1 and PMI-2, PMI-1 remains the default. Interestingly, the scalability concerns that motivated PMI-2 never fully materialized. Intra-node communication can be efficiently handled via shared memory, bypassing PMI, and multithreaded access to PMI is avoided by restricting its use to the initialization stage, where concurrency is usually not required. Interestingly, MPI Sessions allows the possibility of calling MPI_Session_init or the communicator creation routines from concurrent threads, thus requiring multithread support in PMI. MPICH’s support for multithreaded usage of MPI Sessions requires an extension to PMI-1 that allows concurrent barrier operations distinguished using string tags.
+
+During the early push toward exascale computing, PMI’s scalability limitations again came under scrutiny. It was anticipated that exascale systems might involve 50,000 to 100,000 nodes [7], where PMI-1’s barrier-based data exchange could significantly delay job startup. In response, PMIx was introduced in 2017 [7]. Although it is presented as an extension of PMI, PMIx has a much broader scope, addressing tasks from efficient executable loading to supporting multiple programming models beyond MPI. Comparing PMIx directly to PMI-1 or PMI-2 is not straightforward. As noted in its original proposal, PMIx’s data exchange interfaces were designed primarily for compatibility with legacy systems. While its scope may have since evolved, it remains unclear whether PMIx fundamentally addresses the core limitations of PMI-1.
+
+Currently, only a subset of the PMIx specification, primarily those features that parallel PMI-1, is required to support MPI implementations. However, as future versions of MPI introduce capabilities such as fault tolerance and system malleability, broader PMIx functionality may become increasingly important. While MPICH will continue to support the PMI-1 interface, extensions may be necessary to acquire certain advanced PMIx features.
+
+### 2.3 Efficient MPI Startup
+
+The efficiency of launching large-scale MPI jobs is influenced by several factors, including the workload manager, resource manager, shared file system, network infrastructure, and the MPI initialization process itself. In this paper, we focus specifically on the MPI layer. Once the MPI processes are instantiated, each process must gather local information and exchange it with its peers—typically via PMI. A straightforward implementation of this process might look as follows:
+
+⬇
+
+PMI_Put(rank, myaddr);
+
+PMI_Barrier();
+
+for (int i = 0; i < size; i++) {
+
+PMI_Get(i, &addrs[i]);
+
+}
+
+The PMI interface is designed for simplicity, but its implementations are often not optimized for large-scale environments. For instance, MPICH uses ASCII-based wire protocols, and communication between PMI proxies and the PMI server frequently occurs over TCP connections using the SSH protocol. While this approach is sufficient for medium-scale jobs (e.g., a few thousand processes), it becomes a bottleneck at higher scales. In scenarios with high process-per-node (PPN) counts and thousands of nodes, the address exchange phase can take tens of minutes, significantly impacting total job runtime.
+
+A key insight is that on modern exascale systems, a significant amount of parallelism resides within nodes. In large jobs, the total number of processes is often driven more by high PPN than by the number of nodes. Consequently, intra-node address exchanges can be efficiently handled via shared memory rather than PMI. By limiting PMI communication to one “node root” per node and performing the rest of the exchange via shared memory, the overall time spent in MPI_Init can be drastically reduced to negligible levels [17].
+
+### 2.4 The MPI Sessions API
+
+The MPI Sessions API, introduced in the MPI-4 standard, provides a more flexible approach to initializing and managing MPI environments. Unlike traditional initialization via MPI_Init or MPI_Init_thread, which implicitly sets up MPI_COMM_WORLD, the Sessions model replaces it with the following pseudo code:
+
+⬇
+
+MPI_Session_init(info, errhan, &session);
+
+MPI_Group_from_session_pset(session, "mpi://WORLD", &group);
+
+MPI_Comm_create_from_group(group, "stringtag", info, errhan, &comm);
+
+Both MPI_Session_init and group preparations are local calls, while MPI_Comm_create_from_group is collective over the participating process group. In the rest of the paper, we refer to MPI_Session_init as local initialization and MPI_Comm_create_from_group as communicator bootstrapping.
+
+## 3 Implementation
+
+MPICH is a mature project with many downstream vendor implementations, including Cray MPICH [12], Intel MPI [14], ParaStation MPI [16], and MVAPICH [21]. When introducing major features such as MPI Sessions, it can be tempting to start with a clean-slate design and backport functionality as needed. This strategy was previously used in the development of shared-memory communication in the CH3 device [6] and lightweight communication in the CH4 device [11], helping to minimize disruption to production environments and downstream vendors. However, starting from scratch often results in long transition periods, during which prior features must be re-implemented, past mistakes may be repeated, and hard-earned lessons must be re-learned. To avoid this, we adopted a strategy of gradual refactoring. Ultimately, we achieved a new design that enabled the implementation of MPI Sessions within the existing codebase. This incremental approach is validated through comprehensive continuous integration (CI) testing and iterative feedback from downstream users and vendors, ensuring both stability and forward progress.
+
+The remainder of this section outlines the key stages involved in preparing for and ultimately implementing full MPI Sessions support in MPICH.
+
+### 3.1 Separating Local and Collective Initialization
+
+The functions MPI_Init and MPI_Init_thread are collective and must be called by all processes, whereas MPI_Session_init is a local operation. Therefore, the first step in implementing MPI Sessions is to disentangle local-only initializations—suitable for MPI_Session_init—from those that require synchronization across processes. To do this, we split each component’s initialization into two distinct phases: a local phase and a collective phase. While conceptually simple, this separation introduces implementation complexities and can be tedious to apply uniformly across all components. There is some discretion in deciding which operations belong to the local phase. For instance, initializing self-communication could, in principle, be handled locally, since it does not depend on other processes. However, from a semantic standpoint, it may be more appropriate to delay this step until the creation of the first communicator, as establishing self-communication parallels connecting with a peer. In our implementation, we chose to move as much logic as possible into the local phase to ease the later task of eliminating the dependency on MPI_COMM_WORLD.
+
+This separation of local and collective initialization enabled us to implement the complete MPI Sessions API in MPICH 4.0. However, because the collective phase still involves constructing a default global context, every process must participate in the first non-self call to MPI_Comm_create_from _group, during which an internal world communicator is established. While it supports the majority of applications using MPI Sessions, it retains a hidden dependency on the world communicator. The remaining subsections describe recent work that eliminates this dependency and realizes true MPI Sessions support. This improved implementation is expected to be included in the next MPICH release.
+
+### 3.2 Communicator-Independent Process IDs
+
+In traditional MPICH implementations, each device defines its own process ID mechanism, typically derived from internal communication data structures. These IDs are used to access communication metadata, such as remote addresses and connection states, resulting in tight coupling between process identity and device internals. To enable true support for MPI Sessions—without relying on comm_world—a process ID scheme must be available before device-layer data structures are initialized.
+
+To this end, MPICH introduces a communicator-independent process ID scheme defined at the MPIR layer. Each process is uniquely identified by a pair: a world ID and a world rank. World Rank corresponds to the process’s PMI ID, which, in a traditional world model, is the same as its rank in MPI_COMM_WORLD. World ID is a sequential integer assigned locally by each process. World ID 0 always refers to the process’s original world, where the process is created in. New worlds encountered via dynamic process creation or internal mechanisms are assigned incrementally higher world IDs. A world is defined as a group of processes sharing a PMI namespace—a logical unit of coordination that shares a key-value store. In the world model, a world consists of processes that make up MPI_COMM_WORLD.
+
+A key step in constructing communicators is exchanging process metadata, either via PMI or through a direct connection established via the dynamic process interface. When all process IDs originate from the same PMI interface, they can be directly mapped to PMI identifiers (e.g., PMI namespace and PMI IDs) for metadata exchange. However, dynamic processes may not share a common PMI context. Therefore, MPICH must explicitly exchange world information during dynamic process operations (e.g., MPI_Accept and MPI_Connect). This ensures proper mapping between remote and local world IDs and allows processes to populate their local world tables with the appropriate metadata. This design enables MPICH to support a wide range of PMI implementations and dynamic process scenarios, providing flexibility while maintaining consistency.
+
+MPICH’s device layers have been modified to adopt this MPIR-defined process ID scheme. While this change reduces the device layer’s flexibility in designing its own communication databases, it eliminates redundant implementations and promotes consistency across devices by offloading ID management to a centralized, device-independent layer.
+
+### 3.3 Group-Collective Address Exchange Over PMI
+
+A key step in bootstrapping communicators is the exchange of network addresses using PMI. In the traditional MPI_COMM_WORLD model, all processes collectively exchange addresses, as described in Section 2.2. However, in the MPI Sessions model, a global initialization stage may not exist. Instead, users may choose to bootstrap a communicator over a subset of processes rather than the entire process set.
+
+MPICH can be configured to work with different PMI interfaces including PMI-1, PMI-2, and PMIx. Group-level data exchange in PMIx is supported via PMIx_Put, PMIx_Get, and PMIx_Fence. In particular, PMIx_Fence accepts a process array as an argument, allowing it to execute a blocking barrier across a specified group while collecting data posted via PMIx_Put. However, support for performing PMIx_Fence over subsets of MPI_COMM_WORLD remains inconsistent across implementations. In testing our implementation on the Cray Programming Environment using the Parallel Application Launch Service (PALS), we observed that jobs could hang or crash. As a workaround until the PMIx implementation issues are fixed, we introduce a fallback environment variable, which when set, all processes must call MPI_Comm_create_from_group collectively, allowing PMIx_Fence to be executed over MPI_COMM_WORLD. Processes not part of the target group participate only in the PMIx_Fence call to ensure progress and consistency.
+
+To support group-level data exchange in PMI-1 or PMI-2, extensions are required. We propose a new collective operation, PMI_Barrier_group:
+
+⬇
+
+int PMI_Barrier_group(const int *group, int count);
+
+This extension achieves the same semantics as PMIx_Fence over a group of processes. When using a PMI server that supports this extension, such as MPICH’s bundled process launcher, Hydra, there won’t be restrictions. Otherwise, the same fallback environment variable must be set and all processes are required to call MPI_Comm_create_from_group collectively.
+
+An additional PMI extension is required to support multithreaded usage. However, since most applications do not require concurrent access to communicator bootstrapping, we defer this work to future development.
+
+### 3.4 Atomic Shared Memory Initialization
+
+Unlike network communications, where remote connections can be established on demand, shared memory communication requires all participating processes to share a common memory segment. The segment must be large enough to accommodate all local processes on the node even if some are not present during the initial communicator bootstrapping phase. Additionally, each process must ensure that its peers are ready before using the shared memory for communication. In previous versions of MPICH, which includes an explicit global initialization stage, shared memory initialization is accomplished via collectives in which all local processes participate. To support the true Sessions model, however, we cannot rely on collectives since not all local processes may be present during the communicator bootstrapping. Therefore, we redesigned shared memory initialization based on atomic operations.
+
+Atomic shared memory creation is performed using the POSIX API shm_open. Each process initially calls shm_open with the flag O_CREAT | O_EXCL. The first process to succeed in this call becomes the “root” and is responsible for creating and initializing the shared memory segment. All other processes, upon failing the initial call, subsequently invoke shm_open again—this time to open the segment created by the root. Other processes must wait for the root to complete initializing the memory. This is coordinated in two steps. First, processes call fstat on the file descriptor returned by shm_open to ensure that the root process has set the size of the region before mapping it. Second, processes read an atomic variable named root_ready from a fixed location in the shared memory region until the value indicates the root process has completed setup. In addition, each process maintains its own atomic ready flag. During a communicator bootstrapping call, each process waits for the ready flags of all other local processes in the group before completing the call, ensuring the communicator is fully initialized and safe to use upon return.
+
+### 3.5 Bootstrapping Communicators from Sparse Connections
+
+PMI is designed primarily for bootstrapping MPI and emphasizes simplicity over communication efficiency. While this approach is adequate for small to medium-sized jobs involving thousands of processes, it becomes unsuitable for large-scale all-to-all address exchanges. In jobs with hundreds of thousands of processes—often with high process-per-node (PPN) counts—using PMI for such exchanges can make MPI initialization prohibitively slow. To improve scalability and efficiency, we use PMI only to exchange addresses between node roots within the target communicator. Once this exchange is complete and connections are established, a sub-communicator consisting of the node roots—referred to as node_roots_comm—becomes operational. Within each node, after local processes initialize shared memory, another sub-communicator composed of all local processes—referred to as node_comm—is also brought online. With both node_roots_comm and node_comm active, communication paths are established between any pair of processes. At this point, the communicator forms a sparsely connected graph rather than a fully connected (logical all-to-all) topology. In the final phase, we perform an MPI_Allgather across all processes to exchange address information and establish a logical all-to-all connection. This step is executed using MPI collectives instead of PMI, as MPI can take advantage of high-bandwidth interconnects such as InfiniBand and shared memory, providing significantly better performance. Because the communicator begins in a sparsely connected state, we employ a specialized hierarchical collective algorithm to efficiently perform the MPI_Allgather. After this stage, the communicator is fully bootstrapped and ready for use.
+
+While previous versions of MPICH included a similar algorithm that used node roots to bootstrap all-to-all address exchange, it assumed a world initialization context. In this work, we redesigned the algorithm to support arbitrary communicator bootstrapping.
+
+## 4 Experimental Evaluation
+
+MPICH’s implementation of MPI Sessions modifies only the MPI initialization process and the bootstrapping of initial communicators. Runtime communication behavior remains unchanged between the world and Session models. Therefore, our evaluation focuses on the scalability of initialization, specifically comparing the world model against the Session model. All experiments were conducted on the Aurora system at the Argonne Leadership Computing Facility [2], using between 1 and 2048 nodes, with 96 processes per node (PPN). Each node is equipped with two Intel Xeon CPU Max Series processors, 512 GB of DDR5 RAM, six Intel Data Center GPUs, and eight Slingshot 11 network endpoints. To ensure a clear measurement of MPI initialization scalability, MPICH’s GPU support was disabled, as GPU initialization introduces significant time and memory overhead that can obscure the interesting part of the measurements. A high PPN configuration was chosen to emphasize scalability challenges. Although additional experiments were performed with 12 PPN, those results are omitted due to space constraints.
+
+### 4.1 Comparing World Initialization
+
+Traditional MPI applications can be adapted to use MPI Sessions by replacing calls to MPI_Init or MPI_Init_thread with an initial call to MPI_Session_init, followed by MPI_Comm_create_from_group using groups derived from the process sets “mpi://SELF” and “mpi://WORLD”. These steps create communicators functionally equivalent to MPI_COMM_SELF and MPI_COMM_WORLD, respectively. In MPICH, communicators created via MPI Sessions behave identically to those created under the traditional world model.
+
+Figure 4 presents the initialization time and memory usage for the development version of MPICH (MPICH-dev). Initialization time is calculated as the average, across all processes, of the duration taken to execute MPI_Init, MPI_Session_init, and MPI_Comm_create_from_group, respectively. Memory usage is estimated based on the MemFree field from /proc/meminfo, capturing the total memory consumed by all processes on a node. To minimize interference from phase misalignment among processes on the same node, deliberate pauses are inserted between measurement phases.
+
+Figure 4: Comparing MPI Initialization between the world model and the session model using mpich-dev. The session model measurements are split into session init and bootstrapping the self and the world communicators. (a) Initialization times in seconds. (b) Node memory usage in GB.
+
+(a) MPICH Dev - Init Time12481632641282565121024204802468101214secNumber of nodesMPI_InitSession InitSelf CommWorld Comm(b) MPICH Dev - Node Memory124816326412825651210242048024681012141618GBNumber of nodesMPI_InitSession InitSelf CommWorld Comm
+
+The results reveal several key observations. Local initialization, represented by MPI_Session_init, accounts for the majority of both initialization time and memory usage. Only a small fraction of this cost is due to MPICH itself. The bulk originates from lower-level components such as libfabric and hardware supporting libraries. The overhead is likely due to slow hardware initialization on hybrid-node architectures with multiple GPUs and NICs, with performance further degraded under high PPN as processes compete for resources. Additional overhead may come from dynamic loading of supporting libraries, which stresses shared file systems at scale. The memory allocations may include buffers anticipating a full world communication, which may explain why the local initialization also increases in both the initialization time and memory consumption as the total number of nodes increase.
+
+As an anecdote, MPICH defaults to using the tcp;rxm libfabric provider instead of the cxi provider when a job runs on a single node. This choice avoids the resource limitations associated with the cxi provider for single-node jobs. Our initial experiments showed a memory usage outlier at the 1-node scale, caused by tcp;rxm allocating significantly more memory ( 17GB) than cxi. By explicitly selecting the cxi provider, we obtained the consistent measurements shown in Fig. 4.
+
+Creating the self communicator incurs a negligible, constant cost. In contrast, constructing the world communicator, the only collective step during initialization, scales with node count in both time and memory, though it only becomes a significant factor at scales above 1024 nodes.
+
+Overall, session-based initialization takes slightly longer than the world model, while both models exhibit comparable memory usage. The reason for the longer initialization time in the sessions model is not entirely clear. One contributing factor may be the additional context ID allocation required during communicator bootstrapping in the sessions model. However, we suspect the more significant factor is overhead caused by process imbalance. In the world model, local initialization and world communicator construction are combined, which may help mask some of the load imbalance.
+
+### 4.2 Comparing Implementations
+
+To provide a broader comparison, we conducted the same set of experiments using MPICH 4.3.0 and Open MPI 5.0.7.
+
+Figure 5 shows the results for MPICH 4.3.0, the current stable release, which implements MPI Sessions using an internal world communicator. As a result, it only supports bootstrapping either the self or world communicator. The comparison between the world and session models in MPICH 4.3.0 is similar to that observed with MPICH-dev. Comparing Figure 5 and Figure 4, MPICH 4.3.0 demonstrates faster initialization times but significantly higher memory usage, especially at larger node counts. The initialization time difference is mainly attributed to the redesign of the address exchange algorithm. MPICH 4.3.0 assumes world initialization, whereas the new address exchange algorithm in MPICH-dev supports arbitrary communicator bootstrapping. This flexibility introduces additional steps for collecting and parsing process compositions, which increases the overall initialization time. The memory consumption difference, on the other hand, is due to an unrelated optimization in the MPICH development branch. MPICH 4.3.0 statically allocates address tables for all potential internal communication endpoints. These tables are replicated for each network interface card (NIC) on the node and for every process. In contrast, MPICH-dev employs a more dynamic approach to address table allocation, significantly reducing memory usage at the cost of a negligible increase in runtime latency when additional address vector (AV) entries are required for new contexts.
+
+Figure 5: Comparing MPI Initialization between the world model and the session model using MPICH 4.3.0. (a) Initialization times in seconds. (b) Node memory usage in GB.
+
+(a) MPICH-4.3.0 - Init Time1248163264128256512102420480246810secNumber of nodesMPI_InitSession InitSelf CommWorld Comm(b) MPICH-4.3.0 - Node Memory1248163264128256512102420480102030405060708090GBNumber of nodesMPI_InitSession InitSelf CommWorld Comm
+
+Running Open MPI on Aurora, especially with the session model, presents several challenges. We experienced crashes or hangs using the system job launcher (PALS from the Cray Programming Environment), in particular when performing group-level communication bootstrap. Thus, we ran experiments using Open MPI’s mpiexec instead. Even so, we encountered instability at high node counts, and were unable to obtain results at 1024 and 2048 nodes due to frequent job failures.
+
+As shown in Figure 6, Open MPI uses less memory overall but exhibits longer initialization time compared to MPICH. Notably, the time for both MPI_Session_init and self communicator bootstrapping increases super-linearly with the number of nodes. Although neither step is collective, we suspect that some components of the software stack may still introduce implicit synchronization overhead, contributing to the observed scaling inefficiencies. Using Open MPI’s bundled mpiexec on Aurora is likely to have integration issues with the system resource manager. Thus, further insights are needed to interpret this experiment.
+
+Figure 6: Comparing MPI Initialization between the world model and the session model using Open MPI 5.0.7. (a) Initialization times in seconds. A zoomed section show the same data from 1 to 128 nodes. (b) Node memory usage in GB.
+
+(a) OMPI-5.0.7 - Init Time124816326412825651210242048020406080100120140secNumber of nodesMPI_InitSession InitSelf CommWorld Comm(b) OMPI-5.0.7 - Node Memory12481632641282565121024204805101520GBNumber of nodesMPI_InitSession InitSelf CommWorld Comm124816326412805101520
+
+### 4.3 Sparse World Initialization
+
+By supporting true MPI Sessions, applications can bypass the creation of a global world communicator altogether. One compelling use case is a sparsely connected hierarchical topology, in which all processes on a node form a node communicator, and a designated node root from each node joins a second communicator, the node roots communicator. This hierarchical structure still enables global collective operations through explicitly programmed algorithms. For example, an MPI_Allreduce can be implemented as follows:
+
+⬇
+
+MPI_Reduce(buf, recvbuf, count, datatype, MPI_SUM, 0, node_comm);
+
+if (node_comm->rank == 0) {
+
+MPI_Allreduce(MPI_IN_PLACE, recvbuf, count, datatype, MPI_SUM, node_roots_comm);
+
+}
+
+MPI_Bcast(recvbuf, count, datatype, 0, node_comm);
+
+Let $m$ represent the number of processes per node (PPN). Compared to a fully connected world communicator, this hierarchical setup reduces the number of internode connections by approximately a factor of $m^{2}$ . The actual resource savings, however, depends on the overhead associated with establishing internode connections.
+
+Figure 7 compares initialization time and memory usage between the traditional world model and the Sessions-based sparse model. The results confirm that constructing a sparse world using MPI Sessions reduces both initialization time and memory consumption relative to building a full world communicator in the Sessions model (Figure 4). However, on Aurora, the traditional world model still initializes slightly faster. The sparse model does provide modest memory savings.
+
+Figure 7: Comparing MPI Initialization between the world model and the Sessions-based sparse model using mpich-dev. (a) Initialization times in seconds. (b) Node memory usage in GB.
+
+(a) MPICH Dev - Init Time124816326412825651210242048024681012secNumber of nodesMPI_InitSession InitNode CommRoots Comm(b) MPICH Dev - Node Memory124816326412825651210242048024681012141618GBNumber of nodesMPI_InitSession InitNode CommRoots Comm
+
+A significant portion of both the initialization time and memory usage occurs during local initialization, incurred not by MPICH itself but by its lower-layer dependencies. We suspect that these costs are mostly implementation issues rather than the fundamental limit. Many dependency layers in an HPC system assume and optimize for a traditional world model.
+
+## 5 Conclusions
+
+MPI Sessions was introduced into MPI to address scalability challenges on exascale systems. We recently completed a significant code restructuring in MPICH to support MPI Sessions in alignment with its original design goal—eliminating dependence on MPI_COMM_WORLD. We evaluated MPI initialization scalability by comparing equivalent use cases between the traditional world model and the sessions model. As expected, when a fully connected world communicator is required, the sessions model does not provide a performance advantage over the world model. However, with our recent development, MPICH now supports the construction of sparsely connected communication structures without relying on a world communicator. Our experiments demonstrate that such sparse topologies can reduce memory usage and improve initialization time compared to the traditional all-to-all world communicator.
+
+While MPI Sessions may not be essential for scalability alone, transitioning from the world model to the Sessions model introduces greater flexibility and dynamism at minimal cost and without significant performance penalties. This flexibility may become increasingly valuable for emerging and non-traditional application workflows.
+
+MPI Sessions is a major addition in the MPI 4.0 standard, though it has yet to see widespread adoption. With robust support now available in MPICH, we aim to promote broader use and stimulate further research into the capabilities and practical use cases of MPI Sessions.
+
+{credits}
+
+#### 5.0.1 Acknowledgements
+
+This research was supported by the U.S. Department of Energy, Office of Science, under Contract DE-AC02-06CH11357.
+
+#### 5.0.2 \discintname
+
+The authors have no competing interests to declare that are relevant to the content of this article.
+
+## References
+
+- References
+- [1] D. H. Ahn, J. Garlick, M. Grondona, D. Lipari, B. Springmeyer, and M. Schulz (2014) Flux: a next-generation resource management framework for large HPC centers. In 2014 43rd International Conference on Parallel Processing Workshops, pp. 9–17. Cited by: §2.2.
+- [2] Argonne Leadership Computing Facility (2025) Aurora. External Links: Link Cited by: §4.
+- [3] S. Atchley, C. Zimmer, J. Lange, D. Bernholdt, V. Melesse Vergara, T. Beck, M. Brim, R. Budiardja, S. Chandrasekaran, M. Eisenbach, et al. (2023) Frontier: exploring exascale. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 1–16. Cited by: §1.
+- [4] P. Balaji, D. Buntinas, D. Goodell, W. Gropp, J. Krishna, E. Lusk, and R. Thakur (2010) PMI: a scalable parallel process-management interface for extreme-scale systems. In European MPI Users’ Group Meeting, pp. 31–41. Cited by: §2.2.
+- [5] P. Balaji, D. Buntinas, D. Goodell, W. Gropp, S. Kumar, E. Lusk, R. Thakur, and J. L. Träff (2009) MPI on a million processors. In Recent Advances in Parallel Virtual Machine and Message Passing Interface: 16th European PVM/MPI Users’ Group Meeting, Espoo, Finland, September 7-10, 2009. Proceedings 16, pp. 20–30. Cited by: §1.
+- [6] D. Buntinas, G. Mercier, and W. Gropp (2007) Implementation and evaluation of shared-memory communication and synchronization operations in MPICH2 using the Nemesis communication subsystem. Parallel Computing 33 (9), pp. 634–644. Cited by: §3.
+- [7] R. H. Castain, D. Solt, J. Hursey, and A. Bouteiller (2017) PMIx: process management for exascale environments. In Proceedings of the 24th European MPI Users’ Group Meeting, pp. 1–10. Cited by: §2.2.
+- [8] M. G. Dosanjh, A. Worley, D. Schafer, P. Soundararajan, S. Ghafoor, A. Skjellum, P. V. Bangalore, and R. E. Grant (2021) Implementation and evaluation of MPI 4.0 partitioned communication libraries. Parallel Computing 108, pp. 102827. Cited by: §1.
+- [9] J. Fecht, M. Schreiber, M. Schulz, H. Pritchard, and D. J. Holmes (2022) An emulation layer for dynamic resources with MPI sessions. In International Conference on High Performance Computing, pp. 147–161. Cited by: §1.
+- [10] W. Gropp, E. Lusk, N. Doss, and A. Skjellum (1996) A high-performance, portable implementation of the MPI Message Passing Interface Standard. Parallel computing 22 (6), pp. 789–828. Cited by: §1.
+- [11] Y. Guo, K. Raffenetti, H. Zhou, P. Balaji, M. Si, A. Amer, S. Iwasaki, S. Seo, G. Congiu, R. Latham, et al. (2025) Preparing MPICH for exascale. The International Journal of High Performance Computing Applications, pp. 10943420241311608. Cited by: §2.1, §3.
+- [12] Hewlett Packard Enterprise (2024) Cray MPICH. External Links: Link Cited by: §3.
+- [13] D. Holmes, K. Mohror, R. E. Grant, A. Skjellum, M. Schulz, W. Bland, and J. M. Squyres (2016) MPI Sessions: leveraging runtime infrastructure to increase scalability of applications at exascale. In Proceedings of the 23rd European MPI Users’ Group Meeting, pp. 121–129. Cited by: §1.
+- [14] Intel Corporation (2025) Intel® MPI library. External Links: Link Cited by: §3.
+- [15] Message Passing Interface Forum (2021-06) MPI: a message-passing interface standard version 4.0. External Links: Link Cited by: §1.
+- [16] ParTec AG (2025) ParaStation MPI. External Links: Link Cited by: §3.
+- [17] K. Raffenetti, N. Bayyapu, D. Durnov, M. Takagi, and P. Balaji (2018) Locality-aware PMI usage for efficient MPI startup. In 2018 IEEE 4th International Conference on Computer and Communications (ICCC), pp. 624–628. Cited by: §2.3.
+- [18] R. Rocco, G. Palermo, and D. Gregori (2023) Fault awareness in the MPI 4.0 session model. In Proceedings of the 20th ACM International Conference on Computing Frontiers, pp. 189–192. Cited by: §1.
+- [19] E. Suarez, N. Eicker, and H. Hoppe (2024) The DEEP-SEA project: a software stack for heterogeneous and modular supercomputers. PARS-Mitteilungen: Vol. 36. Cited by: §1.
+- [20] R. Thakur, W. Gropp, and E. Lusk (1999) Data sieving and collective I/O in ROMIO. In Proceedings. Frontiers’ 99. Seventh Symposium on the Frontiers of Massively Parallel Computation, pp. 182–189. Cited by: §1.
+- [21] The Ohio State University (2025) MVAPICH. External Links: Link Cited by: §3.
+- [22] J. M. Wozniak, M. Dorier, R. Ross, T. Shu, T. Kurc, L. Tang, N. Podhorszki, and M. Wolf (2019) MPI jobs within MPI jobs: a practical way of enabling task-level fault-tolerance in HPC workflows. Future Generation Computer Systems 101, pp. 576–589. Cited by: §1.
+- [23] A. B. Yoo, M. A. Jette, and M. Grondona (2003) Slurm: simple Linux utility for resource management. In Workshop on job scheduling strategies for parallel processing, pp. 44–60. Cited by: §2.2.
+- [24] H. Zhou, K. Raffenetti, W. Bland, and Y. Guo (2024) Generating bindings in MPICH. arXiv preprint arXiv:2401.16547. Cited by: §2.1.

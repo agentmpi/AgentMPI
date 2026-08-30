@@ -1,0 +1,422 @@
+Configurable and Hierarchical Allreduce
+
+arXiv is now an independent nonprofit! Learn more×
+
+# Configurable and Hierarchical Allreduce
+
+Valentino Guerrini13, Ke Fan2, Sidharth Kumar1
+
+###### Abstract
+
+MPI_Allreduce is among the most performance-critical collectives in large-scale scientific computing and distributed machine learning, yet the small- and medium-message regime remains challenging: latency, synchronization depth, and strong hardware hierarchy between intra- and inter-domain communication all compound per-invocation cost. We present CHiArA, a configurable hierarchical Allreduce that encodes hardware hierarchy through a logical batch–lane topology and executes a staged schedule in which only a bounded portion of the reduction vector is active at a time. Inter-batch communication is distributed across multiple ranks via a rotating-root lane primitive, avoiding centralized leaders. CHiArA further enables a semi-composed Rabenseifner-style Allreduce by preserving a lane-aligned intermediate layout across the Reduce-Scatter/Allgather boundary, eliminating redundant intra-domain reorganization. We evaluate CHiArA on Polaris, Aurora, and Fugaku, achieving speedups of up to $1.94\times$ , $13.43\times$ , and $13.48\times$ over vendor MPI_Allreduce, and up to $2.2\times$ end-to-end speedup in a parallel $k$ -means application.
+
+## I INTRODUCTION
+
+Collective communication is a critical component of large-scale scientific computations, data-intensive workflows, and distributed machine learning. Operations such as Allreduce, Allgather, and Reduce-Scatter are invoked repeatedly to exchange intermediate values, synchronize algorithmic state, and compute global reductions. Representative applications include Krylov subspace solvers [23, 14], multidimensional FFT-based simulations [2], ensemble and multi-trajectory workflows [22], and distributed deep learning systems [1]. These workloads may issue tens of thousands of collectives during a single execution, so even modest inefficiencies can accumulate into substantial runtime overhead at scale.
+
+Achieving high performance in the small- and medium-message regime (roughly 64 B to 32 KB per rank in our experiments) remains particularly challenging. Unlike large messages where bandwidth dominates, small messages are sensitive to both the latency term $\alpha$ and the per-round overheads implied by the $\alpha$ – $\beta$ model[13], including synchronization and message-matching costs. Modern HPC platforms [17, 3] amplify this challenge by exposing strong communication hierarchy: exchanges within a fast shared-memory domain (e.g., within a socket or node) are fundamentally cheaper than exchanges that traverse the network fabric (e.g., Slingshot, InfiniBand, or Tofu-D). As a result, reducing global synchronization depth and restricting expensive communication to a structured subset of the algorithm are central to improving performance in this regime.
+
+Figure 1: Rabenseifner-style Allreduce decomposition into Reduce-Scatter and Allgather [16].
+
+State-of-the-art implementations of Allreduce are typically built on classical tree- and ring-based algorithms, as well as composite schemes that trade latency for bandwidth across message-size regimes [15]. Modern MPI libraries already incorporate hierarchical designs that distinguish between intra-node and inter-node communication to exploit shared memory within nodes. However, these hierarchies are often implicit, fixed by the library implementation, and not directly exposed to algorithm designers or users.
+
+Building on this observation, prior work has proposed node- and topology-aware collectives that optimize these hierarchical strategies by improving aggregation, scheduling, and topology mapping [4, 8]. While these approaches demonstrate substantial performance benefits, they typically rely on predefined hierarchical decompositions and focus on optimizing specific levels of the hierarchy, offering limited flexibility to adapt the overall communication structure to varying node sizes, socket counts, or system scales.
+
+More recent research has explored generalized collective frameworks that expose algorithmic parameters, such as radix, to better exploit modern hardware features. Wilkins et al. propose system-agnostic generalized communication kernels with tunable radix values, demonstrating that variable-radix designs can outperform fixed-structure implementations across multiple platforms [21]. While effective at improving generality and adaptability, this work does not explicitly target hierarchical decomposition within nodes or coordinated tuning across Allreduce phases.
+
+Overall, existing Allreduce implementations address different parts of the performance space, but with complementary limitations. Latency- and bandwidth-optimized algorithms rely on largely fixed communication structures, while topology-aware approaches operate at the granularity of whole collectives rather than exposing control over their hierarchical organization. On modern HPC systems with strong asymmetry between intra- and inter-node communication, these limitations restrict the ability to systematically balance latency, bandwidth, and hierarchy. This gap motivates Allreduce designs that expose a small set of explicit parameters and directly encode hierarchical structure.
+
+This work is driven by the observation that, on modern hierarchical HPC systems, the performance of MPI_Allreduce in the small- and medium-message regime is primarily limited by synchronization depth and redundant data movement across locality boundaries rather than by peak bandwidth. While bandwidth-efficient designs based on Reduce-Scatter followed by Allgather are widely used, their hierarchical realizations typically introduce additional intra-node reorganization steps between phases and often centralize cross-domain communication on a small subset of ranks, creating injection and progress bottlenecks.
+
+To address this gap, we develop CHiArA, a Configurable Hierarchical Allreduce Algorithm inspired by the Reduce-Scatter + Allgather factorization popularized by Rabenseifner [16] (Figure 1). CHiArA is built on three insights. First, expressing hierarchy through a logical batch–lane topology exposes locality while allowing inter-batch communication to be distributed across multiple ranks instead of a single leader. Second, staging the reduction vector bounds the working set and decouples the inter-batch schedule from the full message size. Third, preserving a lane-aligned intermediate layout across Reduce-Scatter and Allgather eliminates redundant intra-batch reorganization, enabling a semi-composed Allreduce that reduces synchronization and local data movement without altering the inter-batch communication pattern. This paper makes the following contributions:
+
+1.
+
+We present CHiArA, a hierarchical Allreduce with a configurable batch–lane topology that confines the majority of communication to fast shared-memory and exposes a set of tuning parameters, including batch size and independent intra-batch radices for Reduce-Scatter and Allgather.
+
+2.
+
+We introduce a staged Reduce-Scatter and Allgather design that preserves a lane-aligned intermediate layout, enabling a semi-composed Allreduce that eliminates redundant intra-batch reorganization otherwise incurred when composing standalone hierarchical collectives.
+
+3.
+
+We evaluate CHiArA on three leadership-class systems (Polaris, Aurora, and Fugaku), demonstrating speedups of up to $1.94\times$ , $13.43\times$ , and $13.48\times$ , respectively, over vendor MPI_Allreduce.
+
+4.
+
+We integrate CHiArA as a drop-in replacement into an open-source MPI+OpenMP $k$ -means implementation, achieving end-to-end iteration speedups.
+
+1. References
+
+## II Background
+
+This section reviews the collective communication algorithms and patterns that form the basis of the hierarchical and parameterized design developed in this paper. We focus on the algorithmic building blocks used for Allgather, Reduce-Scatter, and Allreduce.
+
+(a) Recursive doubling and recursive halving: Recursive doubling is a classic logarithmic collective algorithm with radix 2, commonly used for Allgather and Allreduce in latency-dominated regimes. In each of $\log_{2}P$ rounds, a process exchanges data with a single partner whose rank differs by a power of two. Recursive halving is the reduction analogue and forms the basis of many Reduce-Scatter implementations. These algorithms are primarily used for small messages, where latency dominates. By completing in $O(\log P)$ rounds, recursive doubling minimizes synchronization overhead and outperforms linear schemes in latency-dominated regimes[12, 19]. For Allgather, the exchanged payload grows across rounds, whereas for Reduce-Scatter via recursive halving the payload shrinks as the vector is progressively partitioned.
+
+(b) Ring-based algorithms: Ring algorithms arrange processes in a logical cycle and perform nearest-neighbor communication over $P-1$ rounds. Each process sends and receives a fixed-size data chunk per round, enabling efficient pipelining and high bandwidth utilization. Ring-based collectives are widely used in production MPI libraries and form the core of bandwidth-optimal Allreduce implementations for large messages, where minimizing total data volume dominates performance.
+
+(c) Rabenseifner’s Allreduce: A widely adopted approach for implementing Allreduce is Rabenseifner’s method[16], which decomposes the operation into a Reduce-Scatter followed by an Allgather (two phases). This factorization reduces redundant communication and allows combining bandwidth-efficient algorithms for the two phases. Rabenseifner style Allreduce is used in MPICH, OpenMPI, and vendor MPI implementations and provides the structural foundation for the Allreduce design studied in this work.
+
+(d) Recursive exchange and radix- $k$ algorithms: Recursive exchange generalizes recursive doubling by allowing an arbitrary radix $2\leq k\leq P-1$ . Each round communicates with $k-1$ peers, reducing the number of rounds to $\lceil\log_{k}P\rceil$ at the cost of increased per-round data movement. This defines a continuous design space between logarithmic-depth algorithms and high-fanout, low-depth exchanges. Radix- $k$ exchange patterns form the basis of several generalized Allgather, Reduce-Scatter, and Allreduce schemes proposed in the literature[21].
+
+(e) Hierarchical collectives: Modern MPI implementations exploit node-level hierarchy by separating intra-node and inter-node communication. Collective operations are decomposed into local shared-memory phases and global network phases, reducing inter-node traffic and improving locality. However, this hierarchical decomposition is typically fixed at the physical node granularity and implemented using a small set of predefined algorithms (e.g., master-based intra-node reduction)[4], with limited exposure of algorithmic parameters for tuning or adaptation.
+
+## III Design of CHiArA
+
+CHiArA revisits the classical Rabenseifner Allreduce under modern HPC hierarchical systems. While Rabenseifner achieves communication efficiency through a two-phase decomposition consisting of Reduce-Scatter followed by Allgather, practical implementations (e.g., in MPICH [11] and OpenMPI [10]) incorporate hierarchy using fixed intra- and inter-node data exchanges. However, such designs rely on fixed decomposition boundaries and treat the two phases independently, resulting in excessive synchronization depth, redundant data movement at the phase boundary, and imbalanced inter-node communication (see Section II (c) for details).
+
+CHiArA addresses these limitations by jointly introducing explicit and tunable hierarchy. The design overview of CHiArA is detailed in Section III-A. Specifically, CHiArA designs an efficient batch–lane structure that exposes hardware hierarchy while distributing global communication across ranks to maximize network utilization (Section III-B). It further introduces a staged execution model that decomposes data into smaller blocks, limiting the working set and balancing workload across ranks (Section III-C). Finally, CHiArA enables a small set of tunable parameters that directly control the hierarchy granularity and the communication schedules to adapt to various hardware and workloads (Section III-D).
+
+TABLE I: Definitions of Notations
+
+| $P$ | Total number of ranks (processes) | $\geq 1$ |
+| --- | --- | --- |
+| $PPN$ | Number of ranks per node | $0\leq PPN<P$ |
+| $b$ | Batch size (ranks per batch) | $1\leq b\leq b_{\max}$ |
+| $B$ | Number of batches ( $B=P/b$ ) | $B\geq 1$ |
+| $x$ | Batch id of rank $r$ ( $x=\lfloor r/b\rfloor$ ) | $0\leq x<B$ |
+| $i$ | Lane id of rank $r$ ( $i=r\bmod b$ ) | $0\leq i<b$ |
+| $m$ | Elements contributed per rank | $\geq 0$ |
+| $X_{d}$ | Block $d$ of the input vector (size $m/B$ ) | $0\leq d<B$ |
+| $I$ | Number of stages ( $I=\lceil B/b\rceil=\lceil P/b^{2}\rceil$ ) | $\geq 1$ |
+| $\rho$ | Root batch for stage $t$ , lane $i$ ( $\rho=tb+i$ ) | $0\leq\rho$ ; active if $\rho<B$ |
+| $k_{\mathrm{RS}},k_{\mathrm{AG}}$ | Radices for Reduce-Scatter and Allgather | $2\leq k_{\mathrm{RS}},k_{\mathrm{AG}}\leq b-1$ |
+
+### III-A Design Overview
+
+The core design principle of CHiArA is to enable hierarchical, fully distributed communication with explicit tunable control, eliminating centralized bottlenecks while adapting to hardware and workload diversity. At a high level, the algorithm decomposes into four structured phases: local reduce-scatter, global reduction, global broadcast, and local allgather. The first two phases together realize a hierarchical Reduce-Scatter, while the latter two implement a hierarchical Allgather. Local reduce-scatter first combines data within small local groups, reducing the data volume per participant in global communication and exposing parallelism. Global reduction then aggregates these partial results across groups, distributing communication across multiple participants to avoid centralized bottlenecks. Global broadcast subsequently disseminates the reduced results back to all groups without introducing additional coordination overhead. Finally, local allgather reconstructs the full result within each group, leveraging efficient local communication.
+
+With this design, ranks are grouped into batches that serve as locality domains and map communication onto fast intra-node bandwidth. The batch size is tunable from 1 to the number of ranks per node (PPN), allowing flexible control over the locality granularity. This grouping separates communication into intra-batch and inter-batch phases, enabling locality-aware execution. However, routing inter-batch communication through a single representative per batch leads to serialization and underutilization of network bandwidth. To address this limitation, CHiArA introduces lanes: ranks with the same intra-batch index across batches form independent communication paths, allowing multiple ranks to participate in inter-batch reduction and broadcast concurrently. This design distributes communication load across participants and eliminates centralized bottlenecks. Together, batches and lanes form the essential batch–lane structure of CHiArA.
+
+Importantly, this structure aligns naturally with the Reduce-scatter/Allgather boundary. Lane-parallel inter-batch reduction produces disjoint sets of fully reduced blocks, and inter-batch broadcast reuses the same lanes to redistribute them. As a result, no additional data reorganization is required between phases, and both proceed with the same distributed execution pattern without introducing extra synchronization overhead.
+
+To map computation onto this structure, the input vector per rank is uniformly partitioned into blocks, one per batch, ensuring balanced workload distribution. Execution proceeds in stages, each activating a subset of lanes to process their assigned blocks. This staged execution bounds the working set, enables pipelined progress, and reduces global synchronization depth. We now formalize these structural concepts used in CHiArA.
+
+### III-B Logical batch–lane Topology
+
+We organizes ranks into two logical dimensions, batch and lane. Let $P$ be the number of MPI ranks. CHiArA partitions ranks into batches of size $b$ (batch-size), yielding $B=P/b$ batches. To keep intra-batch communication inside the intended fast domain, $b$ should not larger than $PPN$ . Formally, each rank $r\in[0,P)$ is mapped to: $r=xb+i$ , where $x$ is the batch ID and $i$ is the lane ID (position within a batch). All ranks with the same $i$ across batches form a lane. This induces a logical $B\times b$ grid: rows are batches and columns are lanes. Figure 2 (left) illustrates this mapping for $P=9$ and $b=3$ . Each three ranks in a row with the same color is defined as a batch, while each three ranks in a column with the same shape pattern is defined as a lane. Batches are a logical partition computed by integer division and modulo and do not require communicator splits.
+
+Figure 2: Batch–lane topology and staged block mapping. Left: $P=9$ (from 2 nodes) and $b=3$ form $B=3$ batches (colors) and $b=3$ lanes (patterns), with rank $r=xb+i$ . Right: each rank partitions $X[0{:}m)$ into $B$ blocks $\{X_{d}\}$ .
+
+### III-C Block and stage decomposition.
+
+CHiArA processes the input vector in stages, rather than as a single operation. Each rank contributes a vector $X[0{:}m)$ , which is partitioned into $B$ contiguous blocks evenly (one per batch); the last few blocks may contain fewer elements when $m$ is not divisible by $B$ (Figure 2 right). At stage $t$ , each lane $i$ operates on a block $d$ : $d=t\cdot b+i$ . In each stage, at most one block is assigned per lane, enabling up to $b$ blocks to be processed with $b$ lanes in parallel. As a result, processing all $B$ blocks requires $\lceil B/b\rceil$ stages, and the number of stages is $I=\lceil B/b\rceil=\lceil P/b^{2}\rceil$ . This design bounds the active working set that improves data locality, keeps work balanced across lane, reduces global synchronization overhead by decomposing computation into fine-grained steps, and maximizes parallel utilization of the batch–lane topology.
+
+Figure 3: Hierarchical Reduce-Scatter follows a three-phase structure. Phase I illustrates intra-batch local reduction using two neighboring ranks, $P_{x}$ and $P_{y}$ , within a batch $B_{z}$ containing $m=11$ elements. Phase II captures inter-batch reduction across four batches ( $B_{0}$ – $B_{3}$ ) spanning two nodes ( $N_{0}$ , $N_{1}$ ). Phase III completes the process by redistributing the reduced blocks within each batch, ensuring that each block is delivered to its designated owner. Both Phase I and Phase II adopt a staged execution model with two stages (indicated by blue and orange boxes). Color coding consistently tracks blocks according to their destination ranks throughout all phases.
+
+Example: Consider $P=24$ processes with batch size $b=3$ , yielding $B=8$ batches. Suppose each rank $r$ holds 23 elements. We partition $X[0\!:\!23)$ into $8$ blocks, where the first $7$ blocks contain $3$ elements each and the last block contains $2$ elements. In this case, the algorithm proceeds in $I=\lceil B/b\rceil=3$ stages, with the stage index $t$ ranging from $0$ to $2$ . While the first two stages $(t=0,1)$ handle 3 blocks each, the last stage handles 2 blocks. Each batch contains three lanes indexed by $0,1,2$ . At stage $t$ , lane $i$ operates on block $d=tb+i$ (whenever $d<B$ ). Thus, stage 0 assigns blocks $0,1,2$ to lanes $0,1,2$ , respectively; stage 1 assigns blocks $3,4,5$ to lanes $0,1,2$ ; and stage 2 assigns blocks $6,7$ to lanes $0,1$ .
+
+### III-D Tunable Parameters
+
+While the design above defines an efficient communication structure, its performance depends on several key trade-offs, including the balance between intra- and inter- batch communication, and between communication depth and per-round overhead. These trade-offs vary across communication configurations, making a single fixed configuration suboptimal. To expose and control these trade-offs, CHiArA introduces a small set of tunable parameters that directly shape the communication structure.
+
+Batch-size: CHiArA first introduce a tunable batch-size $b$ , which controls the number of ranks per batch, determining the granularity of hierarchical decomposition. A larger $b$ increases work performed within fast intra-batch communication, reducing inter-batch communication rounds, but raises intra-batch cost and may exceed fast hardware domain capacity. A smaller $b$ reduces intra-batch overhead at the cost of more global stages and higher synchronization overhead. Thus, $b$ provides a direct mechanism to balance intra-domain efficiency against inter-domain communication cost.
+
+Intra-batch radices: CHiArA further exposes independent radix parameters for intra-batch communication in the Reduce-Scatter and Allgather phases, denoted as $k_{RS}$ and $k_{AG}$ . These parameters control the fanout of intra-batch communication. A larger radix reduces communication rounds and synchronization depth but increases per-round volume and contention; a smaller radix has the opposite effect. Crucially, $k_{RS}$ and $k_{AG}$ are tuned independently, reflecting the distinct communication characteristics of each phase.
+
+Figure 4: Hierarchical Allgather (example) with eight ranks ( $P_{0}$ – $P_{7}$ ) spanning two nodes ( $N_{0}$ , $N_{1}$ ) and four batches ( $B_{0}$ – $B_{3}$ ). Each rank initially holds its scattered partition, with numeric labels denoting example data values. Each stage $t$ (block $d=tb+i$ ) proceeds in three phases: Phase I redistributes blocks within each batch so that each lane rank holds the block assigned to its lane (required only for standalone Allgather); Phase II broadcasts along lanes across batches via LaneOp(BCAST), with root batch $\rho=tb+i$ sending its block to all other batches; Phase III replicates all stage blocks within a generic batch $B_{y}$ via radix- $k_{\mathrm{AG}}$ intra-batch recursive exchange, so that every rank in the batch holds the complete result. Color coding groups blocks by their originating rank throughout all three phases.
+
+## IV Proposed Algorithms of CHiArA
+
+Building on the design in Section III, CHiArA has two hierarchical building blocks: Reduce-Scatter and Allgather. Each of them consists of both intra- and inter-batch communication, following the same batch-lane topology and staged execution model. This unified structure enables intra-batch communication to be mapped onto high-bandwidth shared-memory domains, while inter-batch communication is distributed across lanes through a rotating lane-root assignment, allowing multiple ranks to participate concurrently and improving network utilization.
+
+In this section, we present the algorithms underlying CHiArA. We begin with the hierarchical algorithmic structure of the two hierarchical building blocks (Section IV-A), and then describe their concrete realizations. For intra-batch communication, CHiArA designs distinct algorithms for Reduce-Scatter and Allgather, each parameterized by a tunable radix (Section IV-B). For inter-batch communication, both building blocks share a unified communication primitive, LaneOp (Section IV-C), which enables fully distributed cross-batch reduction and broadcast. Finally, CHiArA introduces a semi-composed execution algorithm that preserves a structured intermediate layout across Reduce-Scatter and Allgather, eliminating redundant data movement between phases (Section IV-D).
+
+### IV-A Algorithmic Structure of the Hierarchical Building Blocks
+
+This section outlines the algorithmic structure of the two hierarchical building blocks, Reduce-Scatter and Allgather, followed by their integration via a semi-composed execution that eliminates redundant phases.
+
+Hierarchical Reduce-Scatter performs global reduction and produces a distributed partition of the result. It is decomposed into three phases: intra-batch reduction, inter-batch reduction, and intra-batch redistribution. The first phase aggregates partial results within each batch. The second phase completes the reduction across batches to produce globally reduced data. The final phase redistributes the reduced data within each batch to match the output layout required by Reduce-Scatter. Figure 3 illustrates this three-phase structure.
+
+Hierarchical Allgather replicates distributed data such that every rank obtains the full result. It follows a symmetric three-phase structure: intra-batch alignment, inter-batch broadcast, and intra-batch allgather. The first phase prepares the local data layout for global communication. The second phase disseminates data across batches so that all batches receive the required intermediate results. The final phase completes replication within each batch. Figure 4 illustrates this process.
+
+Semi-composed execution is then introduced by CHiArA that preserves a lane-aligned intermediate layout across the boundary of the two building blocks. This design eliminates the need for the intra-batch redistribution phase in Reduce-Scatter and the intra-batch alignment phase in Allgather. As a result, the combined execution proceeds in four phases, reducing redundant data movement and synchronization while remaining consistent with the design described in Section III-A. Figure 5 illustrates the four-phase.
+
+Figure 5: Semi-composed hierarchical Allreduce example. Allreduce is executed in four phases with this design: intra-batch Reduce-Scatter, inter-batch lane reduction, inter-batch lane broadcast, and intra-batch Allgather.
+
+### IV-B Intra-batch Algorithms
+
+This section presents the intra-batch communication algorithms used in the local phases of both hierarchical building blocks, including intra-batch reduction in Reduce-Scatter and intra-batch allgather in Allgather. Within each batch, communication is performed using radix-parameterized recursive exchange, enabling efficient use of shared-memory bandwidth while providing flexible control over communication depth and per-round cost. In all algorithms, we assume ranks have been organized into batch-lane topology with $B$ batches and $b$ lanes. The input vector per rank is also partitioned into $B$ contiguous blocks, and and execution proceeds stage by stage (as defined in Section III).
+
+Intra-batch Reduce-scatter: Algorithm 1 describes the intra-batch reduction procedure. For stage $t$ , at most one block $d=tb+i$ is assigned to each lane $i$ (line 1). Within each batch, the ranks collaboratively reduce the active blocks using a radix- $k_{\mathrm{RS}}$ recursive-exchange schedule. The radix $k_{\mathrm{RS}}$ determines that each active rank communicates with up to $(k_{\mathrm{RS}}-1)$ other ranks per round, for a total of $\lceil\log_{k_{\mathrm{RS}}}b\rceil$ rounds. In each round, ranks exchange only a slice of the active blocks in the current stage for a specific target rank and immediately apply the reduction operator in-place (lines 9-12). Radix- $k_{\mathrm{RS}}$ recursive exchange requires the number of participating ranks to be a power of $k_{\mathrm{RS}}$ to form complete communication groups per round. Thus, when $b$ is not a power of $k_{\mathrm{RS}}$ , not all ranks in the batch can participate in the data exchange. In that case, a non-participating rank sends its active blocks to a participating rank in the same batch, which is referred to as fold (lines 5-6). After the exchange completes, the reduced result corresponding to each non-participating rank is sent back, which is referred to as unfold (lines 14). This phase produces a lane-aligned state: for each active lane $i$ in stage $t$ , rank $i$ in each batch holds the batch-local reduced result for block $d=tb+i$ , thereby combining reduction and local scattering.
+
+Algorithm 1 Intra-batch Radix- $k_{\mathrm{RS}}$ Reduce-Scatter
+
+1: $d\leftarrow tb+i$
+
+2:if $d\geq B$ then
+
+3: return
+
+4:end if
+
+5:if non-participating then
+
+6: send active blocks to a participating rank $\triangleright$ fold
+
+7:end if
+
+8:reduce folded data (if any)
+
+9:for each $\lceil\log_{k_{\mathrm{RS}}}b\rceil$ rounds do
+
+10: exchange slices of active blocks with up to $(k_{\mathrm{RS}}-1)$ target ranks
+
+11: apply reduction in-place
+
+12:end for
+
+13: $U\leftarrow$ block $d$
+
+14:send $U$ to folded ranks (if any) $\triangleright$ unfold
+
+15:return $U$
+
+Intra-batch Allgather: Algorithm 3 describes the intra-batch allgather procedure. Due to the same batch-lane topology, this algorithm also enables each lane $i$ handles one reduced block $d$ per stage $t$ (line 1). Within each batch, the ranks collaboratively replicate the active blocks using a radix- $k_{\mathrm{AG}}$ recursive-exchange schedule, which proceeds in $\lceil\log_{k_{\mathrm{AG}}}b\rceil$ rounds (line 5). In each round, a rank communicates with up to $(k_{\mathrm{AG}}-1)$ peers (line 6). Specifically, for each neighbor, the rank receives a contiguous segment of blocks and sends out its currently available prefix of blocks (lines 5–9). After each round, the number of blocks available at a rank increases by a factor of $k_{\mathrm{AG}}$ (line 8). When $b$ is not a power of $k_{\mathrm{AG}}$ , some communication groups in a round may be incomplete. In that case, the exchanged segment size is clipped to avoid exceeding the valid block range (line 7). After all rounds complete, each rank holds all active blocks for the current stage. A final local reindexing step restores the blocks to their natural lane order (line 10), completing the intra-batch allgather.
+
+### IV-C Inter-batch Algorithm (LaneOp)
+
+Both hierarchical Reduce-Scatter and hierarchical Allgather require inter-batch communication. CHiArA expresses all such inter-batch traffic through LaneOp (Algorithm 2), which is invoked in two complementary modes: REDUCE for lane-wise accumulation (used by Reduce-Scatter) and BCAST for lane-wise distribution (used by Allgather).
+
+Formally, for each stage $t$ and lane $i$ , LaneOp selects a unique root batch $\rho=tb+i$ (line 4). If $\rho\geq B$ , lane $i$ is inactive and LaneOp returns immediately. Otherwise, the corresponding lane root rank is $root=\rho b+i$ (line 8). In REDUCE mode, the root rank accumulates values across batches: it initializes the accumulator with its local value and receives contributions from all other batches along the same lane, applying the reduction operator upon arrival (lines 9–13). Non-root ranks simply send their local value to $root$ (line 18). In BCAST mode, the communication pattern is reversed: the root rank sends its value to all other batches, while non-root ranks receive from $root$ (lines 20–26). Because $\rho$ depends on $(t,i)$ , the root responsibility rotates across lanes and stages, distributing inter-batch communication across ranks rather than concentrating it on a fixed leader.
+
+Algorithm 2 Rotating-root inter-batch lane operation
+
+1:mode $\in\{\textsf{REDUCE},\textsf{BCAST}\}$ , stage $t$ , batch id $x$ , lane id $i$
+
+2: $B$ batches, batch size $b$ , local block $V$ (size $m/B$ ), reduction $\oplus$
+
+3:updated block $V^{\prime}$ (reduced at root / broadcast to all)
+
+4: $\rho\leftarrow tb+i$ $\triangleright$ root batch
+
+5:if $\rho\geq B$ then
+
+6: return $V$
+
+7:end if
+
+8: $root\leftarrow\rho\cdot b+i$ $\triangleright$ lane root rank
+
+9:if mode $=$ REDUCE then
+
+10: if $x=\rho$ then $\triangleright$ root accumulates
+
+11: $A\leftarrow V$
+
+12: for $y=0$ to $B-1$ , $y\neq x$ do
+
+13: recv $T$ from rank $(y\cdot b+i)$ ; $A\leftarrow A\oplus T$
+
+14: end for
+
+15: return $A$
+
+16: else
+
+17: send $V$ to rank $root$ ;
+
+18: return $V$
+
+19: end if
+
+20:else $\triangleright$ mode $=$ BCAST
+
+21: if $x=\rho$ then $\triangleright$ root distributes
+
+22: for $y=0$ to $B-1$ , $y\neq x$ do
+
+23: send $V$ to rank $(y\cdot b+i)$
+
+24: end for
+
+25: else
+
+26: recv $V$ from rank $root$
+
+27: end if
+
+28: return $V$
+
+29:end if
+
+Algorithm 3 Intra-batch Radix- $k_{\mathrm{AG}}$ Allgather
+
+1: $d\leftarrow tb+i$
+
+2:if $d\geq B$ then return
+
+3:end if
+
+4: $G\leftarrow\{\text{block }d\}$
+
+5:for each $\lceil\log_{k_{\mathrm{AG}}}b\rceil$ rounds do
+
+6: exchange subsets of $G$ with up to $(k_{\mathrm{AG}}-1)$ neighbors
+
+7: clip exchanged blocks for non-powers of $k_{\mathrm{AG}}$
+
+8: expand $G$ by a factor of $k_{\mathrm{AG}}$
+
+9:end for
+
+10: $U\leftarrow$ block $d$
+
+11:reorder $G$ to natural block order $\triangleright$ unfold
+
+12:return $G$
+
+### IV-D Semi-composed Execution Algorithm
+
+The above building blocks can be composed to implement Allreduce. However, a naive composition introduces redundant intra-batch work at the boundary between Reduce-Scatter and Allgather. In particular, hierarchical Reduce-Scatter performs a batch-local redistribution to place reduced blocks on their final scattered owners, while hierarchical Allgather begins with a batch-local lane-alignment step to reconstruct the layout required for lane-wise broadcast.
+
+CHiArA avoids both these redundant steps by preserving the lane-aligned intermediate layout, as shown in Algorithm 4. In Phase I (lines 4–9), each batch performs an intra-batch Reduce-Scatter. Each batch locally reduces the corresponding blocks using radix- $k_{\mathrm{RS}}$ recursive exchange, producing a lane-aligned partial result $R_{t}$ . In Phase II-a (lines 10–12), the reduction is completed across batches. For each stage, LaneOp is invoked in REDUCE mode to aggregate the lane-aligned values across batches, producing the globally reduced block $U_{t}$ at the lane root. In Phase II-b (lines 13–15), the reduced result is distributed back to all batches. LaneOp is invoked in BCAST mode so that each batch obtains the reduced block at its corresponding lane rank $(x,i)$ , preserving the lane-aligned layout. In Phase III (lines 16–18), each batch performs an intra-batch Allgather using radix- $k_{\mathrm{AG}}$ recursive exchange. Starting from the lane-aligned blocks, each rank replicates the stage blocks within the batch, producing the final output segments $Y_{t}$ .
+
+After Phase II-b, each batch already holds the reduced stage blocks in the exact layout required by Phase III, enabling a direct composition of Reduce-Scatter Phases I–II with Allgather Phases II–III without any intermediate local reorganization. Importantly, this semi-composition does not constrain the intra-batch algorithms: the reduction and replication phases remain independent, exposing separate radices $k_{\mathrm{RS}}$ and $k_{\mathrm{AG}}$ , while sharing the same inter-batch lane schedule.
+
+Algorithm 4 CHiArA: Semi-composed hierarchical Allreduce
+
+1:rank $r$ , size $P$ , input $X[0:m)$ , op $\oplus$ , batch $b$ , radixes $k_{AG},k_{RS}$
+
+2:output $Y[0:m)=\bigoplus_{p=0}^{P-1}X_{p}$
+
+3: $i\leftarrow r\bmod b$ ; $x\leftarrow\lfloor r/b\rfloor$ $\triangleright$ lane ID, batch id
+
+4: $B\leftarrow P/b$ ; $I\leftarrow\lceil B/b\rceil$ $\triangleright$ $=\lceil P/b^{2}\rceil$
+
+5:split $X$ into $B$ equal blocks $\{X_{d}\}_{d=0}^{B-1}$ (each size $m/B$ )
+
+6:for $t=0$ to $I-1$ do $\triangleright$ Phase I: intra-batch Reduce-Scatter
+
+7: $d\leftarrow t\cdot b+i$
+
+8: if $d<B$ then
+
+9: $R_{t}\leftarrow\textsc{IntraRS}_{k}\!\left(i,b,k_{RS},\{X_{tb},\dots,X_{\min((t+1)b,B)-1}\},\oplus\right)$
+
+10: end if
+
+11:end for
+
+12:for $t=0$ to $I-1$ do $\triangleright$ Phase II-a: inter-batch lane reduction
+
+13: $U_{t}\leftarrow\textsc{LaneOp}(\textsf{REDUCE},t,x,i,B,b,R_{t},\oplus)$
+
+14:end for
+
+15:for $t=0$ to $I-1$ do $\triangleright$ Phase II-b: inter-batch lane broadcast
+
+16: $R_{t}\leftarrow\textsc{LaneOp}(\textsf{BCAST},t,x,i,B,b,U_{t},\oplus)$
+
+17:end for
+
+18:for $t=0$ to $I-1$ do $\triangleright$ Phase III: intra-batch Allgather (radix $k$ )
+
+19: $Y_{t}\leftarrow\textsc{IntraAG}_{k}(i,b,k_{AG},R_{t})$ $\triangleright$ $b$ blocks for stage $t$
+
+20:end for
+
+## V Evaluation
+
+We evaluate CHiArA using microbenchmarks on three leadership-class systems: Polaris and Aurora at Argonne Leadership Computing Facility (ALCF), and Fugaku at RIKEN R-CCS. Polaris is an HPE Cray Slingshot 11 system with single-socket AMD EPYC (Zen3) CPUs (32 cores per node), Aurora is an HPE Cray Slingshot 11 system with dual-socket Intel Xeon Max CPUs (104 cores per node), and Fugaku uses Fujitsu A64FX CPUs (48 user-accessible cores per node) interconnected by the Tofu-D 6D mesh/torus network. All measurements use CPU-resident MPI collectives and run at full node concurrency (one rank per core). Since CHiArA uses a logical batch mapping based on contiguous rank ids (Section III), ranks are placed so that contiguous rank groups map to the intended locality domain (socket on multi-socket nodes, node on single-socket systems). Each reported runtime is the median over 50 iterations. The evaluation follows the design structure in Section III. We first study the batch-size parameter $b$ (Section V-A), which defines the batch–lane decomposition and controls the number of inter-batch stages $I=\lceil P/b^{2}\rceil$ . We then examine radix selection for the hierarchical building blocks (Section V-B), focusing on the distinct behaviors of $k_{\mathrm{AG}}$ for Allgather and $k_{\mathrm{RS}}$ for Reduce-Scatter. Next, we quantify the end-to-end benefit of semi-composition in CHiArA (Section V-C). Finally, we compare CHiArA against vendor MPI_Allreduce implementations on all three systems (Section V-D).
+
+Message-size convention. Unless stated otherwise, all plots report the per-rank segment size $S$ (in doubles) used by the staged schedule. This $S$ corresponds to the Allgather send count (equivalently, the Reduce-Scatter receive count). The equivalent MPI_Allreduce element count is $P\cdot S$ .
+
+Figure 6: Sensitivity of hierarchical Allgather runtime to the batch size $b$ on Polaris (top) and Aurora (bottom).
+
+### V-A Batch Decomposition
+
+The batch size $b$ defines the logical batch–lane topology in Section III: ranks are grouped into contiguous batches of size $b$ , and inter-batch communication occurs along lanes in $I=\lceil P/b^{2}\rceil$ stages. Increasing $b$ reduces the number of stages, with $I=1$ once $b\geq\sqrt{P}$ . For $b<\sqrt{P}$ , multiple full stages are required and the final stage may be partial. At the same time, larger $b$ increases the cost of the intra-batch phases because more ranks participate in each recursive-exchange round. To keep intra-batch communication inside the intended fast domain, we additionally restrict $b\leq b_{\max}$ , where $b_{\max}$ is the maximum number of ranks placed on a single socket (and equals ranks per node on single-socket systems).
+
+Figure 6 shows the sensitivity of hierarchical Allgather runtime to $b$ on Polaris (top) and Aurora (bottom) for representative process counts. Two trends are consistent across configurations. First, the best-performing $b$ lies near $\sqrt{P}$ , reflecting the reduction in inter-batch stages $I=\lceil P/b^{2}\rceil$ . Second, choosing $b$ beyond the socket limit degrades performance because the intra-batch phases spill into slower locality levels; this effect is visible on systems where candidate $b$ values exceed $b_{\max}$ . Across segment sizes, the best-performing $b$ is stable and its neighbors are the next-best choices, with runtimes degrading as $b$ moves away from the optimum.
+
+Based on these results, all subsequent experiments select $b$ using a simple rule consistent with the cost-model guidance: among divisors of $P$ , choose the value $b\leq b_{\max}$ that is closest to $\sqrt{P}$ (breaking ties toward the larger $b$ ). This behavior holds for Reduce-Scatter since it shares the same stage structure and inter-batch schedule.
+
+Figure 7: Radix sensitivity of hierarchical Allgather on different systems. Execution time is shown as a function of $k_{\mathrm{AG}}$ for representative process counts and and per-rank segment sizes.
+
+Polaris
+
+Aurora
+
+Fugaku
+
+Figure 8: Radix sensitivity of hierarchical Reduce-Scatter. Each panel shows the three best-performing $k_{\mathrm{RS}}$ values (selected by overall runtime across per-rank segment sizes) for a small and a large configuration on each system. In all cases, the binary radix $k_{\mathrm{RS}}=2$ is optimal across segment sizes.
+
+Polaris
+
+Aurora
+
+Fugaku
+
+### V-B Radix Sensitivity of the Building Blocks
+
+We now examine how the intra-batch radices affect the two hierarchical building blocks. Recall that CHiArA exposes two independent radices: $k_{\mathrm{RS}}$ for the intra-batch Reduce-Scatter phase and $k_{\mathrm{AG}}$ for the intra-batch Allgather phase. This separation matters because the two collectives stress different parts of the communication stack and have different dependency structures.
+
+Figure 7 sweeps $k_{\mathrm{AG}}$ for hierarchical Allgather on all three systems. For small segment sizes, the best-performing radix consistently clusters near $k_{\mathrm{AG}}\approx\sqrt{b}$ . In this latency-dominated regime, a moderate fanout balances the reduction in communication depth against per-round synchronization and message-matching overhead. As the per-rank segment size increases, the optimum shifts toward larger radices, and for medium to large messages the minimum is attained near the upper end of the admissible range, with $k_{\mathrm{AG}}$ often close to $b-1$ . This trend reflects the recursive-exchange trade-off: larger $k_{\mathrm{AG}}$ reduces the number of rounds $\lceil\log_{k_{\mathrm{AG}}}b\rceil$ but increases per-round fanout and data per round. For larger messages, the optimum therefore depends on whether the platform can sustain the higher fanout; in our measurements it typically shifts toward $k_{\mathrm{AG}}$ close to $b-1$ .
+
+Reduce-Scatter shows markedly different behavior. Figure 8 plots the three best-performing radices for hierarchical Reduce-Scatter on each system. On all platforms and per-rank segment sizes, the radix $k_{\mathrm{RS}}=2$ consistently minimizes runtime. Intuitively, the reduction dependency structure limits the benefit of aggressive fan-in, while larger radices increase per-round message pressure and local reduction overhead without sufficient depth reduction to compensate. Consequently, we fix $k_{\mathrm{RS}}=2$ in the remainder of the evaluation and treat $k_{\mathrm{AG}}$ as the primary message-size-dependent tuning knob.
+
+Figure 9: Effect of semi-composition on Allreduce runtime.
+
+### V-C Impact of Semi-Composition
+
+We next quantify the benefit of semi-composition in CHiArA. As shown in Section IV-D, CHiArA preserves the lane-aligned intermediate layout produced by inter-batch reduction and reuses it as the input to the inter-batch broadcast and the final intra-batch replication. This removes the redundant boundary work that would otherwise occur when composing standalone Reduce-Scatter and standalone Allgather.
+
+Figure 9 compares CHiArA against a naive hierarchical Allreduce constructed as standalone Reduce-Scatter followed by standalone Allgather, and also shows the corresponding phase components. Across segment sizes, semi-composition consistently reduces runtime by eliminating redundant intra-batch data movement and synchronization at the Reduce-Scatter to Allgather boundary, with the largest relative gains appearing in the small to medium regime where intra-batch overheads are most visible.
+
+Figure 10: Allreduce latency versus per-rank segment size for 512 and 4096 processes. The default MPI_Allreduce in MPICH closely tracks the fastest internal algorithm across message sizes, motivating its use as the baseline.
+
+Figure 11: Speedup of CHiArA relative to vendor MPI_Allreduce on Polaris (left), fugaku (center) and Aurora (right).
+
+### V-D Comparison with Vendor MPI_Allreduce
+
+We now compare the final CHiArA configuration against the vendor MPI_Allreduce on each platform. All CHiArA parameters are fixed according to the sensitivity studies above: $b$ is selected by the batch rule in Section V-A, $k_{\mathrm{RS}}$ is fixed to 2 based on Figure 8, and $k_{\mathrm{AG}}$ is selected based on the message-size trends observed in Figure 7. We use vendor MPI_Allreduce as the baseline because it performs internal algorithm selection as a function of per-rank segment size and scale; Figure 10 explicitly validate that this baseline tracks the best available MPICH variants across the studied regimes.
+
+Figures 11 report the speedup of CHiArA relative to the baseline as a function of process count and per-rank segment size. Each heatmap cell reports the ratio between the median runtime of the vendor MPI_Allreduce and that of CHiArA for the same configuration; values larger than 1 indicate configurations where CHiArA is faster.
+
+On Polaris (Figure 11 (left)), CHiArA provides consistent gains in the small to medium regime and at scale, reaching up to about $1.9\times$ . Aurora (Figure 11 (right)) shows substantially larger improvements, with speedups exceeding $10\times$ in several regions and peaking above $13\times$ , reflecting the deeper effective hierarchy and higher sensitivity to synchronization depth at scale. Fugaku (Figure 11 (center)) shows a similar pattern, with the strongest gains concentrated in small to medium send counts and moderate to large process counts. For very large messages, speedups approach 1 as bandwidth dominates and baseline implementations approach peak throughput.
+
+## VI Application Case Study: Parallel K-Means
+
+Figure 12: End-to-end impact of CHiArA in Parallel K-Means. Runtime breakdown for two scales on Polaris (left) and Fugaku (right), comparing the vendor MPI_Allreduce against CHiArA for all Allreduce calls in the iteration loop. Stacked bars show the iteration-phase wall-clock time on the critical path; the hatched portion is the cumulative time spent inside the three Allreduce operations per iteration (counts, centroid sums, and convergence), and the remaining portion is local compute and other MPI overheads. Numbers above bars report the mean runtime and the observed run-to-run variance.
+
+To complement the microbenchmarks in Section V, we evaluate CHiArA in an end-to-end application by integrating it into an open-source parallel MPI+OpenMP implementation of Lloyd-style $k$ -means clustering[18]. In each iteration, every rank (i) assigns its local points to the closest centroid, (ii) accumulates per-cluster membership counts and per-cluster coordinate sums, and (iii) forms updated global centroids via collective reductions. Concretely, the implementation invokes MPI_Allreduce three times per iteration: a reduction of the cluster counts (length $K$ integers), a reduction of the centroid sums (length $K\cdot D$ doubles), and a scalar reduction used for convergence detection. The centroid-sum Allreduce is the dominant communication in this workload, and it is exactly the pattern targeted by CHiArA: repeated dense Allreduces on CPU-resident buffers inside a bulk-synchronous loop.
+
+We integrated CHiArA as a drop-in replacement by introducing a wrapper that preserves MPI_Allreduce semantics for the datatypes and operator used by the application (here, MPI_INT and MPI_DOUBLE with MPI_SUM) and dispatches at runtime either to the vendor MPI_Allreduce or to CHiArA. This isolates the effect of the collective implementation: the computation, data distribution, and convergence logic are identical across runs. CHiArA is configured using the same parameter-selection strategy derived in Section V.
+
+We run synthetic instances to ensure controlled, repeatable communication volume while exercising the full iterative path. Each iteration performs three Allreduces: (i) a cluster-count reduction of $K$ integers, (ii) a centroid-sum reduction of $K\cdot D$ doubles, and (iii) a convergence reduction of one integer. On Polaris, we use $D=K=256$ and 100 points per rank, so the three collectives operate on $256$ integers (1 KiB), $65{,}536$ doubles (512 KiB), and 1 integer (4 B) per iteration, respectively. We evaluate $P=256$ (8 nodes) and $P=2048$ (64 nodes). On Fugaku, we use $D=K=192$ with the same points-per-rank, yielding $192$ integers (768 B), $36{,}864$ doubles (288 KiB), and 1 integer (4 B) per iteration, and evaluate $P=576$ (12 nodes) and $P=2304$ (48 nodes). Each configuration is executed for 10 runs after 2 warmup runs; we report the per-run wall-clock time on the critical path (maximum across ranks) and summarize run-to-run variability.
+
+Figure 12 shows that the iteration time is strongly Allreduce-dominated, especially on Fugaku, and that substituting CHiArA reduces the Allreduce portion directly, translating into end-to-end gains. On Polaris, CHiArA reduces the total iteration time from 1.51 s to 1.27 s at $P=256$ (1.19 $\times$ ) and from 1.57 s to 1.45 s at $P=2048$ (1.08 $\times$ ). On Fugaku, where the collective fraction is larger, CHiArA reduces the iteration time from 10.32 s to 4.88 s at $P=576$ (2.11 $\times$ ) and from 11.20 s to 5.04 s at $P=2304$ (2.22 $\times$ ). These results confirm that CHiArA improves not only microbenchmarks but also the runtime of a real iterative workload whose performance is bottlenecked by repeated global reductions.
+
+## VII Related Work
+
+Hierarchy-aware and node-aware collectives in MPI libraries aim to exploit fast locality domains while limiting expensive cross-domain traffic, often by aggregating locally and restricting the off-domain collective to a subset of processes. Bienz et al. analyze node-aware Allreduce schemes in which only few ranks participate in the inter-node phase; while this reduces redundant off-node messages, it can concentrate injection/progress responsibility and leave many ranks idle, particularly for small reductions [4]. A related modeling perspective is provided by Träff’s k-lane formulation, which makes explicit that multiple processes per node can act as concurrent “lanes” for inter-node communication, and contrasts this capability with k-ported assumptions for hierarchical networks [20]. CHiArA adopts the same guiding principle, avoiding a single fixed leader on the cross-domain path, by distributing inter-batch communication across lanes and rotating root across stages.
+
+A further line of work shows that collective performance depends on tunable algorithmic parameters and that robust performance requires selection policies rather than a single fixed template. Faraj and Yuan demonstrate that automatically generating and empirically tuning collective variants can improve robustness across platforms and topologies [7], while Wilkins et al. argue for generalized, parameterized collective families (including variable-radix constructions) to span depth–fanout trade-offs on modern systems [21]. CHiArA aligns with this philosophy by exposing a small set of hardware-relevant knobs (batch size and independent intra-batch radices) while retaining a fixed, analyzable hierarchical schedule. Orthogonal approaches either synthesize topology-specific collective schedules [5] or reduce host overhead via in-network reduction mechanisms such as SHArP and Flare [9, 6]; CHiArA instead focuses on a portable host-driven design that can be deployed and tuned within standard MPI environments.
+
+## References
+
+- [1] T. Akiba, S. Suzuki, and K. Fukuda (2017) Extremely large minibatch sgd: training resnet-50 on imagenet in 15 minutes. External Links: 1711.04325, Link Cited by: §I.
+- [2] A. Ayala, S. Tomov, M. Stoyanov, A. Haidar, and J. Dongarra (2021) Accelerating multi - process communication for parallel 3-d fft. In 2021 Workshop on Exascale MPI (ExaMPI), Vol. , pp. 46–53. External Links: Document Cited by: §I.
+- [3] C. Bertoni, J. Kwack, T. Applencourt, A. Bagusetty, Y. Ghadar, B. Homerding, C. Knight, Y. Luo, M. Thavappiragasam, J. Tramm, et al. (2024) Early application experiences on aurora at alcf: moving from petascale to exascale systems. In Proceedings of the Cray User Group, pp. 12–23. Cited by: §I.
+- [4] A. Bienz, L. N. Olson, and W. D. Gropp (2019) Node-aware improvements to allreduce. External Links: 1910.09650, Link Cited by: §I, §II, §VII.
+- [5] Z. Cai, Z. Liu, S. Maleki, M. Musuvathi, T. Mytkowicz, J. Nelson, and O. Saarikivi (2021) Synthesizing optimal collective algorithms. In Proceedings of the 26th ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming, PPoPP ’21, New York, NY, USA, pp. 62–75. External Links: ISBN 9781450382946, Link, Document Cited by: §VII.
+- [6] D. De Sensi, S. Di Girolamo, S. Ashkboos, S. Li, and T. Hoefler (2021-11) Flare: flexible in-network allreduce. In Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC ’21, pp. 1–16. External Links: Link, Document Cited by: §VII.
+- [7] A. Faraj and X. Yuan (2005) Automatic generation and tuning of mpi collective communication routines. In Proceedings of the 19th Annual International Conference on Supercomputing, ICS ’05, New York, NY, USA, pp. 393–402. External Links: ISBN 1595931678, Link, Document Cited by: §VII.
+- [8] B. Goglin, J. Hursey, and J. M. Squyres (2014-09) Netloc: Towards a Comprehensive View of the HPC System Topology . In 2014 43nd International Conference on Parallel Processing Workshops (ICCPW), Vol. , Los Alamitos, CA, USA, pp. 216–225. External Links: ISSN 1530-2016, Document, Link Cited by: §I.
+- [9] R. L. Graham, L. Levi, D. Burredy, G. Bloch, G. Shainer, D. Cho, G. Elias, D. Klein, J. Ladd, O. Maor, A. Marelli, V. Petrov, E. Romlet, Y. Qin, and I. Zemah (2020) Scalable hierarchical aggregation and nbsp;reduction protocol (sharp)tm streaming-aggregation hardware design and evaluation. In High Performance Computing: 35th International Conference, ISC High Performance 2020, Frankfurt/Main, Germany, June 22–25, 2020, Proceedings, Berlin, Heidelberg, pp. 41–59. External Links: ISBN 978-3-030-50742-8, Link, Document Cited by: §VII.
+- [10] R. L. Graham, T. S. Woodall, and J. M. Squyres (2006) Open mpi: a flexible high performance mpi. In Parallel Processing and Applied Mathematics, R. Wyrzykowski, J. Dongarra, N. Meyer, and J. Waśniewski (Eds.), Berlin, Heidelberg, pp. 228–239. External Links: ISBN 978-3-540-34142-0 Cited by: §III.
+- [11] W. Gropp, E. (. Lusk, R. Thakur, P. Balaji, T. Gillis, Y. Guo, R. Latham, K. Raffenetti, and H. Zhou (2023-06) MPICH. Note: [Computer Software] https://doi.org/10.11578/dc.20200514.13 External Links: Document, Link Cited by: §III.
+- [12] S. Hammer, S. Schmid, R. Singh, and V. Addanki (2025) Short-circuiting rings for low-latency allreduce. External Links: 2510.03491, Link Cited by: §II.
+- [13] R. W. Hockney (1994) The communication challenge for mpp: intel paragon and meiko cs-2. Parallel Computing 20 (3), pp. 389–398. External Links: ISSN 0167-8191, Document, Link Cited by: §I.
+- [14] S. Lockhart, A. Bienz, W. Gropp, and L. Olson (2022) Performance analysis and optimal node-aware communication for enlarged conjugate gradient methods. External Links: 2203.06144, Link Cited by: §I.
+- [15] P. Patarasuk and X. Yuan (2009-02) Bandwidth optimal all-reduce algorithms for clusters of workstations. J. Parallel Distrib. Comput. 69 (2), pp. 117–124. External Links: ISSN 0743-7315, Link, Document Cited by: §I.
+- [16] R. Rabenseifner (2004) Optimization of collective reduction operations. In Computational Science - ICCS 2004, M. Bubak, G. D. van Albada, P. M. A. Sloot, and J. Dongarra (Eds.), Berlin, Heidelberg, pp. 1–9. External Links: ISBN 978-3-540-24685-5 Cited by: Figure 1, Figure 1, §I, §II.
+- [17] M. Sato, Y. Kodama, M. Tsuji, and T. Odajima (2021) Co-design and system for the supercomputer “fugaku”. IEEE micro 42 (2), pp. 26–34. Cited by: §I.
+- [18] T. Scarlatti and A. Russo Introito (2019) k-means-parallel: a parallel implementation of the clustering algorithm k-means with openmp and mpi. Note: GitHub repositoryAccessed: 2026-02-06. Last commit on master: d83490c (2019-09-24). License: Apache-2.0. External Links: Link Cited by: §VI.
+- [19] R. Thakur, R. Rabenseifner, and W. Gropp (2005) Optimization of collective communication operations in MPICH. International Journal of High Performance Computing Applications 19 (1), pp. 49–66. External Links: Document Cited by: §II.
+- [20] J. L. Träff (2020) $k$ -Ported vs. $k$ -lane broadcast, scatter, and alltoall algorithms. External Links: 2008.12144, Link Cited by: §VII.
+- [21] M. Wilkins, H. Wang, P. Liu, B. Pham, Y. Guo, R. Thakur, P. Dinda, and N. Hardavellas (2023) Generalized collective algorithms for the exascale era. In 2023 IEEE International Conference on Cluster Computing (CLUSTER), Vol. , pp. 60–71. External Links: Document Cited by: §I, §II, §VII.
+- [22] J. M. Wozniak, M. Dorier, R. Ross, T. Shu, T. Kurc, L. Tang, N. Podhorszki, and M. Wolf (2019) MPI jobs within mpi jobs: a practical way of enabling task-level fault-tolerance in hpc workflows. Future Generation Computer Systems 101, pp. 576–589. External Links: ISSN 0167-739X, Document, Link Cited by: §I.
+- [23] I. Yamazaki, M. Hoemmen, P. Luszczek, and J. Dongarra (2017) Improving performance of gmres by reducing communication and pipelining global collectives. In 2017 IEEE International Parallel and Distributed Processing Symposium Workshops (IPDPSW), Vol. , pp. 1118–1127. External Links: Document Cited by: §I.

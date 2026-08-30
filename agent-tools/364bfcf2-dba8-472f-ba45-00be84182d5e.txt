@@ -1,0 +1,371 @@
+Exploiting copy engines for intra-node MPI collective communication | The Journal of Supercomputing | Springer Nature Link
+
+# Exploiting copy engines for intra-node MPI collective communication
+
+- Open access
+- Published: 11 May 2023
+
+- Volume 79, pages 17962–17982 (2023)
+- Cite this article
+
+You have full access to this open access article
+
+The Journal of Supercomputing Aims and scope Submit manuscript
+
+## Abstract
+
+As multi/many-core processors are widely deployed in high-performance computing systems, efficient intra-node communication becomes more important. Intra-node communication involves data copy operations to move messages from source to destination buffer. Researchers have tried to reduce the overhead of this copy operation, but the copy operation performed by CPU still wastes the CPU resources and even hinders overlapping between computation and communication. The copy engine is a hardware component that can move data between intra-node buffers without intervention of CPU. Thus, we can offload the copy operation performed by CPU onto the copy engine. In this paper, we aim at exploiting copy engines for MPI blocking collective communication, such as broadcast and gather operations. MPI is a messaging-based parallel programming model and provides point-to-point, collective, and one-sided communications. Research has been conducted to utilize the copy engine for MPI, but the support for collective communication has not yet been studied. We propose the asynchronism in blocking collective communication and the CE-CPU hybrid approach to utilize both copy engine and CPU for intra-node collective communication. The measurement results show that the proposed approach can reduce the overall execution time of a microbenchmark and a synthetic application that perform collective communication and computation up to 72% and 57%, respectively.
+
+### Exploring Hierarchical MPI Reduction Collective Algorithms Targeted to Multicore Node Clusters
+
+### Optimization of communication-computation overlapping in parallel multigrid methods by process/thread allocation
+
+### User Co-scheduling for MPI+OpenMP Applications Using OpenMP Semantics
+
+## 1 Introduction
+
+As multi/many-core processors equipped with 10 to 100 CPU cores are being widely deployed in high-performance computing systems, the number of parallel processes running on the same compute node is also rapidly increasing. For example, Intel Xeon Sapphire Rapids and NVIDIA Grace processors can scale up to 60 and 144 cores, respectively. Therefore, efficient and scalable intra-node data sharing by either message passing or shared memory becomes more important. The message-passing interface (MPI) standard provides a messaging-based parallel programming model by supporting point-to-point, collective, and one-sided communications [1]. MPI has been widely used since it can provide high-performance data sharing and transparent programming interfaces for inter- and intra-node communications. There are several implementations of MPI, such as MPICH [2], MVAPICH2 [3], and OpenMPI [4]. These implementations include optimizations for intra-node communications that decrease data copy overheads by using a shared memory [5] or reduce the number of data copies with the aid of memory mapping [6,7,8, 9]. Nevertheless, the data copy operations in intra-node communications are performed by CPU. Thus, the CPU resources that are supposed to be utilized for computation are wasted for communication, which even hinders overlapping of computation and communication.
+
+The copy engine is a hardware component that can move data from memory-to-memory inside a compute node [10]. For example, Intel I/O Acceleration Technology (I/OAT) is the copy engine in Intel Xeon processors and supports asynchronous memory copy and parity check [11]. Thus, we can offload copy operations performed by CPU onto the copy engine and save CPU resources. There have been several studies to utilize the copy engine for MPI intra-node communication [12, 13]. These studies suggested an additional process/thread that takes full charge of managing the copy engine for intra-node data movements and monopolizes a CPU core. However, these were limited to either point-to-point communication or one-sided communication. In the case of collective communications, we have to consider fair sharing of the copy engine between processes involved in the same collective call. In addition, we need to exploit the copy engine in concert with existing CPU-based collectives.
+
+In this study, we aim at exploiting copy engines for MPI blocking collective communication. To support collective communication, we have to address challenging issues, such as how best to deploy asynchronous memory copy for blocking collective communication and how best to utilize multiple copy engines and CPUs in a combined manner. Our mechanism does not require an additional process/thread for copy engines while preserving blocking semantics of collective communication interfaces. In addition, our mechanism efficiently utilizes multiple copy engines and CPUs. We especially target MPI_Bcast and MPI_Gather as the first phase of this study. We implement the proposed mechanism in MVAPICH2 and measure its performance on an Intel Xeon-based NUMA system. Measurement results show that the proposed mechanism can improve overlapping of computation and communication and reduce the execution time of parallel applications. We summarize our contributions as follows:
+
+We propose a scheme to exploit multiple copy engines and CPUs for intra-node MPI collective communication. Our scheme primarily utilizes copy engines, but also uses CPUs when the communication latency becomes more important than overlapping of computation and communication. Although the experimental system used has a limited number of copy engines, our scheme is general enough for a system that supports a larger number of copy engines.
+
+We present schemes to efficiently utilize the kernel-level support for high-performance intra-node collective communication on multi/many-core systems. For instance, we implement the asynchronous data copy by means of memory protection mechanism without additional management process. In addition, we extend the kernel-level support to enhance the scalability of CPU-based intra-node collective communication.
+
+Our study provides insight into the design of processor architectures and MPI implementations in terms of high-performance intra-node data movements and overlapping of computation and communication. For example, our study can provide inspiration for better implementations of copy engines on next-generation processors and nonblocking collective communication defined in the MPI-3.1 standard.
+
+The rest of this paper is organized as follows: We brief MPI intra-node communication and copy engines in Sect. 2 as background. We suggest mechanisms to efficiently exploit copy engines for MPI broadcast and gather collective operations in Sect. 3. The proposed mechanisms include asynchronous interfaces for blocking collective communication and hybrid approach to utilize both copy engines and CPUs. The performance measurement results and their implications are presented in Sect. 4. We discuss related work in Sect. 5. Finally, we conclude this paper in Sect. 6.
+
+## 2 Background
+
+### 2.1 MPI intra-node communication
+
+The MPI standard provides a messaging-based parallel programming model [1]. The standard defines programming interfaces for point-to-point, collective, and one-sided communications. These interfaces are transparent for inter- and intra-node communications.
+
+MPI implementations generally use different intra-node communication channels for different message sizes [5]. The shared memory channel provides shared buffers between MPI processes running on the same node so that messages in source buffers can be moved to destination buffers through the shared buffers. Therefore, the shared memory channel requires two memory copies for each message. The memory mapping channel supports a direct data copy from source to destination buffer; thus, it can reduce the number of copies into one. There are several implementations of the memory mapping channel, such as CMA [6], XPMEM [7], LiMIC2 [8], and KNEM [9]. However, this approach requires a kernel-level memory mapping operation for each page frame, which adds a significant per-message overhead for small messages. Accordingly, MPI libraries use the memory mapping channel for large messages and the shared memory channel for small messages.
+
+As these intra-node communication channels initially targeted only point-to-point communication, the gains for collective communication were limited to the reduction of internal point-to-point communication overheads. For example, MPI_Bcast can be implemented based on different algorithms, such as binomial, scatter doubling gather, and scatter ring allgather, which perform point-to-point communications along the edge of a broadcast tree. To maximize benefits from intra-node communication channels, researchers proposed collective-communication-aware intra-node communication mechanisms. MVAPICH2, for instance, implements a broadcast-specific shared buffer that leaf nodes of the broadcast tree can copy the message to destination buffers concurrently once the root (i.e., source) node places the message into the shared buffer. There are also optimizations based on the memory mapping for collective communication [14, 15].
+
+### 2.2 Copy engines
+
+The copy engine is a special-purpose processor that can independently access memory and copy data [10]. The copy engine can be inside the processor package or on the main board of the system. The copy engine does not cause cache pollution compared to the CPU-based memory copy and does not consume CPU resources.
+
+Intel I/O Acceleration Technology (I/OAT) is the copy engine provided by Intel Xeon processors [11]. It can perform asynchronous memory copy and parity check. The Linux operating system provides I/OAT driver and direct memory access (DMA) memcpy subsystem since kernel version 2.16.17. I/OAT has been used for network packet processing and parity checking for storage devices. The copy engine has been also used for intra-node MPI point-to-point and one-sided communications [12, 13]. The AMD EPYC processors also include a set of DMA engines that can perform asynchronous memory-to-memory copy.
+
+To use the copy engine, the source and destination buffers should be locked in the physical memory to prevent the buffers from being swapped out by the paging system. The buffers may consist of multiple page frames, which are likely to be noncontiguous in the physical memory. Thus, each buffer is represented by multiple 2 tuples of (physical address, length), each of which describes a page frame or data fraction.
+
+## 3 Exploiting copy engines
+
+### 3.1 Overall design
+
+Figure 1 shows the overall design of proposed mechanism, which comprises of i) support for asynchronous data movements, ii) a copy-engine-based data movement, iii) a hybrid scheme of using copy engines and CPUs, and iv) extensions for CPU-based data movements.
+
+To achieve overlapping of computation and communication, the data movement should be asynchronously performed by the copy engines. At the same time, the semantics of existing blocking programming interfaces that returning of interfaces means the completion of collective communication has to be preserved in order to ensure transparency for existing applications. Thus, we provide asynchronous blocking interfaces by means of memory protection mechanism, which will be described in Sect. 3.2.
+
+Fig. 1
+
+The alternative text for this image may have been generated using AI.
+
+Overall design of software components to exploit copy engines in MPI collective communications
+
+We provide basic support functions to utilize the copy engine from the MPI library in terms of collective communication. In addition, as collective communications involve concurrent data movements, it is expected to utilize multiple copy engines in parallel for a single collective communication. However, a system may not have a sufficient number of copy engines to perform all data movements completely in parallel. Therefore, we need to efficiently share available copy engines as much as possible. We will describe our copy-engine-based collective communication in Sect. 3.3.
+
+Sometimes CPUs can still be better than copy engines. For example, CPUs can provide a higher degree of parallelism in data movements due to a large number of cores. Thus, we utilize both copy engines and CPUs. In this hybrid scheme, we mainly utilize copy engines when asynchronous data movements are important and use CPUs when the communication latency is important. We will explain more details of this hybrid scheme in Sect. 3.4.
+
+MPI implementations use a memory-mapping-based intra-node communication channel for large messages. This channel reduces the number of data copies required for message passing into one thanks to kernel-level support. We suggest extending the kernel-level support to optimize existing CPU-based intra-node collective communication in our target MPI, which will be described in Sect. 3.5.
+
+### 3.2 Asynchronous blocking interfaces
+
+Blocking collective communication interfaces do not return its control to user application until the collective communication is completed. MPI implementations usually perform busy waiting to poll the completion within the progress engine. The progress engine is the main layer that takes care of message transmission and reception within MPI library. Therefore, application-level computation cannot be performed until the pending collective communication is completed and its interface returns. Consequently, application-level computation is hardly likely to be overlapped with blocking collective communications. Although nonblocking collective communications defined in MPI-3.1 provide immediate returns without waiting for completion, it may require modifications of existing computation algorithms to elevate overlapping between computation and communication. Instead, we aim at providing overlapping between computation and communication with blocking collective communication.
+
+Our blocking collective communication interfaces return asynchronously though the collective communication is not completed so that the application can perform computation while the collective communication is in progress. However, such asynchronous return can have a data inconsistency problem that a process touches (i.e., reads or writes) the communication buffer before completion of collective communication. For example, if the intra-node root process of MPI_Bcast overwrites its communication buffer before completion, leaf processes can receive corrupted data. Similarly, if leaf processes reads their communication buffer before completion, they may receive wrong data. Since returning from blocking interfaces has to guarantee the completion of collective communication, the data inconsistency should not happen. To resolve this problem, we use the memory protection mechanism that controls the permission of read and write operations on user buffers.
+
+Inside the collective communication interfaces, we protect the communication buffer by using the mprotect() system call and store the buffer information (i.e., virtual address of the communication buffer, its length, etc.). If an application process tries to touch the communication buffer, a segmentation fault is generated by the operating system. We register a handler of the segmentation fault, which suspends the memory access operation until the completion of collective communication. Therefore, application-level computation performed after the collective communication interface returns asynchronously is likely to overlap with communication. However, if the computation finishes before the completion of communication, the application may attempt to access the communication buffer. This access invokes our handler that blocks accessing the buffer until the communication is completed. In this manner, our asynchronous interfaces preserve the blocking semantics without violating the MPI standard. We will detail the handler in Sect. 3.4. As existing implementations of blocking collective communications guarantee that there is only one pending collective call at a time, our interfaces also return asynchronously only if there is no pending collective communication.
+
+### 3.3 Copy engine (CE)-based approach
+
+As mentioned in Sect. 2.2. the copy engine is a hardware component that can move data between intra-node buffers without intervention of CPU. Thus, by offloading the copy operation to the copy engine and applying the asynchronous interface described in Sect. 3.2, computation and intra-node data movement can be overlapped. There can be multiple copy engines in the same node and each copy engine can provide several channels. Data movements can be physically parallelized between different copy engines. A channel of the copy engine is a queue that stores requests. For example, the experimental system used in Sect. 4 is equipped with two copy engines, each of which provides eight channels. The copy engine of the experimental system processes requests in its channels in a round-robin fashion.
+
+We consider a simple tree topology for intra-node broadcast and gather, the height of which is one as shown in Fig. 2. In the case of broadcast, the root process provides information of the source buffer to leaf processes, and leaf processes request copy engines to asynchronously move the source data to destination buffers. The gather is also similar, but the data are moved in the opposite direction (i.e., from leaves to the root). Since collective communications induce many concurrent data movements, we fully utilize available channels provided by copy engines by mapping channels to processes involved in the collective communication in a round-robin manner for each NUMA node.
+
+Fig. 2
+
+The alternative text for this image may have been generated using AI.
+
+Tree-based communication topology and steps for collective communications
+
+To move data by using the copy engine, buffers must be locked to prevent those from being swapped out. We lock communication buffers with the aid of the kernel module. Then the information of the root process’ buffer, such as physical addresses of page frames and length, is sent to leaf processes through the shared memory described in Sect. 2.1(step 1 in Fig. 2). The leaf processes insert requests, which comprise vectors of source and destination buffers, to the channel mapped to the process and initialize DMA operations of copy engines (step 2 in Fig. 2). As described in Sect. 3.2, interfaces of collective communication asynchronously return after the initialization of DMA without waiting for the completion of collective communication. The message is moved by the copy engine while CPU performs computation (step 3 in Fig. 2). The completion of DMA operations is detected by a callback function, which will be detailed in Sect. 3.4. We have implemented a kernel module that provides physical page information of user buffers and operate the copy engine.
+
+### 3.4 CE-CPU hybrid approach
+
+Although the copy engine can elevate overlapping between computation and communication, the number of copy engines equipped in the contemporary systems is very limited. Thus, the level of concurrency of data movements can be lower than what we expect. If several MPI processes share the same copy engine at the same time, the data movement overheads increase. For example, Fig. 3 compares data movement overheads of different process sets. Figure 3 a shows data movement overheads when only one process uses the copy engine without competition. Thus, this shows the ideal performance. Figure 3 b shows data movement overheads when two processes use different copy engines. As processes in this case also use a copy engine exclusively, data movement overheads do not increase. In Fig. 3 c, however, data movement overheads have almost doubled as two processes share the same copy engine.
+
+Fig. 3
+
+The alternative text for this image may have been generated using AI.
+
+Data movement overheads of a copy engine (the lower the better)
+
+To make up for high data movement overheads of the copy engine shared between multiple processes, we use CPU to move data when lowering the overhead is more important than overlapping. As we described in Sect. 3.2, to preserve the blocking semantics, a segmentation fault is raised if a process accesses a communication buffer that the collective communication asynchronously returned is not completed yet. The segmentation fault handler forces the process to wait until the completion of the collective communication; that is, the application does not perform computation until the collective communication is completed. Thus, we assume that overlapping does not matter anymore if a segmentation fault is raised and switch the copy device from copy engine to CPU.
+
+It is to be noted that we can neither preempt nor cancel the DMA request already submitted to a channel. Therefore, we need a mechanism that switches from the CE mode to the CPU mode in the middle of data movements when a segmentation fault is raised. In our CE-CPU hybrid approach, we implement virtual queues that store DMA requests before submitting these to channels. A DMA request for a collective communication is fragmented into several requests, each of which include vectors for only n pages constituting the communication buffer. We register a callback function, which is invoked whenever a fragmented request is completed by the copy engine. In the CE mode, the callback function moves fragmented requests in virtual queues to channels. Thus, if n is large, there are fewer fragmented requests because each request covers more pages, reducing the chance of switching to the CPU mode and increasing the waiting time for completion. On the other hand, if n is small, the callback function is triggered more frequently and has to move requests from virtual queues to channels more often due to a small batch size. On our experimental system described in Sect. 4, the per-callback overhead is 1 \(\mu \)s for \(n = 1\) and 4 \(\mu \)s for \(n= 8\). Accordingly, reducing the batch size can promote immediate switching to CPU mode without significantly increasing the overall overhead despite frequent execution of the callback function. Thus, we set n to 1. If the state is changed to the CPU mode by the segmentation fault handler, the callback function does not move fragmented requests to channels anymore but initializes the CPU-based approach described in Sect. 3.5.
+
+### 3.5 Enhancement of CPU-based approach
+
+As we also utilize the CPU-based approach as described in Sect. 3.4, we try to enhance the existing CPU-based approach. In addition to optimizations of intra-node point-to-point communications, MPI implementations provide collective-communication-aware optimizations for CPU-based intra-node data movements. For instance, MVAPICH2 implements shared-memory-based intra-node collective communications as a default one. In the case of broadcast, the source data in the root process are copied into the shared memory by the CPU core where the root process is running. Leaf processes copy the data in the shared memory into their destination buffers in a pipelined manner so that data movements into and out of shared memory can overlap. In MVAPICH2 version 2.3.7, this broadcast-specific shared buffer starts working after 16 consecutive collective calls. However, the shared-memory-based mechanism requires memory copy operations at the root and leaves, respectively, and sometimes the copy overheads do not completely overlap.
+
+Since we apply the CE-CPU hybrid approach to MVAPICH2, we try to improve existing intra-node collective communication of MVAPICH2. By leveraging the memory mapping mechanism, we can move data directly from root’s buffer to leaves’ buffer without intermediate buffers. Compared with the existing shared-memory-based mechanism, the memory mapping mechanism not only can reduce the number of data copy operations, but has the potential for fully overlapping copy overheads. However, we cannot directly benefit from the memory mapping mechanism used for point-to-point communications in MVAPICH2 because the legacy kernel-level support, such as CMA and LiMIC2, provides limited interfaces for memory mapping and direct data copy. Thus, we extend LiMIC2 so that it can map the root’s buffer into the kernel address space only once and perform multiple direct data copy operations on that buffer.
+
+In existing implementation that uses memory mapping mechanism, both memory mapping and copy operations are done on the receiver side. Thus, leaf processes should perform redundant memory mapping on the root’s buffer for broadcast. Since the memory mapping operation has to acquire a kernel-level lock in get_user_pages(), memory mapping on leaf processes perform sequentially as shown in Fig. 4 a. In this figure, descriptor represents the information of the source buffer sent to leaf processes. By using this information, leaf processes map the source buffer into their address space, but mapping operations represented by purple blocks are sequentially performed due to the kernel-level lock. Consequently, copy operations to move data from root to leaves on different cores are not fully overlapped. In the case of gather, the root process in the existing implementation has to perform memory mapping for all leaf processes’ buffer as shown in Fig. 5 a. This results in sequential memory mapping and data copy operations represented by purple and blue blocks, respectively.
+
+To address these issues, we segregate memory mapping and copy operations. With this extension, the root process performs memory mapping, and the leaf processes perform data copy. For example, the root process of broadcast maps its buffer into the kernel space, and leaf processes perform only copy operations from root to leaf as shown in Fig. 4 b.The gather operation of the enhanced CPU-based approach is also similar to the broadcast operation as shown in Fig. 5 b except the direction of data movements, the extended LiMIC2 manages a reference counter for the root buffer to notice the completion of data movements. The counter is set to the number of processes involved in the collective communication when the communication is initialized and decreased whenever a leaf process completes its data movement. When the reference counter reaches 1, the root process performs memory unmapping, which is actually delayed until certain times to avoid repeated mapping for the same user buffer. This enhanced CPU-based collective communication is triggered when the CE-CPU hybrid approach switches the copy device to CPU as described in Sect. 3.4.
+
+Fig. 4
+
+The alternative text for this image may have been generated using AI.
+
+Memory-mapping-based intra-node broadcast
+
+Fig. 5
+
+The alternative text for this image may have been generated using AI.
+
+Memory-mapping-based intra-node gather
+
+## 4 Performance measurement
+
+We measured the performance on a NUMA-based multi-core system equipped with two Intel Xeon 3.10 GHz 10-core Haswell processors and DDR4 128 GB memory. Each processor includes a Crystal Beach DMA v3.2 copy engine that provides eight channels. We installed Linux kernel version 5.3.7 and Intel QuickData Technology Driver 5.00. We implemented our enhanced CPU-based approach and CE-CPU hybrid approach in MVAPICH2 version 2.3. We analyzed the performance of MPI_Bcast and MPI_Gather and compared our implementations with MVAPICH2 version 2.3.7.
+
+### 4.1 Microbenchmarks
+
+We measured the latency of MPI_Bcast and MPI_Gather of 16 processes by using OSU microbenchmarks [16]. Since these microbenchmarks aim at measuring the pure latency or throughput of MPI communication calls without any computation routines, these do not show benefits of overlapping between computation and communication. The measurement results are shown in Figs. 6 and 7. In these experiments, we compare existing CPU-based approach implemented in MVAPICH2 version 2.3.7, enhanced CPU-based approach proposed in Sect. 3.5, and CE-CPU hybrid approach that integrates all ideas proposed in Sect. 3.
+
+As we can see, the enhanced CPU-based approach outperforms the existing CPU-based approach and reduces the latency of MPI_Bcast and MPI_Gather up to 67% and 85%, respectively. Since there is no computation between communication calls in these microbenchmarks, benefits from overlapping between computation and communication are not expected in the CE-CPU hybrid approach. The CE-CPU hybrid approach shows higher latency than the enhanced CPU-based approach because the first page is moved by the copy engine while the rest of pages are done by the CPU in these microbenchmarks. This CE-based movement of the first page adds about 50 \(\mu \)s overhead for each collective call. In addition, initialization of DMA and memory protection adds another 10 \(\mu \)s overhead. Due to these per-message overheads, the CE-CPU hybrid approach is suitable for large messages where even CPU-based copying cannot take the advantage of cache. In the case of MPI_Gather with large messages (Fig. 7 b), proposed approaches show very limited latency improvements compared with the existing CPU-based approach. This is mainly because the existing implementation switches the gather algorithm into binomial-tree-based one while our implementations do not exploit this algorithm yet.
+
+Fig. 6
+
+The alternative text for this image may have been generated using AI.
+
+Latency of MPI_Bcast without computation (the lower the better)
+
+Fig. 7
+
+The alternative text for this image may have been generated using AI.
+
+Latency of MPI_Gather without computation (the lower the better)
+
+### 4.2 Overlapping with computation
+
+In order to observe the capability of overlapping between computation and communication, we inserted a computation routine in between collective communication calls of OSU microbenchmarks. The computation routine performs multiplication of two 2D matrices, which are irrelevant to communication buffers and reused for every iteration. We varied the number of processes from 8 to 20. In 8-process cases, all processes ran on a single NUMA node and did not share channels of the copy engine. In 16-process cases, 10 and 6 processes ran on different NUMA nodes. Thus, 10 processes shared 8 channels of the copy engine, and the others did not. For 20-process cases, we ran 10 processes on each NUMA node. Therefore, processes shared channels on both NUMA nodes. Since proposed approaches are generally beneficial for large messages as mentioned in Sect. 4.1, we analyze the overlapping capability for 2 MB to 16 MB messages.
+
+Fig. 8
+
+The alternative text for this image may have been generated using AI.
+
+Overlapping of MPI_Bcast and computation (the higher the better)
+
+Fig. 9
+
+The alternative text for this image may have been generated using AI.
+
+Overlapping of MPI_Gather and computation (the higher the better)
+
+The measurement results of MPI_Bcast are shown in Fig. 8. The enhanced CPU-based approach and the CE-CPU hybrid approach could reduce the overall execution time up to 45% and 58%, respectively. The performance gain of the CE-CPU hybrid approach increases when the number of processes is 20. As the number of processes increases, the overhead of CPU-based copying increases because the remote memory access path across NUMA nodes becomes a bottleneck. Since the CPU-based copy overhead cannot be overlapped with computation, this increased overhead significantly worsens the overall execution time. The copy engine, on the other hand, can hide the increased copy overhead by overlapping data movement and computation.
+
+Figure 9 shows measurement results of MPI_Gather, which present that the enhanced CPU-based approach and the CE-CPU hybrid approach could reduce the execution time up to 76% and 72%, respectively. Like MPI_Bcast, the CE-CPU hybrid approach shows higher performance gains than the enhanced CPU-based approach for 20-process cases.
+
+### 4.3 Synthetic application
+
+To measure the performance in a scenario that a computation routine and a communication routine share buffers, we implemented a synthetic application shown in Algorithm 1. The first matrix \(A_0\) is initialized and broadcasted to leaf processes before entering the loop (Lines 2 – 3). In the loop, the root process initializes the next matrix represented as \(A_{i+1}\) with random values (Line 6) and broadcasts it to leaf processes (Line 7). Processes perform the computation that searches the maximum values from the matrix received from the root in the previous iteration (Line 9). The computation result is saved in matrix C. The root process gathers the results from leaf processes (Line 10). In this algorithm, MPI_Bcast and computation can be overlapped, and MPI_Gather can overlap with matrix initialization. The count parameter represents the number of iterations performed in experiments, which was set to 100. As we have described in Sect. 3.2, since our asynchronous interfaces totally comply with the blocking semantics of the MPI standard, we use the same application code for both existing and modified implementations in experiments.
+
+The alternative text for this image may have been generated using AI.
+
+The measurement results with 20 processes are shown in Fig. 10. As we can see in Fig. 10 a, the enhanced CPU-based approach and the CE-CPU hybrid approach could reduce the overall execution time up to 51% and 57%, respectively. Fig. 10 b presents detailed overheads for the 2048 x 2048 matrix size. As mentioned above, since MPI_Bcast and computation can overlap, we profiled these overheads together. Compared with the default approach, the enhanced CPU-based approach and the CE-CPU hybrid approach reduced this Bcast+Computation overhead by 77% and 79%, respectively. Since the computation overhead is not significant in this experiment, the majority of performance gain comes from enhanced CPU-based data movements. The Gather+Initialization overhead reduced by 7% and 18%, respectively, with our approaches thanks to both overheads overlapping and enhanced CPU-based data movements.
+
+Fig. 10
+
+The alternative text for this image may have been generated using AI.
+
+Execution time of synthetic application (the lower the better)
+
+### 4.4 Implications
+
+As we have observed in previous subsections, exploiting the copy engine does not always guarantee a better performance. To gain benefits of copy engine, the number of processes and the message size should be large enough to hide per-message overheads, such as memory protection, and to promote overlapping with computation. In addition, the computation time to be overlapped with a collective communication should be similar to communication overhead.
+
+We can provide configurable static thresholds of number of processes and message size to decide whether a collective communication call uses the CPU-based approach or the CE-CPU hybrid approach. However, deciding the threshold values without considerations on computation time may not guarantee as much overlap of computation and communication as expected. To take the computation time into account, we may need run-time monitoring. As most parallel applications perform a computation loop [17, 18], we can estimate the computation time by measuring the interval of MPI communication calls at run time. Moreover, we can profile if the collective communication and the computation routines access the same buffer by tracing the first few iterations. Based on estimation of computation time and buffer sharing, we can dynamically decide whether using the copy engine is beneficial or not.
+
+## 5 Related work
+
+Overlapping of computation and communication in MPI has been studied from various perspectives. One is to introduce asynchronism to the MPI progress engine. MPI implementations assume that a process occupies one CPU core, so the progress engine handles message transmission and reception using a polling-based scheme, minimizing the communication latency. However, polling in the MPI library hinders overlapping of computation and communication. Therefore, researchers proposed asynchronous progress engines, which were implemented as a separate process or thread. Si et al. [19, 20] especially focused on point-to-point communication and one-sided communication, respectively. These approaches, however, require a number of CPU cores to be dedicated for the progress engine. To address this issue, Ruhela et al. [21] suggested a thread-based design that uses signaling and applied it to point-to-point communication. Hoefler and Lumsdaine [22] and Pritchard et al. [23] also proposed interrupt-based asynchronous progress engines but these are not able to utilize high-speed intra-node communication channels, such as shared memory and memory mapping.
+
+In addition to the studies described above, Vaidyanathan et al. [12, 13] offloaded the copy operation into the copy engine for intra-node point-to-point and one-sided communications and showed the potential for overlap between computation and communication. Buntinas et al. [24] also showed benefits of the copy engine for large messages. There were also studies on overlap between communication overheads [25, 26], but these did not consider computation overheads. There were also efforts to offload MPI functionalities, such as communication progress and tag matching, into NIC or processing engine [27, 28].
+
+Another approach to achieve overlapping between computation and communication is to deploy nonblocking communication interfaces defined in the MPI-3.1 standard. LibNBC [29] provides a prototype implementation of nonblocking collective communication interfaces. Its overlapping capability has been analyzed on InfiniBand [30] and Ethernet. However, intra-node collective communication is not considered.
+
+There have been also significant studies to reduce the latency of intra-node communications. The shared memory channel is used for small messages, and the memory mapping channel is used for large messages. CMA [6], LiMIC2 [8], and KNEM [9] map the source buffer into the kernel address space so that the message can be directly copied to the destination buffer. Unlike these implementations, XPMEM [7] maps the buffer into the user address space of the corresponding process. These intra-node communication channels initially suggested for point-to-point communication and were extended for collective communications. Hashmi et al. [14], for example, proposed XPMEM-based optimization of collective communications. Unlike CMA and LiMIC2, since XPMEM has an additional overhead to map the communication buffer into the user address space, it requires a registration cache to mitigate the mapping overhead. Ma et al. [15] also presented intra-node topology-aware collective communications based on KNEM. Our enhancement of the CPU-based approach was inspired by these studies.
+
+As modern computer architectures comprise complex data movement paths, researchers try to utilize heterogeneous data paths to provide high-performance intra-node collective communications. For example, there have been studies on combining multiple GPU-to-GPU communication channels. Chu et al. [31] combined host-staged copies and GPU global memory. Temuçin et al. [32] utilized NVLink and PCIe concurrently for message striping. We can also consider the PCIe channel by using the NIC-level loopback in our hybrid approach. Like the copy engine, the NIC-level loopback can provide overlapping between communication and computation, but this would be slower due to intermediate NIC buffer and low-speed I/O bus. Zhou et al. [33] showed that the data compression for a slow channel can improve the performance of collective communication on a GPU cluster. We believe that the performance of the copy engine channel also can be improved by embedding an online compression module.
+
+## 6 Conclusions
+
+In this paper, we proposed a design to exploit copy engines for intra-node collective communications, such as MPI_Bcast and MPI_Gather. The copy engine has the potential to offload copy operations performed by CPU and promote overlapping between computation and communication. Our design provides asynchronous blocking interfaces and virtual queues to efficiently utilize copy engines. However, since contemporary systems are equipped with a limited number of copy engines, we suggested using the CPU-based approach as well. Accordingly, we also enhanced the traditional CPU-based intra-node collective communication by extending kernel-level support. We implemented our CE-CPU hybrid approach that exploits both copy engine and CPU in MVAPICH2. The measurement results showed that the proposed CE-CPU hybrid approach could reduce the overall execution time of a microbenchmark and a synthetic application that perform collective communication and computation up to 72% and 57%, respectively.
+
+As future work, we intend to extend our implementation to support more collective communication interfaces and measure their performance with real-world applications on a multi-node system. We believe that we can easily apply our schemes to other one-to-many or many-to-one collectives, such as MPI_Scatter and MPI_Allgather, but supporting MPI_Alltoall and MPI_Allreduce will be complicate. To implement efficient many-to-many collectives and support multi-node systems, hierarchical algorithms and NUMA-awareness will be required. In addition, we plan to study more effective schemes to determine whether to use the CE-CPU hybrid approach or the CPU-based approach.
+
+## Data availability
+
+The data can be provided upon request.
+
+## References
+
+Message Passing Interface. https://www.mpi-forum.org/. Accessed 26 Feb 2023
+
+MPICH: high-performance portable MPI. https://www.mpich.org/. Accessed 26 Feb 2023
+
+MVAPICH: MPI over infiniBand, omni-path, ethernet/iWARP, and RoCE. http://mvapich.cse.ohio-state.edu/. Accessed 26 Feb 2023
+
+Open MPI: open source high performance computing. https://www.open-mpi.org/. Accessed 26 Feb 2023
+
+Chai L, Hartono A, Panda DK Designing high performance and scalable mpi intra-node communication support for clusters. In: 2006 IEEE International Conference on Cluster Computing, pp. 1–10 (2006). IEEE
+
+Vienne J Benefits of cross memory attach for mpi libraries on hpc clusters. In: Proceedings of the 2014 Annual Conference on Extreme Science and Engineering Discovery Environment, pp. 1–6 (2014)
+
+XPMEM: Cross-process memory mapping. https://code.google.com/archive/p/xpmem/. Accessed 26 Feb (2023)
+
+Jin H-W, Sur S, Chai L, Panda DK Lightweight kernel-level primitives for high-performance mpi intra-node communication over multi-core systems. In: 2007 IEEE International Conference on Cluster Computing, pp. 446–451 (2007). IEEE
+
+Goglin B, Moreaud S (2013) Knem: a generic and scalable kernel-assisted intra-node mpi communication framework. J Parallel Distrib Comput 73(2):176–188
+
+Zhao L, Iyer R, Makineni S, Bhuyan L, Newell D Hardware support for bulk data movement in server platforms. In: 2005 International Conference on Computer Design, pp. 53–60 (2005). IEEE
+
+Intel\(\text{registered} \) I/O Acceleration technology. https://www.intel.com/content/www/us/en/wireless-network/accel-technology.html/. Accessed 26 Feb (2023)
+
+Vaidyanathan K, Huang W, Chai L, Panda DK Designing efficient asynchronous memory operations using hardware copy engine: a case study with i/oat. In: 2007 IEEE International Parallel and Distributed Processing Symposium, pp. 1–8 (2007). IEEE
+
+Vaidyanathan K, Chai L, Huang W, Panda DK Efficient asynchronous memory copy operations on multi-core systems and i/oat. In: 2007 IEEE International Conference on Cluster Computing, pp. 159–168 (2007). IEEE
+
+Hashmi JM, Chakraborty S, Bayatpour M, Subramoni H, Panda DK Design and characterization of shared address space mpi collectives on modern architectures. In: 2019 19th IEEE/ACM International Symposium on Cluster, Cloud and Grid Computing (CCGRID), pp. 410–419 (2019). IEEE
+
+Ma T, Bosilca G, Bouteiller A, Goglin B, Squyres JM, Dongarra JJ Kernel assisted collective intra-node mpi communication among multi-core and many-core cpus. In: 2011 International Conference on Parallel Processing, pp. 532–541 (2011). IEEE
+
+OSU Micro-Banchamrks. http://mvapich.cse.ohio-state.edu/benchmarks/. Accessed 26 Feb (2023)
+
+Bailey DH, Barszcz E, Barton JT, Browning DS, Carter RL, Dagum L, Fatoohi RA, Frederickson PO, Lasinski TA, Schreiber RS, et al.: The nas parallel benchmarks summary and preliminary results. In: Supercomputing’91: Proceedings of the 1991 ACM/IEEE Conference on Supercomputing, pp. 158–165 (1991). IEEE
+
+Karlin I, Bhatele A, Keasler J, Chamberlain BL, Cohen J, DeVito Z, Haque R, Laney D, Luke E, Wang F, et al.: Exploring traditional and emerging parallel programming models using a proxy application. In: 2013 IEEE 27th International Symposium on Parallel and Distributed Processing, pp. 919–932 (2013). IEEE
+
+Si M, Balaji P Process-based asynchronous progress model for mpi point-to-point communication. In: 2017 IEEE 19th International Conference on High Performance Computing and Communications; IEEE 15th International Conference on Smart City; IEEE 3rd International Conference on Data Science and Systems (HPCC/SmartCity/DSS), pp. 206–214 (2017). IEEE
+
+Si, M., Pena, A.J., Hammond, J., Balaji, P., Takagi, M., Ishikawa, Y.: Casper: An asynchronous progress model for mpi rma on many-core architectures. In: 2015 IEEE International Parallel and Distributed Processing Symposium, pp. 665–676 (2015). IEEE
+
+Ruhela A, Subramoni H, Chakraborty S, Bayatpour M, Kousha P, Panda DK (2019) Efficient design for mpi asynchronous progress without dedicated resources. Parallel Comput 85:13–26
+
+Hoefler T, Lumsdaine A Message progression in parallel computing-to thread or not to thread? In: 2008 IEEE International Conference on Cluster Computing, pp. 213–222 (2008). IEEE
+
+Pritchard H, Roweth D, Henseler D, Cassella P Leveraging the cray linux environment core specialization feature to realize mpi asynchronous progress on cray xe systems. In: Proceedings of the Cray User Group Conference, vol. 79, p. 130 (2012)
+
+Buntinas D, Goglin B, Goodell D, Mercier G, Moreaud S Cache-efficient, intranode, large-message mpi communication with mpich2-nemesis. In: 2009 International Conference on Parallel Processing, pp. 462–469 (2009)
+
+Ramesh S, Mahéo A, Shende S, Malony AD, Subramoni H, Panda DK Mpi performance engineering with the mpi tool interface: the integration of mvapich and tau. In: Proceedings of the 24th European MPI Users’ Group Meeting, pp. 1–11 (2017)
+
+Chakraborty S, Bayatpour M, Hashmi J, Subramoni H, Panda DK Cooperative rendezvous protocols for improved performance and overlap. In: SC18: International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 361–373 (2018). IEEE
+
+Bayatpour M, Hashmi Maqbool J, Chakraborty S, Kandadi Suresh K, Ghazimirsaeed SM, Ramesh B, Subramoni H, Panda DK Communication-aware hardware-assisted mpi overlap engine. In: High Performance Computing: 35th International Conference, ISC High Performance 2020, Frankfurt/Main, Germany, June 22–25, 2020, Proceedings, pp. 517–535 (2020). Springer
+
+Sugawara Y, Chen D, Haring RA, Kayi A, Ratzlaff E, Senger RM, Sugavanam K, Bellofatto R, Nathanson BJ, Stunkel C Data movement accelerator engines on a prototype power10 processor. IEEE Micro (2022)
+
+Hoefler T, Lumsdaine A, Rehm W Implementation and performance analysis of non-blocking collective operations for mpi. In: SC’07: Proceedings of the 2007 ACM/IEEE Conference on Supercomputing, pp. 1–10 (2007). IEEE
+
+Technology M infiniBand – industry standard data center fabric is ready for prime time. Mellanox White Papers (2005)
+
+Chu C-H, Kousha P, Awan AA, Khorassani KS, Subramoni H, Panda DK Nv-group: link-efficient reduction for distributed deep learning on modern dense gpu systems. In: Proceedings of the 34th ACM International Conference on Supercomputing, pp. 1–12 (2020)
+
+Temuçin YH, Sojoodi AH, Alizadeh P, Kitor B, Afsahi A (2022) Accelerating deep learning using interconnect-aware ucx communication for mpi collectives. IEEE Micro 42(2):68–76
+
+Zhou Q, Kousha P, Anthony Q, Shafie Khorassani K, Shafi A, Subramoni H, Panda DK Accelerating mpi all-to-all communication with online compression on modern gpu clusters. In: High Performance Computing: 37th International Conference, ISC High Performance 2022, Hamburg, Germany, May 29–June 2, 2022, Proceedings, pp. 3–25 (2022). Springer
+
+## Acknowledgements
+
+This research was supported by the Super Computer Development Leading Program of the National Research Foundation of Korea(NRF) funded by the Korean government (Ministry of Science and ICT(MSIT)) (No. 2020M3H6A1084853).
+
+## Funding
+
+This research was supported by the Super Computer Development Leading Program of the National Research Foundation of Korea(NRF) funded by the Korean government (Ministry of Science and ICT(MSIT)) (No. 2020M3H6A1084853).
+
+## Author information
+
+Author notes
+
+Joong-Yeon Cho, Pu-Rum Seo: These authors contributed equally to this work.
+
+### Authors and Affiliations
+
+Hyundai Mobis Co., Ltd., Yongin-si, Gyeonggi-do, 16891, Korea
+
+Joong-Yeon Cho
+
+Department of Computer Science and Engineering, Konkuk University, Gwangjin-gu, Seoul, 05029, Korea
+
+Pu-Rum Seo & Hyun-Wook Jin
+
+Authors
+
+Joong-Yeon Cho
+
+Search author on: PubMed Google Scholar
+
+Pu-Rum Seo
+
+Search author on: PubMed Google Scholar
+
+Hyun-Wook Jin
+
+Search author on: PubMed Google Scholar
+
+### Contributions
+
+J-YC implemented proposed ideas. P-RS implemented proposed ideas and conducted performance measurements. H-WJ wrote the main manuscript text and prepared figures. All authors reviewed the manuscript.
+
+### Corresponding author
+
+Correspondence to Hyun-Wook Jin (jinh@konkuk.ac.kr).
+
+## Ethics declarations
+
+### Conflict of interest
+
+We declare that the authors have no competing interests as defined by Springer, or other interests that might be perceived to influence the results and/or discussion reported in this paper.
+
+### Ethical approval
+
+Not applicable.
+
+## Additional information
+
+### Publisher's Note
+
+Springer Nature remains neutral with regard to jurisdictional claims in published maps and institutional affiliations.
+
+## Rights and permissions
+
+Open Access This article is licensed under a Creative Commons Attribution 4.0 International License, which permits use, sharing, adaptation, distribution and reproduction in any medium or format, as long as you give appropriate credit to the original author(s) and the source, provide a link to the Creative Commons licence, and indicate if changes were made. The images or other third party material in this article are included in the article's Creative Commons licence, unless indicated otherwise in a credit line to the material. If material is not included in the article's Creative Commons licence and your intended use is not permitted by statutory regulation or exceeds the permitted use, you will need to obtain permission directly from the copyright holder. To view a copy of this licence, visit http://creativecommons.org/licenses/by/4.0/.
+
+## About this article
+
+### Cite this article
+
+Cho, JY., Seo, PR. & Jin, HW. Exploiting copy engines for intra-node MPI collective communication. J Supercomput 79, 17962–17982 (2023). https://doi.org/10.1007/s11227-023-05340-x
+
+Accepted: 24 April 2023
+
+Published: 11 May 2023
+
+Version of record: 11 May 2023
+
+Issue date: November 2023
+
+DOI: https://doi.org/10.1007/s11227-023-05340-x
+
+### Keywords

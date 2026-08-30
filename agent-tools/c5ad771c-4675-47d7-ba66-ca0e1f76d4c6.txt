@@ -1,0 +1,388 @@
+LLNL-CONF-427005
+ScalaTrace: Tracing, Analysis
+and Modeling of HPC Codes at
+Scale
+F. Mueller, X. Wu, M. Schulz, B. de Supinski, T.
+Gamblin
+April 1, 2010
+PARA 2010
+Reykjavík, Iceland
+June 6, 2010 through June 9, 2010
+Disclaimer 
+This document was prepared as an account of work sponsored by an agency of the United States 
+government. Neither the United States government nor Lawrence Livermore National Security, LLC, 
+nor any of their employees makes any warranty, expressed or implied, or assumes any legal liability or 
+responsibility for the accuracy, completeness, or usefulness of any information, apparatus, product, or 
+process disclosed, or represents that its use would not infringe privately owned rights. Reference herein 
+to any specific commercial product, process, or service by trade name, trademark, manufacturer, or 
+otherwise does not necessarily constitute or imply its endorsement, recommendation, or favoring by the 
+United States government or Lawrence Livermore National Security, LLC. The views and opinions of 
+authors expressed herein do not necessarily state or reflect those of the United States government or 
+Lawrence Livermore National Security, LLC, and shall not be used for advertising or product 
+endorsement purposes. 
+ScalaTrace: Tracing, Analysis and Modeling of HPC Codes at Scale
+Frank Mueller∗1, Xing Wu1, Martin Schulz2, Bronis R. de Supinski2, and Todd Gamblin2
+1 Dept. of Computer Science, North Carolina State University, Raleigh, NC 27695-7534
+2 Lawrence Livermore National Laboratory, Center for Applied Scientific Computing, Livermore, CA 94551
+Abstract Characterizing the communication behavior of largescale applications is a difficult and costly task due to code/system
+complexity and their long execution times. An alternative to running actual codes is to gather their communication traces and
+then replay them, which facilitates application tuning and future
+procurements. While past approaches lacked lossless scalable
+trace collection, we contribute an approach that provides orders
+of magnitude smaller, if not near constant-size, communication
+traces regardless of the number of nodes while preserving structural information. We introduce intra- and inter-node compression techniques of MPI events, we develop a scheme to preserve
+time and causality of communication events, and we present results of our implementation for BlueGene/L. Given this novel capability, we discuss its impact on communication tuning and on
+trace extrapolation. To the best of our knowledge, such a concise representation of MPI traces in a scalable manner combined
+with time-preserving deterministic MPI call replay are without
+any precedence.
+1 Introduction
+Scalability is one of the main challenges of petascale computing. One central problem lies in a lack of scaling of
+communication. However, understanding the communication patterns of complex large-scale scientific applications
+is non-trivial. An array of analysis tools have been developed, both by academia and industry, to aid this process.
+For example, Vampir is a commercial tool set including a
+trace generator and GUI to visualize a time line of MPI
+events [2]. While the trace generation supports filtering,
+trace files, which are stored locally, grow with the number
+of MPI events in a non-scalable fashion. Another example is the mpiP tool that uses the profiling layer of MPI
+to gather user-configurable aggregate metrics for statistical
+analysis [10]. Locally stored profiling files are constrained
+in size by the number of unique call sites of MPI events,
+which is independent of the number of nodes. However,
+mpiP does not preserve the structure and temporal ordering
+of events, which limits its use to high-level analysis. Other
+communication analysis tools have similar constraints: either their storage requirements do not scale or they are
+lossy with respect to program structure and temporal ordering.
+In contrast to prior work, our work develops a scalable
+trace-driven approach to analyze MPI communication that
+can represent lossless, full traces in constant size. We
+demonstrate in in our results that our objective has been
+achieved for a number of benchmarks. We have further
+developed tools (a) to replay communication, optionally
+∗Email: mueller@cs.ncsu.edu
+with widely preserved timing information, (b) to detect inefficiencies in the utilization of the communication API,
+and (c) to extrapolate traces for strong scaling.
+2 Lossless Tracing
+Communication analysis tools are currently constrained in
+that either their storage requirements do not scale or they
+fall short in tracing all events by only providing aggregate
+statistics.
+In contrast to prior work, ScalaTrace provides a scalable trace-driven approach to analyze MPI communication. While past approaches fail to gather full traces for
+hundreds of nodes in a scalable manner or only gather aggregate information, we have designed a framework that
+extracts full communication traces orders of magnitude
+smaller, if not near constant size, regardless of the number of nodes while preserving structural information and
+temporal event order.
+Our trace-gathering framework utilizes the MPI profiling layer (PMPI) to intercept MPI calls during application
+execution. Profiling wrappers trace which MPI function
+was called along with call parameters within each node,
+such as source and destination of communications, yet
+without recording the actual message content. This intranode information (task-level) is compressed on-the-fly. We
+also perform inter-node compression upon application termination to obtain a single trace file that preserves structural information suitable for lossless replay.
+Intra-Node Compression: Within each node, we compress MPI call entries, generally repeated due to a code’s
+loop structure, on-the-fly. To this extent, regular section
+descriptors (RSDs) are exploited to express MPI events
+nested in a single loop in constant size [3] while powerRSDs (PRSDs) are utilized to specify recursive RSDs
+nested in multiple loops [5]. MPI events may occur at
+any level in PRSDs. For example, the tuple RSD1:<100,
+MPI Send1, MPI Recv1> denotes a loop with 100 iterations of alternating send/receive calls with identical
+parameters (omitted here), and PRSD1:<1000, RSD1,
+MPI Barrier1> denotes 1000 invocations of the former
+loop (RSD1) followed by a barrier. These construct correspond to the code in Figure 1. The algorithmic details of
+MPI event compressions over PRSDs can be found elsewhere [7, 8].
+To efficiently compress events, a set of generic and another set of domain-specific optimizations are performed.
+(1) Calling sequences are identified by generating a signature derived from a stack walk. Thus, call origins to
+common routines (e.g., MPI Send at call site 1) can be distinguished. (2) Communication end-points are encoded in
+a location-independent manner (relative to the rank of the
+current MPI task). This fosters identical encoding, e.g.,
+for stencil codes, across nodes. (3) Request handles are
+identified by a relative index into a handle buffer of constant size, which is dynamically updated. This abstracts
+for (i = 1; i < 1000; i++) {
+for (k = 1; k < 100; k++) {
+MPI Send(...); /* send call 1 */
+MPI Recv(...); /* recv call 1 */
+}
+MPI Barrier(...); /* barrier call 1 */
+}
+Figure 1: Sample Code for PRSDs
+from runtime-dependent data structures in a portable manner, e.g., for handles returned by asynchronous communication calls such as MPI Isend. (4) Iterative constructs
+with an indeterministic number of repetitions of a common event type are aggregated into a single event. For
+example, an application may wait for the completion of n
+asynchronous events using MPI Waitsome in a loop, yet
+the MPI call may aggregate multiple completions as a result of each call. This will be abstracted as n calls.
+Inter-Node Compression: Local traces are combined
+into a single global trace upon application completion
+within the PMPI wrapper for MPI Finalize. This approach
+is in contrast to generating local trace files, which results
+in linearly increasing disk space requirements and does
+not scale as traces must be moved to permanent (global)
+file space. The I/O bandwidth, particularly in systems like
+BlueGene/L (BG/L) with a limited number of I/O nodes,
+could severely suffer under such a load. To guarantee scalability, we instead employ cross-node compression, stepwise and in a bottom-up fashion over a binary tree network overlay. To this extent, events and structures (RSD
+/ PRSDs) of nodes are merged when events, parameters,
+structure and iteration counts match (see [7, 8] for algorithmic details).
+We again employ a set of generic and domain-specific
+optimizations: (1) Sequences of nodes/task IDs are encoded using PRSDs, which allows a concise representation
+even for subsets of nodes as traces from different nodes are
+merged within the reduction tree. We utilize a radix tree
+whose encoding fosters efficient PRSD representations of
+sets of task IDs. (2) Events are temporally reordered when
+they originate from different nodes (and have no causal relation) to result in a more concise representation.
+3 Deterministic Replay
+One of the objectives of collecting communication traces
+is to analyze them off-line. One key virtue of our environment is that one can replay communication traces in a
+generic manner, even without the availability of application code. All that is needed is the trace itself. Our replay
+engine will be discussed in more detail in the preliminary
+results.
+We have designed and implemented a replay engine that
+issues communication calls in the same order that they
+were originally issued by an application. The input to the
+replay engine consists of the compressed trace. The replay
+engine itself does not actually decompress this trace. Instead, it interprets the compressed trace on-the-fly to issue
+communication calls. In effect, the replay engine implements the inverse functions of the compression algorithms
+in an interpretative manner. When it encounters an RSD
+or PRSD, it issues calls iteratively observing the structure,
+frequency and parameters of communication calls. Hence,
+our structure-preserving compression scheme is key to a
+scalable replay methodology, which does not require excess amounts of memory. In fact, its memory requirement
+is loosely bounded by the size of the compressed trace,
+which is often of constant size.
+Using the replay engine, we conducted experiments to
+verify the correctness of our scalable compression approach. We replayed compressed traces to ensure MPI semantics are preserved, to verify that the aggregate number
+of MPI events per MPI call matches that of the original
+code and that the temporal ordering of MPI events within
+a node are observed. The results of communication replays
+confirmed the correctness of our approach. During replay,
+all MPI calls are triggered over the same number of nodes
+with original payload sizes, yet with a random message
+payload (content). Thus, the replay incurs comparable
+bandwidth requirements on communication interconnects,
+albeit with potentially different contention characteristics
+since event times are not preserved (addressed below).
+Communication replay also provides an abstraction from
+compute-bound application performance, which is neither
+captured nor replayed. This makes the replay mechanism
+extremely portable, even across platforms, which can benefit rapid prototyping and tuning. It also supports assessing
+communication needs of future platforms for large-scale
+procurements.
+4 Preserving Time
+The objective of trace analysis is generally to find inefficiencies in the code, e.g., as indicated by load imbalance
+between nodes. Such analysis requires knowledge about
+the timing between events. Hence, conventional trace techniques simply attach a timestamp to all communication
+events. Such timestamps also facilitate a time-accurate replay. However, our compression techniques would seize to
+be effective if each event was timestamped. Hence, scalable trace compression with precise timestamps is infeasible.
+Our trace compression scheme and the replay engine
+support two methods of capturing timing information of
+different tasks in computational sections (between any two
+communication calls) [9]. First, a low-cost statistical approach to capture delta times has been designed. Second, to resemble computational imbalance, a variation-
+none intra inter
+100
+102
+104
+106
+108
+1010
+1012
+128256512
+3264
+Trace size [Bytes]
+Number of CPUs
+(a) LU Trace File, Varied # Nodes
+none intra inter
+100 101 102 103 104 105 106 107 108 109 1010
+128256512
+3264
+Trace size [Bytes]
+Number of CPUs
+(b) CG Trace File, Varied # Nodes
+none intra inter
+100
+101
+102
+103
+104
+105
+106
+107
+108
+128256512
+3264
+Trace size [Bytes]
+Number of CPUs
+(c) IS Trace File, Varied # Nodes
+Figure 2: Subset of NAS PB, Trace File Size per Node on a BG/L
+preserving recording scheme was devised, still within a
+constant size trace representation, yet with a higher constant factor. Delta times denote the elapsed time between
+adjacent trace events. In contrast to absolute time, the relative notion of time makes delta times amenable to compression. Delta times are collected for event pairs. For
+example, RSD1 has two timing regions that will be captured: (a) from send to receive and (b) from receive to send
+(between consecutive loop iterations). Each delta time is
+associated with the terminal communication event, i.e., at
+the beginning (prologue) of receive for (a) and the beginning of send for (b).
+We dynamically create size-limited histograms of delta
+times suitable for our existing trace compression scheme.
+Based on a user-defined number of bins, delta times are
+recorded in an online balancing scheme to equalize bin
+volumes using a weighted subrange partitioning scheme
+(algorithm 2 in [9]).
+5 Trace Extrapolation
+Judging the effect of problem and/or task scaling on performance is a hard problem. While some advances have been
+made using application modeling or deriving similarities
+and characteristics from microbenchmarks [4, 6, 1], we
+follow a complementary direction. We extrapolate larger
+communication traces from smaller ones, which can then
+be used to replay these larger traces and empirically detect
+communication problems or project system requirements
+for future procurements of HPC systems. If communication is the impeding factor to scalability, our framework
+can aid in the analysis of codes and performance projections for existing and future systems.
+The extrapolation of system overhead from small application runs to larger ones is a challenging problem that has
+not been solved. Yet, a number of subproblems become
+feasible with ScalaTrace. We consider the problem of
+strong (task) scaling. Given a set of communication traces
+of, say, 8, 16, 32 and 64 nodes, we can extrapolate the
+corresponding trace for n nodes of the same application.
+We devised a method to extrapolate larger communication
+traces from smaller ones for task (strong) scaling. The key
+insight is that communication parameters combined with
+PRSD iterators provide sufficient detail for this approach.
+E.g., if a communication parameter depends on the number of columns of a matrix whose size is input dependent,
+then problem scaling will increase this parameter at a certain rate. Given a minimum of three data points, a fitting
+curve can be constructed to extrapolate the growth rate of
+this parameter. Thus, payloads can be adjusted according
+to such fitting curves. A larger problem size can also affect the number of timesteps of a convergence algorithm.
+By capturing the iterators of timesteps within histograms,
+such dependencies can be discovered and modeled again
+via curve fitting.
+Similar to problem scaling, the size of a group communicator may depend on the total number of nodes, and this
+growth under task scaling can be extrapolated with curve
+fitting methods. For such node dependencies, we require
+d + 1 data points (traces) for a d-dimensional Cartesian
+layout and then apply Gaussian elimination to extrapolate
+parameters, such as communication end-points, for arbitrary sizes n. E.g., after determining the dimensionality, we
+can infer the coefficients A,B,C,D for a given layout and
+solve for values Vi: A × ni + B × xi × yi +C × xi + D = Vi
+for i ∈ {1,...,d+1} where ni = f(zi) to facilitate the calculation for row-major layouts. We have prototyped a trace
+extrapolation method for strong scaling that automatically
+transforms a set of traces of smaller size (number of nodes)
+to one of arbitrary size. The extrapolated traces have been
+replayed successfully, as reported in the next section.
+6 Results
+We assessed the effectiveness of ScalaTrace through experiments with benchmarks and an application on BG/L.
+Our results confirm the scalability of our on-the-fly MPI
+trace compression by yielding orders of magnitude smaller
+or even near constant size traces for processor scaling and
+problem scaling.
+We conducted experiments with the NAS Parallel
+Benchmark (NPB) codes for class C inputs [12] and
+UMT2k on BG/L. Figure 2 depicts the trace file sizes on a
+logarithmic scale without compression (none), with local
+compression (intra-node) and with cross-node compression (inter). We identified three categories of codes wrt.
+inter-node compression efficiency: (1) those that result in
+near constant-size traces (DT, EP, LU, BT and FT), regardless of the number of nodes, (2) those with sub-linear scaling of trace size as the node count increases (MG and CG)
+and (3) those that do not scale yet (IS and UMT2k). The
+first class, represented by LU (Fig. 2(a)), shows reductions
+for intra but only inter delivers constant size traces. The
+second class, represented by CG (Fig. 2(b)), shows considerable compression at the node level (intra) and sub-linear
+(but not constant) sized traces for inter-node compression.
+The third class, represented by IS (Fig. 2(c)), shows a similar trend but with a faster than linear growth rate for inter.
+The next experiment assesses the effectiveness of delta
+times to resemble application behavior during replay. Figure 3 depicts the wall-clock time for the uninstrumented
+application, mpiP[10]-instrumented application and three
+replay options based on uncompressed, intra-node compressed and globally compressed traces. It shows highly
+accurate replay times irrespective of number of nodes
+and levels of compression, which is representative for all
+benchmarks.
+Total MPI Compute
+ 0
+ 500
+ 1,000
+ 1,500
+ 2,000
+ 2,500
+ 3,000
+ 3,500
+node
+glob
+uncompr
+mpiP
+uninst
+node
+glob
+uncompr
+mpiP
+uninst
+node
+glob
+uncompr
+mpiP
+uninst
+node
+glob
+uncompr
+mpiP
+uninst
+node
+glob
+uncompr
+mpiP
+uninst
+Execution time
+Number of CPUs 32 64 128 256 512
+Figure 3: FT Replay: Aggregate of All Nodes (BG/L)
+We have also replayed traces successfully at extrapolated sizes. Preliminary results not only indicate functional
+correctness but also close results in timing of extrapolated
+traces when replayed compared to application behavior at
+scaled size for up to 16k nodes (see Figure 4, dark/maroon
+bars are extrapolated, scaling is limited by input sizes). We
+are working on generalizing our approach to a large number of common communication patterns.
+ 1
+ 4
+ 16
+ 64
+ 256
+ 1024
+FT512 FT1024 FT2048 FT4096 FT8192 FT16384 - IS64IS128 IS256 IS512 IS1024 IS2048 IS4096 IS8192 IS16384 - CG16 CG64 CG256 CG1024 CG4096
+Running Time (s)
+App Time
+Replay Time
+Figure 4: Replay after Extrapolation on a BG/P
+7 Conclusions
+This paper gives an updated overview over ScalaTrace.
+ScalaTrace provides a scalable methodology for event tracing that has been demonstrated for MPI and I/O events. It
+annotates events with time-preserving information suitable
+for deterministic MPI call replay. Traces can further be extrapolated in the dimension of number of tasks (nodes) to
+assess communication scalability and assist procurement
+decisions for future HPC installations. Further information about ScalaTrace can be found elsewhere [7, 9, 8, 11].
+8 Acknowledgements
+This work was supported in part by NSF grants 0410203,
+0429653, 0237570 (CAREER), 0937908, and 0958311.
+Part of this work was performed under the auspices of
+the U.S. Department of Energy by University of California
+Lawrence Livermore National Laboratory under contracts
+DE-AC05-00OR22725, W-7405-Eng-48, and DE-AC52-
+07NA27344 under LLNL-CONF-427005.
+References
+[1] R. Bell and L. John. Improved automatic testcase synthesis
+for performance model validation. In International Conference on Supercomputing, pages 111–120, June 2005.
+[2] H. Brunst, H.-C. Hoppe, W. E. Nagel, and M. Winkler. Performance optimization for large scale computing: The scalable VAMPIR approach. In International Conference on
+Computational Science (2), pages 751–760, 2001.
+[3] P. Havlak and K. Kennedy. An implementation of interprocedural bounded regular section analysis. IEEE Transactions on Parallel and Distributed Systems, 2(3):350–360,
+July 1991.
+[4] D. Kerbyson, H. Alme, A. Hoisie, F. Petrini, H. Wasserman, and M. Gittings. Predictive performance and scalability modeling of a large-scale application. In Supercomputing, Nov. 2001.
+[5] J. Marathe, F. Mueller, T. Mohan, B. R. de Supinski, S. A.
+McKee, and A. Yoo. METRIC: Tracking down inefficiencies in the memory hierarchy via binary rewriting. In International Symposium on Code Generation and Optimization, pages 289–300, Mar. 2003.
+[6] G. Marin and J. Mellor-Crummey. Cross architecture performance predictions for scientific applications using parameterized models. In SIGMETRICS Conference on Measurement and Modeling of Computer Systems, page (to appear), 2004.
+[7] M. Noeth, F. Mueller, M. Schulz, and B. R. de Supinski.
+Scalable compression and replay of communication traces
+in massively parallel environments. In International Parallel and Distributed Processing Symposium, Apr. 2007.
+[8] M. Noeth, F. Mueller, M. Schulz, and B. R. de Supinski.
+Scalatrace: Scalable compression and replay of communication traces in high performance computing. Journal
+of Parallel Distributed Computing, 69(8):969–710, Aug.
+2009.
+[9] P. Ratn, F. Mueller, B. R. de Supinski, and M. Schulz. Preserving time in large-scale communication traces. In International Conference on Supercomputing, pages 46–55,
+June 2008.
+[10] J. Vetter and M. McCracken. Statistical scalability analysis
+of communication operations in distributed applications. In
+ACM SIGPLAN Symposium on Principles and Practice of
+Parallel Programming, 2001.
+[11] K. Vijayakumar, F. Mueller, X. Ma, and P. C. Roth. Scalable multi-level i/o tracing and analysis. In Petascale Data
+Storage Workshop, Nov. 2009.
+[12] F. Wong, R. Martin, R. Arpaci-Dusseau, and D. Culler. Architectural requirements and scalability of the NAS parallel
+benchmarks. In Supercomputing, 1999.

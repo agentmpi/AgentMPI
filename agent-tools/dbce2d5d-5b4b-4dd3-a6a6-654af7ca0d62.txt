@@ -1,0 +1,901 @@
+Resource Optimization with MPI Process Malleability for Dynamic Workloads in HPC Clusters
+
+[orcid=0000-0003-3654-7924]
+
+[orcid=0000-0002-3337-3298] [orcid=0000-0002-2635-7345] [orcid=0000-0001-8469-764X] [orcid=0000-0002-2826-3086] [orcid=0009-0002-9003-4898] [orcid=0000-0002-3575-4617]
+
+1]organization=Barcelona Supercomputing Center (BSC), city=Barcelona, country=Spain
+
+2]organization=Universitat Jaume I (UJI), city=Castelló de la Plana, country=Spain
+
+3]organization=Department of Computer Science, Częstochowa University of Technology (PCZ), city=Częstochowa, country=Poland
+
+# Resource Optimization with MPI Process Malleability for Dynamic Workloads in HPC Clusters
+
+Sergio Iserte sergio.iserte@bsc.es Iker Martín-Álvarez Krzysztof Rojek José I. Aliaga Maribel Castillo Weronika Folwarska Antonio J. Peña [ [ [
+
+###### Abstract
+
+Dynamic resource management is essential for optimizing computational efficiency in modern high-performance computing (HPC) environments, particularly as systems scale. While research has demonstrated the benefits of malleability in resource management systems (RMS), the adoption of such techniques in production environments remains limited due to challenges in standardization, interoperability, and usability. Addressing these gaps, this paper extends our prior work on the Dynamic Management of Resources (DMR) framework, which provides a modular and user-friendly approach to dynamic resource allocation. Building upon the original DMRlib reconfiguration runtime, this work integrates new methodology from the Malleability Module (MaM) of the Proteo framework, further enhancing reconfiguration capabilities with new spawning strategies and data redistribution methods. In this paper, we explore new malleability strategies in HPC dynamic workloads, such as merging MPI communicators and asynchronous reconfigurations, which offer new opportunities for dramatically reducing memory overhead. The proposed enhancements are rigorously evaluated on a world-class supercomputer, demonstrating improved resource utilization and workload efficiency. Results show that dynamic resource management can reduce the workload completion time by $40\%$ and increase the resource utilization by over $20\%$ , compared to static resource allocation.
+
+###### keywords:
+
+\sepHigh-performance Computing \sepResource Management \sepJob Reconfiguration \sepMPI Malleability \sepDynamic Workloads
+
+## 1 Introduction
+
+In the evolving landscape of high-performance computing (HPC), dynamic resource management has become increasingly critical for efficiently leveraging the vast computational capabilities required by modern scientific applications. These range across domains such as aerodynamics SanderseReviewAerogenerators, industrial mixing CFDMixing, nuclear reactor safety CFDNucelar, and wastewater treatment CFDAeration, among others.
+
+The advent of Exascale computing, marked by unprecedented levels of parallelism and architectural complexity—as evidenced in the TOP500 list Dongarra2011—has amplified the demand for flexible and adaptive resource management strategies. In response, initiatives like the EuroHPC Joint Undertaking (JU) eurohpc_ju have supported numerous European projects dedicated to developing dynamic resource managers tailored to domain-specific requirements. As the community seeks to maximize scientific productivity and resource efficiency, dynamic resource management has emerged as a vital strategy for modern HPC systems.
+
+Several studies Iserte2020; Chadha2021 have shown that dynamic jobs can improve critical metrics such as resource utilization, makespan, and job turnaround time. While moldability offers flexibility at job launch, malleability—the ability to adapt resource usage during execution—enables continuous optimization, further enhancing system efficiency. Beyond scheduling, malleability can be leveraged at the file system level Sanchez2023 to improve I/O performance, and has also been used to reduce energy consumption in HPC workloads Iserte2019a; Cascajo2023.
+
+Despite these advances, integrating dynamic resource management into production environments remains challenging due to limitations in standardization, interoperability, and usability. Many existing solutions lack the modularity needed to support diverse runtimes and impose substantial adaptation burdens on applications. Addressing these barriers requires a unified framework that combines flexible resource allocations with comprehensive malleability support at both application and system levels.
+
+This paper builds upon and significantly extends our previous work on the Dynamic Management of Resources (DMR) framework iserte_towards_2025, which was developed to democratize dynamic resource management via a modular and user-friendly application programming interface (API). The original DMR framework introduced a stacked architecture capable of integrating multiple reconfiguration managers, and offered an API that abstracts away low-level details of reconfiguration runtimes and resource managers.
+
+A key outcome of that work was the seamless integration of DMRlib Iserte2020, our reconfiguration runtime, with MaM, the malleability engine from the Proteo framework proteo_2024. This integration enabled a comprehensive suite of spawning strategies and data redistribution techniques suitable for production environments. We demonstrated its feasibility through a prototype evaluation using a malleable implementation of the Multidimensional Positive Definite Advection Transport Algorithm (MPDATA) SMO2006 in a controlled testbed.
+
+This paper presents a substantially extended version of that work. We evaluate the enhanced DMR framework at scale on a world-class supercomputing facility and demonstrate how the new capabilities lead to improved resource utilization, coding usability, and scientific productivity. Furthermore, we explore novel strategies for malleability in MPI workloads —including asynchronous reconfigurations and communicator merging— that significantly reduce memory overhead and increase flexibility.
+
+In particular, this paper introduces the following key contributions:
+
+1.
+
+An improved MaM module capable of dynamically selecting the optimal reconfiguration strategy.
+
+2.
+
+An enhanced MPDATA implementation with a redesigned data layout to fully exploit MaM’s redistribution capabilities.
+
+3.
+
+A new plugin for malleability-aware Slurm, supporting reconfiguration to any natural number of resources.
+
+4.
+
+A detailed experimental evaluation of different reconfiguration strategies on a large-scale HPC system, demonstrating the importance of optimal resource management.
+
+The rest of the paper is organized as follows: Section 2 provides an overview of the technologies used; Section 3 discusses related work on MPI malleability and dynamic resource management; Section 4 details the architectural division between DMR and DMRlib and the integration of MaM, with an emphasis on new features that improve resource usage; Section 5 presents and analyzes experimental results; Section 6 discusses the applicability of the presented malleability framework, and finally, Section 7 concludes with a summary.
+
+## 2 Background
+
+This section highlights the main technologies involved in this research, namely: 1) the DMRlib reconfiguration framework, 2) a malleability-enabled implementation of Slurm, 3) the Malleability Module (MaM) of Proteo, and 4) the scientific application MPDATA, with which we evaluate the presented malleability ecosystem.
+
+### 2.1 DMRlib
+
+The Dynamic Management of Resources Library (DMRlib) Iserte2020 is an advanced API that facilitates the integration of malleability into HPC applications. It provides a communication interface between the parallel distributed runtime (PDR) and the resource management system (RMS), allowing users to transparently manage processes and resources, thereby improving productivity and optimizing resource utilization in HPC environments.
+
+Fundamentally, DMRlib provides passive dynamic resource management through the following steps:
+
+•
+
+During job execution, DMRlib periodically communicates with the RMS to signal jobs’ readiness for reconfiguration.
+
+•
+
+This interaction occurs at a designated synchronization point within the code, triggering the reconfiguration process. In iterative applications, the end of an iteration frequently serves as an ideal synchronization point.
+
+•
+
+The RMS then evaluates the overall system status to decide whether a reconfiguration is required and sends this decision back to DMRlib.
+
+•
+
+If this communication leads to a change in job size, the RMS reallocates resources accordingly, which may involve either increasing or decreasing the number of processes.
+
+•
+
+In the end, according to the application’s guidelines, the data is redistributed across the processes, and the job continues execution with the updated process configuration, beginning precisely from the reconfiguration point.
+
+DMRlib has proven to be a highly effective and versatile malleability tool, with its impact demonstrated by a wide range of published success stories and implementations that continue to demonstrate its ability to improve the efficiency and flexibility of HPC applications in diverse environments Iserte2019a; Iserte2020; iserte_towards_2025.
+
+### 2.2 Malleability-enabled Slurm
+
+Slurm is a highly robust and scalable open-source cluster manager and job scheduling system specifically designed for Linux-based clusters Yoo2003. Slurm effectively handles large-scale distributed systems, making it an excellent solution for HPC environments. Its modular architecture allows for flexible configuration and extension, while it supports various advanced features, including job prioritization, resource allocation, and job dependencies. Additionally, Slurm can manage workloads efficiently by providing fine-grained control over job execution and resource utilization, with the ability to schedule both parallel and sequential jobs.
+
+The basic deployment of Slurm involves several components that work together to manage and schedule jobs efficiently in an HPC environment. At the core, there is a daemon called slurmd, which runs on each compute node. This daemon is responsible for managing the execution of jobs on that node, including the allocation of resources, monitoring job status, and reporting back to the central system. The slurmctld is the central daemon that runs on the management node. It oversees the entire scheduling process, including the assignment of jobs to compute nodes, prioritization of jobs, and handling of resource allocation policies.
+
+The daemons are responsible for overseeing the management of key elements within the system, including nodes, queues, allocations and job steps (sets of tasks within a job). By efficiently coordinating these components, they ensure optimal resource utilization and the proper execution of jobs within the Slurm-managed cluster environment. The available nodes within a partition are assigned to jobs in the priority queue.
+
+DMRlib includes a specialized version of Slurm that supports malleable jobs, enabling dynamic resource management during job execution. This functionality is facilitated by a custom resource selection plugin that links DMRlib with Slurm, allowing for seamless reallocation of resources as needed.
+
+Slurm monitors the allocation of resources to jobs during a resize operation, allowing for adjustments in job allocations across nodes. On the one hand, $\textit{Job}\ A$ could be expanded as follows:
+
+1.
+
+Submit a new $\textit{Job}\ B$ with dependency to the initial $\textit{Job}\ A$ . $\textit{Job}\ B$ requests the number of nodes (NB) to be added to the allocated nodes (NA) by $\textit{Job}\ A$ .
+
+2.
+
+Update $\textit{Job}\ B$ , setting its number of nodes to 0. This produces a set of NB nodes not allocated to any job.
+
+3.
+
+Cancel $\textit{Job}\ B$ .
+
+4.
+
+Update $\textit{Job}\ A$ and set its number of nodes to NA+NB.
+
+On the other hand, $\textit{Job}\ A$ could be shrunk by updating $\textit{Job}\ A$ ’s number of nodes to the desired size.
+
+After these steps, the environment variables for $\textit{Job}\ A$ in Slurm are updated accordingly. It is important to note that these commands do not impact the current status of the running job. The user continues to be responsible for managing any malleability process and for redistributing the data as needed.
+
+### 2.3 Proteo
+
+Proteo is a highly configurable framework designed to facilitate the creation of benchmarks and experimental environments to study the effects and integration of malleability in real-world HPC applications proteo_2024. It is composed of various modules that enable users to incorporate malleability to MPI-based applications, implement malleable versions, and monitor performance malleability metrics.
+
+In this work, we specifically leverage the Malleability Module (MaM) of Proteo to enhance the malleability capabilities of DMRlib. MaM acts as the malleability engine and its novel API is adopted by DMRlib to provide advanced spawning strategies and data redistribution techniques. This integration offers increased flexibility and efficiency in adapting resource allocations to the dynamic needs of applications.
+
+MaM is responsible for managing application reconfigurations by adjusting the number of active processes at runtime. Its functionality is centered around two primary tasks: process management and data redistribution.
+
+In the process management stage, MaM assumes an initial group of $NS$ (source) processes and a target size of $NT$ (target) processes. Two main methods are supported:
+
+•
+
+The Baseline method always spawns $NT$ new processes, regardless of the existing group, with the connection between old and new processes handled via either intra- or inter-communicators.
+
+•
+
+The Merge method is more efficient, as it retains the minimum of $NS$ and $NT$ existing processes and spawns only the additional processes needed to reach $NT$ . When shrinking, it removes the excess processes without spawning new ones. Unlike Baseline, Merge exclusively relies on intra-communicators, which are generally more efficient for tightly coupled applications.
+
+MaM also supports multiple optimizations to further enhance reconfigurations:
+
+•
+
+The Asynchronous strategy offloads spawning operations to auxiliary threads, allowing the application to continue execution while new processes are being launched in the background.
+
+•
+
+The Parallel strategy distributes the creation of the new MPI_COMM_WORLD communicator across different nodes in parallel, minimizing synchronization bottlenecks. This is particularly beneficial when aiming for future shrink operations, as it simplifies intra-node reductions.
+
+In the data redistribution phase, MaM handles the migration of application data from the original communicator to the newly created one. This transfer is performed efficiently, with support for both synchronous communication of variable data and asynchronous communication of constant data, depending on the application’s characteristics and performance goals.
+
+### 2.4 MPDATA Algorithm
+
+MPDATA is leveraged to generate the workload with which we evaluate the presented framework. The application is based on a 3D implementation of the Multidimensional Positive Definite Advection Transport Algorithm (MPDATA) SMO2006, which serves as a representative example of a real-world stencil computation. The goal is to highlight key computational and memory access patterns relevant to the optimization strategies discussed in the subsequent sections.
+
+Notably, the MPDATA algorithm forms the foundation of the multiscale fluid solver EULAG (Eulerian/semi-Lagrangian fluid solver) ROJ17a. Its primary function is to compute the advection of a nondiffusive scalar field $\Psi$ within a given velocity field, represented by the continuity equation:
+
+| $${{\partial\Psi}\over{\partial t}}+\text{div}(\mathbf{V}\Psi)=0,$$ | (1) |
+| --- | --- |
+
+where $\mathbf{V}$ denotes the velocity vector. The algorithm utilizes finite difference methods for spatial discretization ROJ17b.
+
+MPDATA operates iteratively and is designed for rapid convergence. In the initial step, the advection of a prognostic field $\psi$ is computed using the donor-cell approximation, providing first-order accuracy ROJ17b. Subsequent iterations introduce corrections that elevate the accuracy to second order in both space and time. These corrections involve reapplying the donor-cell approach, but now incorporating anti-diffusive velocities derived from the computed fields.
+
+As a forward–in–time algorithm, MPDATA advances calculations in discrete time steps, with the number of iterations determined by the specific physical scenario being modeled. Each iteration involves five input arrays and produces a single output array, which serves as input for the subsequent time step.
+
+To achieve scalability and efficiency, a hybrid parallelization approach combining a distributed memory model for inter-node communication and a shared memory model for intra-node computations is adopted. In the distributed memory model, the computational domain is decomposed along the first $X$ dimension and distributed across nodes. Each decomposed part (chunk) of size $N\times(M+1)\times(L+1)$ exchanges halo areas of size $3\times(M+1)\times(L+1)$ with neighboring nodes using MPI, ensuring continuity of calculations across the global domain. Here, $M$ , $N$ , and $L$ denote the dimensions of the 3D computational grid used in the MPDATA algorithm, corresponding respectively to the number of grid points in the $X$ , $Y$ , and $Z$ directions.
+
+Within each node, the shared memory model leverages OpenMP to parallelize computations across the available CPU cores. By benefiting from the shared memory architecture within nodes, we reduce the communication overhead compared to inter-node exchanges. The data distribution scheme is shown in Figure 1.
+
+Figure 1: Scheme of the MPDATA data redistribution
+
+## 3 Related Work
+
+This section explores on–the–fly reconfiguration solutions integrated into production-grade resource managers, emphasizing the need for a modular framework to support diverse malleability engines from a system-wide perspective.
+
+We highlight the most prominent MPI-based solutions for dynamic processes and job malleability. For further details, aliaga_survey_2022 offers a comprehensive survey on spawn-based process malleability, while tarraf_malleability_2024 provides a broader overview of the state of the art in dynamic resource management.
+
+ReSHAPE Sudarsan2007 provides an integrated framework for adapting to varying workloads, combining specialized reconfiguration libraries, a scheduler, and a runtime system. However, the tight coupling of these components requires applications to be specifically tailored for compatibility with ReSHAPE.
+
+The Power-Aware Resource Manager (PARM) Sarood2014 leverages over-provisioning, power capping, and job malleability to optimize throughput under strict power constraints in over-provisioned facilities. Its malleability depends on Charm++ runtime support, which dynamically redistributes computational tasks across processors.
+
+The approach in Prabhakaran2015 integrates Adaptive Message Passing Interface (AMPI) AMPI06, a Charm++-based MPI implementation, with the Torque/Maui job scheduler to address malleable jobs. This integration establishes a communication interface between the Charm++ runtime and Torque/Maui.
+
+Elastic MPI compres_infrastructure_2016 provides the infrastructure and API extensions for running malleable MPI applications, utilizing Slurm and MPICH. Applications using this API can periodically detect reconfiguration events triggered by Slurm. MPICH is also extended with new functions to replace or enhance its standard implementation. However, this approach is limited to MPICH, lacks support for other MPI implementations, and does not handle data redistribution.
+
+The authors in bhattarai_dynamic_2024 present a combination of workflow manager and resource management system that can accommodate a fine-grain elastic resource allocation during the execution of a workflow based on the Parsl workflow manager and PMIx-enabled SLURM.
+
+Thanks to these advancements, malleability is becoming an increasingly accessible technology. As expected, these solutions introduce overhead during data redistribution, whether by loading data from disk or transferring it over the network. Nevertheless, the scheduling overhead in solutions that integrate with resource management systems (RMS) is reported to be negligible.
+
+Originally, DMRlib was built using Nanos++ (the OmpSs runtime) and Slurm as PDR and RMS, respectively. In this work, the DMRlib design has been refactored to support various PDR and RMS systems. Specifically, we introduce the Dynamic Resource Manager (DMR) as a universal programming layer for dynamic resources, with DMRlib acting as the communication layer between the application, the PDR, and the RMS. Particularly, the original work iserte_towards_2025 introduced in the new modular design the support for standard MPI, the most common distributed parallel programming paradigm in supercomputers, as the PDR of the framework.
+
+Beyond spawn-based solutions, modern approaches to dynamic process management are emerging, leveraging MPI Process Sets (PSets)—a key concept introduced in MPI 4.0 under the MPI Sessions model. Although implementation varies across MPI distributions, efforts such as ParaStation MPI partec_docs and Dynamic Processes with PSets (DPP) huber_towards_2022 are expanding their applicability in the context of dynamic resources. In this space, DMR provides seamless support for DPP huber_bridging_2025 and it is ready to enable users to run applications across different malleability backends with the same frontend code.
+
+## 4 Optimizing Resource Utilization
+
+This section outlines the implemented features at each level: malleability framework, malleability engine, and malleable application.
+
+### 4.1 Dynamic Resource Management
+
+Originally, DMRlib was introduced as a framework for managing dynamic resources within HPC applications, offering a user-friendly syntax to ease the development of malleable codes (see Section 2.1). However, the renewed interest in dynamic resource management has led several institutions to develop their own frameworks targeting similar goals.
+
+In the absence of standardized malleability support in MPI, DMRlib fills this gap by offering backend-agnostic support for various reconfiguration runtimes. This abstraction allows both application source code and end users to remain unaware of the specific mechanisms managing resources and processes behind the scenes, significantly lowering the barrier to adopting dynamic execution models.
+
+In particular, an excision of DMRlib is created to provide a user API independent of the underlying dynamic resource manager. This excision is illustrated in Figure 2 in the layer “DMR”, which is responsible for hiding the dynamic resources frameworks from the users.
+
+DMR is extended with an interoperability interface for the new version of DMRlib, as it was done for DPP huber_bridging_2025. Besides, DMRlib is expanded with a pure-MPI backend able to operate without OmpSs, which was a strong dependency in the previous version Iserte2020. Although the logic is similar, DMRlib, alternatively, substitutes OmpSs pragma directives and Nanos++ runtime operations in favor of MPI standard functions, allowing the DMR interface for DMRlib to rely solely on MPI.
+
+In this regard, scientific applications can enable dynamicity by leveraging the new DMR API. Listing 1 contains the three mandatory interfaces to include in the user code. These wrappers expect a series of user functions to perform the operations during the execution initialization and finalization (the first and third in the listing, respectively) and the data redistribution functions (the second) in the case of a resize.
+
+Figure 2: Dynamic Management of Resources Software Stack
+
+Listing 1: DMR interfaces.
+
+DMR_INIT( initialize(…), redistribution(…) );
+
+DMR_RECONFIGURE( redistribution(…) );
+
+DMR_FINALIZE( finalize(…) );
+
+While DMR_INITIALIZE and DMR_FINALIZE can be invoked at the beginning and the end of the code, respectively, DMR_RECONFIGURATION is called whenever the execution is ready to be reconfigured, in other words, at synchronization points. For instance, iterative applications, such as multiphysics simulations VAZQUEZ201615, present a main loop in which each iteration corresponds to a complete time step where the processes are synchronized previously to continue with the next time step. That structure can be seen as a periodic reconfiguration point to trigger malleability.
+
+At that point, if the RMS determines to reconfigure the job, data must be redistributed accordingly to the user function “redistribution”. For this purpose, this function is called when target processes have to set their data according to the current status of the execution. These data come from the parent processes sent during the reconfiguration stage.
+
+Following, the three basic DMR interfaces are introduced:
+
+•
+
+DMR_INITIALIZE: Listing 2 shows the DMR interface for DMRlib which discriminates between ranks initializing from scratch or receiving the state from former ranks.
+
+Listing 2: DMR_INITIALIZE interface for DMRlib.
+
+1#define DMR_INIT(initialize, redistribution) { \
+
+2 MPI_Comm_size(MPI_COMM_WORLD, &DMR_comm_size);\
+
+3 MPI_Comm_rank(MPI_COMM_WORLD, &DMR_comm_rank);\
+
+4 MPI_Comm_get_parent(&DMR_INTERCOMM); \
+
+5 if (DMR_INTERCOMM != MPI_COMM_NULL) { \
+
+6 redistribution; \
+
+7 MPI_Comm_disconnect(&DMR_INTERCOMM); \
+
+8 } else { \
+
+9 initialize; \
+
+10 } \
+
+11}
+
+•
+
+DMR_RECONFIGURE: Listing 3 contains the DMR interface for DMRlib, which in the case of a non-inhibited reconfiguration, determines the action and actuates accordingly, executing the data redistribution and detaching communicators before continuing.
+
+Listing 3: DMR_RECONFIGURE interface for DMRlib.
+
+1#define DMR_RECONFIGURATION(redistribution) { \
+
+2 if (!_inhibit_iter()){ \
+
+3 if (DMR_Reconfiguration( … )) { \
+
+4 redistribution; \
+
+5 DMR_Detach( … ); \
+
+6 } \
+
+7 } \
+
+8}
+
+•
+
+DMR_FINALIZE: Listing 4 illustrates the DMR interface for DMRlib which executes the user function “finalize”.
+
+Listing 4: DMR_FINALIZE interface for DMRlib.
+
+1#define DMR_FINALIZE(finalize) { \
+
+2 finalize; \
+
+3}
+
+To determine the reconfiguration action, this work leverages a Slurm resource selection plugin that supports malleability Iserte2020. When a malleable job triggers a reconfiguration, Slurm decides which action to take: nothing to continue with the current configuration, or expand or shrink to a specific number of processes.
+
+The Slurm plugin presented in this paper, select/natural, is an evolution of the plugin based on select/power2 iserte_towards_2025, which in turn was based on select/linear. Algorithm 1 depicts how select/natural determines the resultant number of nodes assigned to the job after a reconfiguration, if applicable. As its name suggests, select/natural allows reconfigurations to or from any natural number of nodes, offering greater flexibility compared to its predecessor, select/power2, which restricts resizes within only powers of two values.
+
+This policy aims to maximize the resource utilization rate. Specifically, the algorithm first checks if there are no pending jobs in the queue. If none exist, it expands the triggering job to its maximum possible size, provided resources are available. If there are pending jobs, the algorithm evaluates them to determine if one can be initiated using part of the resources currently allocated to the triggering malleable job. If feasible, the necessary nodes are released from the triggering job (never exceeding its given minimum size), and the selected pending job is given the highest priority to be initiated. If no awaiting job can be started, the algorithm attempts to expand the triggering job, if resources permit.
+
+Algorithm 1 Reconfiguration policy implemented in the Slurm plugin select/natural
+
+$resultant\_nodes\leftarrow 0$
+
+if not $pending\_jobs()$ then
+
+if $available\_resources()$ then
+
+$resultant\_nodes\leftarrow expand\_to()$
+
+end if
+
+else
+
+if $job\_can\_be\_initiated\_with\_my\_resources()$ then
+
+increase_selected_pending_job_priority()
+
+$resultant\_nodes\leftarrow shrink\_to()$
+
+else
+
+if $available\_resources()$ then
+
+$resultant\_nodes\leftarrow expand\_to()$
+
+end if
+
+end if
+
+end if
+
+return $resultant\_nodes$
+
+### 4.2 Reconfiguration Engine
+
+DMRlib is enhanced with MaM’s robust process spawning and data redistribution capabilities. In this work, MaM replaces the original reconfiguration engine in DMRlib, as illustrated in Figure 2. In this regard, DMRlib leverages MaM features without interfering with other functionalities such as the communication with Slurm, as well as performance-aware (via TALP talp) and energy-aware (via EAR ear) reconfiguration policies.
+
+For example and analogously to the DMRlib interface presented in listings 2, 3, and 4, listings 5, 6, and 7 contain the respective DMR interfaces for MaM. These are the three interfaces:
+
+•
+
+DMR_INITIALIZE: Listing 5 presents the DMR interface for MaM, where the initialization tasks are performed. First, the MaM resize engine is initialized (line 2), determining if the processes pertain to the source or target group. For the source ranks, DMR initializes its basic data structures and registers in MaM the data that should be redistributed upon future resizes (line 11). Conversely, if the ranks are in the target group, each retrieves its data (line 6), and the root process (line 7) waits for the Slurm confirmation to ensure that the reconfiguration has been completed before proceeding (line 8).
+
+Listing 5: DMR_INITIALIZE interface for MaM.
+
+1#define DMR_INIT(initialize, redistribution) { \
+
+2 MaM_is_children = MAM_Init(&DMR_COMM); \
+
+3 MPI_Comm_size(DMR_COMM, &DMR_comm_size); \
+
+4 MPI_Comm_rank(DMR_COMM, &DMR_comm_rank); \
+
+5 if (MaM_is_children) { \
+
+6 DMR_Retrieve_data(redistribution, … );\
+
+7 if (DMR_comm_rank == 0) { \
+
+8 DMR_Wait_stabilization( … ); \
+
+9 } \
+
+10 } else { \
+
+11 DMR_Set_basic_data(initialize, … ); \
+
+12 } \
+
+13}
+
+•
+
+DMR_RECONFIGURE: Listing 6 illustrates the DMR interface for MaM during reconfiguration. In this case, DMR first communicates with Slurm to determine whether a resize operation (global variable DMR_action) should occur (line 3). If a resize is required, MaM dynamically adjusts the application to the new resource allocation (line 6). Since MaM supports background resizing, the function may be called multiple times until the process is fully completed. Once the resize finishes, DMR returns the unneeded resources and notifies MaM to terminate any excess processes (line 8). Then, the data redistribution is concluded according to the resize action (line 9).
+
+Listing 6: DMR_RECONFIGURE interface for MaM.
+
+1#define DMR_RECONFIGURATION(redistribution) { \
+
+2 if (!_inhibit_iter() && DMR_action < 1) { \
+
+3 DMR_action = DMR_Reconfiguration( … );\
+
+4 } \
+
+5 if (DMR_action >= 1) { \
+
+6 MAM_Checkpoint(&MaM_state, MAM_CHECK_COMPLETION); \
+
+7 if (MaM_state == MAM_COMPLETED) { \
+
+8 DMR_Detach( … ); \
+
+9 redistribution; \
+
+10 } \
+
+11 } \
+
+12}
+
+•
+
+DMR_FINALIZE: Listing 7 contains the DMR interface for MaM. During the finalization, the interface ensures that non-blocking reconfigurations are terminated (line 2) and cleans up the memory (lines 4 and 5).
+
+Listing 7: DMR_FINALIZE interface for MaM.
+
+1#define DMR_FINALIZE(finalize) { \
+
+2 if (MaM_state == MAM_PENDING) \
+
+3 MAM_Checkpoint(&MaM_state, MAM_WAIT_COMPLETION); \
+
+4 finalize; \
+
+5 MAM_Finalize(); \
+
+6}
+
+Notice that MaM has been extended to dynamically select the most suitable resizing technique of its catalog iker_spawn; iker_redistribution. Algorithm 2 describes the procedure created to determine which strategy minimizes the cost of reconfiguring. By default, the algorithm selects the Parallel strategy for process spawning and the Collective method for data redistribution. In addition, the Merge method is set as the default choice for both expansions and shrinkages. An exception is made in shrinkage scenarios where the number of target processes is smaller than the number of original ranks (i.e., the size of the communicator at job startup); in such cases, the Baseline method with intra-communicators is preferred.
+
+Algorithm 2 Procedure to configure MaM parameters.
+
+if $user\_has\_custom\_config()$ then
+
+return
+
+end if
+
+$spawn\_strat\leftarrow MAM\_SPAWN\_PARALLEL$
+
+$redist\_method\leftarrow MAM\_RED\_COLLECTIVE$
+
+if $is\_expanding()$ then
+
+$spawn\_method\leftarrow MAM\_SPAWN\_MERGE$
+
+else
+
+$global\_original\_ranks\leftarrow check\_global\_internodes\_qty()$
+
+$numT\leftarrow get\_number\_targets()$
+
+if $numT<global\_original\_ranks$ then
+
+$spawn\_method\leftarrow MAM\_SPAWN\_BASELINE$
+
+$spawn\_strat\leftarrow MAM\_SPAWN\_INTRACOMM$
+
+else
+
+$spawn\_method\leftarrow MAM\_SPAWN\_MERGE$
+
+end if
+
+end if
+
+return
+
+### 4.3 Malleable Application
+
+MPDATA has been extended to support malleability. Listing 8 showcases the main function of the malleable version of MPDATA and how DMR API and MaM are leveraged.
+
+The listing illustrates an iterative MPI application, incorporating the necessary logic to enable dynamic resource management with DMR. In particular, line 4 initializes the environment. Line 5 defines the malleability limits, specifying the lower and upper bounds. Meanwhile, line 6 introduces an inhibitor to prevent consecutive reconfiguration checks. The "MIN" and "MAX" values are detailed in Table 3 in Section 5. At the end of each iteration, unless inhibited, a reconfiguration is evaluated (line 10). If a resize is scheduled, the operation described in Listing 6 is performed. Finally, the program releases memory and terminates.
+
+Listing 8: MPDATA main function.
+
+1void main(int argc, char **argv) {
+
+2 MPI_Init_thread(&argc, &argv, MPI_THREAD_MULTIPLE, NULL);
+
+3 init(); // initialization
+
+4 DMR_INIT(mam_set(), mam_retrieve());
+
+5 DMR_Set_parameters(MIN, MAX);
+
+6 DMR_Inhibit_iter(INH_ITERS);
+
+7 while (DMR_it < TIME_STEPS) { // main loop
+
+8 update(); // halo exchange
+
+9 mpdata3d(); // computation
+
+10 DMR_RECONFIGURE(mam_retrieve(), release());
+
+11 }
+
+12 DMR_FINALIZE(release()); // finalize
+
+13 MPI_Finalize();
+
+14}
+
+MaM implements predefined data redistribution patterns. For this purpose, MaM can redistribute 1D data with just a few hints from the user. Listing 9 shows the functions in MPDATA to indicate which data will be redistributed. Furthermore, mam_set is invoked once by the source processes to declare the data pointers within the MaM runtime. This function requires an MPI derived datatype, created in create_slice_datatype, representing slices along the $N$ dimension. Each slice is treated as a single data unit containing all the values across the $M$ and $L$ dimensions. As a result, data can be represented as a flattened array in the $N$ dimension. Finally, mam_retrieve is called by the target processes to obtain the new pointers of the redistributed data. It is important to note that these functions do not perform any communications, only declare/retrieve data for/from a redistribution.
+
+Listing 9: Redistribution functions for MaM.
+
+1real *x_, *u1_, *u2_, *u3_; // Data to redistribute
+
+2
+
+3void create_slice_datatype(MPI_Datatype *slice) {
+
+4 int dimension_size = (M + 1) * (L + 1);
+
+5 MPI_Type_contiguous(dimension_size, mpi_real, slice);
+
+6 MPI_Type_commit(slice);
+
+7}
+
+8void mam_set() {
+
+9 real *redist_arrays[] = {x_, u1_, u2_, u3_};
+
+10 int halo_size = HALO * (M + 1) * (L + 1);
+
+11 for (int i=0; i<4; i++) {
+
+12 MAM_Data_add(redist_arrays[i] + halo_size, NULL, N, slice, MAM_DATA_DISTRIBUTED, MAM_DATA_VARIABLE);
+
+13 }
+
+14}
+
+15void mam_retrieve() {
+
+16 release(); // Release previous memory
+
+17 init(); // Allocate new memory
+
+18 real *aux_array;
+
+19 real *redist_arrays[] = {x_, u1_, u2_, u3_};
+
+20 int local_size = n * (M + 1) * (L + 1);
+
+21 int halo_size = HALO * (M + 1) * (L + 1);
+
+22 for (int i=0; i<4; i++) {
+
+23 MAM_Data_get_pointer(&(aux_array), i, NULL, NULL, MAM_DATA_DISTRIBUTED, MAM_DATA_VARIABLE);
+
+24 memcpy(redist_arrays[i] + halo_size, aux_array, size_real * local_size);
+
+25 }
+
+26}
+
+In our original conference paper iserte_towards_2025, the malleable version of MPDATA supported resizing, but it was limited to process counts that were powers of two. This restriction simplified load balancing before malleability was implemented. However, to improve resource utilization, the load-balancing mechanism has been improved to allow any natural number of processes.
+
+In addition, the $N$ -dimension of the 3D grid (with dimensions $N$ , $M$ , and $L$ ) was evenly divided among the processes. As a result, the number of processes, SIZE, needed to be a divisor of the grid size in the $N$ -dimension, ensuring that each process owned an equal number of elements along this dimension. In the new approach, a block distribution along the $N$ -dimension is also applied, considering the case where the size of the $N$ -dimension is not a multiple of the number of processors, so that the difference between the maximum and the minimum of elements is one. Listing 10 illustrates the updated procedure for computing the local grid sizes. In this implementation, RANK represents the rank of the process, and $N$ , $M$ , and $L$ correspond to the grid size dimensions.
+
+This enhancement allows MPDATA to make full use of available resources and leverage all the features provided by MaM.
+
+Listing 10: Optimized load balancing procedure for MPDATA allowing any natural number of processes.
+
+1void get_distribution() {
+
+2 int exp_qty = N / SIZE;
+
+3 int rem = N % SIZE;
+
+4 int ini, end;
+
+5 if(RANK < rem) { // First subgroup
+
+6 ini = RANK * exp_qty + RANK;
+
+7 end = ini + (exp_qty + 1);
+
+8 } else { // Second subgroup
+
+9 ini = RANK * exp_qty + rem;
+
+10 end = ini + exp_qty;
+
+11 }
+
+12 n = end - ini;
+
+13 local_grid = (n + 2 * HALO) * (M + 1) * (L + 1);
+
+14}
+
+## 5 Experimental Results
+
+This section details the experimental platform and its configuration. The experiments evaluate Baseline and Merge reconfiguration techniques and their asynchronous versions.
+
+### 5.1 Setup
+
+The evaluation is performed in the general-purpose partition of the Marenostrum 5 (MN5) supercomputer, a pre-exascale machine integrated into the EuroHPC-JU European supercomputing infrastructure. The nodes of this partition are based on Intel Sapphire Rapids (4th generation of Intel Xeon Scalable Processors), each one equipped with two Intel Xeon Platinum 8480+, with 56 cores each, running at 2 GHz, for a total of 112 cores and 256 GB of DDR5 memory. The nodes are interconnected through a 100 Gbit/s ConnectX-7 NDR200 InfiniBand network.
+
+Regarding the software stack, the executions rely on MPICH-4.2.1 and a customized version of Slurm-17.02.0-0pre1 to support malleability included in the dynamic resource management framework DMRlib. In turn, DMRlib is configured with the MaM reconfiguration engine to enable process layout reshaping, as detailed in Section 4.2. Slurm is deployed using a node running the Slurm controller daemon, while the remaining nodes act as compute nodes. Slurm is configured with sched/backfill, priority/multifactor, and the custom select/natural (introduced in Section 4.1) plugins.
+
+The experiments are scoped within 32 nodes for up to 2 hours, which fits in the QoS of the debug partition in MN5. Notice that a node from the allocation acts as the controller, while the remaining 31 nodes act as actual compute nodes.
+
+To deploy the experiments, DMRlib is launched within a standard Slurm allocation using an sbatch submission. Once the resources are granted, the nested malleable Slurm instance is deployed within the allocated environment. Interactions with either the parent or nested Slurm instance are seamlessly managed through the appropriate configuration of environment variables, allowing direct commands to the intended scheduler context.
+
+Each experiment will execute a workload of 30 jobs instantiating MPDATA in three different flavors. In addition, each experiment is repeated five times to obtain more reliable statistics. Table 1 describes how jobs are classified depending on their problem size (PS) and the number of iterations.
+
+Table 1: MPDATA Configuration.
+
+| Type | Problem Size (PS) | Iterations |
+| --- | --- | --- |
+| Small | 8,192 x 2,048 x 128 | 20 |
+| Medium | 8,192 x 4,096 x 128 | 60 |
+| Large | 8,192 x 8,192 x 128 | 100 |
+
+In this regard, Table 2 showcases the 10-sample average iteration times for different quantities of nodes and job types.
+
+Table 2: MPDATA iteration times ( $T_{i}$ ) for different number of nodes ( $N_{i}$ ) and configuration types.
+
+| Nodes ( $N_{i}$ ) | Small | Medium | Large |
+| --- | --- | --- | --- |
+| 1 | 8.90 s. |
+| 2 | 3.40 s. | 8.70 s. |
+| 3 | 2.20 s. | 5.30 s. |
+| 4 | 1.47 s. | 3.80 s. | 12.20 s. |
+| 5 | 1.31 s. | 3.14 s. | 6.10 s. |
+| 6 | 1.20 s. | 2.84 s. | 5.40 s. |
+| 7 | 1.14 s. | 2.54 s. | 4.80 s. |
+| 8 | 1.09 s. | 2.28 s. | 4.65 s. |
+| 9 | 1.06 s. | 2.19 s. | 4.44 s. |
+| 10 | 1.01 s. | 2.09 s. | 4.39 s. |
+| 11 | 0.99 s. | 2.23 s. | 4.19 s. |
+| 12 | 1.08 s. | 2.24 s. | 4.18 s. |
+
+This scalability analysis is performed by running a process per core, for a total of 112 ranks per node, corresponding to the 112 cores per node available in MN5. The study reveals how times reach an asymptote as long as the iterations are run with more processes. Particularly, Figure 3 depicts how the different MPDATA configurations behave in terms of normalized efficiency (ranging from 0 to 1), which is calculated using the following equation:
+
+| $$\text{Normalized Efficiency}=\frac{\text{Efficiency}-\text{Min}}{\text{Max}-% \text{Min}},$$ | (2) |
+| --- | --- |
+
+where:
+
+•
+
+Efficiency is the actual value to be normalized,
+
+•
+
+Min is the minimum efficiency in the series, and
+
+•
+
+Max is the maximum efficiency in the series.
+
+The efficiency for a given configuration of nodes, denoted as $E_{i}$ , is computed using:
+
+| $$E_{i}=\frac{S_{i}}{{N_{i}}/{N_{0}}},$$ | (3) |
+| --- | --- |
+
+where:
+
+•
+
+$N_{0}$ is the minimum number of nodes required to successfully run an instance of MPDATA for a given problem size,
+
+•
+
+$N_{i}$ is the number of nodes used in the configuration, and
+
+•
+
+$S_{i}$ is the speedup, calculated as $S_{i}=\frac{T_{0}}{T_{i}}$ , being $T_{0}$ the iteration time with $N_{0}$ nodes, and $T_{i}$ is the iteration time with $N_{i}$ nodes.
+
+The same 30-job workload is leveraged in all the experiments. The workload is presented in two flavors: static and dynamic; Depending whether its jobs are malleable.
+
+Static jobs are submitted with the maximum number of nodes that provide an efficiency not lower than the efficiency achieved in $N_{0}$ . Thanks to Figure 3, we can spot those maximums in the node configurations where the efficiency drops below $N_{0}$ (in the figure those events are highlighted with a pointer). Column “Max. Nodes” in Table 3 summarizes the number of nodes for each type of job. Dynamic jobs are configured to work within a given range of nodes. While the upper limit matches the static configuration for each type, the lower limit corresponds to the $N_{0}$ configuration, as column “Min. Nodes” in Table 3 contains. Additionally, malleable jobs activate a DMRlib mechanism that prevents reconfigurations for four consecutive iterations.
+
+Figure 3: MPDATA normalized efficiency.
+
+Table 3: Jobs Configuration.
+
+| Type | Likelihood | Min. Nodes ( $N_{0}$ ) | Max. Nodes |
+| --- | --- | --- | --- |
+| Small | 20% | 1 | 8 |
+| Medium | 20% | 2 | 6 |
+| Large | 60% | 4 | 11 |
+
+Jobs are included in the workload following a weighted random function honoring the likelihoods in Table 3 for each job type. Furthermore, the Feitelson model Feitelson1996, configured with a mean interarrival time of $10$ , is used to determine the delays among consecutive job submissions.
+
+### 5.2 Performance Analysis
+
+The workload is executed in two configurations: static and dynamic. For the dynamic execution, two reconfiguration techniques are evaluated, Baseline and Merge (see Section 2.3).
+
+Figure 4 presents the completion times of the three workload types in seconds. Each bar is labeled with its corresponding speedup relative to the first bar, which represents the workload executed without malleability. The second (Baseline) and third (Merge) bars correspond to dynamic workloads.
+
+Figure 4: Workload Median Completion Times.
+
+The results demonstrate a makespan reduction for dynamic workloads around 41% compared to the static approach. Between dynamic workloads, no substantial performance difference is observed. This similarity is attributed to the negligible overhead of reconfigurations compared to overall execution time. A more detailed analysis of these results follows next.
+
+Figure 5 depicts the median wait, run, and turnaround (sum of wait and run) times for the three job types (see tables 1 and 3) in each workload. The median is a representative metric when data are not normally distributed; besides, each bar is labeled with the corresponding speedup relative to the static workload times.
+
+Figure 5: Median waiting, running, and turnaround times for jobs.
+
+(a) Large jobs.
+
+(b) Medium jobs.
+
+(c) Small jobs.
+
+Among the job types, only large jobs significantly benefit from dynamic resource management, achieving a substantial reduction in wait time with a speedup of $2.65\times$ , leading to a turnaround time speedup of around $1.5\times$ . However, the run time increases because jobs are not always executed with the upper limit of resources, unlike in the static configuration.
+
+Dynamic medium and small jobs are completed approximately $0.4\times$ slower because of the waiting time. In that scenario, large jobs can be initiated with fewer resources, which reduces the available resources to backfill smaller jobs. However, as shown in Figure 4, the overall completion time improves, since large jobs dominate execution time, accounting for approximately $85\%$ of the workload time, compared to the medium and small jobs, contributing with $10\%$ and $5\%$ of the time, respectively. As a result, the turnaround time speedup in large jobs is the main factor driving the overall workload efficiency gains.
+
+Figure 6 illustrates the resource utilization rate for each workload type over its lifetime, with vertical dotted lines of the same color marking the point at which the waiting queue becomes empty for each experiment. An additional vertical dashed black line is shown near the start of the execution and marks the point at which all jobs have been submitted.
+
+Figure 6: Median resource utilization rate for the different experiments.
+
+Both dynamic approaches consistently achieve higher resource utilization than the static counterpart. Initially, utilization remains around $90\%$ in the static configuration, since small and medium jobs fill available idle resources. However, once these jobs are completed, utilization drops to $70\%$ , since only large jobs remain, and no more than two can fit together. As a result, some nodes remain idle for the rest of the workload, leading to an overall mean utilization of $75.89\%$ .
+
+In contrast, the dynamic approaches maintain nearly $100\%$ utilization throughout their lifetime, except during brief moments of job resizes and terminations. These approaches achieve mean utilizations of $96.74\%$ for the Baseline method and $96.01\%$ for the Merge method.
+
+In addition, the resource utilization rate shows why there is an increase in the wait time for medium and small jobs. In the first few minutes of all workloads, all jobs are submitted. In static workloads, all medium and small jobs begin execution between timestamps $0$ and $1150$ , whereas in dynamic workloads, execution is distributed across the entire period. As a result, waiting times of medium and small jobs are reduced for the static workload.
+
+Figure 7 presents the medians of spawn time, data redistribution time, and total resize time for Baseline and Merge methods. Each bar counts with a label indicating the speedup relative to the Baseline method for the corresponding metric.
+
+Figure 7: Median reconfiguration times.
+
+The spawn time is reduced in the Merge method, primarily due to the need to spawn fewer processes—or none at all during shrinkages. Conversely, the data redistribution time favors the Baseline method, yet, they have no significant statistical differences. To validate this observation, a Mann-Whitney U test was conducted to determine whether the medians of the two datasets are statistically different. This test accepted the null hypothesis of equal medians for the data redistribution time. The total resize time confirms that the Merge method is the optimal approach for resizing, achieving a speedup of $1.15\times$ . The Mann-Whitney U test further supports this result by rejecting the null hypothesis of equal medians, indicating that the Merge method has a significantly smaller median resize time.
+
+Despite the difference in resize time, the Baseline method slightly outperforms the Merge method in workload makespan and job turnaround time. This pattern has been consistent across the five experiments conducted for each workload type. Statistical tests applied to these metrics accepted the null hypothesis, showing no significant difference in medians.
+
+In summary, although the Merge method reduces resize time, this improvement does not translate into a significant impact on overall workload metrics, because the time spent on resizing is relatively small. Nevertheless, the Merge method’s ability to avoid oversubscription states makes it preferable to Baseline, since it needs less memory to reconfigure. Specifically, $M_{B}\gg M_{M}$ , where $M_{B}$ and $M_{M}$ represent the maximum memory required during a reconfiguration for Baseline and Merge, respectively.
+
+Equation 4 defines the memory required for reconfiguring in the Baseline Method, where $PS$ denotes the problem size, and $NS$ and $NT$ are the number of source and target ranks, respectively, at the beginning and end of the reconfiguration process.
+
+| $$M_{B}=\frac{PS}{NS}+\frac{PS}{NT}+C$$ | (4) |
+| --- | --- |
+
+Similarly, Equation 5 defines the memory required for reconfiguring using the Merge method. It is important to note that, in both cases, there is a constant amount of memory ( $C$ ) required by MaM to internally register part of the application data.
+
+| $$M_{M}=\frac{PS}{min(NS,NT)}+C$$ | (5) |
+| --- | --- |
+
+More importantly, dynamic workloads nearly maximize resource utilization, reduce workload makespan, and improve the median job turnaround time. These benefits highlight the critical role of dynamic resource management techniques in enhancing productivity and efficiency.
+
+### 5.3 Asynchronous Reconfigurations
+
+The following analysis considers the usage of asynchronous reconfiguration strategies provided by MaM. With these approaches the application continues iterating while the resize is performed in the background. As such, the asynchronous counterparts of the dynamic workloads have been executed and studied, particularly the Baseline asynchronous (BaselineAsync) and the Merge asynchronous (MergeAsync).
+
+Table 4 presents the median makespan and resource utilization rate for each experiment. Compared to the synchronous counterparts, the use of background resizing techniques increases the completion time, resulting in a speedup of approximately $0.95\times$ , while reducing resource utilization by around $2\%$ , regardless of the chosen method. However, a more in-depth analysis is needed to identify the specific factors contributing to the performance degradation observed with background resizing.
+
+Table 4: Median workload metrics.
+
+| Experiment | Makespan | Utilization |
+| --- | --- | --- |
+| Static | 4,567 s. | 75.89% |
+| Baseline | 2,655 s. | 96.74% |
+| Merge | 2,685 s. | 96.01% |
+| BaselineAsync | 2,778 s. | 94.60% |
+| MergeAsync | 2,790 s. | 95.48% |
+
+Figure 8 shows the median wait, run, and turnaround times for the three different job types in each experiment. Each bar includes a label indicating the speedup relative to Baseline synchronous.
+
+Figure 8: Median waiting, running, and turnaround times for jobs in the dynamic workloads.
+
+(a) Large jobs.
+
+(b) Medium jobs.
+
+(c) Small jobs.
+
+When tackling large jobs, the choice of reconfiguration method does not significantly impact performance. The observed differences in runtime are primarily due to the inherent variability of the execution operation itself, not the chosen strategy. However, for medium jobs, some differences emerge. The Merge methods achieve a speedup in runtime of $1.2\times$ , but since turnaround time is monopolized by the waiting time, this does not significantly affect turnaround time. This improvement is mainly due to the Merge method preventing oversubscription effects during reconfigurations. The BaselineAsync method demonstrates a more substantial degradation by reducing its jobs run time to $0.78\times$ .
+
+For small jobs, all methods perform worse compared to the synchronous Baseline method. Their wait time speedup decreases to approximately $0.9\times$ , with only a slight increase in the run time. Since wait time dominates the turnaround time for small jobs, all methods result in longer overall turnaround times.
+
+These slight increments in the jobs turnaround times align with the results in Table 4, which show speedups ranging from $0.95\times$ to $0.98\times$ for Merge, BaselineAsync, and MergeAsync methods.
+
+Figure 9 presents the median times of process spawning, data redistribution, and total resize, for all the dynamic experiments. Each bar includes a label indicating the speedup relative to the Baseline method for the corresponding metric.
+
+Figure 9: Median reconfiguration times with asynchronous experiments.
+
+In both asynchronous methods, the speedup is primarily reduced due to the spawn time, which decreases by $0.34\times$ for BaselineAsync and $0.59\times$ for MergeAsync. This slowdown occurs because spawning processes in the background require creating a separate thread for each rank. However, data redistribution time remains unaffected, since it relies on MPI’s non-blocking functions.
+
+As a result, the total resize time increases, with speedups of $0.22\times$ for BaselineAsync and $0.38\times$ for MergeAsync. These findings indicate that asynchronous approaches are not beneficial for reducing resize times. Moreover, they may negatively impact jobs run times, ultimately affecting makespan times.
+
+Table 5 provides the median values for the accumulated resize time over the workload, the number of iterations performed during asynchronous reconfigurations, and the speedup of those iterations. The iteration speedup ( $IS$ ), calculated as $IS=\frac{T_{o}}{T_{a}}$ , compares the iteration time ( $T_{o}$ ) for a given node configuration (see Table 2) with its asynchronous iteration time ( $T_{a}$ ) counterpart.
+
+Table 5: Median reconfiguration metrics.
+
+| Experiment | Accumulated | Overlapped | Speedup |
+| --- | --- | --- | --- |
+| Resize Time | Iterations | ( $IS$ ) |
+| Baseline | 189.43 s. | 0 | $1\times$ |
+| Merge | 112.88 s. | 0 | $1\times$ |
+| BaselineAsync | 678.73 s. | 197 | $0.41\times$ |
+| MergeAsync | 428.78 s. | 187 | $0.60\times$ |
+
+Synchronous reconfigurations accounts for approximately $5\%$ to $7\%$ of the total workload makespan. This overhead is negligible compared to the overall reduction in execution time achieved through dynamic resource utilization.
+
+In contrast, for asynchronous reconfigurations, resizing overhead lies between $15\%$ and $25\%$ of the workload makespan. This increase is due to iterations continuing while a resize occurs in the background. However, during this period, around 200 iterations are executed, albeit at a reduced speedup of approximately $0.5\times$ , meaning each iteration takes twice as long.
+
+The primary reason asynchronous methods are not preferred is this slowdown, combined with the fact that most resizes involve expanding the job. When increasing resources, the new iteration time will naturally be shorter, making resizing as soon as possible more beneficial than performing additional iterations with a reduced speedup.
+
+## 6 Applicability
+
+This work has focused on a single application (MPDATA) to generate the workload for our evaluation. However, the results are consistent with prior studies involving DMR and other malleability frameworks aliaga_survey_2022. For example, one of the most comprehensive evaluations Iserte2020 included a mix of four different applications, generating both homogeneous and heterogeneous workloads with varying proportions of dynamic jobs. Drawing from that work and the outcomes presented in this paper, we can extrapolate that dynamic resource management proves especially beneficial for workloads composed of malleable jobs with limited scalability. In contrast, applications that exhibit near-perfect scalability may not benefit significantly from malleability, as they already make efficient use of resources.
+
+In terms of general applicability to other codes beyond MPDATA, the DMR framework provides a structured logic centered on initialization, reconfiguration, and finalization phases. This approach allows many existing HPC applications to be adapted for malleability, as demonstrated in previous work Iserte2020; Iserte2019a. Applications must be able to define a clear initialization phase that can be executed at launch and after each reconfiguration, a reconfiguration phase to redistribute data, and a finalization step to properly release memory. While certain large-scale codes cannot be made malleable out of the box, the modularity and abstractions provided by DMR significantly reduce the porting effort. Ongoing work within the DMR team is currently focused on extending malleability support to such complex applications.
+
+It is also worth noting that the proposed resource selection policy, select/natural, developed for the Slurm plugin system, operates independently of existing job scheduling and prioritization plugins such as sched/backfill and priority/multifactor. Establishing coordination between these components could pave the way for holistic scheduling strategies that better integrate dynamic jobs into the global queue, optimizing both resource assignment and job throughput. This is a worthwhile branch to explore in the field of scheduling.
+
+Finally, the current work and its evaluation rely on MPICH-4.1, the MPI distribution supported by Proteo’s malleability engine. While most MPI libraries comply with the MPI standard mpi_forum_mpi_2015, their internal implementations vary, particularly in how certain operations are handled. Therefore, extending MaM to support other MPI implementations, such as Open MPI, is a natural and necessary future direction to broaden its applicability. DMR will seamlessly integrate MaM versions.
+
+## 7 Conclusions
+
+This work addresses the need for a dynamic resource manager that adheres to the standard MPI, supports multiple reconfiguration strategies, integrates seamlessly with a widely used HPC resource management system such as Slurm, and remains easy to use for scientific application developers. To meet these requirements, we have developed and evaluated DMR as a production-ready dynamic resource management solution that enhances flexibility, adaptability, and efficiency in modern HPC environments.
+
+A review of the state of the art reveals a lack of a transversal dynamic resource manager that spans both the parallel runtime and the resource manager while relying on standard MPI implementations and widely adopted RMS frameworks. DMR fills this gap by enabling standardized dynamic resource management and democratizing its adoption. Through its integration with Slurm and support for standard MPI, DMR provides a unified approach that simplifies malleability and resource elasticity in HPC workloads.
+
+To showcase its capabilities, we implemented the MaM interfaces for DMR and developed a malleable version of the MPDATA application. Additionally, we established a synergy between MaM and DMRlib, allowing seamless support for Slurm while incorporating advanced spawning strategies. These integrations demonstrate the versatility of DMR in supporting a wide range of reconfiguration methods while remaining transparent and user-friendly.
+
+Experimental results confirm that our dynamic resource management approach significantly improves efficiency with minimal programming effort. Our findings indicate that enabling dynamic resource allocation allows a workload to be completed in just 60% of the time required by a static configuration while increasing over $20\%$ the resource utilization. This highlights the practical benefits of dynamic malleability, reinforcing its value for HPC workloads.
+
+Furthermore, this work also evaluates additional malleability strategies provided by MaM, including merging MPI communicators and asynchronous reconfigurations, which enhance the versatility of dynamic workloads. And, although these new strategies do not yield a significant performance improvement in the evaluated workloads, they introduce new opportunities by avoiding the need to respawn all MPI ranks, thereby reducing memory consumption, as well as performing reconfigurations in the background when needed.
+
+With these advancements, we hope the DMR methodology to seed technology for integrating malleability into HPC environments, enabling smarter and more adaptive resource management strategies for next-generation supercomputing.
+
+## CRediT authorship contribution statement
+
+•
+
+Sergio Iserte: Conceptualization, Methodology, Investigation, Resources, Writing - Original Draft, Project administration.
+
+•
+
+Iker Martín-Álvarez: Methodology, Software, Investigation, Validation, Formal analysis, Data Curation, Writing - Original Draft.
+
+•
+
+Krzysztof Rojek: Formal analysis, Supervision.
+
+•
+
+José I. Aliaga: Software, Writing - Review & Editing, Supervision, Funding acquisition.
+
+•
+
+Maribel Castillo: Software, Formal analysis, Writing - Review & Editing, Supervision.
+
+•
+
+Weronika Folwarska: Software.
+
+•
+
+Antonio J. Peña: Writing - Review & Editing, Supervision, Funding acquisition.
+
+## Declaration of competing interest
+
+The authors have no conflicts of interest to declare that are relevant to the content of this article.
+
+## Funding sources
+
+The researchers from BSC are involved in The European PILOT project, which has received funding from the European High-Performance Computing Joint Undertaking (JU) under grant agreements No. 101034126 and No. PCI2021-122090-2A funded by MICIU/AEI/10.13039/501100011033 and EU NextGenerationEU/PRTR. They are also grateful for the support from the Department of Research and Universities of the Government of Catalonia to the AccMem (Code: 2021 SGR 00807). Antonio J. Peña was partially supported by the Ramón y Cajal fellowship RYC2020-030054-I funded by MCIN/AEI/10.13039/501100011033 and by “ESF Investing in your future”.
+
+The researchers from UJI have been funded by the project PID2023-146569NB-C22 supported by MICIU/AEI/10.13039/501100011033 and ERDF/UE. Researcher I. Martín-Álvarez was supported by the predoctoral fellowship ACIF/2021/260 from Valencian Region Government and European Social Funds.
+
+## Data availability
+
+The source codes for DMR (https://gitlab.bsc.es/siserte/dmr), MaM (https://lorca.act.uji.es/gitlab/martini/malleability_benchmark/-/tree/PPAM24-JournalSpecialIssue) and MPDATA (https://gitlab.bsc.es/siserte/mpdata-dmr) are publicly available. All data used to create the tables and figures in the Experimental Results section are available at https://doi.org/10.5281/zenodo.14812022.
+
+## References
+
+- [1] B. Sanderse, S. P. V. D. Pijl, B. Koren, Review of computational fluid dynamics for wind turbine wake aerodynamics, Wind Energy 14 (2011) 799–819. doi:10.1002/we.458.
+- [2] T. Kumaresan, J. B. Joshi, Effect of impeller design on the flow pattern and mixing in stirred tanks, Chemical Engineering Journal 115 (2006) 173–193. doi:10.1016/j.cej.2005.10.002.
+- [3] A. Guelfi, D. Bestion, M. Boucker, P. Boudier, P. Fillion, M. Grandotto, J. M. Hérard, E. Hervieu, P. Péturaud, NEPTUNE: A new software platform for advanced nuclear thermal hydraulics, Nuclear Science and Engineering 156 (2007) 281–324. doi:10.13182/NSE05-98.
+- [4] Y. Fayolle, A. Cockx, S. Gillot, M. Roustan, A. Héduit, Oxygen transfer prediction in aeration tanks using CFD, Chemical Engineering Science 62 (2007) 7163–7171. doi:10.1016/j.ces.2007.08.082.
+- [5] J. Dongarra, P. Luszczek, TOP500, Springer US, Boston, MA, 2011, pp. 2055–2057.
+- [6] EuroHPC Joint Undertaking, Discover EuroHPC JU, accessed: 2025-02-04 (2023). URL https://eurohpc-ju.europa.eu/about/discover-eurohpc-ju_en
+- [7] S. Iserte, R. Mayo, E. S. Quintana-Ortí, V. Beltran, A. J. Peña, DMR API: Improving cluster productivity by turning applications into malleable, Parallel Computing 78 (2018) 54–66.
+- [8] M. Chadha, J. John, M. Gerndt, Extending SLURM for dynamic resource-aware adaptive batch scheduling, CoRR abs/2009.08289 (2020).
+- [9] G. Sanchez-Gallegos, J. Garcia-Blas, C. Petre, J. Carretero, Malleable and adaptive ad-hoc file system for data intensive workloads in HPC applications, in: High Performance Computing, Springer Nature Switzerland, Cham, 2023, pp. 56–67. doi:10.1007/978-3-031-40843-4_5.
+- [10] S. Iserte, K. Rojek, A study of the effect of process malleability in the energy efficiency on GPU-based clusters, The Journal of Supercomputing (2019) 1–20 doi:10.1007/s11227-019-03034-x.
+- [11] A. Cascajo, A. Arbe, J. Garcia-Blas, J. Carretero, D. E. Singh, Malleable techniques and resource scheduling to improve energy efficiency in parallel applications, in: High Performance Computing, Springer Nature Switzerland, Cham, 2023, pp. 16–27. doi:10.1007/978-3-031-40843-4_25.
+- [12] S. Iserte, I. Martín-Álvarez, K. Rojek, J. I. Aliaga, M. Castillo, A. J. Peña, Towards the Democratization and Standardization of Dynamic Resources with MPI Spawning, in: Parallel Processing and Applied Mathematics, Springer Nature Switzerland, Cham, 2025, pp. 287–300. doi:10.1007/978-3-031-85697-6_19.
+- [13] I. Martín-Álvarez, J. I. Aliaga, M. Castillo, S. Iserte, Proteo: A framework for the generation and evaluation of malleable MPI applications, The Journal of Supercomputing (2024) 23083–23119 doi:10.1007/s11227-024-06277-5.
+- [14] P. K. Smolarkiewicz, Multidimensional positive definite advection transport algorithm: an overview, International Journal for Numerical Methods in Fluids 50 (10) (2006) 1123–1144. doi:10.1002/fld.1071.
+- [15] A. B. Yoo, M. A. Jette, M. Grondona, SLURM: Simple Linux Utility for Resource Management, in: 9th International Workshop in (JSSPP), 2003, pp. 44–60.
+- [16] K. Rojek, R. Wyrzykowski, Performance modeling of 3D MPDATA simulations on GPU cluster, The Journal of Supercomputing 73 (2) (2017) 664–675. doi:10.1007/s11227-016-1774-z.
+- [17] K. Rojek, R. Wyrzykowski, L. Kuczynski, Systematic adaptation of stencil-based 3D MPDATA to GPU architectures, Concurrency and Computation: Practice and Experience 29 (9) (2017) e3970.
+- [18] J. I. Aliaga, M. Castillo, S. Iserte, I. Martín-Álvarez, R. Mayo, A survey on malleability solutions for high-performance distributed computing, Applied Sciences 12 (10) (2022) 5231. doi:10.3390/app12105231.
+- [19] A. Tarraf, M. Schreiber, A. Cascajo, J.-B. Besnard, M.-A. Vef, D. Huber, S. Happ, A. Brinkmann, D. E. Singh, H.-C. Hoppe, A. Miranda, A. J. Peña, R. Machado, M. G. Gasulla, M. Schulz, P. Carpenter, S. Pickartz, T. Rotaru, S. Iserte, V. Lopez, J. Ejarque, H. Sirwani, F. Wolf, Malleability in Modern HPC Systems: Current Experiences, Challenges, and Future Opportunities, IEEE Transactions on Parallel and Distributed Systems (2024) 1–14Conference Name: IEEE Transactions on Parallel and Distributed Systems. doi:10.1109/TPDS.2024.3406764.
+- [20] R. Sudarsan, C. J. Ribbens, ReSHAPE: a framework for dynamic resizing and scheduling of homogeneous applications in a parallel environment, in: Proceedings of the International Conference on Parallel Processing, 2007.
+- [21] O. Sarood, A. Langer, A. Gupta, L. Kale, Maximizing throughput of overprovisioned HPC data centers under a strict power budget, in: SC14: International Conference for High Performance Computing, Networking, Storage and Analysis, IEEE, 2014, pp. 807–818. doi:10.1109/SC.2014.71.
+- [22] S. Prabhakaran, M. Neumann, S. Rinke, F. Wolf, A. Gupta, L. V. Kale, A batch system with efficient adaptive scheduling for malleable and evolving applications, in: IEEE International Parallel & Distributed Processing Symposium (IPDPS), 2015, pp. 429–438. doi:10.1109/IPDPS.2015.34.
+- [23] C. Huang, G. Zheng, S. Kumar, L. V. Kalé, Performance evaluation of Adaptive MPI, in: Proceedings of ACM SIGPLAN Symposium on Principles and Practice of Parallel Programming, 2006, p. 12–21.
+- [24] I. Comprés, A. Mo-Hellenbrand, M. Gerndt, H.-J. Bungartz, Infrastructure and API extensions for elastic execution of MPI applications, in: Proceedings of the 23rd EuroMPI, 2016, pp. 82–97. doi:10.1145/2966884.2966917.
+- [25] R. Bhattarai, H. Pritchard, S. Ghafoor, Dynamic Resource Management for Elastic Scientific Workflows using PMIx, in: 2024 IEEE International Parallel and Distributed Processing Symposium Workshops (IPDPSW), 2024. doi:10.1109/IPDPSW63119.2024.00131.
+- [26] ParaStationV5 Documentation, accessed: 2024-12-19 (2024). URL http://docs.par-tec.com
+- [27] D. Huber, M. Streubel, I. Comprés, M. Schulz, M. Schreiber, H. Pritchard, Towards dynamic resource management with MPI sessions and PMIx, in: Proceedings of the 29th EuroMPI/USA, 2022, pp. 57–67. doi:10.1145/3555819.3555856.
+- [28] D. Huber, S. Iserte, M. Schreiber, A. J. Peña, M. Schulz, Bridging the Gap Between Genericity and Programmability of Dynamic Resources in HPC, in: ISC25, Hamburg, Germany, 2025.
+- [29] M. Vázquez, G. Houzeaux, S. Koric, A. Artigues, J. Aguado-Sierra, R. Arís, D. Mira, H. Calmet, F. Cucchietti, H. Owen, A. Taha, E. D. Burness, J. M. Cela, M. Valero, Alya: Multiphysics engineering simulation toward exascale, Journal of Computational Science 14 (2016) 15–27. doi:10.1016/j.jocs.2015.12.007.
+- [30] V. Lopez, G. Ramirez Miranda, M. Garcia-Gasulla, TALP: A lightweight tool to unveil parallel efficiency of large-scale executions, in: PERMAVOST’21: Proceedings of the 2021 on Performance EngineeRing, Modelling, Analysis, and VisualizatiOn STrategy, 2021, p. 3–10. doi:10.1145/3452412.3462753.
+- [31] J. Corbalan, L. Alonso, J. Aneas, L. Brochard, Energy optimization and analysis with EAR, in: Proceedings of IEEE International Conference on Cluster Computing (CLUSTER), 2020, pp. 464–472. doi:10.1109/CLUSTER49012.2020.00067.
+- [32] I. Martín-Álvarez, J. I. Aliaga, M. Castillo, S. Iserte, R. Mayo, Dynamic spawning of MPI processes applied to malleability, The International Journal of High Performance Computing Applications 38 (2) (2024) 69–93. doi:10.1177/10943420231176527.
+- [33] I. Martín Álvarez, J. I. Aliaga, M. Castillo, S. Iserte, Efficient data redistribution for malleable applications, in: Proceedings of the SC’23 Workshops of The International Conference on High Performance Computing, Network, Storage, and Analysis, SC-W ’23, 2023, pp. 416–426. doi:10.1145/3624062.3624110.
+- [34] D. G. Feitelson, L. Rudolph, Toward convergence in job schedulers for parallel supercomputers, in: Job Scheduling Strategies for Parallel Processing, Vol. 1162, Springer Berlin Heidelberg, 1996, pp. 1–26.
+- [35] MPI Forum, MPI: A Message-Passing Interface Standard, Tech. rep. (Jun. 2015). URL https://www.mpi-forum.org/docs/mpi-3.1/mpi31-report.pdf

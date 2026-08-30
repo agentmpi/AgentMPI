@@ -1,0 +1,410 @@
+Context Rot: Why LLMs Degrade as Context Grows (Complete Guide) | Morph
+
+# Context Rot: The Complete Guide to Why LLMs Degrade as Context Grows
+
+Context rot is the measurable performance degradation LLMs experience as input length increases. Chroma tested 18 frontier models and found every one gets worse. Here's the research, the mechanisms, the real-world impact on coding agents, and what actually fixes it.
+
+March 13, 2026 · 3 min read
+
+Context rot is the degradation in LLM output quality that happens as input context grows longer. More tokens in, worse output out, even when the model's context window isn't close to full. Chroma's research tested 18 frontier models and found that every single one gets worse as input length increases. Not some. Not most. All of them.
+
+For coding agents, context rot is the primary failure mode. Not model capability. Not reasoning ability. The models are smart enough to solve the problem if their context stays clean. The problem is that context doesn't stay clean: agents accumulate noise during search, exploration, and backtracking, and that noise directly degrades every subsequent output.
+
+This guide covers the mechanisms, the research, the real-world impact on coding agents, and the techniques that actually work. If you build, operate, or depend on AI coding agents, context rot is the single most important phenomenon to understand.
+
+18
+
+Frontier models tested by Chroma (all degraded)
+
+30%+
+
+Accuracy drop from lost-in-the-middle
+
+60%
+
+Agent time spent just retrieving context
+
+90.2%
+
+Multi-agent improvement over single agent
+
+## What Is Context Rot
+
+Context rot describes a specific, measurable phenomenon: as you add tokens to an LLM's input, the quality of its output decreases. The term was formalized by Chroma's 2025 research, which systematically tested how 18 frontier models handle increasing context lengths.
+
+Context rot is not context window overflow. Overflow happens when you exceed the model's maximum token limit. Rot happens well before that. A model with a 200K token window can exhibit significant degradation at 50K tokens. The decline is continuous, not a cliff.
+
+This distinction matters because teams routinely assume their context window is "big enough." They pick a model with 128K or 1M tokens, load it up, and wonder why output quality degrades. Context rot explains why: capacity is the wrong metric. Signal-to-noise ratio is what determines output quality.
+
+Context rot vs. context window overflow
+
+Context window overflow: you hit the model's maximum token limit. Tokens get truncated or rejected. Binary failure.
+
+Context rot: performance degrades gradually as context fills with tokens, long before reaching any limit. Continuous degradation. Harder to detect because the model still produces output; it just produces worse output.
+
+## The Research: 18 Models, All Degraded
+
+Chroma's study is the most comprehensive evaluation of context rot to date. They tested 18 models across multiple experiments: needle-question similarity tests, distractor interference tests, haystack structure tests, conversational QA (LongMemEval), and repeated word tasks. The key findings:
+
+Chroma Context Rot Findings (2025)
+
+| Finding | Detail | Implication |
+| --- | --- | --- |
+| Universal degradation | All 18 models degrade with length | No model is immune to context rot |
+| Low similarity = faster rot | Performance drops faster when needle-question semantic similarity is low | Real-world queries rarely match their answers word-for-word |
+| Distractors compound rot | 4 distractors degrade further than 1, non-uniformly | Code search returns many semantically similar distractors |
+| Coherent docs hurt more | Shuffled haystacks outperform logically structured ones | Structured codebases may be harder to search than random text |
+| Hallucination patterns vary | GPT models: ~2.55% hallucination rate. Claude models: lowest rate, abstains when uncertain | Model choice affects failure mode, not whether failure occurs |
+| LongMemEval gap | Significant accuracy gap between focused (~300 tokens) and full (~113K tokens) inputs | Same information, radically different performance based on context size |
+
+The counterintuitive finding about document structure deserves emphasis. Models performed better on shuffled haystacks than on logically coherent documents across all 18 models. Structural coherence consistently hurt performance. This suggests the attention mechanism is negatively influenced by logical document flow, possibly because coherent text creates more plausible-seeming distractors.
+
+What "all 18 models degraded" means in practice
+
+This isn't "older models struggled." The list includes GPT-4.1, Claude Opus 4, Gemini 2.5 Pro, and Qwen3-235B. These are the best models available in 2025. Context rot is an architectural property of transformer-based attention, not a capability gap that training solves.
+
+## The Lost-in-the-Middle Effect
+
+Liu et al.'s research(Stanford/TACL 2024) established one of the most cited findings in LLM reliability: performance follows a U-shaped curve across input positions. Models attend strongly to the beginning and end of their context and poorly to everything in the middle.
+
+In multi-document question answering with 20 documents, accuracy dropped by more than 30% when the relevant document was placed in positions 5-15 compared to position 1 or 20. This holds even for models explicitly designed for long contexts.
+
+Accuracy by Document Position (20-Document QA)
+
+| Position | Relative Accuracy | What Happens |
+| --- | --- | --- |
+| Position 1 (start) | Highest (~75%) | Strong primacy bias, model attends well |
+| Positions 5-15 (middle) | Lowest (~45-55%) | Lost-in-the-middle blind spot |
+| Position 20 (end) | High (~72%) | Strong recency bias |
+
+The practical impact for coding agents: when an agent greps for a function name and reads 8 files, the relevant code in file #4 sits in the model's blind spot. The agent has the right information in its context but can't effectively attend to it. It may hallucinate edits to the wrong file, repeat work it already did, or generate code that contradicts what it just read.
+
+This effect persists across model sizes, architectures, and training approaches. It's a fundamental property of how softmax attention distributes weight across tokens, not a bug that can be trained away. For more on how this specifically impacts coding tools, see our lost-in-the-middle deep dive.
+
+## Attention Dilution at Scale
+
+The lost-in-the-middle effect describes where models fail. Attention dilution explains why they fail, and why the problem gets worse with scale.
+
+Transformer self-attention is quadratic in sequence length. Each token must compute attention weights against every other token. The math:
+
+100M
+
+Pairwise relationships at 10K tokens
+
+10B
+
+Pairwise relationships at 100K tokens
+
+1T
+
+Pairwise relationships at 1M tokens
+
+At 10,000 tokens, the model tracks 100 million pairwise relationships. At 100,000 tokens (a typical coding agent session after 15 minutes), that number grows to 10 billion. At 1 million tokens, it's 1 trillion.
+
+This isn't just a computational cost issue. It's an information-theoretic one. Softmax attention normalizes weights across all tokens. As the denominator grows, each individual token receives proportionally less attention. The signal doesn't get louder as context grows; the noise floor rises. A 50-line function that was clearly relevant at 10K tokens becomes one signal among thousands at 100K tokens.
+
+#### Attention weight dilution (simplified)
+
+```
+# Softmax attention weight for a single relevant token:
+
+At 10K tokens:   attention_weight ≈ 1/10,000  = 0.0001
+At 100K tokens:  attention_weight ≈ 1/100,000 = 0.00001
+At 1M tokens:    attention_weight ≈ 1/1,000,000 = 0.000001
+
+# Each 10x increase in context reduces per-token attention by 10x.
+# The model doesn't "ignore" your code — it physically can't
+# attend to it as strongly when surrounded by more tokens.
+```
+
+As Chroma's researchers concluded: what matters more than whether relevant information is present is how that information is presented. Position and context size determine whether the model can actually use the information, regardless of whether it's technically within the window.
+
+## Distractor Interference
+
+Chroma's study isolated a third mechanism that compounds the first two: distractor interference. Adding semantically similar but irrelevant content causes degradation beyond what context length alone explains. Distractors that are topically related to the query but factually irrelevant appeared most frequently in hallucinated responses.
+
+The findings were granular. A single distractor reduces baseline performance. Four distractors compound the effect, but non-uniformly. Some distractors are more "distracting" than others. The model-specific patterns: GPT models had the highest hallucination rates (~2.55% on refusal-prone tasks). Claude models exhibited the lowest, often choosing to abstain rather than hallucinate.
+
+Why code search is the worst case for distractor interference
+
+When a coding agent searches for a webhook handler, its context fills with test fixtures, deprecated implementations, mock objects, and similarly-named functions from unrelated modules. Every one of these is semantically close to the target (same domain, similar variable names, related imports) but factually irrelevant. This is the exact pattern that maximizes distractor interference.
+
+A codebase with good naming conventions and consistent architecture actually increases distractor density. The more consistent your code, the more plausible each wrong result looks to the model.
+
+The coherent-vs-shuffled finding reinforces this. Models performed better on randomly shuffled documents than logically structured ones across all 18 models tested. Logical structure creates more plausible distractors because adjacent documents share terminology, concepts, and patterns. A well-organized codebase is, perversely, harder for an LLM to search than a randomly arranged one.
+
+## Why Context Rot Hits Coding Agents Hardest
+
+General chat conversations might stay under a few thousand tokens. Coding agents routinely push past 100K. The difference isn't just scale. Coding agents have three properties that maximize context rot:
+
+1. Accumulative context: every file read, grep result, and tool output stays in the window for the rest of the session
+2. High distractor density: code search returns many semantically similar results (see distractor interference above)
+3. Long task horizons: real coding tasks take 15-60 minutes, during which context continuously degrades
+
+#### Context accumulation in a typical coding task
+
+```
+Step 1: Read issue description                    →    500 tokens (clean)
+Step 2: Grep for function, read 4 candidate files → 8,000 tokens (noise entering)
+Step 3: Wrong lead, read 3 more files              → 6,000 tokens (noise accelerating)
+Step 4: Backtrack, read test files for clues       → 5,000 tokens (noise compounding)
+Step 5: Found the right file, begin editing        → 20,000 tokens total
+
+Of those 20,000 tokens, ~500 are the relevant code.
+Signal-to-noise ratio: 2.5%. The model now attends to
+the right code with 1/40th the weight it would have
+in a clean context.
+```
+
+Cognition (Devin) measured this directly: agents spend over 60% of their first turn just retrieving context. Not editing. Not reasoning. Searching. Each search result stays in the context window for the rest of the session, accumulating like sediment.
+
+An OpenReview study on token consumption confirmed that input tokens dominate overall cost in agentic tasks, with some runs consuming 10x more tokens than others on equivalent tasks. The variance was driven almost entirely by search efficiency, not coding ability. Agents that found the right code quickly used fewer tokens, accumulated less noise, and produced better results. The token consumption correlation was weak (r<0.15 for predicting total cost), meaning even sophisticated cost prediction fails because search behavior is inherently unpredictable.
+
+## The 35-Minute Wall
+
+Research on long-running agents identified a critical threshold: every AI agent's success rate decreases after 35 minutes of human-equivalent task time. The relationship is non-linear: doubling task duration quadruples the failure rate.
+
+35 min
+
+Threshold where all agents degrade
+
+4x
+
+Failure rate when task duration doubles
+
+60%
+
+First turn spent on retrieval
+
+10x
+
+Token variance on equivalent tasks
+
+Why 35 minutes? Because that's roughly when context accumulation crosses a critical threshold for most coding tasks. By 35 minutes, the agent has typically read 15-30 files, run multiple searches, and accumulated 80K-150K tokens of context. Even with a 200K token window, the signal-to-noise ratio has degraded enough that reasoning quality drops measurably.
+
+This creates a compounding problem. As the agent gets less accurate, it makes mistakes. Mistakes require corrections. Corrections require reading more files and running more searches. Each correction adds more noise to the context. The loop accelerates: more noise leads to more errors leads to more noise. This is why doubling the task time doesn't double the failure rate. It quadruples it.
+
+The compounding loop
+
+Context rot is self-reinforcing. Degraded output quality leads to more recovery actions (re-reading files, running additional searches, undoing mistakes). Each recovery action adds more context. More context means more rot. This is why tasks don't fail gradually. They tend to work well for a while, then fall off a cliff.
+
+## What Doesn't Fix Context Rot
+
+### Bigger Context Windows
+
+The intuitive fix (just give the model more room) doesn't work. Chroma tested models across 8 different input lengths and found that performance degrades at every length increment, not just near the limit. A model with a 1M token context window still exhibits context rot at 50K tokens. The problem isn't running out of space. It's the noise that fills the space.
+
+### RAG for Code
+
+Retrieval-augmented generation works well for document QA but hits both mathematical and practical limits for code. Google DeepMind proved that embedding-based retrieval has a hard mathematical ceiling: the number of top-k document subsets retrievable is constrained by embedding dimension. Even state-of-the-art models fail on their LIMIT dataset despite the simplicity of the tasks. BM25 keyword search outperformed neural embedding models.
+
+Code search queries are structurally adversarial for embeddings. "Where does the auth middleware check JWT expiration?" requires understanding call graphs, import chains, and framework conventions. A single embedding vector can't capture these multi-hop relationships.
+
+### Post-Hoc Compaction
+
+Modern coding agents use context compaction to summarize conversation history when approaching context limits. Claude Code auto-compacts at 95% capacity. OpenAI Codex runs server-side compaction after every turn. This buys time but doesn't solve the root problem.
+
+By the time compaction triggers, the damage is done. The agent has already spent 15+ minutes producing degraded outputs based on noisy context. Compaction cleans up the history, but it can't undo the wrong edits, missed bugs, or hallucinated code generated during the degraded period. It's a treatment, not a prevention.
+
+Why Common Fixes Fall Short
+
+| Approach | What It Does | Why It Falls Short |
+| --- | --- | --- |
+| Bigger windows | More room for tokens | Rot happens at every length, not just near limits |
+| RAG / embeddings | Vector similarity search | Mathematical ceiling on retrieval; can't capture code structure |
+| Post-hoc compaction | Summarize history at limits | Damage already done during degraded period; can't undo bad edits |
+| Sliding windows | Drop oldest context | Discards potentially relevant earlier context indiscriminately |
+| Context isolation | Subagent search in separate windows | Prevents noise from entering context in the first place |
+
+For a deeper comparison of compaction vs. summarization approaches, see our dedicated analysis.
+
+## What Actually Fixes Context Rot
+
+### The Subagent Architecture
+
+The fix for context rot isn't making models better at long contexts. It's keeping their context short.
+
+Anthropic's multi-agent research system demonstrated this directly. Their architecture (an Opus 4 lead agent delegating to Sonnet 4 subagents) outperformed a single Opus 4 agent by 90.2% on research tasks. The lead agent typically spawns 3-5 subagents in parallel, each using 3+ tools simultaneously. Simple tasks use 1 agent with 3-10 tool calls. Complex research deploys 10+ subagents.
+
+The performance gain isn't because the subagents are smarter. It's because the lead agent's context stays clean. Each subagent explores, backtracks, and discards dead ends in its own context window. The lead agent never sees the 15 files that were explored and rejected. It only sees the condensed result.
+
+### Lead Agent
+
+Holds task-level context: the goal, the plan, high-level progress. Never polluted with search traces or dead-end explorations.
+
+### Search Subagent
+
+Explores in its own context window. Reads, rejects, and backtracks without polluting the parent. Returns only relevant file and line ranges.
+
+### Condensed Return
+
+Subagent returns 50-200 tokens of precise context. The lead agent never sees the 15 files that were explored and rejected.
+
+This is why every major coding agent has converged on the same pattern. Claude Code uses Task agents in parallel context windows. Cursor runs background search agents. Cognition built SWE-grep, with inference speeds of 2,800+ tokens/second for the mini variant and 650+ tokens/second for the full model. The principle is universal: isolate search into a dedicated context window so the reasoning model's context stays clean.
+
+### Context Isolation in Practice
+
+#### How context isolation prevents rot
+
+```
+# WITHOUT isolation (context rot accumulates):
+1. Coding model searches for Stripe webhook handler
+2. Reads 15 files: test fixtures, deprecated code, wrong modules
+3. All 15 files stay in context (20,000+ tokens of noise)
+4. Model finds the right file but can't attend to it effectively
+5. Result: hallucinated edit, wrong file path, wasted tokens
+
+# WITH isolation (context stays clean):
+1. Coding model delegates search to WarpGrep subagent
+2. WarpGrep explores 15 files in its own context window (0.73 F1, 3.8 steps)
+3. WarpGrep returns: "src/api/webhooks/stripe.ts, lines 47-89" (150 tokens)
+4. Coding model receives only the relevant code snippet
+5. Result: correct edit on first attempt, context stays clean
+```
+
+### Measured Results: Anthropic's Multi-Agent System
+
+Anthropic's multi-agent numbers provide the clearest evidence that context isolation works:
+
+90.2%
+
+Improvement over single-agent Opus 4
+
+4x
+
+More tokens consumed than single chat
+
+80%
+
+Performance variance explained by token usage
+
+3-5
+
+Subagents spawned per complex query
+
+Token usage alone explains 80% of performance variance in their browsing evaluations. Three factors account for 95%: token usage, tool call quantity, and model selection. The multi-agent system uses roughly 15x more total tokens than a single chat, but the key difference is where those tokens live. They're distributed across isolated context windows, not crammed into one.
+
+## FlashCompact: Prevention Over Compression
+
+Most approaches to context rot are reactive: they wait for context to fill up, then compress it. FlashCompact is preventive: it stops noise from entering context in the first place.
+
+The system has three components, each addressing a different source of context waste:
+
+### WarpGrep: Search Isolation
+
+RL-trained search subagent. 0.73 F1 in 3.8 steps. Returns only relevant code snippets, not entire files. The coding model never sees the 15 files that were explored and rejected.
+
+### Fast Apply: Compact Diffs
+
+10,500 tok/s. Generates surgical edit diffs instead of full-file rewrites. A 500-line file edit that would normally echo all 500 lines back into context now adds only the changed lines.
+
+### Morph Compact: Verbatim Cleanup
+
+3,300+ tok/s. Removes remaining noise from conversation history without summarization loss. Verbatim compaction preserves all critical details.
+
+The combination extends effective context life by 3-4x, meaning compaction fires 3-4x less often. And when compaction does fire, the context it compacts is higher-signal to begin with, so less information is lost.
+
+Why prevention beats compression
+
+Post-hoc compression has an irreversible problem: by the time you compress, the model has already spent multiple turns reasoning over noisy context. The bad edits, hallucinated paths, and forgotten constraints are already committed. Compression cleans the history but can't undo the decisions made during the noisy period.
+
+Prevention sidesteps this entirely. If the noise never enters context, the model never reasons over it, and downstream decisions stay sound. For a full comparison, see context distillation methods.
+
+### Impact on SWE-Bench Pro
+
+When WarpGrep is paired with frontier models on SWE-Bench Pro, it lifts every model to #1 on the leaderboard, while being 15.6% cheaper and 28% faster than letting the coding model search on its own. Adding a model makes the system cheaper because the expensive model stops wasting tokens on search.
+
+0.73
+
+F1 score in 3.8 steps
+
+10,500
+
+tok/s Fast Apply
+
+15.6%
+
+Cheaper than self-search
+
+28%
+
+Faster than self-search
+
+## Context Engineering Over Context Capacity
+
+Anthropic defines context engineering as the discipline of curating and maintaining the optimal set of tokens during inference. The core principle: find the smallest possible set of high-signal tokens that maximize the likelihood of the desired outcome.
+
+This reframes the entire approach to LLM context management. The question isn't "how do I fit more tokens in?" It's "how do I keep irrelevant tokens out?"
+
+Context Capacity vs. Context Engineering
+
+| Dimension | Capacity Approach | Engineering Approach |
+| --- | --- | --- |
+| Goal | Fit more tokens | Maximize signal-to-noise ratio |
+| Strategy | Bigger windows, compression | Prevention, isolation, selective retrieval |
+| Search | Let coding model search | Delegate to subagent with isolated context |
+| Edits | Full file rewrites | Compact diffs (surgical changes only) |
+| Compaction | Reactive: compress when full | Preventive: minimize noise entry |
+| Architecture | Single agent, large window | Multi-agent, isolated windows |
+
+For coding agents, context engineering translates to concrete practices:
+
+- Isolate search into subagents with their own context windows
+- Return precise results: file and line ranges, not whole files
+- Discard exploration traces: the parent model should never see the search process
+- Use compact diffs: never echo an entire file back into context when 10 lines changed
+- Compress early: run compaction proactively, not just at capacity limits
+
+The models are already good enough. The constraint is what you put in front of them.
+
+## Frequently Asked Questions
+
+### What is context rot in LLMs?
+
+Context rot is the measurable degradation in LLM output quality that occurs as input context length increases. Even when a model's context window isn't close to full, adding more tokens degrades performance. Chroma's 2025 research tested 18 frontier models, including GPT-4.1, Claude Opus 4, and Gemini 2.5, and found that every one exhibits this behavior at every input length increment tested.
+
+### Why does context rot happen?
+
+Three compounding mechanisms. First, the lost-in-the-middle effect: models attend well to the start and end of context but poorly to the middle, causing 30%+ accuracy drops (Liu et al., Stanford/TACL 2024). Second, attention dilution: transformer attention is quadratic, so 100K tokens means 10 billion pairwise relationships. Third, distractor interference: semantically similar but irrelevant content actively misleads the model.
+
+### How does context rot affect coding agents?
+
+Coding agents are the worst case. They accumulate context during multi-step tasks: file reads, grep results, exploration dead-ends. Cognition measured that agents spend 60%+ of their first turn just searching. By 35 minutes, every agent's success rate drops, and doubling task duration quadruples the failure rate.
+
+### Does a bigger context window prevent context rot?
+
+No. Chroma tested across 8 input lengths and found degradation at every increment, not just near the limit. A 1M-token window still rots at 50K tokens. The problem is noise accumulation, not capacity. A larger window just gives you more room to fill with irrelevant tokens.
+
+### What is the lost-in-the-middle effect?
+
+LLM performance follows a U-shaped curve: high accuracy for information at the start and end of context, 30%+ lower accuracy for information in the middle. Discovered by Liu et al. at Stanford. This affects every model, including those explicitly trained for long contexts. For coding agents, it means the relevant code found mid-search sits in a blind spot.
+
+### What is attention dilution?
+
+Transformer attention is quadratic: each token computes weights against every other token. At 100K tokens, that's 10 billion relationships. Softmax normalization means each token's attention weight shrinks as context grows. The signal doesn't get louder; the noise floor rises. This is architectural, not a training problem.
+
+### How do you prevent context rot?
+
+Context isolation through subagent architectures. Delegate search to specialized agents with their own context windows. The coding model only sees condensed results, never the search process. Anthropic's multi-agent system improved performance by 90.2% with this approach. FlashCompact implements this with WarpGrep (search isolation), Fast Apply (compact diffs at 10,500 tok/s), and Morph Compact (verbatim cleanup at 3,300+ tok/s).
+
+### What is context engineering?
+
+Context engineering, as defined by Anthropic, is the discipline of curating the optimal set of tokens during inference. Unlike prompt engineering (focused on a single input), context engineering manages the entire context state across multi-turn interactions. The goal: find the smallest set of high-signal tokens for the task. See our LLM context management guide.
+
+### Is context rot the same as hallucination?
+
+No, but context rot causes hallucination. Context rot is the degradation of the model's ability to attend to and use information in its context. Hallucination is one symptom: when the model can't effectively attend to the right information, it generates plausible-sounding but incorrect output. Other symptoms include forgotten constraints, contradictory edits, and repeated work.
+
+### Can RAG solve context rot for code?
+
+RAG helps for document QA but doesn't solve context rot for code. Google DeepMind showed that embedding-based retrieval has a hard mathematical ceiling: the number of retrievable document subsets is constrained by embedding dimension. Code queries require understanding call graphs and framework conventions that single vectors can't capture. RL-trained search agents (like WarpGrep) outperform embedding-based approaches because they can reason about code structure.
+
+### Related Resources
+
+- LLM Context Management Guide
+- Lost in the Middle: Deep Dive
+- WarpGrep: RL-Trained Code Search
+
+### Stop Context Rot Before It Starts
+
+FlashCompact prevents noise from entering your coding agent's context. WarpGrep isolates search (0.73 F1, 3.8 steps). Fast Apply generates compact diffs (10,500 tok/s). Morph Compact does verbatim cleanup (3,300+ tok/s). Every frontier model lifted to #1 on SWE-Bench Pro.

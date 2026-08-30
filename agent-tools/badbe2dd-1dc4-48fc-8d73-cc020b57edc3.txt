@@ -1,0 +1,332 @@
+# Implement the MPI_T events interface (mca_base_event framework + producers)
+
+- State: open
+- Author: jsquyres
+- Created: 2026-06-20T19:12:27Z
+- Updated: 2026-07-07T04:42:40Z
+- Repository: open-mpi/ompi
+- Number: #14083
+- +7566 -120 in 92 files
+- Merge commit: 8766ca94ed1b7fa7525b82dfae2d784b7028d646
+
+## Labels
+
+- Target: main
+
+---
+
+Parent issue: #14019
+
+## Summary
+
+The MPI_T *events* interface (MPI-5.0 §15.3.8) has shipped in Open MPI as inert stubs: every `MPI_T_event_*` / `MPI_T_source_*` symbol is present, but `MPI_T_event_get_num` and `MPI_T_source_get_num` always return 0, there is no `mca_base_event` framework, and no producer ever registers a source or event (see #14019 for the full conformance analysis).
+
+This PR implements the facility end to end:
+
+- a new OPAL **`mca_base_event` framework** (modeled on `mca_base_pvar`): source/event registration, enumeration, handle management, callbacks with safety-level dispatch, dropped-event accounting, and a raise path;
+- the **MPI_T tool layer** wired to that framework (all `event_*`/`source_*` entry points, plus `MPI_T_category_get_events`, #14017);
+- a set of **in-tree producers** for control-plane events — communicator and session lifecycle, error-handler invocations, MPI memory allocation (`ompi.mpi.memory`), an OS-memory drop demonstrator (`ompi.os.memory`), and a family of example events — all registered in the OMPI layer;
+- **visibility** via `ompi_info --event` and two read-only cvars;
+- **tests** (an OPAL white-box test plus MPI_T singletons) and **docs** (man pages and a developer guide).
+
+With the default build, the events facility is now non-empty (7 sources, 12 event types) and the #14019 reproducer prints `RESULT: HAS_EVENTS` (exit 0).
+
+## How to review this PR
+
+This is a large change, but it is organized as **7 self-contained commits** in dependency order. Please **review commit by commit** — each commit is a small, coherent unit and its commit message explains the *why* in detail:
+
+1. **Add opal_count_t** — a layer-safe `MPI_Count` backing type usable below the OMPI boundary (the framework stores counts in OPAL).
+2. **Add the mca_base_event framework** — the heart of the PR: registry, hardened lock-free dispatch, deferred free, instance pool, timestamps, drop accounting, the OS-memory drop-demonstrator *mechanism* (the OS free-hook, name-agnostic), and the white-box test. (The producers themselves are registered in the OMPI layer; this commit keeps only the generic framework and the OS-hook machinery.)
+3. **Wire the MPI_T events tool layer** — the entry points + the OMPI callback trampolines.
+4. **Populate MPI_T_category_get_events** — the per-category event list (#14017).
+5. **Add the in-tree event producers** — all registered in the OMPI layer: the communicator / session / error-handler / MPI-memory sources and their raise sites, the `ompi.os.memory` drop demonstrator (wiring in OPAL's mechanism), and the `ompi.example*` producers.
+6. **Expose MPI_T events via `ompi_info --event`** — the listings, `--level` filtering of event types, and cvars.
+7. **Tests and documentation** — the MPI_T singletons, man pages, changelog, and the developer guide.
+
+(The two error classes the interface returns — `MPI_T_ERR_NOT_SUPPORTED` / `MPI_T_ERR_NOT_ACCESSIBLE` — are already on `main` via #14018, so the earlier commit that defined them has been dropped from this branch.)
+
+## Basic design
+
+The framework mirrors `mca_base_pvar`. An **event source** is a clock domain plus metadata (ordering, ticks/sec, max ticks, ad-hoc timestamp support); every **event type** belongs to exactly one source and has a fixed *element layout* (typed fields, like a struct). A tool allocates a **registration handle** on an event type, attaches **callbacks** keyed by the Table 15.5 safety level (`NONE`/`MPI_RESTRICTED`/`THREAD_SAFE`/`ASYNC_SIGNAL_SAFE`) and/or a **dropped-event handler**, and the implementation **raises** the event to deliver one instance per attached, safety-compatible callback.
+
+Dispatch is a **snapshot-under-lock → invoke-callbacks-lock-free → reconcile** design with refcounted deferred free, so **no user callback of any kind runs while a framework lock (or `ompi_mpit_big_lock`) is held** — a callback may free its own handle or re-enter MPI_T without deadlock, as the standard permits. Lifetime is managed by refcounts with a live-registration table so a stale/double `handle_free` returns `MPI_T_ERR_INVALID_HANDLE` without dereferencing freed memory.
+
+## Design precepts
+
+- **Near-zero overhead when unused.** Each raise site is a single relaxed atomic read of a per-event `num_active` gate plus a predicted branch; when no tool is listening it returns immediately, before building any payload. No per-MPI-object storage is added anywhere.
+- **No allocation/locks on the no-listener path.** The instance pool, the clock origin, and (for `ompi.os.memory`) the OS memory hook are all created/installed **lazily on first listener-attach** and torn down on last detach — when the facility is unused, the allocator and the rest of the runtime are untouched.
+- **The empty-event-space path stays conformant.** A master MCA switch (`mca_base_event_register_producers=0`) disables every producer, so N=0 is reachable and tested; the entry points then return the standard error codes.
+- **Bounded, robustly implementable v1.** Synchronous, normal-context delivery only; the instance pool is capped (drops, never unbounded allocation) and the per-thread re-entrant dispatch depth is capped. `ASYNC_SIGNAL_SAFE` delivery and data-bearing memory events are explicitly deferred (see *v1 scope* below).
+
+## Producers (`ompi_info --event`)
+
+The producers register control-plane / environmental events, listable with `ompi_info --event` (also covered by `--all`). Event **sources** are always listed; event **types** are filtered by `--level` against the type's verbosity (the in-tree types register at levels 2-4), so `--level 9` shows them all:
+
+```
+     MPI_T event sources: --------------------------------------------------
+                          ompi.communicator (ordered, ticks/sec: 1000000000)
+                          ompi.session (ordered, ticks/sec: 1000000000)
+                          ompi.errhandler (ordered, ticks/sec: 1000000000)
+                          ompi.mpi.memory (ordered, ticks/sec: 1000000000)
+                          ompi.example / ompi.example.unordered / ompi.example.noadhoc
+       MPI_T event types: --------------------------------------------------
+                          ompi.communicator_base_created (source: ompi.communicator, elements: 2)
+                          ompi.communicator_base_freed   (source: ompi.communicator, elements: 1)
+                          ompi.session_base_created / ompi.session_base_destroyed
+                          ompi.errhandler_base_invoked   (source: ompi.errhandler, elements: 2)
+                          ompi.mpi.memory_base_allocated / ompi.mpi.memory_base_freed
+                          ompi.example_base_heartbeat / _lossy / _multi_element / _unordered_event / _noadhoc_event
+```
+
+Event-type names carry the same `ompi.` namespace prefix as the source names. `--parsable` emits the same data as stable, colon-delimited records — `mpi_t_event:source::: ` and `mpi_t_event:type::: `. (On platforms whose OPAL memory hooks report frees, an additional `ompi.os.memory` source and its `ompi.os.memory_base_released` drop-demonstrator event also appear.)
+
+## Documentation
+
+- A developer guide, **`docs/developers/mpi-t-event-producers.rst`**, explains how to write an event producer (register a source/event type, raise events, and the producer contract — no MPI_T lock held, fixed-size payloads, near-zero cost when unused, gating registration on availability).
+- A new **`MPI_T_Events(3)`** man page gives a user-facing overview of Open MPI's MPI_T events support, a **receiving-events** walkthrough (the registration/callback flow), and itemizes each built-in event source and event type — including **when each event is raised and what its payload fields mean** — framed as examples / a possible subset (discover the real set via the MPI_T API or `ompi_info --event`). The **`MPI_T(3)`** overview page's events section is updated from its old "stub interfaces" text to point at it, and every `MPI_T_event_*` / `MPI_T_source_*` man page now cross-links to it.
+- The `MPI_T_event_get_num` / `MPI_T_source_get_num` man pages are updated from the old "returns 0" notes and gain a "discovering available events" section (`ompi_info --event` plus a short enumeration program).
+- The `ompi_info(1)` man page documents the new `--event` option and notes that `--level` filters the listed event types.
+- A changelog entry under `docs/release-notes/changelog/v6.0.x.rst`.
+
+## Tests
+
+- **OPAL white-box test** (`test/util/mca_base_event_test.c`, ~60 assertions wired into `make check`): registration, raise → callback delivery + payload read, drop accounting + flush, free-from-callback, saturation, drop-restore on pool exhaustion, all-drops-consumes-no-instance, ORDERED CAS-max monotonic timestamps, the drop-fold mechanism, smallest-valid-safety-level selection, bounded re-entrant dispatch, and a concurrency stress test.
+- **MPI_T singletons** under `test/mpi/t/` (all wired into `make check`): `mpi_t_event_smoke`, `_producers`, `_examples`, `_inert_ok`, `_reinit`, `_async_only`, and `mpi_t_event_14019` (the issue reproducer), plus `mpi_t_errcodes` and the updated `mpi_t_category_get_events`.
+
+Built **warning-free** and all tests pass on **Linux and macOS**.
+
+## How this PR meets the #14019 success criteria
+
+| # | Success criterion (#14019) | Status |
+|---|---|---|
+| 1 | `mca_base_event` framework in `opal/mca/base/`, mirroring `mca_base_pvar` (registration, enumeration, handles, dispatch, raise path) | ✅ `mca_base_event.{h,c}` + `mca_base_event_dispatch.c` |
+| 2 | ≥1 producer → nonzero `source_get_num` / `event_get_num` | ✅ **7 sources, 12 event types** |
+| 3 | `source_get_info` → ordering / ticks_per_second / max_ticks; `INVALID_INDEX` out of range | ✅ implemented |
+| 4 | `source_get_timestamp` → SUCCESS+timestamp / `INVALID_INDEX` / `NOT_SUPPORTED` | ✅ implemented (SUCCESS + `NOT_SUPPORTED` asserted in `mpi_t_event_examples`) |
+| 5 | `event_get_info` / `get_index`; `handle_alloc` / `handle_free` | ✅ asserted (`mpi_t_event_smoke`) |
+| 6 | `register_callback` at the requested safety level; actual safety passed to the callback (Table 15.5) | ✅ asserted (white-box: `cb_safety == context`; smallest-valid-level selection) |
+| 7 | `set_dropped_handler` invoked with the dropped count | ✅ asserted (`_examples` lossy = count *n*; `_async_only` = *n+1*) |
+| 8 | in-callback `event_read` / `copy` / `get_timestamp` / `get_source` | ✅ read/timestamp/source asserted (`_smoke`, `_examples`) |
+| 9 | reproducer prints `HAS_EVENTS` (exit 0); callback fires | ✅ `mpi_t_event_14019` → `RESULT: HAS_EVENTS`; callback firing asserted (`_smoke`/`_producers`/`_examples`) |
+| 10 | empty-event-space stays conformant when no producer is enabled | ✅ asserted (`mpi_t_event_inert_ok`) |
+
+The issue's verbatim C reproducer, compiled against this build, prints:
+
+```
+num_sources=7 num_events=12
+RESULT: HAS_EVENTS
+```
+
+**Honest coverage note (implementation vs. tests):** every facet above is implemented and functional. Three narrow sub-facets are implemented but not yet covered by a dedicated MPI_T-level assertion (they are partly covered by the OPAL white-box test): the field values returned by `MPI_T_source_get_info` (ordering/ticks/max), the `MPI_T_source_get_timestamp` `INVALID_INDEX` branch, and `MPI_T_event_copy`. These are easy follow-on singletons if reviewers want each criterion individually asserted.
+
+## Relationship to PR #13133 (a different approach)
+
+#13133 (a rebase of the long-standing #8057) targets the same conformance gap but takes a fundamentally different approach, and this PR deliberately diverges on the points that drew review pushback there:
+
+- **Critical performance path.** #13133 instruments the message-passing hot path (`pml/ob1` send/recv requests, `osc/rdma` RMA). **This PR intentionally adds no events to any critical performance path** — confirmed: it touches no `mca/pml`, `mca/osc`, or datatype code. Its producers are all control-plane/cold (communicator/session/errhandler lifecycle, memory alloc/free). This is exactly the lower-risk producer option #14019 itself lists ("runtime/process-management events") and directly honors the issue's own Risk note that hot-path raising must stay zero-overhead.
+- **Locking / threading.** #13133 hit a self-deadlock in CI (`mca_base_source_register` → `..._get_by_name`, both taking a non-recursive `mca_base_source_lock`) and a muddled locking model. This PR uses one framework lock, **never runs a user callback under it**, and makes registration idempotent-by-name (no recursive-lock trap). (An early revision of this work had the same class of bug — a big lock held across a callback — but it was caught and fixed during review, with a regression test that re-enters MPI_T from a handler.)
+- **No separate `mca_base_source` framework.** Sources are a sub-object inside the single `mca_base_event` framework (sources are registered during init, a single sequential context), avoiding the separate framework that carried the locking bugs in #13133.
+- **No new datatype machinery.** Element types reuse the existing `mca_base_var_type_t` + `ompit_var_type_to_datatype` path (exact-width types), rather than #13133's `ompi_datatype_lookup_by_opal_id` mapping that was an open design question there.
+- **Bounded v1 scope.** The trade-off: #13133 aims for rich per-message telemetry (which is *why* it must touch the hot path); this PR delivers lifecycle/environmental events plus the robust infrastructure, and defers per-message/async/data-bearing delivery to future work — addressing the "too ambitious / reconsider the basic design" feedback on #13133.
+
+## v1 scope (explicitly deferred)
+
+Synchronous normal-context delivery only; no `ASYNC_SIGNAL_SAFE` delivery (such a callback registers successfully but is never selected in v1); the `ompi.os.memory` producer is a drop-accounting demonstrator (its in-`free()` hook cannot safely deliver, so it counts releases and surfaces them to dropped handlers); and a few example events (`cycle_clock`, `info_tunable`) and dedicated per-entry-point test singletons are left as follow-ons. None of these are required by the #14019 success criteria.
+
+## Timeline
+
+- github-actions[bot] added label "Target: main"
+
+- jsquyres ready_for_review
+
+- jsquyres head_ref_force_pushed
+
+- Review requested from hppritcha
+
+- Review requested from bosilca
+
+- Review requested from Copilot
+
+- jsquyres copilot_work_started
+
+- Review by Copilot: ## Pull request overview
+
+Implements the MPI-5 MPI_T *events* facility end-to-end by adding a new OPAL `mca_base_event` framework, wiring the OMPI MPI_T tool entry points to it, registering a set of in-tree event producers, exposing listings via `ompi_info --event`, and adding tests + documentation to validate behavior and conformance.
+
+**Changes:**
+- Add OPAL `mca_base_event` framework for event source/type registration, handle management, dispatch, and in-callback accessors.
+- Wire OMPI’s MPI_T `event_*` / `source_*` APIs and category event listing to the OPAL back-end, and add several built-in producers + raise sites.
+- Add `make check` tests (OPAL white-box + MPI_T singletons) and update docs/manpages/release notes.
+
+### Reviewed changes
+
+Copilot reviewed 70 out of 70 changed files in this pull request and generated 4 comments.
+
+ 
+ Show a summary per file 
+
+| File | Description | 
+| ---- | ----------- | 
+| test/util/mca_base_event_test.c | Adds OPAL white-box unit test for the event dispatch core. | 
+| test/util/Makefile.am | Wires the new OPAL white-box test into `make check`. | 
+| test/mpi/t/mpi_t_event_smoke.c | MPI_T singleton smoke test covering enumeration/handle/callback + trampoline path. | 
+| test/mpi/t/mpi_t_event_reinit.c | Tests stability across repeated `MPI_T_init_thread`/`MPI_T_finalize`. | 
+| test/mpi/t/mpi_t_event_producers.c | Exercises in-tree OMPI producers via real MPI operations. | 
+| test/mpi/t/mpi_t_event_inert_ok.c | Verifies conformant inert behavior with producers disabled via MCA param. | 
+| test/mpi/t/mpi_t_event_examples.c | Exercises example producers and timestamp support contracts. | 
+| test/mpi/t/mpi_t_event_async_only.c | Tests drop accounting/flush behavior for callbacks that never deliver in v1. | 
+| test/mpi/t/mpi_t_event_14019.c | Minimal reproducer for issue #14019 asserting events are non-empty and usable. | 
+| test/mpi/t/mpi_t_errcodes.c | Tests presence/registration of new MPI_T error classes and MPI_Count sizing invariant. | 
+| test/mpi/t/Makefile.am | Adds the new MPI_T singleton tests to `make check`. | 
+| opal/runtime/opal_info_support.h | Declares `opal_info_do_event()` for `ompi_info --event`. | 
+| opal/runtime/opal_info_support.c | Implements `--event` CLI option and output logic for event sources/types. | 
+| opal/mca/base/mca_base_vari.h | Adds `mca_base_var_group_add_event()` declaration. | 
+| opal/mca/base/mca_base_var.c | Initializes/finalizes the event framework alongside var/pvar frameworks. | 
+| opal/mca/base/mca_base_var_group.h | Adds `group_events` storage to MCA var groups. | 
+| opal/mca/base/mca_base_var_group.c | Implements append-only group event membership + lifecycle hooks. | 
+| opal/mca/base/mca_base_event.h | Introduces the OPAL public API for event sources/types/handles/callbacks/accessors. | 
+| opal/mca/base/mca_base_event.c | Implements registry + producer-side registration and ompi_info dump helpers. | 
+| opal/mca/base/mca_base_event_memory.c | Adds `opal.memory` drop-demonstrator producer using fold mechanism. | 
+| opal/mca/base/mca_base_event_example.c | Adds example producers and a deterministic trigger helper for tests/demos. | 
+| opal/mca/base/Makefile.am | Builds and installs the new event framework sources/headers. | 
+| opal/include/opal/types.h | Adds `opal_count_t` as an OPAL-layer-safe `MPI_Count` backing type. | 
+| ompi/tools/ompi_info/ompi_info.c | Hooks `opal_info_do_event()` into `ompi_info --event` and `--all`. | 
+| ompi/runtime/ompi_mpit_register_events.c | Registers in-tree producers (sources/types) and calls OPAL producers. | 
+| ompi/runtime/ompi_mpit_events.h | Declares producer event handles and the registration entry point. | 
+| ompi/runtime/ompi_mpi_params.c | Ensures event producers are registered during MCA param registration. | 
+| ompi/runtime/ompi_mpi_init.c | Adds build-time `_Static_assert`s tying `opal_count_t` and `MPI_Count`. | 
+| ompi/runtime/Makefile.am | Builds/installs new OMPI runtime event registration sources/headers. | 
+| ompi/mpi/tool/source_get_timestamp.c | Implements `MPI_T_source_get_timestamp` via OPAL back-end with correct error mapping. | 
+| ompi/mpi/tool/source_get_num.c | Implements `MPI_T_source_get_num` via OPAL source count. | 
+| ompi/mpi/tool/source_get_info.c | Implements `MPI_T_source_get_info` and returns a user-freeable `MPI_Info`. | 
+| ompi/mpi/tool/mpit-internal.h | Adds event handle casting helpers, trampoline declarations, and context types. | 
+| ompi/mpi/tool/mpit_common.c | Implements trampoline contexts + debug “no big lock during raise” hook. | 
+| ompi/mpi/tool/init_thread.c | Installs OPAL debug raise-check hook during MPI_T init (debug builds). | 
+| ompi/mpi/tool/event_set_dropped_handler.c | Wires dropped-handler API to OPAL framework and trampolines. | 
+| ompi/mpi/tool/event_register_callback.c | Wires callback registration/removal to OPAL framework and trampolines. | 
+| ompi/mpi/tool/event_read.c | Implements `MPI_T_event_read` via OPAL instance accessor. | 
+| ompi/mpi/tool/event_handle_set_info.c | Implements handle `set_info` via OPAL back-end. | 
+| ompi/mpi/tool/event_handle_get_info.c | Implements handle `get_info` via OPAL back-end and copies to `MPI_Info`. | 
+| ompi/mpi/tool/event_handle_free.c | Implements handle free without holding the MPI_T big lock (allows reentry). | 
+| ompi/mpi/tool/event_handle_alloc.c | Implements handle alloc via OPAL back-end with proper error mapping. | 
+| ompi/mpi/tool/event_get_timestamp.c | Implements instance timestamp accessor via OPAL. | 
+| ompi/mpi/tool/event_get_source.c | Implements instance source accessor via OPAL. | 
+| ompi/mpi/tool/event_get_num.c | Implements `MPI_T_event_get_num` via OPAL event count. | 
+| ompi/mpi/tool/event_get_info.c | Implements `MPI_T_event_get_info` via OPAL event metadata. | 
+| ompi/mpi/tool/event_get_index.c | Implements name→index lookup via OPAL registry. | 
+| ompi/mpi/tool/event_copy.c | Implements `MPI_T_event_copy` via OPAL instance copy. | 
+| ompi/mpi/tool/event_callback_set_info.c | Implements callback-slot `set_info` (v1 no-op storage) via OPAL back-end. | 
+| ompi/mpi/tool/event_callback_get_info.c | Implements callback-slot `get_info` returning user-freeable `MPI_Info`. | 
+| ompi/mpi/tool/category_get_num_events.c | Returns category event counts from new group event list. | 
+| ompi/mpi/tool/category_get_events.c | Populates per-category event indices and validates category index. | 
+| ompi/mpi/c/free_mem.c.in | Raises memory-free event before freeing MPI allocated memory. | 
+| ompi/mpi/c/alloc_mem.c.in | Raises memory-allocated event after successful allocation. | 
+| ompi/mpi/bindings/ompi_bindings/consts.py | Adds new MPI_T error codes to bindings generator constant list. | 
+| ompi/instance/instance.c | Raises session lifecycle events on instance init/finalize. | 
+| ompi/include/mpi.h.in | Defines new MPI_T event/source error classes. | 
+| ompi/errhandler/errhandler_invoke.c | Raises errhandler-invoked event prior to invoking error handler logic. | 
+| ompi/errhandler/errcode.c | Registers error strings/objects for new MPI_T error classes. | 
+| ompi/communicator/comm.c | Raises communicator-freed event before communicator teardown. | 
+| ompi/communicator/comm_cid.c | Raises communicator-created event upon successful communicator activation. | 
+| docs/release-notes/changelog/v6.0.x.rst | Adds release note entry for MPI_T events implementation and `ompi_info --event`. | 
+| docs/man-openmpi/man3/MPI_T_source_get_num.3.rst | Updates manpage note to describe non-stub behavior and discovery via `ompi_info --event`. | 
+| docs/man-openmpi/man3/MPI_T_event_get_num.3.rst | Updates manpage and adds “discovering available events” section + example code. | 
+| docs/developers/mpi-t-event-producers.rst | Adds developer guide for registering/raising MPI_T events and producer contract. | 
+| docs/developers/index.rst | Adds new MPI_T event producer guide to developer docs TOC. | 
+| configure.ac | Runs `OPAL_FIND_COUNT_TYPE` unconditionally as single source of truth for count type. | 
+| config/opal_find_count_type.m4 | Adds macro to compute `opal_count_t` backing type and max value. | 
+| config/ompi_find_mpi_aint_count_offset.m4 | Derives `MPI_Count` from OPAL’s computed count type (guarantees same width). |
+ 
+
+---
+
+💡 Add Copilot custom instructions for smarter, more guided reviews. Learn how to get started.
+
+- Review by hppritcha: 
+
+- jsquyres review_dismissed
+
+- jsquyres head_ref_force_pushed
+
+- Review by hppritcha: 
+
+- Referenced by PR #13830: HPE Cassini (CXI) Hardware Performance Counters (HWPC) Feature
+
+- jsquyres review_dismissed
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+- Review by github-advanced-security[bot]: 
+
+- jsquyres head_ref_force_pushed
+
+**jsquyres** commented on 2026-06-26T12:59:32Z:
+
+> Moved to draft mainly because there's a few small things I still want to do here (the overall approach is the same; these are minor issues):
+> 
+> * There are currently multiple `ompi.*` MPI_T event sources. Can we consolidate? I.e., should we just have multiple sources when they are required to be different in source characteristics (Vs. having multiple sources just for the sake of distinguishing the types of events they produce)? 
+> * All of these events are from the OMPI runtime software -- these are not fundamentally different event sources.
+> * Should we have some demo PMIx events? They don't need to actually report anything useful -- these are just example MPI_T events. But they could nicely show unordered and/or dropped events.
+
+- jsquyres convert_to_draft
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+**github-actions[bot]** commented on 2026-06-27T14:06:17Z:
+
+> Hello! The Git Commit Checker CI bot found a few problems with this PR:
+> 
+> **08caedd3: Add opal_count_t, a layer-safe backing type for MP...**
+> * *check_cherry_pick: contains a cherry pick message that refers to a commit that exists, but is in an as-yet unmerged pull request: 6288344316c6b7e13093027e8db7d22700e252ee*
+> 
+> Please fix these problems and, if necessary, force-push new commits back up to the PR branch. Thanks!
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+- jsquyres head_ref_force_pushed
+
+**jsquyres** commented on 2026-06-27T14:59:51Z:
+
+> Event sources consolidated, event types updated. This PR is now ready for comments.
+
+- jsquyres ready_for_review
+
+**jsquyres** commented on 2026-06-29T18:17:57Z:
+
+> bot:ompi:retest
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- someone committed
+
+- jsquyres head_ref_force_pushed
+
+**jsquyres** commented on 2026-07-05T14:28:09Z:
+
+> Rebased to fix conflicts with recent PR's landing on main.
+
+- Review by bosilca: It looks reasonable overall. However, this is 7k+ lines of code that affects the critical path, all to gain access to events that could have been obtained through the traditional PMPI abstraction. That said, I'm cautiously optimistic that the benefits justify the effort.

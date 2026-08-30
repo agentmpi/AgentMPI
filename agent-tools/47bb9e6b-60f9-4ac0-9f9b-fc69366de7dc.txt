@@ -1,0 +1,213 @@
+Sessions | OpenAI Agents SDK
+
+Skip to content
+
+# Sessions
+
+Sessions give the Agents SDK a persistent memory layer. Provide any object that implements the`Session` interface to`Runner.run`, and the SDK handles the rest. When a session is present, the runner automatically:
+
+1. Fetches previously stored conversation items and prepends them to the next turn.
+2. Persists new user input and assistant output after each run completes.
+3. Keeps the session available for future turns, whether you call the runner with new user text or resume from an interrupted`RunState`.
+
+This removes the need to manually call`toInputList()` or stitch history between turns. The TypeScript SDK ships with two implementations:`OpenAIConversationsSession` for the Conversations API and`MemorySession`, which is intended for local development. Because they share the`Session` interface, you can plug in your own storage backend. For inspiration beyond the Conversations API, explore the sample session backends under`examples/memory/`(Prisma, file-backed, and more). When you use an OpenAI Responses model, wrap any session with`OpenAIResponsesCompactionSession` to automatically shrink stored conversation history via responses.compact.
+
+Tip: To run the`OpenAIConversationsSession` examples on this page, set the`OPENAI_API_KEY` environment variable (or provide an`apiKey` when constructing the session) so the SDK can call the Conversations API.
+
+Use sessions when you want the SDK to manage client-side memory for you. If you are already using OpenAI server-managed state with`conversationId` or`previousResponseId`, you usually do not also need a session for the same conversation history.
+
+---
+
+## Getting started
+
+### Quick start
+
+Use`OpenAIConversationsSession` to sync memory with the Conversations API, or swap in any other`Session` implementation.
+
+Use the Conversations API as session memory
+
+```
+import { Agent, OpenAIConversationsSession, run } from '@openai/agents';const agent = new Agent({  name: 'TourGuide',  instructions: 'Answer with compact travel facts.',});// Any object that implements the Session interface works here. This example uses// the built-in OpenAIConversationsSession, but you can swap in a custom Session.const session = new OpenAIConversationsSession();const firstTurn = await run(agent, 'What city is the Golden Gate Bridge in?', {  session,});console.log(firstTurn.finalOutput); // "San Francisco"const secondTurn = await run(agent, 'What state is it in?', { session });console.log(secondTurn.finalOutput); // "California"
+```
+
+Reusing the same session instance ensures the agent receives the full conversation history before every turn and automatically persists new items. Switching to a different`Session` implementation requires no other code changes.
+
+For local demos, tests, or process-local chat state,`MemorySession` provides the same interface without talking to OpenAI:
+
+Use MemorySession for local state
+
+```
+import { Agent, MemorySession, run } from '@openai/agents';const agent = new Agent({  name: 'TourGuide',  instructions: 'Answer with compact travel facts.',});const session = new MemorySession();const result = await run(agent, 'What city is the Golden Gate Bridge in?', {  session,});console.log(result.finalOutput);
+```
+
+`OpenAIConversationsSession` constructor options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `conversationId` | `string` | Reuse an existing conversation instead of creating one lazily. |
+| `client` | `OpenAI` | Pass a preconfigured OpenAI client. |
+| `apiKey` | `string` | API key used when creating an internal OpenAI client. |
+| `baseURL` | `string` | Base URL for OpenAI-compatible endpoints. |
+| `organization` | `string` | OpenAI organization ID for requests. |
+| `project` | `string` | OpenAI project ID for requests. |
+
+`MemorySession` constructor options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `sessionId` | `string` | Stable identifier for logs or tests. Generated automatically by default. |
+| `initialItems` | `AgentInputItem[]` | Seed the session with existing history. |
+| `logger` | `Logger` | Override the logger used for debug output. |
+
+`MemorySession` stores everything in local process memory, so it is reset when your process exits.
+
+If you need to pre-create a conversation ID before constructing the session, use`startOpenAIConversationsSession(client?)` and pass the returned ID as`conversationId`.
+
+---
+
+## Core session behavior
+
+### How the runner uses sessions
+
+- Before each run it retrieves the session history, merges it with the new turn’s input, and passes the combined list to your agent.
+- After a non-streaming run one call to`session.addItems()` persists both the original user input and the model outputs from the latest turn.
+- For streaming runs it writes the user input first and appends streamed outputs once the turn completes.
+- When resuming from`RunResult.state`(for approvals or other interruptions) keep passing the same`session`. The resumed turn is added to memory without re-preparing the input.
+
+When an output guardrail rejects a terminal function-tool result, the runner does not add the raw rejected result to new session history. The runner persists a replay-safe placeholder for a recognized function call and result pair, and omits an ambiguous current-response suffix rather than storing output whose ownership it cannot prove. This protection does not undo external tool side effects or erase data that an application stored outside the session pipeline.
+
+---
+
+### Inspecting and editing history
+
+Sessions expose simple CRUD helpers so you can build “undo”, “clear chat”, or audit features.
+
+Read and edit stored items
+
+```
+import { OpenAIConversationsSession } from '@openai/agents';import type { AgentInputItem } from '@openai/agents-core';// Replace OpenAIConversationsSession with any other Session implementation that// supports get/add/pop/clear if you store history elsewhere.const session = new OpenAIConversationsSession({  conversationId: 'conv_123', // Resume an existing conversation if you have one.});const history = await session.getItems();console.log(`Loaded ${history.length} prior items.`);const followUp: AgentInputItem[] = [  {    type: 'message',    role: 'user',    content: [{ type: 'input_text', text: 'Let’s continue later.' }],  },];await session.addItems(followUp);const undone = await session.popItem();if (undone?.type === 'message') {  console.log(undone.role); // "user"}await session.clearSession();
+```
+
+`session.getItems()` returns the stored`AgentInputItem[]`. Call`popItem()` to remove the last entry—useful for user corrections before you rerun the agent.
+
+---
+
+## Custom storage and merge behavior
+
+### Bring your own storage
+
+Implement the`Session` interface to back memory with Redis, DynamoDB, SQLite, or another datastore. Only five asynchronous methods are required.
+
+Custom in-memory session implementation
+
+```
+import { Agent, run } from '@openai/agents';import { randomUUID } from '@openai/agents-core/_shims';import { getLogger } from '@openai/agents-core';import type { AgentInputItem, Session } from '@openai/agents-core';/** * Minimal example of a Session implementation; swap this class for any storage-backed version. */export class CustomMemorySession implements Session {  private readonly sessionId: string;  private readonly logger: ReturnType<typeof getLogger>;  private items: AgentInputItem[];  constructor(    options: {      sessionId?: string;      initialItems?: AgentInputItem[];      logger?: ReturnType<typeof getLogger>;    } = {},  ) {    this.sessionId = options.sessionId ?? randomUUID();    this.items = options.initialItems      ? options.initialItems.map(cloneAgentItem)      : [];    this.logger = options.logger ?? getLogger('openai-agents:memory-session');  }  async getSessionId(): Promise<string> {    return this.sessionId;  }  async getItems(limit?: number): Promise<AgentInputItem[]> {    if (limit === undefined) {      const cloned = this.items.map(cloneAgentItem);      this.logger.debug(        `Getting items from memory session (${this.sessionId}): ${JSON.stringify(cloned)}`,      );      return cloned;    }    if (limit <= 0) {      return [];    }    const start = Math.max(this.items.length - limit, 0);    const items = this.items.slice(start).map(cloneAgentItem);    this.logger.debug(      `Getting items from memory session (${this.sessionId}): ${JSON.stringify(items)}`,    );    return items;  }  async addItems(items: AgentInputItem[]): Promise<void> {    if (items.length === 0) {      return;    }    const cloned = items.map(cloneAgentItem);    this.logger.debug(      `Adding items to memory session (${this.sessionId}): ${JSON.stringify(cloned)}`,    );    this.items = [...this.items, ...cloned];  }  async popItem(): Promise<AgentInputItem | undefined> {    if (this.items.length === 0) {      return undefined;    }    const item = this.items[this.items.length - 1];    const cloned = cloneAgentItem(item);    this.logger.debug(      `Popping item from memory session (${this.sessionId}): ${JSON.stringify(cloned)}`,    );    this.items = this.items.slice(0, -1);    return cloned;  }  async clearSession(): Promise<void> {    this.logger.debug(`Clearing memory session (${this.sessionId})`);    this.items = [];  }}function cloneAgentItem<T extends AgentInputItem>(item: T): T {  return structuredClone(item);}const agent = new Agent({  name: 'MemoryDemo',  instructions: 'Remember the running total.',});// Using the above custom memory session implementation hereconst session = new CustomMemorySession({  sessionId: 'session-123-4567',});const first = await run(agent, 'Add 3 to the total.', { session });console.log(first.finalOutput);const second = await run(agent, 'Add 4 more.', { session });console.log(second.finalOutput);
+```
+
+Custom sessions let you enforce retention policies, add encryption, or attach metadata to each conversation turn before persisting it.
+
+### Make custom persistence atomic and idempotent
+
+For backends that can update history and record an operation identifier atomically, implement the optional`SessionHistoryTransactionAwareSession` interface. Its`applyHistoryTransaction(...)` method receives a stable`operationId` and one of two transaction shapes:
+
+- `append_items` appends a group of history items.
+- `replace_suffix` replaces an expected history suffix only when the currently stored suffix still matches.
+
+Persist the operation identifier and history mutation in the same backend transaction. Repeating an operation identifier with the same transaction must succeed without applying it twice. Reusing the identifier with different content, or applying`replace_suffix` after its expected suffix changed, must fail without changing history. This lets the runner safely reconcile persisted output across retries and resumable output-guardrail flows.
+
+`MemorySession` implements this contract as a reference. Existing`Session` implementations remain valid without it, but they do not opt into transaction-aware persistence paths.
+
+### Scope custom sessions with the run context
+
+Implement`RunContextAwareSession ` and set`acceptsRunContext` to`true` when a custom session needs the active`RunContext` for storage routing or metadata. The runner passes the same context instance to all history operations during a run, including streamed persistence and resumed runs. Sessions that only implement`Session` keep the existing method signatures and are called without the additional argument.
+
+Partition session history with the run context
+
+```
+import {  Agent,  run,  type AgentInputItem,  type RunContext,  type RunContextAwareSession,} from '@openai/agents';type TenantContext = {  tenantId: string;};class TenantSession implements RunContextAwareSession<TenantContext> {  readonly acceptsRunContext = true;  private readonly itemsByTenant = new Map<string, AgentInputItem[]>();  async getSessionId(): Promise<string> {    return 'shared-tenant-session';  }  async getItems(    limit?: number,    runContext?: RunContext<TenantContext>,  ): Promise<AgentInputItem[]> {    const items = this.getTenantItems(runContext);    return limit === undefined ? [...items] : items.slice(-limit);  }  async addItems(    items: AgentInputItem[],    runContext?: RunContext<TenantContext>,  ): Promise<void> {    this.getTenantItems(runContext).push(...items);  }  async popItem(    runContext?: RunContext<TenantContext>,  ): Promise<AgentInputItem | undefined> {    return this.getTenantItems(runContext).pop();  }  async clearSession(runContext?: RunContext<TenantContext>): Promise<void> {    this.itemsByTenant.set(this.getTenantId(runContext), []);  }  private getTenantItems(    runContext: RunContext<TenantContext> | undefined,  ): AgentInputItem[] {    const tenantId = this.getTenantId(runContext);    const items = this.itemsByTenant.get(tenantId) ?? [];    this.itemsByTenant.set(tenantId, items);    return items;  }  private getTenantId(    runContext: RunContext<TenantContext> | undefined,  ): string {    if (!runContext) {      throw new Error('TenantSession requires a run context.');    }    return runContext.context.tenantId;  }}const agent = new Agent<TenantContext>({  name: 'Assistant',  instructions: 'Reply concisely.',});const session = new TenantSession();await run(agent, 'Remember that my favorite color is green.', {  context: { tenantId: 'tenant-a' },  session,});await run(agent, 'What is my favorite color?', {  context: { tenantId: 'tenant-a' },  session,});
+```
+
+`OpenAIResponsesCompactionSession` does not forward a run context to its underlying session. Keep one compaction-session instance per context scope if you combine these capabilities.
+
+---
+
+### Control how history and new items merge
+
+When you pass an array of`AgentInputItem` s as the run input, provide a`sessionInputCallback` to merge them with stored history deterministically. The runner loads the existing history, calls your callback before the model invocation, and hands the returned array to the model as the turn’s complete input. This hook is ideal for trimming old items, deduplicating tool results, or highlighting only the context you want the model to see.
+
+Truncate history with sessionInputCallback
+
+```
+import { Agent, OpenAIConversationsSession, run } from '@openai/agents';import type { AgentInputItem } from '@openai/agents-core';const agent = new Agent({  name: 'Planner',  instructions: 'Track outstanding tasks before responding.',});// Any Session implementation can be passed here; customize storage as needed.const session = new OpenAIConversationsSession();const todoUpdate: AgentInputItem[] = [  {    type: 'message',    role: 'user',    content: [      { type: 'input_text', text: 'Add booking a hotel to my todo list.' },    ],  },];await run(agent, todoUpdate, {  session,  // function that combines session history with new input items before the model call  sessionInputCallback: (history, newItems) => {    const recentHistory = history.slice(-8);    return [...recentHistory, ...newItems];  },});
+```
+
+For string inputs the runner merges history automatically, so the callback is optional. The callback only runs when your turn input is already an item array.
+
+If you are also using`conversationId` or`previousResponseId`, keep at least one new item from the current turn in the callback result. Those server-managed APIs depend on the current-turn delta. If the callback drops every new item, the SDK restores the original new inputs and logs a warning instead of sending an empty delta.
+
+---
+
+## Resumable runs
+
+### Handling approvals and resumable runs
+
+Human-in-the-loop flows often pause a run to wait for approval:
+
+Resume a run with the same session
+
+```
+import { Agent, MemorySession, Runner } from '@openai/agents';const agent = new Agent({  name: 'Trip Planner',  instructions: 'Plan trips and ask for approval before booking anything.',});const runner = new Runner();const session = new MemorySession();const result = await runner.run(agent, 'Search the itinerary', {  session,});if (result.interruptions?.length) {  // ... collect user feedback, then resume the agent in a later turn.  for (const interruption of result.interruptions) {    result.state.approve(interruption);  }  const continuation = await runner.run(agent, result.state, { session });  console.log(continuation.finalOutput);}
+```
+
+When you resume from a previous`RunState`, the new turn is appended to the same memory record to preserve a single conversation history. Most human-in-the-loop (HITL) approval checkpoints round-trip through`RunState` while the session keeps the conversation history complete.
+
+Output guardrails impose a stricter boundary when an approved function-tool result can become the final output. If a serialized checkpoint does not contain enough provenance to identify the current output safely, the SDK fails closed before further model, tool, or session side effects. Some output-bearing approval checkpoints therefore cannot be resumed from serialized state with a session attached. Start a new run from safe input when the SDK reports this condition; do not work around it by replaying the rejected raw items.
+
+---
+
+## Advanced: history compaction
+
+### Compact OpenAI Responses history automatically
+
+`OpenAIResponsesCompactionSession` decorates any`Session` and uses the OpenAI Responses API to replace a long stored history with a shorter equivalent list of conversation items. After each persisted turn the runner passes the latest`responseId` into`runCompaction`, which calls`responses.compact` when your decision hook returns true. Depending on`compactionMode`, the request is built either from the latest Responses API chain or from the session’s current items. The default trigger compacts once at least 10 non-user items have accumulated; override`shouldTriggerCompaction` to base the decision on token counts or custom heuristics. After compaction returns, the decorator clears the underlying session and rewrites it with the reduced item list, so avoid pairing it with`OpenAIConversationsSession`, which uses a different server-managed history flow.
+
+Decorate a session with OpenAIResponsesCompactionSession
+
+```
+import {  Agent,  MemorySession,  OpenAIResponsesCompactionSession,  run,} from '@openai/agents';const agent = new Agent({  name: 'Support',  instructions: 'Answer briefly and keep track of prior context.',  model: 'gpt-5.4',});// Wrap any Session to trigger responses.compact once history grows beyond your threshold.const session = new OpenAIResponsesCompactionSession({  // You can pass any Session implementation except OpenAIConversationsSession  underlyingSession: new MemorySession(),  // (optional) The model used for calling responses.compact API  model: 'gpt-5.4',  // (optional) your custom logic here  shouldTriggerCompaction: ({ compactionCandidateItems }) => {    return compactionCandidateItems.length >= 12;  },});await run(agent, 'Summarize order #8472 in one sentence.', { session });await run(agent, 'Remind me of the shipping address.', { session });// Compaction runs automatically after each persisted turn. You can also force it manually.await session.runCompaction({ force: true });
+```
+
+`OpenAIResponsesCompactionSession` constructor options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `client` | `OpenAI` | OpenAI client used for`responses.compact`. |
+| `underlyingSession` | `Session` | Backing session store to clear/rewrite with compacted items. Defaults to an in-memory session for demos and must not be`OpenAIConversationsSession`. |
+| `model` | `OpenAI.ResponsesModel` | Model used for compaction requests. Defaults to the SDK’s current default OpenAI model. |
+| `compactionMode` | `'auto' | 'previous_response_id' | 'input'` | Controls whether compaction uses server response chaining or local input items. |
+| `shouldTriggerCompaction` | `(context) => boolean | Promise ` | Custom trigger hook based on`responseId`,`compactionMode`, candidate items, and current session items. |
+
+`compactionMode: 'previous_response_id'` is useful when you are already chaining turns with Responses API response IDs.`compactionMode: 'input'` rebuilds compaction requests from the current session items instead, which is helpful when the response chain is unavailable or you want the underlying session contents to be the source of truth.
+
+`runCompaction(args)` options:
+
+| Option | Type | Notes |
+| --- | --- | --- |
+| `responseId` | `string` | Latest Responses API response id for`previous_response_id` mode. |
+| `compactionMode` | `'auto' | 'previous_response_id' | 'input'` | Optional per-call override of the configured mode. |
+| `store` | `boolean` | Indicates whether the last run stored server state. |
+| `force` | `boolean` | Bypass`shouldTriggerCompaction` and compact immediately. |
+
+`OpenAIResponsesCompactionSession` serializes mutations issued through the same wrapper instance. Calls to`runCompaction()`,`addItems()`,`popItem()`, and`clearSession()` run in invocation order, and the queue continues after a rejected operation, so later wrapper mutations do not interleave with replacement or rollback. A successful replacement or rollback keeps the wrapper’s cached history aligned with the underlying session. If both replacement and restoration fail, recover the underlying session before continuing. This ordering guarantee does not coordinate a different wrapper instance or direct mutation of`underlyingSession`; coordinate those access paths in your application.
+
+#### Manual compaction for low-latency streaming
+
+Compaction clears and rewrites the underlying session, so the SDK waits for it before resolving a streaming run. If compaction is heavy,`result.completed` can stay pending for a few seconds after the last output token. For low-latency streaming or faster turn-taking, disable auto-compaction and call`runCompaction` yourself between turns (or during idle time).
+
+Disable auto-compaction and compact between turns
+
+```
+import {  Agent,  MemorySession,  OpenAIResponsesCompactionSession,  run,} from '@openai/agents';const agent = new Agent({  name: 'Support',  instructions: 'Answer briefly and keep track of prior context.',  model: 'gpt-5.4',});// Disable auto-compaction to avoid delaying stream completion.const session = new OpenAIResponsesCompactionSession({  underlyingSession: new MemorySession(),  shouldTriggerCompaction: () => false,});const result = await run(agent, 'Share the latest ticket update.', {  session,  stream: true,});// Wait for the streaming run to finish before compacting.await result.completed;// Choose force based on your own thresholds or heuristics, between turns or during idle time.await session.runCompaction({ force: true });
+```
+
+You can call`runCompaction({ force: true })` at any time to shrink history before archiving or handoff. Enable debug logs with`DEBUG=openai-agents:openai:compaction` to trace compaction decisions.

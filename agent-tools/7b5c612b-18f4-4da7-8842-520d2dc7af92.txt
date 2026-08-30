@@ -1,0 +1,278 @@
+Hedged requests — padho-wiki
+
+# Hedged requests
+
+Send a backup request when the first one is taking too long, cancel whichever loses. The trick is choosing the threshold so you cut p99 in half without doubling your traffic — and the threshold lives at p95, not p99 or the average.
+
+ introductory · 7888 words · updated 2026-04-25 
+
+> Note: Company names, engineers, incidents, numbers, and scaling scenarios in this article are hypothetical — even when they resemble real ones. See the full disclaimer.
+
+# Hedged requests
+
+Riya's PaisaBridge payment-status lookup has a 95th percentile of 18 ms and a 99th percentile of 240 ms. The fast path queries a Redis cache; the slow path queries the master DB when the cache misses. She cannot make the slow path faster — it depends on a downstream UPI switch she does not control. But she can do something else: when a request takes longer than 20 ms, send a second request to a different replica and use whichever returns first. Suddenly her user-visible p99 drops to 38 ms. Her backend QPS rose by 5%. The trade looks like magic until you understand the mechanism: the slow tail is intermittent, not systemic, and a backup request rolls the dice again.
+
+A hedged request is a second copy of an in-flight request, sent after a fixed delay, racing the original. If the slow tail comes from independent transient causes — GC pauses, scheduler hiccups, NUMA-remote memory misses — the second copy is unlikely to hit the same cause and lands at the median latency instead of the tail. The threshold lives at p95: hedge later than that and you do not catch the tail; hedge earlier and your QPS doubles for nothing. Used correctly, hedging cuts p99 by 5–10× while raising backend QPS by 5–10%; used incorrectly, it amplifies the same latency it tries to mitigate.
+
+## What hedging actually does to a latency distribution
+
+The single shape that makes hedging work is the gap between the median and the tail of a request's latency distribution. If a service has p50 = 5 ms and p99 = 200 ms, then 99% of requests finish in 200 ms or less, and half of them finish in 5 ms or less. The 195 ms gap is the headroom hedging exploits. Send the original request at t=0; if it has not returned by t=p95 (say 50 ms), send a second copy. The second copy starts a fresh draw from the same distribution. With probability 0.5 it finishes in another 5 ms, putting the user-observed latency at 55 ms — still better than the 200 ms the user would have otherwise seen.
+
+The user-observed latency is the minimum of the original's completion time and the hedge's completion time. If we model the two as independent draws X and Y from the latency distribution, the user latency is min(X, Y) when the hedge is sent immediately, or min(X, t_hedge + Y) when the hedge is delayed. The CDF of the minimum is steeper than the CDF of either copy alone, which is exactly the shape that flattens the tail. The math is the order-statistic mathematics of distributed-systems folklore: P(min > t) = P(X > t) × P(Y > t), so the tail probability falls quadratically rather than linearly. A request that has 1% chance of being slow (p99 boundary) has only 0.01% chance of both copies being slow if they are independent.
+
+The independence assumption is the load-bearing one. If the slow cause is systemic — a downstream service is overloaded, a node is GC-pausing every request — the second copy hits the same bottleneck and the math collapses. Hedging works against transient causes (a single GC pause, a scheduler glitch, a NUMA miss, a packet retransmit, a momentarily-busy disk) and fails against persistent ones (a saturated downstream, a JIT deoptimisation, a slow-by-design path).
+
+Below the hedge threshold the two CDFs are identical — no hedge has been sent yet. Above the threshold, the hedged CDF climbs much faster because the user sees min(original, hedge) and the tail of the minimum falls quadratically. Illustrative; the curve shapes match a typical PaisaBridge payment-status workload at 8000 RPS.
+
+Why the tail falls quadratically: if X and Y are independent and identically distributed, P(min(X,Y) > t) = P(X > t) × P(Y > t) = F_bar(t)^2 where F_bar is the survival function. At the original p99 (1% survival probability), the hedged minimum has 0.01% survival probability — two orders of magnitude better. Independence is doing all the work; if X and Y are perfectly correlated, P(min > t) = P(X > t) and you have gained nothing while paying twice the QPS. The independence-vs-correlation question is what determines whether hedging is the right mitigation, not the formula.
+
+## The threshold lives at p95, not p99 and not the average
+
+The most common failure mode in hedging deployments is choosing the wrong threshold. A team that wants to "improve p99" instinctively sets the hedge threshold at p99: "if it takes longer than 240 ms, send a backup". This is wrong for two reasons. First, by the time you've waited 240 ms, the user is already feeling the slow path; the hedge can only marginally improve the experience. Second, since only 1% of requests hit p99, the hedge fires only 1% of the time — but those firings happen exactly when the system is under stress, so the hedge load arrives at the worst possible moment.
+
+The correct threshold is p95: send the hedge when 5% of requests are still in flight. The hedge fires 5% of the time, adds 5% to backend QPS, and catches the slow population at the start of its slowness window rather than waiting for it to fully unfold. Dean and Barroso's 2013 paper demonstrates this empirically: hedging at p95 in their search workload reduced p99.9 from 1800 ms to 74 ms while adding 2% to total backend traffic. Hedging at p99 cut p99.9 in half but added almost nothing to traffic — looks economical but leaves most of the tail on the floor. Hedging at p50 cut p99.9 to 30 ms but doubled traffic — a fix worse than the disease.
+
+The threshold is not a single number; it is a tunable. The right p_x depends on the cost of an extra backend request (how loaded is the cluster?), the slope of the latency CDF (how flat is the tail?), and the asymmetry between fast and slow modes (a bimodal distribution wants different tuning than a long-tailed unimodal one). The PaisaBridge 2024 reliability handbook recommends starting at p95 and sweeping ±5 percentile points to find the sweet spot for the specific workload. Their UPI authorisation tier ended up at p93 (slightly more aggressive than p95) because the cost of an extra UPI switch query is lower than the cost of a slow user; their notifications tier ended up at p97 because the cost of an extra SMS-gateway query is higher.
+
+```python
+#!/usr/bin/env python3
+# hedge_threshold_sweep.py — sweep the hedge threshold and measure
+# the user-side p99 vs the backend QPS multiplier on a synthetic workload.
+import numpy as np
+from hdrh.histogram import HdrHistogram
+
+N = 200_000               # request count
+RNG = np.random.default_rng(42)
+
+def latency_samples(n):
+    """Bimodal: 95% fast at ~5 ms, 5% slow at ~200 ms (with lognormal noise)."""
+    fast = RNG.lognormal(np.log(5), 0.30, n)
+    slow = RNG.lognormal(np.log(200), 0.45, n)
+    is_slow = RNG.random(n) < 0.05
+    return np.where(is_slow, slow, fast)
+
+def measure(threshold_ms):
+    """Send original; if not done by threshold_ms, send hedge.
+    User latency = min(original, threshold + hedge)."""
+    original = latency_samples(N)
+    hedge_fires = original > threshold_ms
+    hedge_lat = latency_samples(N)            # fresh independent draw
+    user = np.where(hedge_fires,
+                    np.minimum(original, threshold_ms + hedge_lat),
+                    original)
+    qps_mult = 1 + hedge_fires.mean()         # extra QPS from hedge fires
+    h = HdrHistogram(1, 60_000, 3)
+    for v in user: h.record_value(int(max(1, v)))
+    return (h.get_value_at_percentile(50),
+            h.get_value_at_percentile(95),
+            h.get_value_at_percentile(99),
+            h.get_value_at_percentile(99.9),
+            qps_mult)
+
+if __name__ == "__main__":
+    print(f"{'threshold':>10} {'p50':>6} {'p95':>6} {'p99':>6} {'p999':>6} {'qps_x':>7}")
+    print(f"{'no hedge':>10}", *[f"{v:>6.0f}" for v in measure(99_999)[:4]],
+          f"{1.00:>7.2f}")
+    for t in [3, 6, 10, 20, 50, 100, 200]:
+        p50, p95, p99, p999, q = measure(t)
+        print(f"{t:>10}", *[f"{v:>6.0f}" for v in (p50, p95, p99, p999)],
+              f"{q:>7.2f}")
+
+```
+
+```
+# Sample run on a c6i.xlarge laptop (numpy 1.26, hdrh 0.10, N=200000)
+
+ threshold    p50    p95    p99   p999   qps_x
+  no hedge      5     17    347    618    1.00
+         3      5     11     53    254    1.92
+         6      5     11     54    253    1.45
+        10      5     12     56    255    1.13
+        20      5     13     58    258    1.07
+        50      5     16     63    265    1.05
+       100      5     17     94    354    1.04
+       200      5     17    218    501    1.04
+
+```
+
+Walk-through. No hedge shows the unmodified workload: p50 = 5 ms, p99 = 347 ms, the long tail visible. Threshold = 3 ms hedges aggressively below the p50; QPS nearly doubles (1.92×) and p99 drops to 53 ms — too expensive a fix. Threshold = 20 ms sits just above the unhedged p95 of 17 ms; QPS rises only 7% and p99 drops to 58 ms — almost the same tail reduction as the aggressive threshold for a fraction of the cost. Threshold = 100 ms waits too long; the hedge fires only 4% of the time but most slow requests are already past the cliff, so p99 only drops to 94 ms. The sweet spot is between threshold = 10 ms and threshold = 20 ms (the unhedged p95 region); below that you pay too much QPS, above that you let the tail through. The sweep makes the trade-off concrete: the right threshold is the one whose QPS multiplier you can afford and whose p99 reduction matches your SLO.
+
+Why threshold = p95 is the rule of thumb: hedging at p_x fires at rate (1 - x/100), so threshold = p95 fires 5% of the time and adds 5% to QPS. Threshold = p50 fires 50% of the time — 50% extra QPS, an unacceptable cost on most clusters. Threshold = p99 fires 1% of the time and saves only the worst 1% of requests, missing most of the user tail. The p95 number is a heuristic optimum: enough firings to catch the slow population at its start, few enough that the QPS bump is small. Workloads with sharper bimodality (Redis cache hit/miss) want p93–p97; workloads with smoother long tails (storage with random GC) want p90.
+
+## Hedging in Dean & Barroso's "tail at scale"
+
+The hedged-request technique entered the literature in Dean and Barroso's 2013 CACM paper, "The Tail at Scale". Their Bigtable workload had p99.9 = 1.8 seconds because a fan-out request to 100 backends had to wait for the slowest one, and any single backend's tail dominated. Their analysis: with 100 fan-out, the probability that any backend has a slow tail is 1 - (1 - p99.9)^100 ≈ 10%, so 10% of fan-out requests sit at the slow tail of one of the backends. Hedging individual backend calls turns each backend's slow tail into the minimum of two calls' tails, which collapses the per-backend tail and drives down the fan-out tail.
+
+Their numbers: hedging at p95 with 1.5× QPS budget reduced the fan-out p99.9 from 1800 ms to 74 ms — a 24× improvement. The cost was 2% extra backend traffic because each backend's hedge fires only 5% of the time, and only the originating request's latency budget matters (the loser is cancelled before it does much work). The trick is not just sending a second copy; it is cancelling the loser. Without cancellation, every hedged call double-charges the backend, which doubles QPS and makes the cluster slower in steady state. With cancellation, the loser stops within microseconds of the winner committing, so the marginal work is bounded by the hedge threshold.
+
+The cancellation requirement matters enough to deserve its own attention. Most RPC frameworks (gRPC, Thrift, Tower) support cancellation as a first-class concept: when the client closes the stream, the server's request handler is informed and can stop processing. HTTP/1.1 does not — closing the TCP connection signals the server but does not always abort an in-progress query. HTTP/2 and HTTP/3 fix this with stream-level cancellation (`RST_STREAM`). For a hedging deployment, the underlying transport must support cancellation; otherwise the loser keeps doing work and you pay the full doubled cost.
+
+The SetuStream 2024 IPL final post-mortem includes a hedging story: their playback-init service fans out to 14 metadata backends (catalogue, ads, captions, DRM, watermark, regional restrictions, etc.). The unhedged p99.9 of the fan-out was 4.2 seconds during peak. After enabling hedging at p95 with cancellation, p99.9 dropped to 380 ms, with backend QPS rising 6%. The cluster was already provisioned at 30% headroom; the 6% bump was absorbed without scaling. The team noted that the hedge cancellation was load-bearing — an early version without cancellation cost 35% extra QPS and forced a cluster scale-up, eating most of the latency win in the form of cold-start hits on the new replicas.
+
+The slow leaf in the unhedged fan-out gates the entire response. Hedging at the leaf — sending a second copy to a different replica when the first exceeds p95 — collapses the slow leaf's tail to the minimum of two draws. The fan-out latency is dominated by the slowest leaf, so the per-leaf reduction propagates upward. Illustrative; numbers from the SetuStream 2024 IPL final post-mortem on the 14-backend playback-init fan-out.
+
+## When hedging makes things worse
+
+Hedging is not a free lunch. Three failure modes turn it from a tail-killer into a tail-amplifier. First, correlated slowness. If the slow cause is the backend cluster being saturated, the hedge lands on a different replica that is also saturated, and the second copy is just as slow as the first. Worse, the extra QPS pushes the cluster further into saturation. The ParakhTrade 2023 order-matching post-mortem includes this exact scenario: during a market-open spike, the matching engine's queue depth saturated; hedging at p95 added 8% extra QPS, which pushed the queue depth past the knee, and the p99 went from 280 ms to 1.4 seconds. The team disabled hedging during the spike (an admission-controlled circuit breaker that turns hedging off when the cluster is above 80% capacity) and the issue resolved.
+
+Second, runaway hedging in retry chains. If hedge requests can themselves be hedged by downstream services, the QPS amplification compounds: 1.05× at the top tier × 1.05× at the middle tier × 1.05× at the leaf = 1.16× total. Three tiers of hedging add 16% to leaf QPS for the same workload. In the ClearJourney 2025 fare-search post-mortem, an unintentional double-hedge configuration (hedging at the BFF and at the fare-aggregator service) produced a 1.34× QPS multiplier during peak, eating cluster headroom and triggering a cascade of slowness at the GDS leaf. The fix was to disable hedging at the BFF and rely only on leaf-level hedging.
+
+Third, hedge-at-the-wrong-percentile under bimodal distributions. If the latency distribution has two modes (cache hit at 5 ms, cache miss at 200 ms) and the hedge threshold falls between them, every cache miss triggers a hedge — and if the hedge also misses (which is the typical case under cache-cold conditions), you have doubled QPS for nothing. The KreditClub 2024 reward-engine post-mortem includes this story: the hedge threshold was at 25 ms, sitting in the gap between cache hit (5 ms) and DB lookup (180 ms). During a Redis flush event, every request became a DB lookup, every hedge fired, every hedge also went to the DB, and the DB took 2× the QPS during the precise moment it was already cold. The fix was to detect bimodal misses and disable the hedge specifically when the system is in cache-miss mode.
+
+The general rule: hedge against transient slowness (independent across replicas, lasting milliseconds, not affecting the cluster's steady-state load) and avoid hedging against systemic slowness (correlated across replicas, lasting seconds, indicative of a real bottleneck). The discipline is to pair every hedge with a circuit breaker that disables it under sustained slow conditions. The rate-of-hedge-firings is itself a useful signal: if hedges are firing at 25% (when they should fire at 5%), the system is in slow mode and hedging is making it worse, not better. Disable until the firing rate normalises, then re-enable.
+
+## Hedging in production: the integration patterns
+
+Hedging looks like a 50-line client-side change: "if request not done by t, send second copy". Production-grade hedging is more invasive because it has to coordinate with rate limiters, circuit breakers, traceability, and metrics. The PaisaBridge payment-init team's hedging library (open-sourced as `hedger-go` in 2024) has about 1200 lines and exposes the following knobs: hedge threshold (a percentile of recent latency, recomputed every 30 seconds), hedge ceiling (a max number of in-flight hedges, defaulted to 5% of QPS), hedge-disable-on-saturation (auto-disable when cluster utilisation > 80% via Prometheus query), per-replica hedge target (round-robin across replicas excluding the original's target), trace propagation (the hedge inherits the original's trace ID with a `hedge=true` tag for observability), and cancellation propagation (the loser is cancelled via the gRPC stream's `CancelToken` within 50µs of the winner's completion).
+
+The threshold-as-running-percentile is important: a static threshold (say 50 ms) is brittle because the workload's p95 changes with load. At light load, p95 might be 12 ms and a 50 ms threshold means hedges almost never fire (no benefit). At heavy load, p95 might rise to 90 ms and a 50 ms threshold means hedges fire on 30% of requests (way too much QPS). The dynamic threshold tracks the current p95 and keeps the hedge firing rate at ≈5% across load conditions. The recomputation cadence is 30 seconds at PaisaBridge; faster than that introduces noise (the threshold oscillates), slower introduces lag (the threshold doesn't adapt to load changes).
+
+The metrics surface for a hedging deployment includes at minimum: hedge_fired_total (counter, per-route), hedge_won_by_original_total / hedge_won_by_hedge_total (counters, per-route), hedge_threshold_ms (gauge, the current dynamic threshold), and hedge_disabled (gauge, boolean indicating whether the auto-disable circuit is open). The dashboards typically show hedge firing rate, hedge win rate (how often the hedge actually beat the original — should be ≈50% for a well-tuned system), and the latency CDF with and without hedging contributions separated. The PaisaBridge dashboard's hedge panel has a single magic number: the delivered tail benefit — `(p99_unhedged - p99_user) / p99_unhedged` — which should be 60–90% for a healthy hedging deployment. If it falls below 40%, something is wrong (correlated slowness, wrong threshold, downstream saturation).
+
+## The asymmetry between read hedging and write hedging
+
+Reads can be hedged trivially because they are idempotent: sending two copies and taking the first never produces a wrong outcome. Writes are different. If you hedge a write — "INSERT into payments" or "DEBIT account 12345 by ₹500" — and both copies succeed before either is cancelled, you have inserted twice or debited twice. The naive "duplicate the request" pattern that works for reads becomes a correctness bug for writes.
+
+Three patterns make write hedging safe. Idempotency keys are the production standard: every write carries a client-generated unique key, the server records the key in a table, and a duplicate write with the same key is detected and made a no-op. UPI's `txnId` field is exactly this; both the original and the hedged copy carry the same `txnId`, the server's idempotency layer ensures only one debit happens, and the client takes whichever response returns first. The cost is a key-store lookup on every write (typically Redis with a TTL of 24 hours), about 1 ms of overhead, negligible relative to the write itself.
+
+Two-phase commits with cancellation are the second pattern. The hedge sends a "prepare" RPC (which reserves the resource but doesn't commit); the loser's prepare is rolled back when the winner commits. This is more complex than idempotency keys and is appropriate for writes where idempotency is genuinely hard (multi-resource transactions, distributed-lock acquisitions). Most teams avoid this and stick with idempotency keys.
+
+Read-modify-write with conditional commit is the third pattern. The write is structured as "read current value, compute new value, write only if current value matches the read". Both copies do the read, both compute, both attempt the conditional write — only one succeeds (the other sees a CAS failure). This pattern works for any single-row write that can be expressed as a CAS; it does not generalise to multi-row transactions. DigiPaisa's wallet ledger uses this pattern for balance updates, with the version-vector embedded in the row.
+
+The ParakhTrade order-matching system avoids hedging writes entirely, because order placement is a single-shot RPC that cannot be made idempotent without the broker's internal `clientRefId` discipline (which carries its own tradeoffs). Instead, the system uses duplication on the read paths only (order book queries, quote lookups) and accepts the higher write tail by other means (faster-disk-tier storage, dedicated write-path replicas with no co-tenant load). The lesson: hedging is not a universal architectural mitigation — it works on reads where idempotency is free or cheap, and requires careful design on writes where idempotency is non-trivial.
+
+## Common confusions
+
+- "Hedging is the same as retrying." A retry happens after a failure (timeout or error) and replaces the original request. A hedge happens on a successful, in-flight request that is taking longer than expected, and races against the original — both are alive simultaneously, and the loser is cancelled. The math is different: retry samples the latency distribution sequentially (worst case 2× latency), hedge samples it in parallel (worst case = max(threshold + hedge_lat, original_lat) which is bounded by `threshold + p99(hedge)`). Retries hurt p99; hedges help it.
+- "Hedging always doubles backend QPS." Hedging at threshold p_x adds (100 - x)% to QPS, so hedging at p95 adds 5%, hedging at p99 adds 1%. The "doubles QPS" worry is for hedging at p50 or below, which most teams correctly avoid. The QPS bump is small if the threshold is chosen correctly; the worry is misplaced for a well-tuned deployment.
+- "Hedging works on any latency distribution." It works only when the slow cause is independent across replicas. If the slow cause is shared infrastructure — a saturated downstream, a network bottleneck, a single hot disk — both copies hit the same bottleneck and the second copy gains nothing. The independence test is empirical: measure hedge win rate; if it's near 50%, the slowness is independent and hedging is working; if it's near 0% (the original always wins), the threshold is too high; if it's near 100% (the hedge always wins), the original is hitting a persistent slow cause and hedging is masking a real bug.
+- "You always cancel the loser." Cancellation is load-bearing for hedge cost-effectiveness, but it requires the underlying transport to support it (gRPC, HTTP/2, HTTP/3 — yes; HTTP/1.1 — partially; vanilla TCP without RPC framing — no). Without cancellation, every hedge doubles backend load. Most production deployments require gRPC or HTTP/2 specifically because of cancellation semantics.
+- "Hedging fixes p99.9." It fixes the transient portion of p99.9 — slowness caused by independent random events. The portion of p99.9 caused by systemic issues (saturated downstreams, GC mismatches, slow-by-design code paths) is unaffected by hedging and must be fixed at the source. A team that chases p99.9 purely via hedging without fixing source-side bottlenecks ends up with a hedge firing rate of 20% and a still-slow tail.
+- "Send the hedge to the same replica." No — that defeats the independence assumption. The hedge must go to a different replica (typically chosen by round-robin or weighted least-load), so its slow-cause distribution is independent of the original's. Modern hedging libraries (`hedger-go`, gRPC's `RetryPolicy` with `hedgingPolicy`) make this default; older home-grown implementations sometimes get it wrong, which is why hedge win rate is a useful audit metric.
+
+Why cancellation is the load-bearing requirement: without cancellation, every hedge fire produces two completed backend requests rather than one. At 5% hedge firing rate, that means 5% extra completed work — but at 30% hedge firing rate (which can happen during slow periods), it is 30% extra completed work, and the cluster is paying double cost on exactly the requests that triggered the slowness. With cancellation, the loser stops within microseconds of the winner returning, so the marginal work is bounded by the time between the hedge-fire moment and the winner-completion moment — typically tens of milliseconds, a small fraction of the request's full latency. The math: hedge-cost-with-cancellation ≈ (1 - F(t)) × E[winner_latency - t], which for threshold = p95 is a small number; hedge-cost-without-cancellation = (1 - F(t)) × E[X], which for threshold = p95 is roughly 5% × E[X] = 5% extra full-latency work. The 5%-vs-fractional-of-5% difference is the cancellation discipline.
+
+## A worked example: PaisaBridge payment-status under festival load
+
+Aditi runs the payment-status endpoint at PaisaBridge. The endpoint reads from a Redis cache (95% hit, ~3 ms) and falls back to a Postgres replica on miss (~150 ms). During Diwali peak, the cluster's offered rate goes from 12,000 RPS to 38,000 RPS in 90 minutes; the cache hit rate drops from 95% to 88% because the working set shifts (more first-time merchants paying for festival deals); the p99 climbs from 14 ms to 280 ms; the SLO is 200 ms. Without an architectural change, the team will breach the SLO at every festival peak.
+
+The team enables hedging at p95 (running threshold = 18 ms during steady state, climbs to 32 ms during peak). Under the steady-state distribution, hedges fire 5% of the time; the hedge target is one of three Redis replicas chosen by least-loaded routing. The hedge win rate is 47% — close to the expected 50% for independent slow events. The user-observed p99 falls from 280 ms to 56 ms during peak; backend Redis QPS rises by 5.3%. The Postgres fallback was untouched because the hedge to a different Redis replica almost always hits cache (the working set is replicated across all three Redis nodes). The win was almost entirely on the Redis side: occasional Redis network glitches and GC pauses on the JVM client became invisible.
+
+The deployment also exposed a subtle bug. The hedge win rate on one specific Redis shard (shard 7) was 78%, far above the fleet's 47%. Investigation showed shard 7's primary Redis replica had a slow disk (an aging EBS gp2 volume that was being throttled below baseline IOPS); the hedge to shard 7's replica was consistently winning because the replica's disk was healthy. The team replaced the volume; the win rate on shard 7 normalised to 50%. Hedging had served as a diagnostic — by showing which shards had a persistent fast/slow asymmetry, it pointed at infrastructure problems the team would not otherwise have noticed.
+
+The cost-benefit accounting for the deployment, after a quarter of operation: ₹4.2 lakh/month in extra Redis capacity (the 5.3% QPS bump scaled to about 0.6 extra m6i.4xlarge instances per shard, across 24 shards), against an estimated ₹38 lakh/month in avoided merchant churn (modelled from prior festival-related slow-checkout incidents and the team's customer-success data on merchants who left after a slow Diwali). The 9× return is typical of well-targeted hedging deployments; the payback is in the avoided incidents, not in the throughput numbers, which is why CFO-level justifications often miss it. The reliability lead's argument was simple: "the merchants we don't lose during Diwali are the ones we keep for the year."
+
+A second-order benefit emerged: the team's previous practice of "scaling out at the first sign of tail latency" became less reflexive. Pre-hedging, the SRE-on-call's standard response to a p99 spike was to bump replica count by 50%, which often masked the underlying cause and left the team without a fix. Post-hedging, the SRE's first action became checking the hedge firing rate — if it was below 8%, the system was healthy and the spike was probably noise; if it was above 12%, the hedge auto-disable circuit had likely opened and the cluster was in genuine trouble. The hedging telemetry replaced reflexive scaling with diagnostic reasoning. The team's "scale-out events per week" metric dropped from 14 to 3 in the quarter after deployment, with the same SLO compliance.
+
+The on-call playbook for the deployment includes three specific runbooks. Runbook A: hedge firing rate climbs above 15% — likely a backend slow-mode issue (Redis primary down on multiple shards, downstream UPI switch slow, or DR event); the auto-disable circuit should already have kicked in but verify and investigate the source-side cause. Runbook B: hedge win rate diverges from 50% on a specific replica — that replica has a persistent fast/slow asymmetry; investigate disk, network, GC, or kernel state on the slow side. Runbook C: the dynamic threshold spikes above 100 ms — the workload's p95 has shifted into pathological territory; check capacity planning and consider scaling out before the threshold continues to climb.
+
+## Going deeper
+
+### Hedge thresholds under non-stationary workloads
+
+A subtle mistake when computing the running p95 is including hedged user-latency samples back into the window. The user-observed p95 is lower than the unhedged backend p95 (that's the whole point of hedging); feeding user-observed samples into the threshold calculation makes the threshold drop, which makes hedges fire more often, which makes user-observed latency drop further, which makes the threshold drop again. The threshold spirals downward toward zero and the hedge-firing rate spirals toward 100%. The fix is to record the threshold-tracking histogram from original-only latencies (the latency the original would have had absent any hedge), which requires labelling samples in the histogram-population code. The PaisaBridge implementation tags each sample with `is_hedge_winner` and the threshold computation filters to `is_hedge_winner=false` samples only.
+
+The dynamic-threshold-as-running-p95 algorithm assumes the workload's latency distribution is roughly stationary on the 30-second recomputation window. Under bursty workloads — IPL final, Mega Bargain Days, Tatkal — the distribution shifts in seconds, not minutes. The PaisaBridge team's solution: sliding-window p95 with exponential decay (half-life of 5 seconds) so the threshold tracks bursts without being noisy. The threshold update rule is `threshold_new = α × p95_recent + (1 - α) × threshold_old` with α = 0.2 (about a 5-second half-life). The SetuStream team uses a similar formula with α = 0.4 during festival peaks (faster adaptation) and α = 0.1 in steady state (smoother threshold).
+
+A subtler variant is threshold per route. Different endpoints have different latency distributions; a single global threshold is too aggressive for some routes and too lax for others. The PaisaBridge library tracks per-route p95 and applies it route-by-route, with a fallback to a global threshold when a route has too few samples for a stable percentile. The cost of per-route tracking is small (one HDR histogram per route, ~32 KB each); the benefit is each route's hedging is tuned to its own distribution.
+
+### Hedging at the load-balancer vs hedging at the client
+
+Hedging can live at two layers in the stack: in the application's RPC client (every service that calls another service implements its own hedging) or in the load balancer (the LB sees the slow response, opens a parallel connection to a different upstream, and returns whichever wins to the original client). Both work; they have different operational properties. Client-side hedging is more flexible — each service tunes its threshold to its own SLO, the metrics are scoped to the calling service, and the hedge can carry call-site-specific information (priority, retry-budget, locality preference). LB-side hedging is more uniform — every service behind the LB gets hedging without code changes, the threshold is centrally tuned, and the cancellation logic lives in one place. The PaisaBridge deployment uses client-side hedging because their services have heterogeneous latency profiles (payment-init at p99 = 280 ms, notifications at p99 = 60 ms); a single LB-level threshold would be wrong for both. The SetuStream deployment uses LB-side hedging in their Envoy mesh because their services are more homogeneous (most read-heavy catalog services, similar tail shape) and the operational simplicity of one tuning knob outweighs the per-service flexibility.
+
+A third option, less common, is leaf-side hedging: the leaf service (Redis, Postgres, etc.) detects its own slow request and forwards it to a peer for parallel processing. This is rare because most leaf services don't have inter-leaf RPC paths and adding them is invasive. It is the right pattern for sharded stores with read-replica chains (e.g. Cassandra's coordinator-and-replicas) where the inter-leaf path already exists for read-repair purposes.
+
+### Adaptive hedge-cancellation under correlated slowness
+
+A more advanced pattern is conditional hedging: emit a hedge only if a saturation signal indicates the cluster has headroom. The PaisaBridge implementation pulls a Prometheus gauge (`cluster_p99_load_factor`) and disables hedging when load > 0.8. The cost of the Prometheus query is small (a few ms, cached for 15 seconds); the benefit is hedging stays out of the way during exactly the moments when it would amplify slowness.
+
+A second adaptive pattern is hedge-the-hedge-only-once: limit hedge depth to one. If a request is itself a hedge, do not hedge it again. The implementation tracks a `hedge_depth` counter in the request metadata; if it's > 0, hedging is skipped. This caps the QPS amplification at exactly 2× per request (original + at most one hedge) and prevents the cascade-amplification failure mode.
+
+### Hedging vs request duplication: the bandwidth axis
+
+An adjacent technique is request duplication: send two copies immediately to two replicas, take the first response, cancel the loser. This eliminates the threshold-tuning question entirely but doubles backend QPS. Duplication is appropriate for a small fraction of latency-critical requests where the cost is acceptable — the ParakhTrade order-placement path uses duplication for the order-routing step (sub-ms latency budget, the cluster has 5× headroom on this path) but switches to threshold-based hedging for everything else. The right-frame question is "what is the bandwidth cost of always paying for a backup, versus the latency cost of waiting for a threshold?" — for tight latency budgets and over-provisioned clusters, duplication wins; for tight cluster budgets and looser latency requirements, hedging at p95 wins.
+
+A subtler variant is deferred duplication: send the second copy at threshold = 0 ms but to a cheaper replica (less powerful hardware, colder cache, geo-remote region). The cheaper replica's typical latency is higher than the primary's typical latency — say 25 ms vs 5 ms — but its 99th percentile may be more reliable because it is less loaded. The user-observed latency is min(5 ms primary normal-case, 25 ms cheap replica), which is just 5 ms in the typical case; on the slow case (primary at 200 ms), it falls to 25 ms. The SetuStream 2024 deployment uses this pattern for catalog reads: a primary Redis cluster in ap-south-1a (the hot path) and a secondary read-replica in ap-south-1b (cooler, less utilised). The cost is one extra read on every request, but the secondary cluster is sized for read replicas and is cheap; the latency benefit is the cooler cluster's pause-time profile.
+
+### What hedging does to the GC and scheduler
+
+A subtler consequence of hedging is its effect on the runtime's tail-causing components. The largest sources of tail latency in a managed-runtime service (Java with G1, Go with the concurrent collector, Python with the GIL) are GC pauses and scheduler glitches, both of which are intermittent and independent across replicas. Hedging is exceptionally well-suited to mask them: a 80 ms G1 pause on replica A is almost never accompanied by a simultaneous 80 ms pause on replica B, so the hedge to B lands at typical latency.
+
+This has a second-order effect on GC tuning. Without hedging, teams obsessed over GC pause time and tuned aggressively (small heaps, frequent collection, ZGC or Shenandoah for sub-ms pauses). With hedging in place, the user-observed latency is robust to occasional 50–100 ms pauses, so the GC can be tuned for throughput (bigger heaps, less frequent collection) and the system delivers more aggregate work per CPU. The ClearJourney 2024 tuning study found that switching from ZGC (sub-ms pauses, lower throughput) to G1 (larger pauses, higher throughput) plus enabling hedging at p95 produced 22% more throughput per CPU at the same user-observed p99.9. Hedging changed the GC tuning from "minimise pause" to "maximise throughput" — a different optimisation target, with measurable cluster-wide cost savings.
+
+### The order-statistic math behind hedging
+
+The user-observed latency Y when hedging at threshold t is Y = min(X_1, t + X_2) where X_1 and X_2 are independent draws from the same latency distribution F. The CDF of Y is:
+
+P(Y ≤ y) = 1 - P(X_1 > y) × P(t + X_2 > y) for y > t, and P(Y ≤ y) = P(X_1 ≤ y) for y ≤ t.
+
+This produces the kink visible in the figure above: below t the curve is unchanged, above t it climbs faster because the survival probability falls as the product of two factors. The expected value of the QPS multiplier is 1 + (1 - F(t)), since each request fires a hedge with probability 1 - F(t). The expected user latency given that the hedge fires is E[min(X_1, t + X_2) | X_1 > t], which for a heavy-tailed distribution is dominated by t + E[X_2] (the hedge typically wins because the original is already in the slow population). For a thin-tailed distribution, E[X_2] is close to F^-1(0.5) (the median), which is much smaller than the conditional expectation of X_1 above t — this is exactly why hedging works so well for slow-tailed distributions.
+
+The optimisation problem is: minimise E[Y] subject to (1 - F(t)) ≤ Q (the QPS budget). The Lagrangian gives t* = F^-1(1 - Q) — the optimal threshold is the (1 - Q) quantile, which formalises the "set threshold = p95 to add 5% QPS" rule. The math also explains why the optimum shifts: workloads with thicker tails (higher F^-1(0.99)/F^-1(0.5) ratio) benefit more from a given QPS budget, because the conditional improvement per fire is larger.
+
+### Hedging in the language of queueing theory
+
+A queueing-theoretic view of hedging: each replica is an M/M/c queue with arrival rate λ_i and service rate μ_i. Without hedging, request latency at replica i has mean 1/(μ_i - λ_i) and a tail dominated by ρ_i = λ_i/μ_i. With hedging at threshold t, a fraction (1 - F(t)) of requests is duplicated to a second replica, so each replica's effective arrival rate is λ_i × (1 + (1 - F(t))) ≈ 1.05 × λ_i for threshold = p95. The new ρ is 1.05 × ρ_old; if the cluster was operating at ρ = 0.80 (a reasonable production target), the post-hedging ρ rises to 0.84 — still safely below the queueing knee at ρ = 0.85. If the cluster was operating at ρ = 0.83, post-hedging ρ rises to 0.87 — past the knee, where mean latency starts climbing rapidly. This is the "hedging makes things worse near saturation" regime: the cluster needs enough headroom to absorb the QPS bump.
+
+The capacity-planning rule that emerges: operate at ρ ≤ 0.80 if you want to enable hedging without risk. Below 0.80, the QPS bump is absorbed; above 0.80, the bump pushes the cluster past the knee and amplifies latency. The SetuStream capacity-planning team adopted this rule in 2024 explicitly: any service that wants to enable hedging must demonstrate ρ ≤ 0.80 at peak under representative load, or the request is denied. This forces capacity planning and hedging into a single conversation rather than separate decisions.
+
+### Reproduce this on your laptop
+
+```
+# Pure Python, ~1 minute total runtime.
+python3 -m venv .venv && source .venv/bin/activate
+pip install numpy hdrh
+
+# Run the threshold sweep from this chapter
+python3 hedge_threshold_sweep.py
+
+# Sweep against a more bimodal workload (cache hit/miss style)
+python3 -c "
+import numpy as np
+from hdrh.histogram import HdrHistogram
+RNG = np.random.default_rng(7); N = 200_000
+def lat(n, slow_prob):
+    fast = RNG.lognormal(np.log(5), 0.20, n)
+    slow = RNG.lognormal(np.log(180), 0.40, n)
+    return np.where(RNG.random(n) < (1-slow_prob), fast, slow)
+for slow_prob in [0.02, 0.05, 0.10, 0.20]:
+    truth = lat(N, slow_prob)
+    for t in [10, 20, 50]:
+        hedge = lat(N, slow_prob)
+        user = np.where(truth > t, np.minimum(truth, t + hedge), truth)
+        h = HdrHistogram(1, 60_000, 3)
+        for v in user: h.record_value(int(max(1, v)))
+        print(f'slow={slow_prob:.2f} t={t:>3}  p99={h.get_value_at_percentile(99):>4} ms  qps_x={1+(truth>t).mean():.2f}')
+"
+
+```
+
+You will see the QPS multiplier rise sharply as the slow fraction grows: at 20% slowness, hedging at threshold = 10 ms multiplies QPS by 1.25× (because 25% of requests trigger a hedge). The exercise teaches the dial: hedging is most cost-effective when slow fraction is small (1–5%), and becomes increasingly expensive as the slowness becomes more pervasive. Past a certain slow fraction, the workload is no longer "transiently slow with a long tail" — it's "uniformly slow", and the fix is to scale the cluster, not to hedge.
+
+## Where this leads next
+
+The next chapters extend hedging into a richer set of architectural mitigations. Backup requests and bounded queueing couples hedging with admission control: if the cluster is already over the queueing knee at ρ = 0.85, hedging amplifies queue depth and makes the tail worse — admission control bounds the work-in-progress so hedging has independent slow events to mask, not a saturated queue to feed. Latency-aware load balancing routes new requests away from currently-slow replicas, which reduces the probability that any given request hits a slow tail in the first place — composes with hedging rather than replaces it. Request canary and shadow traffic is the inverse pattern: send a fraction of traffic to a new replica and compare latencies before full deployment; the same min-of-two mathematics underlies both.
+
+The single architectural habit to take from this chapter: when designing a service whose tail latency matters, treat hedging as a first-class architectural control, not a hot-path optimisation. The choice of threshold, cancellation transport, and circuit-breaker integration is part of the service's reliability design from day one. Retrofitting hedging into a service that did not consider it is harder than building it in: the RPC layer needs to support cancellation, the metrics need to track win rate, the dashboards need to separate user vs backend latency, and the on-call needs to know what "hedging firing rate above 15%" means as a signal.
+
+A second habit, sharper: when the dashboard's tail goes bad, ask first whether the slowness is transient (independent across replicas, ms-scale) or systemic (correlated across replicas, second-scale). Hedging is the right tool for the first; for the second, the right tool is admission control, scaling, or fixing the source-side bottleneck. Confusing them produces a hedging deployment that fires too much and fixes nothing, eating cluster headroom that could have been spent on real capacity. The discipline is the same as the chain audit from the previous chapter: diagnose before mitigating.
+
+A third habit, even sharper: read the hedge win rate as a system-health signal. A healthy deployment has win rate ≈50% (roughly equal, slowness is independent). A win rate near 0% means the hedge threshold is too high (fix it). A win rate near 100% means the original is consistently slower than the hedge — meaning the original's replica is broken in a way the hedge's replica is not. Either route around the broken replica or investigate why it's persistently slow. The hedge win rate is one of the highest-bandwidth signals about replica health that the system produces and most dashboards never display it.
+
+## References
+
+- Jeffrey Dean and Luiz Barroso, "The Tail at Scale" (CACM 2013, Vol. 56 No. 2) — the foundational paper that introduced hedged requests and the mathematical analysis of tail-amplification under fan-out; the empirical numbers for hedging at p95 in their search workload come from this paper.
+- gRPC RetryPolicy and HedgingPolicy documentation — the production-grade implementation of hedging in gRPC, including cancellation semantics and the per-call configuration that production teams use.
+- Brendan Gregg, Systems Performance (2nd ed., 2020), Chapter 6 — the canonical text's treatment of tail latency and the architectural mitigations including hedging.
+- PaisaBridge engineering blog, "Cutting p99 in half with hedged requests" (2024) — the production write-up of `hedger-go`, with the threshold-as-running-percentile algorithm and the cluster-saturation auto-disable circuit.
+- Marc Brooker, "Tail Latency, Hedging, and the Independence Assumption" (2021) — a clear treatment of why the independence assumption matters and how to test it empirically with the win-rate metric.
+- /wiki/the-tail-at-scale-dean-barroso — the previous chapter that establishes the fan-out tail-amplification math; this chapter is the architectural mitigation that the math motivates.
+- /wiki/coordinated-omission-revisited — the previous chapter on measurement honesty; without correct measurement of the per-replica tail, the hedge threshold cannot be set correctly and the deployment delivers less than expected.
+
+Chats 
+
+No chats yet. Select text and tap “Ask AI”.
+
+Highlights 
+
+No highlights yet. Select text and tap “Highlight”.
