@@ -564,7 +564,7 @@ def cmd_respawn(args: argparse.Namespace) -> int:
 def cmd_kill(args: argparse.Namespace) -> int:
     """Fault injection: declare a rank failed without its cooperation."""
     rt, _ = make_runtime(args)
-    rt.declare_failed(args.target, args.reason or "injected fault")
+    rt.declare_failed(args.target, args.reason or "injected fault", confirmed=True)
     return emit({"killed": args.target, "reason": args.reason or "injected fault"})
 
 
