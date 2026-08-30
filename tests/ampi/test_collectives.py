@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 import pytest
 
 from ampi.constants import (
@@ -170,17 +171,25 @@ def test_collective_mismatch_is_diagnosed(make_job):
     job = make_job(3)
 
     def body(rt, r):
-        if r == 2:
+        if r == 0:
+            try:
+                coll.barrier(rt, "world", timeout=5)
+                return "barrier-ok"
+            except Exception:
+                return "interrupted"
+        elif r == 1:
+            try:
+                coll.barrier(rt, "world", timeout=5)
+                return "barrier-ok"
+            except Exception:
+                return "interrupted"
+        else:
+            time.sleep(0.05)
             with pytest.raises(AmpiCollectiveMismatch):
-                coll.bcast(rt, "world", 0, None, timeout=20)
+                coll.bcast(rt, "world", 0, None, timeout=5)
             return "diagnosed"
-        try:
-            coll.barrier(rt, "world", timeout=20)
-        except Exception as exc:  # the healthy ranks time out or are unblocked
-            return type(exc).__name__
-        return "barrier-ok"
 
-    out = job.run_ranks(body, timeout=120)
+    out = job.run_ranks(body, timeout=30)
     assert out[2] == "diagnosed"
 
 
