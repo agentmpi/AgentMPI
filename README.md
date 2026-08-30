@@ -252,6 +252,15 @@ produced them:
   text they bought nothing measurable, because the entities were famous enough that
   models render them identically without coordination. We report that rather than
   swapping the metric.
+- **A capacity-bound reduction erases whole contributors, silently.** This is the finding
+  we nearly missed. Aggregate retention of 0.385 looks like graceful degradation; the
+  per-rank breakdown shows ranks 0–2 retained *completely*, rank 3 at 8%, and ranks 4–7
+  contributing **nothing at all** — identically under every tree shape. Once the
+  accumulator fills the budget it has no room to admit anything, so each later
+  contribution is discarded whole. Every merge reported success and the root received a
+  well-formed report with no indication that five of its eight inputs were missing. That
+  is why `Op` exposes the leaf count an accumulator represents, and why aggregate quality
+  metrics are not enough.
 - **Fold depth costs latency, not fidelity.** We predicted a deep reduction tree would
   lose more content than a shallow one. It does not: with an incompressible payload and a
   contract-enforced output budget, retention is identical (0.385) at fold depths 2, 3 and

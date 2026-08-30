@@ -95,13 +95,23 @@ def test_critical_section_serialises_semantic_updates(tmp_path):
     """lock/get/modify/put is the only safe way to let an agent revise shared state."""
     p = 6
 
+    import time
+
     def rank_main(comm):
         win = ampi.win_create(comm, "iface")
         if comm.rank == 0:
             win.put("doc", {"n": 0, "authors": []})
+        # Two barriers, so every rank attempts the lock at the same moment. Without
+        # this the ranks can trivially serialise and contention never occurs, which
+        # made an earlier version of this test depend on scheduling luck.
+        comm.barrier(policy="wait")
         comm.barrier(policy="wait")
         with win.critical("doc"):
             doc = win.get("doc", admit=False)
+            # Hold the lock long enough that concurrent attempts must queue. This is
+            # what a semantic update looks like in cost terms -- an agent call inside
+            # the critical section -- so the test measures the real shape.
+            time.sleep(0.05)
             doc = {"n": doc["n"] + 1, "authors": [*doc["authors"], comm.rank]}
             win.put("doc", doc, expect_version=win.state("doc").version)
         comm.barrier(policy="wait")
@@ -111,11 +121,16 @@ def test_critical_section_serialises_semantic_updates(tmp_path):
     job = ampi.launch(rank_main, size=p, root=tmp_path / "crit")
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
     final = job.value(0)
+    # The invariant that matters, and the one that fails without the lock: every rank's
+    # contribution survives, and no write was issued from a stale view.
     assert final["n"] == p, final
     assert sorted(final["authors"]) == list(range(p))
     report = ampi.rma.contention_report(ampi.Fabric(tmp_path / "crit"), "iface")
     assert report["n_stale_writes"] == 0
-    assert report["n_contended"] >= 1, "a serialised critical section should show contention"
+    # With p ranks contending for a held lock, all but the winner must have waited, so
+    # the serialisation is visible as wall time rather than inferred.
+    assert report["n_contended"] >= p - 1, report
+    assert report["total_lock_wait_s"] > 0.0, report
 
 
 def test_compare_and_swap(tmp_path):

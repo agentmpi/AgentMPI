@@ -632,13 +632,22 @@ spends exactly the $k-1$ successive applications the wide tree was meant to avoi
 message count and round count look correct while the fold depth quietly reverts to
 $p-1$.
 
-\paragraph{A third effect has no MPI counterpart.} A summarising operator given a
-fixed output budget compresses two inputs and sixteen inputs to the same length, so
-the root's answer over-represents whichever subtree merged last --- an unfairness
-\code{MPI\_SUM} cannot exhibit, since it weights every contribution equally by
-construction. \ampi{} therefore exposes the number of leaves an accumulator
-represents so a budget can be allocated proportionally, and reports per-rank
-retention so the unfairness is visible rather than inferred.
+\paragraph{A third effect has no MPI counterpart, and it is the worst of them.} A
+summarising operator given a fixed output budget treats an accumulator standing for
+sixteen inputs exactly as it treats a single new report. Once that accumulator fills the
+budget it has no room to admit anything, so subsequent contributions are not
+under-represented --- they are discarded whole. We measure this: under a uniform enforced
+budget, half of an eight-rank population contributes \emph{nothing} to the result, and
+every merge along the way reports success (\cref{sec:eval}, \cref{tab:erasure}).
+
+\code{MPI\_SUM} cannot exhibit this, because it weights every contribution equally by
+construction. A semantic operator has to be told to, which is why \ampi{}'s operator
+interface exposes the number of leaves an accumulator represents: a budget apportioned in
+proportion to representation forces an accumulator to shed items to make room, rather than
+refusing the newcomer outright. Implementations SHOULD default to proportional
+apportionment for lossy operators, and MUST report per-rank retention where it is
+computable, because the aggregate figure conceals the failure completely --- 38\% retention
+sounds like graceful degradation and was in fact total erasure of five ranks out of eight.
 
 \subsection{Prefer exact operators}
 
@@ -1478,6 +1487,49 @@ larger than the root --- which is exactly what a subtree-proportional budget doe
 why \cref{sec:coll}'s operator interface exposes the leaf count. We did not run that
 variant, so the conditional remains untested; what is now established is that under the
 natural uniform-budget policy, depth costs nothing in quality.
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_erasure}
+\caption{Per-rank retention under a capacity-bound reduction. The aggregate figure of
+0.385 conceals what actually happened: the first three ranks are retained completely and
+\NErasedRanks{} of \NTotalRanks{} are erased entirely, identically under every tree shape.}
+\label{tab:erasure}
+\end{table}
+
+\paragraph{The aggregate figure conceals the real failure: whole ranks are erased.} This
+is the most consequential result in the paper and we nearly missed it, because 0.385 looks
+like graceful degradation and is not. \Cref{tab:erasure} breaks it down by contributing
+rank. Ranks 0, 1 and 2 are retained \emph{completely}; rank 3 contributes 8\%; and ranks 4
+through 7 --- half the population --- contribute \textbf{nothing at all}. The pattern is
+identical under all four algorithms (rank-position correlation \NErasureCorr{} in every
+case).
+
+A capacity-bound semantic reduction, then, does not produce a lossy summary of all its
+inputs. It produces a \emph{complete} summary of a prefix and total silence about the
+remainder. The mechanism is simple once seen, and one of the ranks diagnosed it from the
+inside: once the accumulator saturates the budget, it has no room to admit anything, so
+each subsequent contribution is discarded \emph{whole}. From that point the reduction has
+stopped reducing and is merely forwarding.
+
+What makes this dangerous rather than merely lossy is that nothing reports it. Every
+individual merge satisfied its contract and returned successfully; the operator was never
+wrong, the collective never failed, and the root received a well-formed consolidated report
+that gives no indication that five of its eight inputs are missing. That is precisely
+failure class F4 --- a well-formed, confident, incomplete answer --- arising not from a
+model's mistake but from the \emph{interaction} between a uniform budget and a sequential
+fold. It is exactly the failure a harness author would never think to test for, and it is
+the strongest argument in this paper for the position that aggregate quality metrics are
+inadequate and per-contributor accounting is mandatory.
+
+The fix is one the design anticipates but which our harness did not use. \code{MPI\_SUM}
+cannot exhibit this, because it weights every contribution equally by construction; a
+semantic operator must be \emph{told} to. \ampi{}'s operator interface exposes the number
+of leaves an accumulator represents (\cref{sec:coll}) precisely so that a budget can be
+apportioned in proportion to representation, forcing an accumulator standing for 24 items
+to shed some when a 12-item report arrives rather than refusing it outright. We built that
+mechanism, did not enable it in this experiment, and can now say what it costs not to:
+half the population's work, silently.
 
 \paragraph{And the cost difference is enormous.} With quality pinned at 0.385 for all
 four, the shallowest tree took 52\,s where the serial chain took 634\,s ---

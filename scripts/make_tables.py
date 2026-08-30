@@ -453,6 +453,46 @@ def table_fidelity() -> None:
                 _MACROS["NFidSpeedup"] = f"{by_alg['chain']['wall_s'] / max(by_alg['binomial']['wall_s'], 1e-9):.1f}"
 
 
+def table_erasure() -> None:
+    """Per-rank retention under a capacity-bound reduction.
+
+    The aggregate retention figure conceals the finding that matters. A capacity-bound
+    semantic reduction does not produce a lossy summary of all its inputs; it produces a
+    *complete* summary of a prefix and total silence about the remainder. This table shows
+    which ranks survived, and the answer is the same whatever the tree.
+    """
+    rows: list[dict[str, Any]] = []
+    for f in sorted(glob.glob(str(RESULTS / "microbench" / "*fidelity*.json"))):
+        d = load(Path(f))
+        b = (d or {}).get("benches", {}).get("fidelity")
+        if not b or b.get("executor") != "broker":
+            continue
+        for r in b["rows"]:
+            if r.get("incompressible") and r.get("per_rank_retention"):
+                rows.append(r)
+    if not rows:
+        emit("tab_erasure.tex", MISSING)
+        return
+    ranks = sorted((int(k) for k in rows[0]["per_rank_retention"]), key=int)
+    lines = []
+    for r in sorted(rows, key=lambda x: -(x.get("fold_depth") or 0)):
+        pr = r["per_rank_retention"]
+        cells = " & ".join(f"{pr[str(i)]:.2f}" for i in ranks)
+        alg = r["algorithm"] + (rf", $k{{=}}{int(r['fanin'])}$" if r.get("fanin") else "")
+        lines.append(rf"\texttt{{{tex_escape(r['algorithm'])}}} & {r.get('fold_depth')} & {cells} & {r['retention']:.3f} \\")
+    n_dead = sum(1 for i in ranks if rows[0]["per_rank_retention"][str(i)] == 0.0)
+    _MACROS["NErasedRanks"] = str(n_dead)
+    _MACROS["NTotalRanks"] = str(len(ranks))
+    _MACROS["NErasureCorr"] = f"{rows[0]['rank_position_correlation']:.2f}"
+    body = (
+        "\\begin{tabular}{lr" + "r" * len(ranks) + "r}\n\\toprule\n"
+        "algorithm & depth & " + " & ".join(f"r{i}" for i in ranks) + " & all \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_erasure.tex", body)
+
+
 # --------------------------------------------------------------- software table
 
 
@@ -827,7 +867,8 @@ def summary_macros() -> None:
                  "NVagueNosLines", "NVagueLinesRatio", "NVagueSharedRoundOne", "NVagueNosRoundOne",
                  "NVagueSharedRounds", "NVagueNosRounds",
                  "NConvVagueShared", "NConvVagueNoshared", "NConvMixedVagueShared",
-                 "NConvMixedVagueNoshared", "NConvSolo"):
+                 "NConvMixedVagueNoshared", "NConvSolo",
+                 "NErasedRanks", "NTotalRanks", "NErasureCorr"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
@@ -845,6 +886,7 @@ def main() -> int:
         table_transport,
         table_faults,
         table_fidelity,
+        table_erasure,
         table_software,
         table_module_growth,
         table_scaling_sim,
