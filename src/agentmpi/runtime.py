@@ -858,10 +858,67 @@ class Runtime:
         self._validate_comm(communicator, allow_revoked=tolerate_failures)
         if root not in communicator.members:
             raise ProtocolViolation("collective root is not in communicator")
+        ordinal = self._next_collective_ordinal(communicator.id)
         epoch = self._next_collective_epoch(communicator.id, op)
         started = time.monotonic()
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
         with self._transaction():
+            self._conn.execute(
+                """INSERT OR IGNORE INTO collective_instances(
+                       comm_id, generation, ordinal, operation, root,
+                       reduce_op, error, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?)""",
+                (
+                    communicator.id,
+                    communicator.generation,
+                    ordinal,
+                    op.value,
+                    root,
+                    reduce_op.value,
+                    time.time(),
+                ),
+            )
+            instance = self._conn.execute(
+                """SELECT operation, root, reduce_op, error
+                   FROM collective_instances
+                   WHERE comm_id=? AND generation=? AND ordinal=?""",
+                (communicator.id, communicator.generation, ordinal),
+            ).fetchone()
+            if instance is None:
+                raise ProtocolViolation("collective signature disappeared")
+            expected = (op.value, root, reduce_op.value)
+            actual = (
+                str(instance["operation"]),
+                int(instance["root"]),
+                str(instance["reduce_op"]),
+            )
+            if actual != expected:
+                message = (
+                    f"collective ordinal {ordinal} mismatch: "
+                    f"expected {actual}, rank {self.rank} entered {expected}"
+                )
+                self._conn.execute(
+                    """UPDATE collective_instances SET error=?
+                       WHERE comm_id=? AND generation=? AND ordinal=?""",
+                    (
+                        message,
+                        communicator.id,
+                        communicator.generation,
+                        ordinal,
+                    ),
+                )
+                self._event(
+                    "collective.mismatch",
+                    {
+                        "comm_id": communicator.id,
+                        "ordinal": ordinal,
+                        "expected": actual,
+                        "received": expected,
+                    },
+                )
+                raise ProtocolViolation(message)
+            if instance["error"] is not None:
+                raise ProtocolViolation(str(instance["error"]))
             self._conn.execute(
                 """INSERT INTO collective_contributions(
                        comm_id, generation, operation, epoch, rank,
@@ -879,12 +936,24 @@ class Runtime:
             )
             self._event(
                 "collective.enter",
-                {"comm_id": communicator.id, "op": op.value, "epoch": epoch},
+                {
+                    "comm_id": communicator.id,
+                    "op": op.value,
+                    "epoch": epoch,
+                    "ordinal": ordinal,
+                },
             )
         while True:
             with self._transaction():
                 if not tolerate_failures:
                     self._assert_communicator_live(communicator.id)
+                instance = self._conn.execute(
+                    """SELECT error FROM collective_instances
+                       WHERE comm_id=? AND generation=? AND ordinal=?""",
+                    (communicator.id, communicator.generation, ordinal),
+                ).fetchone()
+                if instance is not None and instance["error"] is not None:
+                    raise ProtocolViolation(str(instance["error"]))
                 members = list(communicator.members)
                 if tolerate_failures:
                     failed = {
@@ -945,7 +1014,12 @@ class Runtime:
                         result = json.loads(result_row["value_json"])
                     self._event(
                         "collective.exit",
-                        {"comm_id": communicator.id, "op": op.value, "epoch": epoch},
+                        {
+                            "comm_id": communicator.id,
+                            "op": op.value,
+                            "epoch": epoch,
+                            "ordinal": ordinal,
+                        },
                     )
                     return result
             if timeout is not None and time.monotonic() - started >= timeout:
@@ -991,6 +1065,33 @@ class Runtime:
                 (comm_id, op.value, self.rank, epoch + 1),
             )
             return epoch
+
+    def _next_collective_ordinal(self, comm_id: str) -> int:
+        """Return this rank's next communicator-global collective ordinal."""
+        with self._transaction():
+            row = self._conn.execute(
+                """SELECT next_ordinal FROM collective_ordinals
+                   WHERE comm_id=? AND rank=?""",
+                (comm_id, self.rank),
+            ).fetchone()
+            if row is None:
+                legacy = self._conn.execute(
+                    """SELECT COALESCE(SUM(next_epoch), 0) AS next_ordinal
+                       FROM collective_counters
+                       WHERE comm_id=? AND rank=?""",
+                    (comm_id, self.rank),
+                ).fetchone()
+                ordinal = int(legacy["next_ordinal"])
+            else:
+                ordinal = int(row["next_ordinal"])
+            self._conn.execute(
+                """INSERT INTO collective_ordinals(comm_id, rank, next_ordinal)
+                   VALUES (?, ?, ?)
+                   ON CONFLICT(comm_id, rank) DO UPDATE SET
+                       next_ordinal=excluded.next_ordinal""",
+                (comm_id, self.rank, ordinal + 1),
+            )
+            return ordinal
 
     def _match_message(
         self, comm_id: str, source: int, tag: str, *, mutate: bool = True
@@ -1243,6 +1344,23 @@ CREATE TABLE IF NOT EXISTS collective_counters (
     rank INTEGER NOT NULL,
     next_epoch INTEGER NOT NULL,
     PRIMARY KEY (comm_id, operation, rank)
+);
+CREATE TABLE IF NOT EXISTS collective_ordinals (
+    comm_id TEXT NOT NULL,
+    rank INTEGER NOT NULL,
+    next_ordinal INTEGER NOT NULL,
+    PRIMARY KEY (comm_id, rank)
+);
+CREATE TABLE IF NOT EXISTS collective_instances (
+    comm_id TEXT NOT NULL,
+    generation INTEGER NOT NULL,
+    ordinal INTEGER NOT NULL,
+    operation TEXT NOT NULL,
+    root INTEGER NOT NULL,
+    reduce_op TEXT NOT NULL,
+    error TEXT,
+    created_at REAL NOT NULL,
+    PRIMARY KEY (comm_id, generation, ordinal)
 );
 CREATE TABLE IF NOT EXISTS collective_contributions (
     comm_id TEXT NOT NULL,
