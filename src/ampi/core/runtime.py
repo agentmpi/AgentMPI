@@ -237,6 +237,17 @@ class Runtime:
             (util.now(), util.now(), self.job_id, self.rank),
         )
 
+    def actor(self) -> int:
+        """This handle's rank, for attributing an action in the log.
+
+        Written out rather than spelled ``self.rank or -1`` because rank 0 is
+        falsy: that idiom silently attributed every window write, lock and
+        revocation made by rank 0 to the sentinel -1, which is indistinguishable
+        from an action taken with no rank identity at all. We found it while
+        reading a trace that said a communicator had been revoked by nobody.
+        """
+        return -1 if self.rank is None else self.rank
+
     def rank_row(self, rank: int | None = None) -> dict[str, Any]:
         rank = self.rank if rank is None else rank
         row = self.device.query_one(
@@ -865,7 +876,7 @@ class Runtime:
         with self.device.write_tx():
             self._touch()
             ok, version, current = self.device.cas(
-                win["win_id"], key, expected_version, value, self.rank or -1
+                win["win_id"], key, expected_version, value, self.actor()
             )
             self.tracer.emit(
                 "AMPI_Put", "exit", window=win_name, key=key, ok=ok,
@@ -922,7 +933,7 @@ class Runtime:
                 op.fn(op.identity, value) if op.identity is not None else value
             )
             ok, version, _ = self.device.cas(
-                win["win_id"], key, None, merged, self.rank or -1
+                win["win_id"], key, None, merged, self.actor()
             )
             self.tracer.emit("AMPI_Accumulate", "exit", window=win_name, key=key,
                              operator=op.name)
@@ -942,7 +953,7 @@ class Runtime:
                 "SELECT * FROM win_cell WHERE win_id=? AND key=?", (win["win_id"], key)
             )
             old = float(util.loads(row["value"], 0) or 0) if row else 0.0
-            self.device.cas(win["win_id"], key, None, old + delta, self.rank or -1)
+            self.device.cas(win["win_id"], key, None, old + delta, self.actor())
             self.tracer.emit("AMPI_Fetch_and_op", "exit", window=win_name, key=key, old=old)
         return {"old": old, "new": old + delta}
 
@@ -959,7 +970,7 @@ class Runtime:
                 return {"claimed": False, "owner": current.get("owner"), "value": current}
             value = {"owner": self.rank, "claimed_at": util.now(), "note": note}
             ok, version, _ = self.device.cas(
-                win["win_id"], key, int(row["version"]) if row else 0, value, self.rank or -1
+                win["win_id"], key, int(row["version"]) if row else 0, value, self.actor()
             )
             self.tracer.emit("AMPI_Claim", "exit", window=win_name, key=key, ok=ok)
         return {"claimed": ok, "owner": self.rank if ok else None, "version": version}
@@ -982,7 +993,7 @@ class Runtime:
         while True:
             with self.device.write_tx():
                 self._touch()
-                lock_id = self.device.lease(win["win_id"], key, self.rank or -1, mode, ttl)
+                lock_id = self.device.lease(win["win_id"], key, self.actor(), mode, ttl)
                 if lock_id:
                     self.tracer.emit("AMPI_Win_lock", "exit", window=win_name, key=key, mode=mode)
                     return {"lock_id": lock_id, "key": key, "mode": mode, "ttl": ttl}
@@ -1000,7 +1011,7 @@ class Runtime:
 
     def win_unlock(self, lock_id: str) -> dict[str, Any]:
         with self.device.write_tx():
-            ok = self.device.release(lock_id, self.rank or -1)
+            ok = self.device.release(lock_id, self.actor())
             self.tracer.emit("AMPI_Win_unlock", "exit", lock_id=lock_id, ok=ok)
         return {"released": ok}
 
@@ -1033,7 +1044,7 @@ class Runtime:
         which is the only way to get all survivors to the same place at the
         same time so that recovery can be collective.
         """
-        comm = self.comms.revoke(comm_name, self.rank or -1)
+        comm = self.comms.revoke(comm_name, self.actor())
         with self.device.write_tx():
             self.tracer.emit("AMPI_Comm_revoke", "exit", comm_id=comm.comm_id)
         return comm.to_dict()

@@ -456,3 +456,31 @@ def test_a_stale_process_abandons_a_rank_that_was_taken_over(make_job):
 
     thread.join(25)
     assert outcome == ["fenced"], outcome
+
+
+def test_rank_zero_is_attributed_to_rank_zero(make_job):
+    """Rank 0 is falsy, and `self.rank or -1` silently blamed the sentinel.
+
+    Every window write, lock and revocation made by rank 0 was logged as
+    having been made by rank -1, which reads in a trace as an action taken
+    with no rank identity at all.
+    """
+    job = make_job(2)
+    rt = job.runtime(0)
+    rt.init(0)
+    assert rt.actor() == 0
+
+    rt.win_create("world", "w")
+    rt.win_put("w", "k", {"v": 1})
+    assert rt.win_get("w", "k")["updated_by"] == 0
+
+    lock = rt.win_lock("w", "k", ttl=30, timeout=10)
+    holder = rt.device.query_one(
+        "SELECT holder FROM win_lock WHERE lock_id=?", (lock["lock_id"],))
+    assert holder["holder"] == 0
+    rt.win_unlock(lock["lock_id"])
+
+    rt.comm_revoke("world")
+    row = rt.device.query_one(
+        "SELECT revoked_by FROM comm WHERE job_id=? AND name='world'", (rt.job_id,))
+    assert row["revoked_by"] == 0
