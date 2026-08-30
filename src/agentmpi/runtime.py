@@ -166,6 +166,7 @@ class Runtime:
         if self.persist_state:
             self.run_id = self._read_run_id()
             self.run_started_at = self._read_run_started_at()
+            self.matching.run_id = self.run_id
             self._load_state()
 
         self.world = self._make_world()

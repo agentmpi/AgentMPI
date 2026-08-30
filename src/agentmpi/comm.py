@@ -375,6 +375,7 @@ class Communicator:
             tokens=tokens,
             chars=len(text),
             epoch=self.epoch,
+            run=self.runtime.run_id,
             reduced=reduced,
             origin_turn=self.runtime.turn,
             provenance=tuple(provenance) or (f"r{self.rank}",),

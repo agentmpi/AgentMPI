@@ -154,6 +154,13 @@ above is reserved for the runtime.
   matched at most once per idempotency key.
 * **M4 (epoch).** A message whose epoch precedes the receiver's current
   epoch for that context MUST NOT be matched.
+* **M4b (run identity).** Every envelope MUST carry the identity of the run
+  that produced it, and a message from a different run MUST NOT be matched.
+  An epoch separates generations *within* a run; nothing otherwise separates
+  two runs that reuse a directory, and a message left in an inbox by a
+  previous run will silently deliver another rank's work. An implementation
+  SHOULD additionally refuse to create a run in a directory that already
+  holds one.
 * **M5 (admission).** A match completes only after the payload is charged
   against the receiver's context budget.
 * **M6 (bounded ordering).** An implementation MAY, after

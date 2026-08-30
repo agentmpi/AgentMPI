@@ -100,6 +100,9 @@ class MatchingEngine:
         self._consumed_extra: dict[tuple[str, int, int], set[int]] = defaultdict(set)
         #: Communicator epochs; messages from an older epoch are dropped.
         self.epochs: dict[str, int] = defaultdict(int)
+        #: Identity of the run this engine belongs to.  Empty means "do not
+        #: check", which is the in-process case where no directory is reused.
+        self.run_id: str = ""
         #: Contexts that have been revoked.
         self.revoked: set[str] = set()
 
@@ -109,6 +112,7 @@ class MatchingEngine:
             "reordered": 0,
             "gaps_skipped": 0,
             "stale_epoch": 0,
+            "foreign_run": 0,
             "matched": 0,
             "polls": 0,
         }
@@ -131,6 +135,11 @@ class MatchingEngine:
                 self.stats["duplicates"] += 1
                 continue
             self._seen_idem.add(env.idem)
+            if self.run_id and env.run and env.run != self.run_id:
+                # A message from a previous run that reused this directory.
+                self.stats["foreign_run"] += 1
+                self.device.consume(self.rank, env)
+                continue
             if env.epoch < self.epochs.get(env.context, 0):
                 self.stats["stale_epoch"] += 1
                 continue

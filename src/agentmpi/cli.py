@@ -30,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -150,6 +151,30 @@ def _finish(rt: Runtime) -> None:
 def cmd_init(args: argparse.Namespace) -> int:
     """Create a run directory and its manifest."""
     root = Path(args.root)
+    existing = root / RUN_MANIFEST
+    if existing.exists() and not args.force:
+        # Refuse to layer a new run over an old one.
+        #
+        # Writing a fresh manifest into a directory that still holds another
+        # run's inbox, blobs and key-value state produces a job that starts
+        # and then delivers the previous run's messages: we watched ranks
+        # receive one another's work assignments this way, "shifted by one
+        # rank", which is impossible to diagnose from inside a rank. Making
+        # the operator say so explicitly is much cheaper than making the
+        # protocol survive it.
+        try:
+            prior = RunManifest.load(existing).run_id
+        except Exception:
+            prior = "unreadable"
+        raise SystemExit(json.dumps({
+            "error": "ERR_RUN_EXISTS",
+            "message": f"{root} already holds run {prior!r}. Remove the "
+                       f"directory, choose another path, or pass --force to "
+                       f"clear the transport and start a new run here.",
+        }))
+    if args.force and root.exists():
+        for sub in ("blobs", "kv", "inbox", "seen", "ack", "journal", "hb", "locks"):
+            shutil.rmtree(root / sub, ignore_errors=True)
     root.mkdir(parents=True, exist_ok=True)
     roles: list[dict[str, Any]] = []
     if args.roles:
@@ -623,6 +648,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--capacity", type=int, default=None)
     sp.add_argument("--label", default="")
     sp.add_argument("--cvar", action="append", help="control variable, name=value")
+    sp.add_argument("--force", action="store_true",
+                    help="clear an existing run's transport and start over here")
     sp.set_defaults(func=cmd_init)
 
     sp = sub.add_parser("info", help="print the run manifest")

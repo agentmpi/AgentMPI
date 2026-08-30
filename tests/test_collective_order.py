@@ -245,13 +245,13 @@ def test_state_from_a_recycled_run_directory_is_discarded(tmp_path):
     call(0, "barrier", "--timeout", "2")
     assert json.loads((root / "kv" / "pstate%2f0").read_text())["coll_counter"]["world"] == 1
 
-    # The directory is recycled for a different run, as ours was.
-    import shutil
-
-    shutil.rmtree(root / "inbox", ignore_errors=True)
-    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2",
-                           "--label", "second"],
-                   check=True, capture_output=True, env=env, timeout=60)
+    # The directory is recycled for a different run, exactly as ours was: a
+    # setup script wrote a fresh manifest over a live transport. `ampi init`
+    # now refuses this, but the fencing must still hold when a manifest
+    # arrives by some other route, so the test writes it directly.
+    manifest = json.loads((root / "meta.json").read_text())
+    manifest["run_id"] = "second"
+    (root / "meta.json").write_text(json.dumps(manifest))
 
     # Rank 0's first collective in the new run must be #1, not #2.
     call(0, "barrier", "--timeout", "2")
@@ -279,3 +279,70 @@ def test_cli_reports_a_deleted_run_instead_of_crashing(tmp_path):
     payload = json.loads((proc.stdout + proc.stderr).strip().splitlines()[-1])
     assert payload["error"] == "ERR_NO_RUN"
     assert "deleted" in payload["message"] or "does not exist" in payload["message"]
+
+
+def test_messages_from_a_previous_run_are_not_delivered(tmp_path):
+    """A recycled directory must not deliver the old run's messages.
+
+    An epoch separates generations *within* a run. Nothing separated two runs
+    that reused a directory, so a message left in an inbox by the previous
+    run matched a receive in the next one and delivered another rank's work.
+    Ranks in our software build reported assignments "shifted by one rank",
+    which is what this looks like from inside a rank and is undiagnosable
+    from there.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+
+    def call(rank, *args, timeout=40):
+        return subprocess.run(
+            ampi + list(args), capture_output=True, text=True, timeout=timeout,
+            env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": str(rank)})
+
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2",
+                           "--label", "first"],
+                   check=True, capture_output=True, env=env, timeout=60)
+    # Rank 0 sends a message nobody ever receives; it stays in the inbox.
+    call(0, "send", "--dest", "1", "--tag", "5", "--text", "from the old run")
+
+    # The directory is reused for a different run, keeping the transport --
+    # a fresh manifest written over the old inbox, which is how ours went.
+    manifest = json.loads((root / "meta.json").read_text())
+    manifest["run_id"] = "second"
+    (root / "meta.json").write_text(json.dumps(manifest))
+
+    # The stale message must not satisfy a receive in the new run.
+    proc = call(1, "recv", "--source", "0", "--tag", "5", "--timeout", "3")
+    assert proc.returncode != 0, (
+        f"a previous run's message was delivered: {proc.stdout!r}")
+    assert json.loads(proc.stderr)["error"] == "ERR_TIMEOUT"
+
+
+def test_init_refuses_to_layer_a_new_run_over_an_existing_one(tmp_path):
+    """The operator error that produced the stale messages is now refused."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2"],
+                   check=True, capture_output=True, env=env, timeout=60)
+    again = subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2"],
+                           capture_output=True, text=True, env=env, timeout=60)
+    assert again.returncode != 0
+    assert json.loads(again.stdout + again.stderr)["error"] == "ERR_RUN_EXISTS"
+
+    forced = subprocess.run(
+        ampi + ["init", "--root", str(root), "--ranks", "2", "--force"],
+        capture_output=True, text=True, env=env, timeout=60)
+    assert forced.returncode == 0, forced.stderr

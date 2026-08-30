@@ -34,7 +34,7 @@ def main() -> int:
     size = args.modules + 1
 
     subprocess.run(
-        [sys.executable, "-m", "agentmpi.cli", "init", "--root", str(root),
+        [sys.executable, "-m", "agentmpi.cli", "init", "--root", str(root), "--force",
          "--ranks", str(size), "--label", args.name,
          "--capacity", str(args.capacity),
          "--cvar", "ampi_failure_timeout_s=3600",

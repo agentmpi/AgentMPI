@@ -78,6 +78,11 @@ class Envelope:
     inline: str | None = None
     blob: str | None = None
     epoch: int = 0
+    run: str = ""
+    """The run this message belongs to.  An epoch separates generations
+    *within* a run; nothing separates two runs that reuse a directory, so a
+    message left in an inbox by a previous run will otherwise match a receive
+    in the next one and deliver another rank's work."""
     idem: str = field(default_factory=lambda: uuid.uuid4().hex)
     ts_send: float = field(default_factory=time.time)
     ts_recv: float | None = None
