@@ -493,10 +493,27 @@ def build_harness(cfg: argparse.Namespace, spec: str, workdir: Path) -> Any:
             # ---- peer review over a degree-2 circulant graph -------------
             if cfg.review and round_no < cfg.rounds and not r_stats["agreed_green"]:
                 t0 = time.time()
-                topo = ampi.dist_graph_create(comm, ampi.review_edges(comm.size, fanout=min(2, comm.size - 1)))
-                mine_payload = [{"path": m["path"], "code": code.get(m["path"], "")[:9000], "exports": exports.get(m["name"], [])} for m in mine]
+                # Two topologies, and needing both is the whole subtlety. `edges` is
+                # (author -> reviewer): a rank's *sources* are the authors whose code
+                # it reviews. A review must travel back to the author, i.e. along the
+                # reversed edges, so the return path needs the transpose.
+                #
+                # An earlier version returned reviews over the forward topology, whose
+                # destinations are the ranks this rank *sends code to* rather than the
+                # ranks it reviewed. Every author therefore received critiques of other
+                # people's modules, and the review phase was a silent no-op -- findings
+                # never reached anyone who could act on them. A worker rank noticed,
+                # reporting that its reviews only ever named a file it did not own.
+                edges = ampi.review_edges(comm.size, fanout=min(2, comm.size - 1))
+                topo = ampi.dist_graph_create(comm, edges)
+                transpose = ampi.dist_graph_create(comm, [(b, a) for a, b in edges])
+                mine_payload = [
+                    {"path": m["path"], "code": code.get(m["path"], "")[:9000], "exports": exports.get(m["name"], [])}
+                    for m in mine
+                ]
                 incoming = ampi.neighbor_allgather(topo, mine_payload, admit=False, label=f"review-r{round_no}")
                 targets = [t for chunk in incoming if chunk for t in chunk]
+                rev = {"target": "", "findings": []}
                 if targets:
                     rev = _safe(
                         comm,
@@ -508,10 +525,24 @@ def build_harness(cfg: argparse.Namespace, spec: str, workdir: Path) -> Any:
                         retries=1,
                         max_tokens=900,
                     )
-                    back = ampi.neighbor_alltoall(
-                        topo, [rev for _ in topo.destinations], admit=False, label=f"reviewback-r{round_no}"
-                    )
-                    my_reviews = [b for b in back if b]
+                returned = ampi.neighbor_allgather(
+                    transpose, rev, admit=False, label=f"reviewback-r{round_no}"
+                )
+                # A reviewer may legitimately raise a cross-module concern, so keep only
+                # the findings that name a file this rank owns; the rest are recorded
+                # for the trace rather than acted on by the wrong owner.
+                my_paths = [m["path"] for m in mine]
+                mine_findings: list[str] = []
+                foreign = 0
+                for chunk in returned:
+                    for finding in (chunk or {}).get("findings") or []:
+                        if any(path in str(finding) or path.split("/")[-1] in str(finding) for path in my_paths):
+                            mine_findings.append(str(finding))
+                        else:
+                            foreign += 1
+                my_reviews = [{"target": ",".join(my_paths), "findings": mine_findings}] if mine_findings else []
+                r_stats["review_findings_mine"] = len(mine_findings)
+                r_stats["review_findings_foreign"] = foreign
                 r_stats["review_s"] = round(time.time() - t0, 3)
 
             # ---- interface renegotiation under an exclusive lock ---------

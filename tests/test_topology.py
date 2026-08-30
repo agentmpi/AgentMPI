@@ -137,3 +137,64 @@ def test_neighborhood_beats_alltoall_in_message_count(tmp_path):
     assert total_full == size * (size - 1), total_full
     assert total_nbr == 2 * size, total_nbr
     assert total_full > 3 * total_nbr
+
+
+def test_review_findings_return_to_the_author(tmp_path):
+    """A critique must reach the rank that can act on it.
+
+    A review graph is directed: `review_edges` yields (author, reviewer) pairs, so a
+    rank's *sources* are the authors whose work it reviews. Returning the review over
+    the same topology sends it to the rank's *destinations* -- the ranks it sends its
+    own work to -- which are in general a disjoint set. Every author then receives
+    critiques of other people's work and the review phase becomes a silent no-op.
+
+    That is exactly the bug this test exists to prevent, and it was found by an agent
+    rank noticing that its reviews only ever named a file it did not own, not by any
+    test. The fix is to return reviews over the transposed graph.
+    """
+    size, fanout = 6, 2
+    edges = ampi.review_edges(size, fanout=fanout)
+
+    def rank_main(comm):
+        topo = ampi.dist_graph_create(comm, edges)
+        transpose = ampi.dist_graph_create(comm, [(b, a) for a, b in edges])
+
+        # Receive the work I am to review, and record whose it was.
+        reviewed = ampi.neighbor_allgather(topo, {"author": comm.rank}, admit=False)
+        authors = sorted(r["author"] for r in reviewed if r)
+        assert authors == sorted(topo.sources), (comm.rank, authors, topo.sources)
+
+        # Return a critique naming the authors it is about.
+        critique = {"reviewer": comm.rank, "about": authors}
+        received = ampi.neighbor_allgather(transpose, critique, admit=False)
+
+        # Every critique I receive must be about me.
+        for c in received:
+            assert c is not None
+            assert comm.rank in c["about"], (
+                f"rank {comm.rank} received a critique from {c['reviewer']} about {c['about']}"
+            )
+        # And I must hear from every rank that reviewed me.
+        assert sorted(c["reviewer"] for c in received) == sorted(topo.destinations)
+        return sorted(c["reviewer"] for c in received)
+
+    job = ampi.launch(rank_main, size=size, root=tmp_path / "revroute")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    # Each rank is reviewed by exactly `fanout` peers.
+    assert all(len(o.value) == fanout for o in job.outcomes), [o.value for o in job.outcomes]
+
+
+def test_forward_topology_would_misroute_reviews():
+    """Document the wrong version, so the fix cannot be quietly undone.
+
+    Pure set arithmetic on the edge list: no runtime needed to show that returning a
+    review over the forward graph delivers it to ranks the reviewer never reviewed.
+    """
+    size = 6
+    edges = ampi.review_edges(size, fanout=2)
+    for r in range(size):
+        reviewed = {a for a, b in edges if b == r}       # authors r reviews
+        forward = {b for a, b in edges if a == r}        # where the buggy return path sent it
+        transpose = {a for b, a in [(b, a) for a, b in edges] if b == r}
+        assert not (reviewed & forward), f"rank {r}: forward path happened to be correct, weakening the test"
+        assert transpose == reviewed, f"rank {r}: transpose must deliver to exactly the reviewed authors"
