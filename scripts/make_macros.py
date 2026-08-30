@@ -71,6 +71,7 @@ def main() -> int:
     ap.add_argument("--e1", default="results/e1_metrics.json")
     ap.add_argument("--e2", default="results/e2_grade.json")
     ap.add_argument("--e3", default="results/e3_metrics.json")
+    ap.add_argument("--e2b", default="results/e2_behaviour.json")
     ap.add_argument("--out", default="paper/results.tex")
     args = ap.parse_args()
     m = Macros()
@@ -244,6 +245,12 @@ def main() -> int:
         for cat in E2_CATS:
             d = (a or {}).get("by_category", {}).get(cat)
             m.add(f"eTwo{tag}{cat.capitalize()}", (d["pass_rate"] if d else None), 2)
+
+    # ---- experiment 2, behaviour and cost ---------------------------------
+    e2b = Path(args.e2b)
+    if e2b.exists():
+        for k, v in (json.loads(e2b.read_text()).get("macros") or {}).items():
+            m.add(k, v)
 
     # ---- experiment 3 -----------------------------------------------------
     e3p = Path(args.e3)
