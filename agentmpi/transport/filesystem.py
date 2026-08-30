@@ -16,8 +16,9 @@ envelope and an artifact path, so receivers do not ingest unbounded context.
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 from agentmpi.constants import (
     ANY_SOURCE,

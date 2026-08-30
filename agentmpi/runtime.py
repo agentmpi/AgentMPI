@@ -12,11 +12,15 @@ import argparse
 import os
 import subprocess
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 from agentmpi.comm import Communicator
-from agentmpi.constants import COMM_WORLD_NAME, DEFAULT_CONTEXT_BUDGET, DEFAULT_FAILURE_TIMEOUT_S
+from agentmpi.constants import (
+    COMM_WORLD_NAME,
+    DEFAULT_CONTEXT_BUDGET,
+    DEFAULT_FAILURE_TIMEOUT_S,
+)
 from agentmpi.types import Lifecycle
 from agentmpi.util import atomic_write_json, now
 
