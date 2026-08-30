@@ -46,7 +46,8 @@ A message envelope is:
 ```
 Envelope = {
   protocol_version, message_id, session_id, communicator_id, generation,
-  source_rank, source_incarnation, destination_rank, tag, sequence,
+  source_rank, source_incarnation, destination_rank, destination_incarnation,
+  tag, sequence,
   delivery_mode, content_type, schema_id?, payload_inline?, artifact_ref?,
   payload_bytes, estimated_tokens, deadline?, trace_context?,
   capability_proof?, checksum, created_at
@@ -69,10 +70,13 @@ fields and SHOULD encrypt confidential values.
 
 `Send(value, destination, tag, communicator)` matches
 `Recv(source, tag, communicator)`. Source may be `ANY_SOURCE`; tag may be
-`ANY_TAG`. Destination and communicator are never wildcards.
+`ANY_TAG`. Destination and communicator are never wildcards. Wildcards are
+disjoint API selectors and are not legal wire-tag values.
 
-For a fixed `(communicator, generation, source, destination, tag)`, matching
-messages MUST NOT overtake. Wildcards, concurrent receive threads,
+For a fixed `(communicator, generation, source, destination)` issue stream,
+messages MUST NOT overtake when both could match the same receive. An exact-tag
+receive may bypass an older message carrying another tag; an `ANY_TAG` receive
+may not. Wildcards, concurrent receive threads,
 `WaitAny`-style operations, cancellation, retries, and executor nondeterminism
 can make an application nondeterministic. Implementations MUST record the
 actual match.
@@ -287,7 +291,7 @@ The Python runtime maps protocol objects to SQLite tables in WAL mode. Short
 membership transition, and lock ownership. Payloads above the inline threshold
 are SHA-256-addressed files atomically renamed into an adjacent artifact store.
 
-This is an executable semantic oracle for local harness development. It offers:
+This is an inspectable executable reference for local harness development. It offers:
 
 - independent OS processes without a resident broker;
 - durable restart inspection and deterministic event export;
@@ -320,7 +324,9 @@ lock takeover, duplicate task commit, and trace completeness.
 
 ## 13. Versioning
 
-Minor versions add optional operations or fields. Major versions may alter
-semantics. Unknown optional envelope fields are ignored; unknown required
-features fail negotiation. Implementations negotiate at session creation and
-record the result in traces.
+Minor versions add optional operations or named extension fields. Major
+versions may alter semantics. Unknown top-level envelope fields are rejected by
+the canonical schema; unknown entries inside the signed `extensions` map may be
+ignored only when no corresponding feature is listed as required. Unknown
+required features fail negotiation. Implementations negotiate at session
+creation and record the result in traces.
