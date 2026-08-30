@@ -74,11 +74,45 @@ def _next_coll_id(comm, name: str = "?") -> int:
     ``"scatterv"`` knows immediately that a peer has fallen out of step --
     rather than waiting forever for a tag that peer will never use.
     """
+    rt = comm.runtime
     key = comm.context
-    nxt = comm.runtime.coll_counter.get(key, 0) + 1
-    comm.runtime.coll_counter[key] = nxt
+
+    # Resynchronise after a crash *inside* a collective, using evidence
+    # rather than a guess.
+    #
+    # A rank restarted mid-collective faces a question it cannot answer
+    # locally: re-enter that collective, or move past it? Both answers are
+    # wrong half the time. Re-entering when the group already finished puts
+    # this rank permanently one behind; skipping when the group is still
+    # waiting strands every peer. The awkward case is a rootless barrier,
+    # where a rank's dissemination messages can satisfy every peer before the
+    # rank itself returns, so the barrier completes for the group and leaves
+    # no local record.
+    #
+    # The peers' durable logs settle it. If any peer recorded the collective
+    # as complete, it completed; move on. If none did, nobody got past it;
+    # re-enter with the same identifier so the tags still line up.
+    pending = rt.pending_collective(key)
+    if pending is not None and pending[1] == name:
+        cid, _ = pending
+        finished_by = rt.peers_completed(comm, cid)
+        if finished_by:
+            rt.complete_collective(key, cid)
+            rt.profiler.note(
+                "skipping an interrupted collective the group already finished",
+                collective=name, cid=cid, evidence=finished_by)
+        else:
+            comm._coll_counter = cid
+            comm._active_coll = (name, cid)
+            rt.profiler.note(
+                "re-entering an interrupted collective no peer completed",
+                collective=name, cid=cid)
+            return cid
+
+    nxt = rt.coll_counter.get(key, 0) + 1
+    rt.coll_counter[key] = nxt
     comm._coll_counter = nxt
-    comm.runtime.record_collective(comm.context, nxt, name)
+    rt.record_collective(comm.context, nxt, name)
     comm._active_coll = (name, nxt)
     # Persist the counter *before* the collective it labels, not after.
     #
@@ -114,7 +148,10 @@ def _tag(coll_id: int, phase: int = 0) -> int:
 
 
 def _emit(comm, op: str, algorithm: str, steps: int, t0: float, **detail: Any) -> None:
+    active = getattr(comm, "_active_coll", None)
     comm._active_coll = None
+    if active is not None:
+        comm.runtime.complete_collective(comm.context, active[1])
     comm.runtime.profiler.emit(
         Event(kind="coll", ts=time.time(), rank=comm.runtime.world_rank, op=op,
               context=comm.context, algorithm=algorithm, dur=time.time() - t0,

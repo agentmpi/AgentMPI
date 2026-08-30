@@ -210,6 +210,17 @@ AMPI_Neighbor_allgather / AMPI_Neighbor_alltoall
   messages it labels are sent. An implementation that persists it afterwards
   will replay a collective after a mid-operation crash and desynchronise
   silently.
+* **K5.** Issuance and completion MUST be recorded as separate durable facts.
+  A rank restarted inside a collective cannot otherwise tell whether to
+  re-enter it or move past it, and both answers are wrong half the time.
+* **K6.** A rank that finds a collective issued and not completed MUST
+  resolve it from evidence, not assumption: if any peer durably recorded that
+  collective as complete, it completed and the rank MUST advance past it;
+  if no peer did, the rank MUST re-enter it with the same sequence number.
+  The case that makes this necessary is a rootless collective, where a rank's
+  messages can satisfy every peer before the rank itself returns, so the
+  operation completes for the group while leaving the interrupted rank no
+  local record of it.
 * **K4.** Algorithm selection MUST NOT change an operation's result. Where an
   operator's declared algebra does not permit a schedule, the implementation
   MUST refuse the schedule rather than compute a different answer.

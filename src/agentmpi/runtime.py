@@ -227,8 +227,10 @@ class Runtime:
             return
         self.send_seq = {k: int(v) for k, v in data.get("send_seq", {}).items()}
         self.coll_counter = {k: int(v) for k, v in data.get("coll_counter", {}).items()}
-        self.coll_log = {ctx: {int(k): v for k, v in log.items()}
-                         for ctx, log in data.get("coll_log", {}).items()}
+        self.coll_log = {
+            ctx: {int(k): self._entry(v) for k, v in log.items()}
+            for ctx, log in data.get("coll_log", {}).items()
+        }
         self.turn = int(data.get("turn", 0))
         for key, value in data.get("consumed", {}).items():
             ctx, src, dst = key.rsplit("|", 2)
@@ -263,7 +265,7 @@ class Runtime:
             "run_id": self.run_id,
             "send_seq": self.send_seq,
             "coll_counter": self.coll_counter,
-            "coll_log": {ctx: {str(k): v for k, v in log.items()}
+            "coll_log": {ctx: {str(k): self._entry(v) for k, v in log.items()}
                          for ctx, log in self.coll_log.items()},
             "consumed": consumed,
             "turn": self.turn,
@@ -510,12 +512,73 @@ class Runtime:
     #: of step, not to keep a full history.
     COLL_LOG_DEPTH = 64
 
-    def record_collective(self, context: str, cid: int, name: str) -> None:
+    @staticmethod
+    def _entry(value: Any) -> dict[str, Any]:
+        """Normalise a collective-log entry, tolerating the older format."""
+        if isinstance(value, str):
+            return {"op": value, "done": 1}
+        return {"op": value.get("op", "?"), "done": int(value.get("done", 0))}
+
+    def record_collective(self, context: str, cid: int, name: str,
+                          done: bool = False) -> None:
         log = self.coll_log.setdefault(context, {})
-        log[cid] = name
+        log[cid] = {"op": name, "done": 1 if done else 0}
         if len(log) > self.COLL_LOG_DEPTH:
             for stale in sorted(log)[: len(log) - self.COLL_LOG_DEPTH]:
                 log.pop(stale, None)
+
+    def complete_collective(self, context: str, cid: int) -> None:
+        """Record that a collective finished, durably.
+
+        Issuance and completion are separate durable facts. Knowing only that
+        a rank *issued* collective 7 leaves the question a restarted rank
+        most needs answered -- should it re-enter 7, or move to 8? -- and
+        getting it wrong desynchronises the rank permanently in one direction
+        or the other.
+        """
+        log = self.coll_log.setdefault(context, {})
+        entry = self._entry(log.get(cid, {"op": "?", "done": 0}))
+        entry["done"] = 1
+        log[cid] = entry
+        self.save_state()
+
+    def pending_collective(self, context: str) -> tuple[int, str] | None:
+        """The most recent collective this rank issued and never completed."""
+        log = self.coll_log.get(context) or {}
+        if not log:
+            return None
+        cid = max(log)
+        entry = self._entry(log[cid])
+        return None if entry["done"] else (cid, entry["op"])
+
+    def peers_completed(self, comm: Communicator, cid: int) -> list[int]:
+        """Which peers durably recorded collective ``cid`` as complete.
+
+        This is the evidence that settles whether an interrupted collective
+        needs re-entering. A rootless barrier is the awkward case: a rank's
+        dissemination messages can satisfy every peer *before* the rank
+        itself returns, so the barrier can complete for the group while the
+        rank that was killed mid-call has no local record of it. Two of our
+        agents worked this out by hand from the trace and from peers'
+        persisted logs, which is a good sign that the runtime should be doing
+        it for them.
+        """
+        done: list[int] = []
+        for local in range(comm.size):
+            wr = comm.world(local)
+            if wr == self.world_rank:
+                continue
+            raw = self.device.kv_get(f"pstate/{wr}")
+            if not raw:
+                continue
+            try:
+                log = (json.loads(raw).get("coll_log") or {}).get(comm.context) or {}
+            except json.JSONDecodeError:
+                continue
+            entry = log.get(str(cid))
+            if entry is not None and self._entry(entry)["done"]:
+                done.append(local)
+        return done
 
     def detect_collective_mismatch(self, comm: Communicator) -> None:
         """Raise if a peer's collective sequence disagrees with ours.
@@ -545,7 +608,8 @@ class Runtime:
             cid, name = env.meta.get("i"), env.meta.get("c")
             if cid is None or name is None:
                 continue
-            mine = log.get(int(cid))
+            recorded = log.get(int(cid))
+            mine = None if recorded is None else self._entry(recorded)["op"]
             if mine is None or mine == name:
                 continue
             disagreeing[env.source] = (int(cid), name)
@@ -570,7 +634,7 @@ class Runtime:
         # participant to blame every other.
         peers = sorted(disagreeing)
         cid, peer_op = disagreeing[peers[0]]
-        mine = log.get(cid, "?")
+        mine = self._entry(log[cid])["op"] if cid in log else "?"
         agreeing_peers = [p for p, (c, n) in disagreeing.items()
                           if c == cid and n == peer_op]
         minority = len(agreeing_peers) >= 2
@@ -685,6 +749,7 @@ class Runtime:
             "matching": dict(self.matching.stats),
             "pvars": self.pvars.snapshot(),
             "device": self.device.name,
+            "pending_collective": self.pending_collective(CONTEXT_WORLD),
             "spec": {
                 "role": self.spec.role, "model": self.spec.model,
                 "provider": self.spec.provider,

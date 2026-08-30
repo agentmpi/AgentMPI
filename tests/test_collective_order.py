@@ -138,16 +138,77 @@ def test_collective_counter_is_durable_before_the_collective(tmp_path):
     state = json.loads((root / "kv" / "pstate%2f0").read_text())
     assert state["coll_counter"]["world"] == 1, (
         "the collective counter was not durable across the killed process")
-    assert state["coll_log"]["world"]["1"] == "barrier"
+    entry = state["coll_log"]["world"]["1"]
+    assert entry["op"] == "barrier"
+    assert entry["done"] == 0, "an interrupted collective was recorded as complete"
 
-    # The rank's next process must therefore issue collective #2, not #1.
+    # No peer completed collective 1, so the rank must re-enter it with the
+    # same identifier rather than advancing. Advancing would put it one ahead
+    # of the peer that is still waiting at 1, and the barrier would never
+    # match.
     with ThreadPoolExecutor(max_workers=2) as pool:
-        a = pool.submit(call, 0, "barrier", "--timeout", "20")
-        b = pool.submit(call, 1, "barrier", "--timeout", "20")
-        b.result()
-        a.result()
+        a = pool.submit(call, 0, "barrier", "--timeout", "25")
+        b = pool.submit(call, 1, "barrier", "--timeout", "25")
+        rb, ra = b.result(), a.result()
+    assert ra.returncode == 0 and rb.returncode == 0, (ra.stderr, rb.stderr)
+
     after = json.loads((root / "kv" / "pstate%2f0").read_text())
-    assert after["coll_counter"]["world"] == 2
+    assert after["coll_counter"]["world"] == 1, (
+        "the rank advanced past a collective no peer had completed")
+    assert after["coll_log"]["world"]["1"]["done"] == 1
+
+
+def test_an_interrupted_collective_the_group_finished_is_not_re_entered(tmp_path):
+    """The other half of the resynchronisation decision.
+
+    A rootless barrier can complete for the whole group before the rank that
+    was killed mid-call returns: its dissemination messages already satisfied
+    every peer. That rank must NOT re-enter the barrier -- doing so leaves it
+    permanently one collective behind. Two of our agents worked this out by
+    hand from the trace and from peers' persisted logs; the runtime now reads
+    the same evidence.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2"],
+                   check=True, capture_output=True, env=env, timeout=60)
+
+    def call(rank, *args, timeout=40):
+        return subprocess.run(
+            ampi + list(args), capture_output=True, text=True, timeout=timeout,
+            env={**env, "AMPI_ROOT": str(root), "AMPI_RANK": str(rank)})
+
+    # Rank 0 is interrupted; rank 1 completes the barrier using rank 0's
+    # already-delivered message, and records the completion durably.
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(call, 0, "barrier", "--timeout", "3")
+        b = pool.submit(call, 1, "barrier", "--timeout", "25")
+        a.result()
+        b.result()
+
+    peer = json.loads((root / "kv" / "pstate%2f1").read_text())
+    assert peer["coll_log"]["world"]["1"]["done"] == 1, (
+        "the peer did not complete the barrier, so this test proves nothing")
+
+    # Rank 0 now issues its next barrier. Because a peer recorded #1 as done,
+    # this must become #2, not a re-entry of #1.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        a = pool.submit(call, 0, "barrier", "--timeout", "25")
+        b = pool.submit(call, 1, "barrier", "--timeout", "25")
+        rb, ra = b.result(), a.result()
+    assert ra.returncode == 0 and rb.returncode == 0, (ra.stderr, rb.stderr)
+
+    after = json.loads((root / "kv" / "pstate%2f0").read_text())
+    assert after["coll_counter"]["world"] == 2, (
+        "the rank re-entered a collective its peer had already completed")
 
 
 def test_state_from_a_recycled_run_directory_is_discarded(tmp_path):
