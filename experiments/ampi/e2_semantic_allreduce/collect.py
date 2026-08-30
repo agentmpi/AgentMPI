@@ -79,8 +79,12 @@ def collect_one(job_dir: str, algo: str) -> dict:
 
         messages = dev.query_one(
             "SELECT COUNT(*) AS n, SUM(tokens) AS tok FROM message WHERE job_id=?", (job_id,))
+        retention_stats = retention(dev, job_id, final)
+        conformance_stats = conformance(dev, job_dir, job_id)
 
         return {
+            "retention": retention_stats,
+            "conformance": conformance_stats,
             "algo": algo,
             "p": len(ranks),
             "joined": len(joined),
@@ -110,6 +114,120 @@ def collect_one(job_dir: str, algo: str) -> dict:
         }
     finally:
         dev.close()
+
+
+# One distinctive, objectively checkable string from each rank's seeded style
+# guide.  These let us separate two very different questions: did the protocol
+# deliver every contribution to the operator, and did the operator keep it?
+RETENTION_PROBES: dict[int, tuple[str, list[str]]] = {
+    0: ("1. Introduction", ["acronym"]),
+    1: ("2. Architecture", ["Speicher", "storage"]),
+    2: ("3. The scheduler", ["pseudocode"]),
+    3: ("4. Memory management", ["page fault"]),
+    4: ("5. The filesystem", ["Verzeichnis", "directory"]),
+    5: ("6. Networking", ["small caps", "RFC"]),
+    6: ("7. Security", ["capability", "block quote"]),
+    7: ("8. Evaluation", ["significant figures"]),
+}
+
+
+def conformance(dev: SqliteDevice, job_dir: str, job_id: str) -> dict:
+    """Did each rank actually contribute the input it was assigned?
+
+    An agent is an unreliable interpreter of its own instructions, and this is
+    the cheapest place to see it: every rank was handed a file and told to pass
+    that file to the collective, so the payload the library recorded can be
+    compared against the file byte for byte.  A mismatch is not a transport
+    fault --- the protocol delivered exactly what it was given --- but it bounds
+    what any guarantee above the transport can be worth, and it is the number
+    a harness author most needs to know.
+    """
+    assigned: dict[int, str] = {}
+    for rank in range(64):
+        path = os.path.join(job_dir, "ranks", str(rank), "notes.json")
+        if not os.path.exists(path):
+            continue
+        with open(path, encoding="utf-8") as fh:
+            assigned[rank] = json.load(fh).get("chapter", "")
+
+    sent: dict[int, str] = {}
+    for row in dev.query(
+        "SELECT src, body FROM message WHERE job_id=? AND body IS NOT NULL ORDER BY msg_id",
+        (job_id,),
+    ):
+        rank = int(row["src"])
+        if rank in sent:
+            continue  # the first contribution is the one the rank was asked for
+        payload = util.loads(row["body"], {})
+        value = payload.get("v") if isinstance(payload, dict) else None
+        if isinstance(value, dict) and "chapter" in value:
+            sent[rank] = value["chapter"]
+
+    # A rank that evaluates the operator contributes locally rather than by
+    # sending, so its own value appears as the first operand of its first
+    # upcall.  Without this the root always looks silent.
+    for row in dev.query(
+        "SELECT assignee, operands FROM pending_op WHERE job_id=? ORDER BY created_at",
+        (job_id,),
+    ):
+        rank = int(row["assignee"])
+        if rank in sent:
+            continue
+        operands = util.loads(row["operands"], [])
+        if operands and isinstance(operands[0], dict) and "chapter" in operands[0]:
+            sent[rank] = operands[0]["chapter"]
+
+    matches, mismatches, silent = [], [], []
+    for rank, expected in sorted(assigned.items()):
+        if rank not in sent:
+            silent.append(rank)
+        elif sent[rank].strip() == expected.strip():
+            matches.append(rank)
+        else:
+            mismatches.append({"rank": rank, "assigned": expected, "sent": sent[rank]})
+    contributing = len(assigned) - len(silent)
+    return {
+        "ranks_assigned_an_input": len(assigned),
+        "ranks_that_contributed": contributing,
+        "conforming": matches,
+        "mismatched": mismatches,
+        "never_contributed": silent,
+        "conformance_rate": round(len(matches) / max(1, len(assigned)), 4),
+        "conformance_rate_among_contributors": round(len(matches) / max(1, contributing), 4),
+    }
+
+
+def retention(dev: SqliteDevice, job_id: str, final: object) -> dict:
+    """Did every rank's contribution reach the operator, and did it survive?
+
+    The two are different guarantees and only one of them is the protocol's.
+    Delivery is checked against the operands the library actually handed to the
+    operator, recorded in the pending_op table; survival is checked against the
+    final artifact.  A gap between them is an operator defect, not a transport
+    defect, and it is the agent-specific analogue of a reduction that is not
+    faithful to its inputs.
+    """
+    operand_text = " ".join(
+        (u["operands"] or "") for u in
+        dev.query("SELECT operands FROM pending_op WHERE job_id=?", (job_id,)))
+    final_text = final if isinstance(final, str) else util.dumps(final)
+    delivered, survived = [], []
+    for rank, (chapter, probes) in sorted(RETENTION_PROBES.items()):
+        if any(pr.lower() in operand_text.lower() for pr in probes):
+            delivered.append(rank)
+        if final_text and any(pr.lower() in final_text.lower() for pr in probes):
+            survived.append(rank)
+    n = len(RETENTION_PROBES)
+    return {
+        "probes": {str(r): {"chapter": c, "markers": pr}
+                   for r, (c, pr) in sorted(RETENTION_PROBES.items())},
+        "delivered_to_operator": delivered,
+        "delivered_fraction": round(len(delivered) / n, 4),
+        "survived_in_result": survived,
+        "retention_fraction": round(len(survived) / n, 4),
+        "lost_by_operator": sorted(set(delivered) - set(survived)),
+        "never_delivered": sorted(set(range(n)) - set(delivered)),
+    }
 
 
 def compare(results: list[dict]) -> dict:
@@ -185,7 +303,11 @@ def main() -> int:
               f"per_rank={c['upcalls_by_rank']} "
               f"suspicions={c['suspicion_events']} "
               f"(spurious {c['spurious_condemnations']}, "
-              f"{len(c['ranks_ever_condemned'])} ranks)")
+              f"{len(c['ranks_ever_condemned'])} ranks) "
+              f"delivered={c['retention']['delivered_fraction']:.2f} "
+              f"retained={c['retention']['retention_fraction']:.2f} "
+              f"lost_by_operator={c['retention']['lost_by_operator']} "
+              f"conformance={c['conformance']['conformance_rate']:.2f}")
     print(json.dumps(payload["comparison"], indent=2))
     print(f"wrote {args.out}")
     return 0
