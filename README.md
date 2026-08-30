@@ -9,7 +9,7 @@ Two reference bindings ship in this repository:
 | Binding | Path | Fabric | Role |
 |---|---|---|---|
 | Filesystem / algorithmic | `agentmpi/` | POSIX mailboxes, binomial/Bruck/doubling collectives | Default SPMD API (`COMM_WORLD.send`, `bcast`, …) |
-| SQLite / durable | `src/agentmpi/` | WAL database, no resident broker | Inspectable semantic oracle, independent processes |
+| SQLite / durable | `src/agentmpi_sql/` | WAL database, no resident broker | Inspectable semantic oracle, independent processes |
 
 The protocol is transport-neutral (`SPEC.md`, `spec/AGENTMPI.md`). A harness can map the same calls to files, SQLite, NATS, Kafka, or gRPC.
 
