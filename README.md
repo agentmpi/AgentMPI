@@ -96,6 +96,10 @@ python3 experiments/scale/harness.py -n 100
 ```
 
 SQLite-binding experiments and the 100-process / fail-stop scripts live under `scripts/` and `experiments/translation`, `experiments/software`.
+The retained live-agent evidence records 25 distinct Cursor executor IDs in
+`experiments/results/live_subagents.json`; deterministic coordinator ranks are
+excluded from that count. The 100-rank Aesop file lacks equivalent launch
+provenance and is explicitly treated as a dry run in the paper.
 
 ## Paper and dashboard
 
