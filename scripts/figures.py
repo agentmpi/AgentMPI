@@ -270,40 +270,84 @@ def fig_e1(e1: Optional[Dict[str, Any]], out: Path) -> None:
     _save(fig, out, "fig_e1")
 
 
-def fig_e2(e2: Optional[Dict[str, Any]], out: Path) -> None:
+def fig_e2(e2: Optional[Dict[str, Any]], out: Path,
+           behaviour: Optional[Dict[str, Any]] = None) -> None:
+    """E2: identical quality, very different cost.
+
+    Both arms passed every held-out case, so a pass-rate chart on its own would
+    carry no information. The figure therefore shows the quality tie alongside
+    the cost of achieving it, which is where the arms actually differ, and the
+    coordination structure each arm built -- including the one the unprotocolled
+    arm built without being asked to.
+    """
     if not e2 or "arms" not in e2:
         return
     arms = e2["arms"]
     names = [n for n in ("naive", "ampi") if n in arms]
     if not names:
         return
-    cats = sorted({c for n in names for c in arms[n]["by_category"]})
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7.4, 2.6),
-                                   gridspec_kw={"width_ratios": [1, 2.4]})
-    label = {"naive": "no protocol", "ampi": "AgentMPI"}
-    vals = [arms[n]["pass_rate"] for n in names]
-    ax1.bar(range(len(names)), vals, 0.55, color=["0.75", "0.35"][: len(names)],
-            edgecolor="black", linewidth=0.4)
-    ax1.set_xticks(range(len(names)))
-    ax1.set_xticklabels([label[n] for n in names])
-    ax1.set_ylim(0, 1.05)
-    ax1.set_ylabel("held-out pass rate")
-    ax1.set_title("(a) overall")
-    for i, v in enumerate(vals):
-        ax1.text(i, v + 0.02, f"{v:.2f}", ha="center", fontsize=8)
+    label = {"naive": "no protocol phase", "ampi": "AgentMPI"}
+    shade = {"naive": "0.75", "ampi": "0.35"}
+    b = (behaviour or {})
 
-    width = 0.8 / max(1, len(names))
+    ncols = 3 if b else 1
+    fig, axes = plt.subplots(1, ncols, figsize=(7.4 if b else 3.0, 2.6))
+    if ncols == 1:
+        axes = [axes]
+
+    ax = axes[0]
+    vals = [arms[n]["pass_rate"] for n in names]
+    ax.bar(range(len(names)), vals, 0.55, color=[shade[n] for n in names],
+           edgecolor="black", linewidth=0.4)
+    ax.set_xticks(range(len(names)))
+    ax.set_xticklabels([label[n] for n in names], rotation=15, ha="right")
+    ax.set_ylim(0, 1.12)
+    ax.set_ylabel(f"held-out pass rate (n={e2.get('suite_size', '?')})")
+    ax.set_title("(a) quality: a tie")
+    for i, v in enumerate(vals):
+        ax.text(i, v + 0.03, f"{v:.2f}", ha="center", fontsize=8)
+
+    if not b:
+        _save(fig, out, "fig_e2")
+        return
+
+    metrics = [
+        ("wall time (s)", "wall_s"),
+        ("runtime calls", "runtime_calls"),
+        ("tokens into contexts", "context_total_tokens"),
+    ]
+    ax = axes[1]
+    width = 0.8 / len(names)
     for k, n in enumerate(names):
-        ys = [arms[n]["by_category"].get(c, {}).get("pass_rate", 0) for c in cats]
-        xs = [i + k * width - 0.4 + width / 2 for i in range(len(cats))]
-        ax2.bar(xs, ys, width, label=label[n], edgecolor="black", linewidth=0.4,
-                color=["0.75", "0.35"][k])
-    ax2.set_xticks(range(len(cats)))
-    ax2.set_xticklabels(cats, rotation=30, ha="right")
-    ax2.set_ylim(0, 1.05)
-    ax2.set_ylabel("pass rate")
-    ax2.set_title("(b) by specification area")
-    ax2.legend(frameon=False)
+        ys = [b.get(n, {}).get(key, 0) for _, key in metrics]
+        xs = [i + k * width - 0.4 + width / 2 for i in range(len(metrics))]
+        ax.bar(xs, ys, width, label=label[n], color=shade[n],
+               edgecolor="black", linewidth=0.4)
+    ax.set_xticks(range(len(metrics)))
+    ax.set_xticklabels([m for m, _ in metrics], rotation=20, ha="right")
+    ax.set_yscale("log")
+    ax.set_title("(b) cost: not a tie")
+    ax.legend(frameon=False, loc="upper left")
+
+    ax = axes[2]
+    struct = [
+        ("p2p msgs", "p2p_messages"),
+        ("window cells", lambda d: d.get("rma", {}).get("cells", 0)),
+        ("accumulates", lambda d: d.get("rma", {}).get("accumulates", 0)),
+        ("agent merges", "agent_merges"),
+    ]
+    for k, n in enumerate(names):
+        ys = []
+        for _, key in struct:
+            d = b.get(n, {})
+            ys.append(max(0.4, (key(d) if callable(key) else d.get(key, 0)) or 0.4))
+        xs = [i + k * width - 0.4 + width / 2 for i in range(len(struct))]
+        ax.bar(xs, ys, width, label=label[n], color=shade[n],
+               edgecolor="black", linewidth=0.4)
+    ax.set_xticks(range(len(struct)))
+    ax.set_xticklabels([m for m, _ in struct], rotation=20, ha="right", fontsize=7.5)
+    ax.set_yscale("log")
+    ax.set_title("(c) coordination each arm built")
     _save(fig, out, "fig_e2")
 
 
@@ -312,6 +356,7 @@ def main() -> int:
     ap.add_argument("--microbench", default="results/microbench.json")
     ap.add_argument("--e1", default="results/e1_metrics.json")
     ap.add_argument("--e2", default="results/e2_grade.json")
+    ap.add_argument("--e2b", default="results/e2_behaviour.json")
     ap.add_argument("--out", default="paper/figures")
     args = ap.parse_args()
     out = Path(args.out)
@@ -333,11 +378,16 @@ def main() -> int:
             fig_matching(mb, out)
     else:
         print(f"  (no {mb_path})")
-    for path, fn in ((Path(args.e1), fig_e1), (Path(args.e2), fig_e2)):
-        if path.exists():
-            fn(json.loads(path.read_text()), out)
-        else:
-            print(f"  (no {path})")
+    if Path(args.e1).exists():
+        fig_e1(json.loads(Path(args.e1).read_text()), out)
+    else:
+        print(f"  (no {args.e1})")
+    if Path(args.e2).exists():
+        beh_path = Path(args.e2b)
+        beh = json.loads(beh_path.read_text()) if beh_path.exists() else None
+        fig_e2(json.loads(Path(args.e2).read_text()), out, beh)
+    else:
+        print(f"  (no {args.e2})")
     return 0
 
 
