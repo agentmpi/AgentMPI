@@ -396,6 +396,7 @@ class Fabric:
     def emit(
         self,
         kind: str,
+        /,
         *,
         rank: int | None = None,
         ctx: int | None = None,
@@ -410,6 +411,11 @@ class Fabric:
         and out-of-band; AgentMPI makes the trace part of the protocol because
         the trace *is* the artifact a harness author debugs against, and
         because an agent run cannot be cheaply re-executed to reproduce a bug.
+
+        ``kind`` is positional-only so that a payload field may itself be called
+        ``kind`` without colliding with the event's own type -- which it very
+        often wants to be, since "what kind of failure" is exactly the sort of
+        thing an event records.
         """
         row = (time.time(), rank, ctx, kind, phase, json.dumps(payload, default=str, ensure_ascii=False))
         sql = "INSERT INTO events(ts, rank, ctx, kind, phase, payload) VALUES(?,?,?,?,?,?)"

@@ -493,29 +493,35 @@ def scatter(
         tr.stats.rounds = 1
 
     elif algorithm == "binomial":
+        # The same tree as the binomial broadcast: a node's parent clears its
+        # lowest set bit, and its children are the nodes reachable by setting a
+        # strictly lower bit.  A node holds the contiguous span of virtual ranks
+        # [vr, vr + span) and hands the upper half of that span to each child in
+        # turn, so the total volume forwarded is n*p*log(p)/2 rather than the
+        # n*(p-1) of the linear algorithm -- the price of the logarithmic depth.
         vr = (r - root) % p
         if vr == 0:
-            block = list(payloads)  # type: ignore[arg-type]
+            span = 1 << _ilog2_ceil(p)
+            # Index the block by *virtual* rank so the rotation by root is
+            # applied once, here, instead of at every level.
+            block = [payloads[(i + root) % p] for i in range(p)]  # type: ignore[index]
             base = 0
         else:
-            highest = 1 << (vr.bit_length() - 1)
-            parent = (vr - highest + root) % p
+            lowest = vr & (-vr)
+            parent = ((vr - lowest) + root) % p
             recvd = comm._crecv(parent, itag, timeout=timeout, admit=False)
-            base, block = recvd["base"], recvd["block"]
-        # Send away the upper half of the block for each child bit.
-        mask = (1 << (vr.bit_length() - 1)) if vr else (1 << _ilog2_ceil(p))
+            base, block, span = int(recvd["base"]), recvd["block"], lowest
+        mask = span >> 1
         while mask > 0:
-            if vr == 0 or mask < (1 << (vr.bit_length() - 1)):
-                child_v = vr | mask
-                if child_v != vr and child_v < p:
-                    child = (child_v + root) % p
-                    # The child owns virtual ranks [child_v, min(child_v+mask, p)).
-                    lo = child_v - vr
-                    hi = min(lo + mask, len(block))
-                    sub = block[lo:hi]
-                    comm._csend({"base": base + lo, "block": sub}, child, itag, mode=mode, timeout=timeout)
-                    tr.sent(sum(_tok(comm, x) for x in sub))
-                    block = block[:lo]
+            child_v = vr + mask
+            if child_v < p:
+                lo = child_v - base
+                hi = min(lo + mask, len(block))
+                comm._csend(
+                    {"base": child_v, "block": block[lo:hi]}, (child_v + root) % p, itag, mode=mode, timeout=timeout
+                )
+                tr.sent(sum(_tok(comm, x) for x in block[lo:hi]))
+                block = block[:lo]
             mask >>= 1
         mine = block[0] if block else None
         tr.stats.rounds = _ilog2_ceil(p)
@@ -815,10 +821,18 @@ def reduce(
             op=op.name,
             algorithm=algorithm,
         )
-    # A binomial tree keeps the lower virtual rank as the accumulator at every
-    # combine, so rank order is preserved along each path and non-commutative
-    # operators remain correct -- the same reasoning MPI uses to permit trees
-    # for user operators declared non-commutative.
+    # A binomial tree keeps the lower *virtual* rank as the accumulator at every
+    # combine, so rank order is preserved along each path -- but virtual rank
+    # order coincides with communicator rank order only when the root is 0.  For
+    # any other root a non-commutative operator would be evaluated in rotated
+    # order, so the tree is refused rather than silently reordering.
+    if algorithm == "binomial" and not op.commutative and root != 0:
+        raise AmpiUsageError(
+            "binomial reduce cannot preserve rank order for a non-commutative operator "
+            "with a non-zero root; use algorithm='chain' or 'flat'",
+            op=op.name,
+            root=root,
+        )
     epoch = comm._next_epoch("reduce")
     tr = _Tracker(comm, "reduce", algorithm, root=root)
     if p == 1:
@@ -830,24 +844,34 @@ def reduce(
     result: Any = None
 
     if algorithm == "chain":
-        # Order-preserving: rank (root+1) starts, each rank folds and passes on.
-        order = [(root + 1 + i) % p for i in range(p - 1)] + [root]
-        pos = order.index(r)
-        if pos == 0:
-            acc, weight = payload, 1
+        # Fold right-to-left with the *local* payload as the left operand, so
+        # the accumulator is always op(payload_r, op(payload_{r+1}, ...)) and the
+        # evaluation order is exactly rank order -- the guarantee a
+        # non-commutative operator needs.  The result lands at rank 0; if the
+        # root is elsewhere it takes one extra hop, which is what MPI
+        # implementations do for the same reason.
+        if r == p - 1:
+            acc, weight, depth = payload, 1, 0
         else:
-            prev = order[pos - 1]
-            got = comm._crecv(prev, itag, timeout=timeout, admit=False)
-            acc = op.fn(got["acc"], payload, _reduce_ctx(comm, got["depth"], got["weight"]))
+            got = comm._crecv(r + 1, itag, timeout=timeout, admit=False)
+            depth = int(got["depth"]) + 1
             weight = int(got["weight"]) + 1
-            tr.stats.fold_depth = int(got["depth"]) + 1
-        if pos < len(order) - 1:
-            nxt = order[pos + 1]
-            comm._csend({"acc": acc, "depth": tr.stats.fold_depth, "weight": weight}, nxt, itag, mode=mode, timeout=timeout)
+            acc = op.fn(payload, got["acc"], _reduce_ctx(comm, depth, weight))
+        tr.stats.fold_depth = depth
+        if r > 0:
+            comm._csend({"acc": acc, "depth": depth, "weight": weight}, r - 1, itag, mode=mode, timeout=timeout)
             tr.sent(_tok(comm, acc))
             result = None
         else:
             result = acc
+        if root != 0:
+            ftag = comm._itag("reduce", epoch, "final")
+            if r == 0:
+                comm._csend(result, root, ftag, mode=mode, timeout=timeout)
+                tr.sent(_tok(comm, result))
+                result = None
+            elif r == root:
+                result = comm._crecv(0, ftag, timeout=timeout, admit=False)
         tr.stats.rounds = p - 1
 
     elif algorithm == "flat":

@@ -28,7 +28,6 @@ import threading
 import time
 import traceback
 from collections.abc import Callable, Sequence
-from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -256,7 +255,7 @@ def launch(
     label: str = "",
     ranks: Sequence[int] | None = None,
     fabric: Fabric | None = None,
-    timeout: float | None = None,
+    timeout: float | None = 7200.0,
 ) -> JobResult:
     """Run ``rank_main`` once per rank, SPMD-style, in this process.
 
@@ -273,6 +272,12 @@ def launch(
     transforms artifacts.  The alternative — telling the model about the protocol
     and hoping it calls the right collective — is available through the CLI, and
     the paper measures how much worse it is.
+
+    ``timeout`` bounds the whole job and defaults to two hours rather than to
+    "forever".  A blocking collective in which one member never arrives is the
+    normal case here, so a launcher that could wait indefinitely would be a
+    liveness bug in the tool rather than in the program under test.  Ranks that
+    exceed the deadline are reported as failed outcomes and the launcher returns.
     """
     root_path = Path(root) if root is not None else Path(os.environ.get("AMPI_ROOT", ".ampi-run"))
     fab = fabric or create_job(root_path, size, label=label)
@@ -328,14 +333,42 @@ def launch(
         finally:
             _CURRENT.session = None
 
-    with ThreadPoolExecutor(max_workers=max(1, len(target_ranks)), thread_name_prefix="ampi-rank") as pool:
-        futures: dict[Future[RankOutcome], int] = {pool.submit(_one, r): r for r in target_ranks}
-        for fut, r in futures.items():
-            try:
-                outcomes.append(fut.result(timeout=timeout))
-            except BaseException as exc:
-                outcomes.append(RankOutcome(rank=r, ok=False, error=repr(exc)))
-    outcomes.sort(key=lambda o: o.rank)
+    # Daemon threads with a bounded join, not a thread pool.  A pool's shutdown
+    # waits for its workers, so one rank stuck in a collective would hang the
+    # launcher forever -- unacceptable for a runtime whose premise is that ranks
+    # get stuck.  With daemon threads the launcher reports the stragglers and
+    # returns; the stuck threads cannot outlive the process.
+    results: dict[int, RankOutcome] = {}
+    threads: dict[int, threading.Thread] = {}
+
+    def _wrap(r: int) -> None:
+        try:
+            results[r] = _one(r)
+        except BaseException as exc:  # pragma: no cover - _one already catches
+            results[r] = RankOutcome(rank=r, ok=False, error=repr(exc))
+
+    for r in target_ranks:
+        th = threading.Thread(target=_wrap, args=(r,), name=f"ampi-rank-{r}", daemon=True)
+        threads[r] = th
+        th.start()
+
+    deadline = time.time() + timeout if timeout is not None else None
+    for r, th in threads.items():
+        remaining = None if deadline is None else max(0.0, deadline - time.time())
+        th.join(timeout=remaining)
+    for r, th in threads.items():
+        if r in results:
+            continue
+        if th.is_alive():
+            fab.emit("rank.stuck", rank=r, waited_s=round(timeout or 0.0, 1))
+            results[r] = RankOutcome(
+                rank=r,
+                ok=False,
+                error=f"rank {r} did not complete within the launcher deadline (stuck in a blocking call)",
+            )
+        else:
+            results[r] = RankOutcome(rank=r, ok=False, error=f"rank {r} produced no outcome")
+    outcomes = sorted(results.values(), key=lambda o: o.rank)
     result = JobResult(root=root_path, size=size, outcomes=outcomes, wall_s=time.time() - t0)
     fab.emit("job.finish", **result.totals())
     return result

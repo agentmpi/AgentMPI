@@ -92,6 +92,11 @@ from .schema import Contract, View, check_match
 POLL_INTERVAL = 0.01
 MAX_POLL_INTERVAL = 0.25
 
+#: How often a blocked call re-reads the communicator's revocation flag.  Small
+#: enough that a revoke frees peers promptly, large enough that many blocked
+#: ranks do not turn the check into the dominant fabric load.
+REVOKE_CHECK_INTERVAL = 0.2
+
 
 @dataclass
 class Status:
@@ -286,6 +291,8 @@ class Communicator:
         #: agreement step.
         self._coll_epoch = 0
         self._freed = False
+        self._revoked = False
+        self._last_revoke_check = 0.0
         self.refresh()
 
     # ------------------------------------------------------------- membership
@@ -334,9 +341,23 @@ class Communicator:
         return self._members.index(wrank) if wrank in self._members else UNDEFINED
 
     def _check_live(self) -> None:
+        """Raise if this communicator is no longer usable.
+
+        Called from inside every blocking poll loop, and it must consult the
+        *fabric* rather than a cached flag: the whole purpose of ``revoke`` is
+        that a rank which has noticed a failure can release peers who are already
+        blocked, and a peer that only checked its local cache would never learn.
+        The fabric read is rate-limited so that a hundred blocked ranks polling
+        concurrently do not contend on it.
+        """
         if self._freed:
             raise AmpiCommError("communicator has been freed", ctx=self.ctx)
-        if getattr(self, "_revoked", False):
+        now = time.time()
+        if not self._revoked and now - self._last_revoke_check >= REVOKE_CHECK_INTERVAL:
+            self._last_revoke_check = now
+            row = self.fabric.query_one("SELECT revoked FROM comms WHERE ctx=?", (self.ctx,))
+            self._revoked = bool(row and int(row["revoked"]))
+        if self._revoked:
             raise AmpiRevoked("communicator revoked", ctx=self.ctx)
 
     # ----------------------------------------------------------- construction
