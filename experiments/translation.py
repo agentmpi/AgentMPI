@@ -558,7 +558,20 @@ def main(argv: list[str] | None = None) -> int:
         "glossary": head.get("glossary") or {},
         "fabric_root": str(root),
     }
-    variant = f"p{cfg.ranks}-{'gloss' if cfg.glossary else 'nogloss'}-{'halo' if cfg.halo else 'nohalo'}-{cfg.glossary_op}"
+    # The variant key must mention every dimension the ablation ladder varies, or
+    # two configurations collide and the later silently overwrites the earlier. An
+    # earlier version omitted the allreduce algorithm and lost a result that way.
+    variant = "-".join(
+        (
+            f"p{cfg.ranks}",
+            "gloss" if cfg.glossary else "nogloss",
+            "halo" if cfg.halo else "nohalo",
+            cfg.glossary_op,
+            cfg.allreduce_alg,
+            f"w{cfg.words_per_unit}",
+            f"u{len(units)}",
+        )
+    )
     path = write_result(f"{cfg.label}-{variant}", payload, subdir="translation")
 
     (root / "output").mkdir(parents=True, exist_ok=True)

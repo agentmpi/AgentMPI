@@ -52,6 +52,7 @@ import agentmpi as ampi
 from agentmpi import algorithms, cost, sim
 from agentmpi.constants import Associativity, BarrierPolicy, FailureClass, Mode
 from common import (  # noqa: E402
+    FACT_ID,
     fact_retention,
     make_executor_factory,
     make_fact_report,
@@ -303,6 +304,24 @@ Return ONLY a JSON object: {{"title": "<short>", "findings": ["[F-x-y] <item>", 
 --- REPORT B ---
 {right}"""
 
+#: The variadic form. This is what makes a wide reduction tree pay: k reports are
+#: merged in ONE application rather than k-1, so the fold depth of a k-ary tree is
+#: log_k p rather than log2 p. MPI has no use for such an operator because its
+#: processes are single-ported; an agent prompt carries k inputs as easily as two.
+MERGE_PROMPT_K = """Merge the {n} reports below into a single consolidated report.
+
+Requirements:
+- Preserve every distinct factual item. Each item carries a bracketed identifier
+  such as [F-3-2]. Keep every identifier that appears in ANY input, exactly as
+  written, attached to its item.
+- You may compress wording, but you may not drop an item.
+- Your output must be at most {budget} tokens. If you cannot fit everything at full
+  length, shorten the wording of items rather than removing any of them.
+
+Return ONLY a JSON object: {{"title": "<short>", "findings": ["[F-x-y] <item>", ...]}}
+
+{inputs}"""
+
 MERGE_CONTRACT = ampi.Contract(
     name="MergedReport", kind="json", required=("title", "findings"), nonempty=("findings",)
 )
@@ -348,32 +367,44 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
             associativity=Associativity.APPROX,
             output_tokens=cfg.merge_budget,
             contract=MERGE_CONTRACT,
+            # Only the k-ary algorithm can use the variadic kernel, but attaching it
+            # unconditionally keeps the operator identical across algorithms so the
+            # comparison isolates the tree shape.
+            variadic_prompt=MERGE_PROMPT_K,
         )
         if not cfg.weighted:
-            # Fixed budget regardless of subtree size: the naive implementation.
+            # Fixed budget regardless of subtree size: the naive implementation. It
+            # still needs the variadic kernel, or the k-ary tree silently degrades to
+            # a left fold and the comparison measures the wrong thing.
             op = ampi.Op(
                 name="MERGE_REPORTS_FIXED",
                 fn=_fixed_budget_merge(cfg.merge_budget),
                 commutative=False,
                 associativity=Associativity.APPROX,
                 cost_tokens=cfg.merge_budget,
+                variadic=_fixed_budget_merge_k(cfg.merge_budget),
             )
 
         def rank_main(comm: ampi.Communicator, op: ampi.Op = op, alg: str = alg) -> Any:
             report = make_fact_report(comm.rank, n_facts)
             t0 = time.perf_counter()
-            out = comm.reduce(report, op, root=0, algorithm=alg, timeout=cfg.timeout)
+            # For the k-ary tree the fan-in is derived from the context budget if the
+            # caller did not fix it, which is the policy the spec recommends.
+            k = cfg.fanin or ampi.ops.optimal_fanin(cfg.context_budget, cfg.merge_budget)
+            out = comm.reduce(report, op, root=0, algorithm=alg, timeout=cfg.timeout, fanin=k)
             st = algorithms.LAST_STATS.get(comm.rt.wrank)
             return {
                 "result": out,
                 "wall_s": time.perf_counter() - t0,
                 "fold_depth": st.fold_depth if st else 0,
                 "rounds": st.rounds if st else 0,
+                "fanin": (st.extra.get("fanin") if st else None) or (k if alg == "kary" else None),
+                "variadic": st.extra.get("variadic") if st else None,
                 "agent_calls": comm.rt.cost.n_agent_calls,
                 "tokens_out": comm.rt.cost.tokens_out,
             }
 
-        root = Path(cfg.root) / f"fidelity-{alg}-{'w' if cfg.weighted else 'f'}"
+        root = Path(cfg.root) / f"fidelity-{alg}-{'w' if cfg.weighted else 'f'}-k{cfg.fanin or 0}"
         factory = (
             make_executor_factory("broker", fabric_root=_ensure(root, cfg.ranks), timeout=cfg.timeout)
             if cfg.executor == "broker"
@@ -398,9 +429,12 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
                 "weighted_budget": cfg.weighted,
                 "p": cfg.ranks,
                 "facts_per_rank": n_facts,
+                "_budget": cfg.merge_budget,
                 "ok": job.ok,
                 "fold_depth": head.get("fold_depth"),
                 "rounds": head.get("rounds"),
+                "fanin": head.get("fanin"),
+                "variadic": head.get("variadic"),
                 "wall_s": round(head.get("wall_s", 0.0), 2),
                 "agent_calls_total": sum((o.value or {}).get("agent_calls", 0) for o in job.outcomes if o.value),
                 "tokens_out_total": sum((o.value or {}).get("tokens_out", 0) for o in job.outcomes if o.value),
@@ -424,27 +458,71 @@ def _fixed_budget_merge(budget: int) -> Any:
     return _fn
 
 
-def _surrogate_merge(drop_rate: float, seed: int) -> Any:
-    """A deterministic stand-in for a lossy merge.
+def _fixed_budget_merge_k(budget: int) -> Any:
+    """Variadic form of the fixed-budget merge: k inputs, one application."""
 
-    Drops a fixed fraction of items at every application, preferring to keep the
-    *later* argument -- the recency bias a summarising model exhibits.  It gives the
-    analytic curve ``retention = (1-r)^depth`` against which the measured
-    agent behaviour can be compared, and it makes the benchmark runnable in CI.
+    def _fn(values: list[Any], ctx: ampi.ReduceContext) -> Any:
+        if ctx.agent is None:
+            raise ampi.AmpiUsageError("needs an executor")
+        inputs = "\n\n".join(
+            f"--- INPUT {i} ---\n{json.dumps(v, ensure_ascii=False)}" for i, v in enumerate(values)
+        )
+        return ctx.agent(
+            MERGE_PROMPT_K.format(inputs=inputs, n=len(values), budget=budget, depth=ctx.depth, weight=ctx.weight),
+            label=f"merge:k{len(values)}:d{ctx.depth}",
+            contract=MERGE_CONTRACT,
+            max_tokens=budget,
+        )
+
+    return _fn
+
+
+def _surrogate_merge(drop_rate: float, seed: int) -> Any:
+    """A deterministic caricature of a lossy merge, for CI and for plumbing checks.
+
+    **This is not evidence about real operators, and must not be read as such.** It
+    implements the paper's loss model -- each application independently drops each
+    item with probability ``drop_rate``, so retention is ``(1-r)^depth`` -- by
+    construction. Running it therefore *reproduces* the analytic curve rather than
+    testing it, and its only legitimate uses are checking that the wide tree actually
+    reaches the fold depth it claims and keeping the benchmark runnable without an
+    agent. The evidence about whether real reduction loss behaves this way comes from
+    the broker-executed run.
+
+    An earlier version made the surviving capacity proportional to the input size,
+    which had the perverse effect of making a serial chain lossless: merging two
+    items at a time never exceeds a proportional budget. That is worth recording
+    because it is the same mistake a careless real experiment would make -- if each
+    merge is given a budget scaled to its input, depth costs nothing and the effect
+    under study disappears.
     """
     import random as _random
 
     def _fn(prompt: str, **_meta: Any) -> Any:
         rng = _random.Random(seed + len(prompt))
+        # Collect the identified items from every input block, whichever prompt form
+        # was used (the binary form labels blocks REPORT, the variadic form INPUT).
         items: list[str] = []
-        for part in prompt.split("--- REPORT ")[1:]:
-            for line in part.splitlines():
-                line = line.strip().strip('",')
-                if line.startswith("[F-") or "[F-" in line:
-                    items.append(line)
-        keep_n = max(1, int(round(len(items) * (1 - drop_rate))))
-        # Recency bias: keep from the end preferentially.
-        kept = items[-keep_n:] if rng.random() < 0.7 else rng.sample(items, keep_n)
+        seen: set[str] = set()
+        for line in prompt.splitlines():
+            line = line.strip().strip('",')
+            m = FACT_ID.search(line)
+            if m and line not in seen:
+                seen.add(line)
+                items.append(line)
+        # Independent per-item loss, once per application. This is the mechanism the
+        # depth model describes: an item is at risk every time it passes through the
+        # operator, so surviving d applications has probability (1-r)^d. Later items
+        # are favoured slightly, reflecting the recency bias models exhibit, which is
+        # what produces the positional unfairness the metric reports.
+        n = len(items)
+        kept = [
+            item
+            for i, item in enumerate(items)
+            if rng.random() > drop_rate * (1.0 - 0.4 * (i / max(1, n - 1)))
+        ]
+        if not kept and items:
+            kept = items[-1:]
         return {"title": "merged", "findings": kept}
 
     return _fn
@@ -678,6 +756,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--facts", type=int, default=4)
     ap.add_argument("--merge-budget", type=int, default=900)
     ap.add_argument("--algorithms", default="binomial,chain,flat")
+    ap.add_argument("--fanin", type=int, default=None, help="k for the kary reduce; default from the context budget")
     ap.add_argument("--weighted", action="store_true", help="give the merge operator a subtree-proportional budget")
     ap.add_argument("--drop-rate", type=float, default=0.15, help="surrogate merge loss per application")
     ap.add_argument("--victims", default="3")

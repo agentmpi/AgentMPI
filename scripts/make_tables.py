@@ -185,14 +185,25 @@ def table_translation() -> None:
         bits.append("glossary" if cfg.get("glossary") else "\\textbf{no glossary}")
         bits.append("halo" if cfg.get("halo") else "\\textbf{no halo}")
         if cfg.get("glossary_op") == "semantic":
-            bits.append("semantic merge")
+            bits.append("\\textbf{semantic merge}")
         if cfg.get("allreduce_alg") == "recursive_doubling":
             bits.append("rec.\\ doubling")
         return ", ".join(bits)
 
+    def order(cfg: dict[str, Any]) -> tuple[int, ...]:
+        # Baseline first, then each single-mechanism change, so the table reads as
+        # a ladder rather than as an arbitrary ordering.
+        return (
+            0 if (cfg.get("glossary") and cfg.get("halo") and cfg.get("glossary_op") == "union"
+                  and cfg.get("allreduce_alg") == "reduce_bcast") else 1,
+            0 if cfg.get("halo") else 1,
+            0 if cfg.get("glossary") else 1,
+            0 if cfg.get("glossary_op") == "union" else 1,
+        )
+
     ablations = [(n, d) for n, d in res if d["config"].get("ranks") == max(x[1]["config"].get("ranks", 0) for x in res)]
     lines = []
-    for _, d in sorted(ablations, key=lambda kv: (not kv[1]["config"].get("glossary"), not kv[1]["config"].get("halo"))):
+    for _, d in sorted(ablations, key=lambda kv: order(kv[1]["config"])):
         q, j, c = d["quality"], d["job"], d["config"]
         lines.append(
             rf"{label(c)} & {fmt(q['consistency'], 3)} & {q['n_divergent_entities']}/{q['n_shared_entities']} & "
@@ -257,6 +268,27 @@ def table_translation() -> None:
         emit("tab_translation_scaling.tex", body)
     else:
         emit("tab_translation_scaling.tex", MISSING)
+
+    # The semantic-vs-exact operator comparison: same mechanism, same measured
+    # quality, very different price. The prose quotes these ratios.
+    full = next((d for _, d in res if d["config"].get("glossary") and d["config"].get("halo")
+                 and d["config"].get("glossary_op") == "union"
+                 and d["config"].get("allreduce_alg") == "reduce_bcast"
+                 and d["config"].get("ranks") == max(x[1]["config"]["ranks"] for x in res)), None)
+    sem = next((d for _, d in res if d["config"].get("glossary_op") == "semantic"), None)
+    if full and sem:
+        _MACROS["NSemTime"] = f"{sem['job']['wall_s'] / max(full['job']['wall_s'], 1e-9):.1f}"
+        _MACROS["NSemTokens"] = (
+            f"{(sem['job']['tokens_in'] + sem['job']['tokens_out']) / max(full['job']['tokens_in'] + full['job']['tokens_out'], 1):.1f}"
+        )
+        _MACROS["NSemPrice"] = f"{sem['job']['usd'] / max(full['job']['usd'], 1e-9):.1f}"
+        _MACROS["NSemCalls"] = str(sem["job"]["agent_calls"])
+    bare = next((d for _, d in res if not d["config"].get("glossary") and d["config"].get("ranks") == max(x[1]["config"]["ranks"] for x in res)), None)
+    if full and bare:
+        _MACROS["NCoordTime"] = f"{100 * (full['job']['wall_s'] / bare['job']['wall_s'] - 1):.0f}"
+        _MACROS["NCoordTokens"] = (
+            f"{100 * ((full['job']['tokens_in'] + full['job']['tokens_out']) / (bare['job']['tokens_in'] + bare['job']['tokens_out']) - 1):.0f}"
+        )
 
     # calibration
     best = max(res, key=lambda kv: kv[1]["job"]["agent_calls"])[1]
@@ -336,31 +368,84 @@ def table_faults() -> None:
 
 
 def table_fidelity() -> None:
+    """Reduction fidelity, separated by executor and by whether it saturated.
+
+    Two separations matter and both were wrong in a first version. Surrogate rows
+    must never share a block with agent-executed rows, because the surrogate
+    *implements* the loss model and so reproduces it by construction; presenting the
+    two together would let a reader mistake a definition for a measurement.
+
+    And saturation is classified *empirically* -- a configuration is capacity-bound
+    if some algorithm actually lost an item -- rather than from an a-priori estimate
+    of whether the items fit the budget. The estimate was wrong: agents told to
+    compress rather than drop did exactly that, so a configuration predicted to
+    saturate did not.
+    """
     rows: list[dict[str, Any]] = []
     for f in sorted(glob.glob(str(RESULTS / "microbench" / "*fidelity*.json"))):
         d = load(Path(f))
         b = (d or {}).get("benches", {}).get("fidelity")
-        if b:
-            rows.extend(b["rows"])
+        if not b:
+            continue
+        for r in b["rows"]:
+            rows.append({**r, "_executor": b.get("executor", "?")})
     if not rows:
         emit("tab_fidelity.tex", MISSING)
         return
-    lines = []
-    for r in sorted(rows, key=lambda x: (x.get("weighted_budget", False), -(x.get("fold_depth") or 0))):
+
+    def alg_label(r: dict[str, Any]) -> str:
+        name = tex_escape(str(r["algorithm"]))
+        if r.get("fanin") and r["algorithm"] == "kary":
+            return rf"\texttt{{{name}}}, $k{{=}}{int(r['fanin'])}$"
+        return rf"\texttt{{{name}}}"
+
+    # Group by (executor, population, per-rank item count, budget): one experimental
+    # configuration per group, so algorithms within a group are comparable.
+    groups: dict[tuple[Any, ...], list[dict[str, Any]]] = {}
+    for r in rows:
+        key = (r["_executor"], r.get("p"), r.get("facts_per_rank"), r.get("_budget"))
+        groups.setdefault(key, []).append(r)
+
+    lines: list[str] = []
+    for key in sorted(groups, key=lambda k: (k[0] != "broker", k[1] or 0, k[2] or 0)):
+        block = groups[key]
+        executor, p, facts, budget = key
+        lost = any((r.get("retention") or 0) < 1.0 for r in block)
+        kind = "agent-executed" if executor == "broker" else f"surrogate operator ({executor})"
+        state = "capacity-bound" if lost else "not capacity-bound"
+        budget_txt = f", {budget}-token merge budget" if budget else ""
         lines.append(
-            rf"\texttt{{{tex_escape(r['algorithm'])}}} & {r.get('p')} & {r.get('fold_depth')} & {r.get('rounds')} & "
-            rf"{fmt(r.get('retention'), 3)} & {fmt(r.get('retention_stdev'), 3)} & "
-            rf"{fmt(r.get('rank_position_correlation'), 3)} & {r.get('n_hallucinated_ids', 0)} & "
-            rf"{fmt(r.get('wall_s'), 0)} & {fmt(r.get('tokens_out_total'))} & "
-            rf"{'yes' if r.get('weighted_budget') else 'no'} \\"
+            rf"\multicolumn{{9}}{{l}}{{\emph{{{kind}}}: $p{{=}}{p}$, "
+            rf"{facts} items/rank{budget_txt} --- \textbf{{{state}}}}} \\"
         )
+        for r in sorted(block, key=lambda x: -(x.get("fold_depth") or 0)):
+            lines.append(
+                rf"\quad {alg_label(r)} & {r.get('fold_depth')} & {r.get('rounds')} & "
+                rf"{fmt(r.get('retention'), 3)} & {fmt(r.get('retention_stdev'), 3)} & "
+                rf"{fmt(r.get('rank_position_correlation'), 3)} & {r.get('n_hallucinated_ids', 0)} & "
+                rf"{fmt(r.get('wall_s'), 0)} & {fmt(r.get('tokens_out_total'))} \\"
+            )
+        lines.append(r"\addlinespace")
+
     body = (
-        "\\begin{tabular}{lrrrrrrrrrl}\n\\toprule\n"
-        "algorithm & $p$ & depth & rounds & retention & sd & rank corr. & halluc. & wall (s) & out tok & weighted \\\\\n\\midrule\n"
+        "\\begin{tabular}{lrrrrrrrr}\n\\toprule\n"
+        "algorithm & depth & rounds & retention & sd & rank corr. & halluc. & wall (s) & out tok \\\\\n\\midrule\n"
         + "\n".join(lines)
         + "\n\\bottomrule\n\\end{tabular}"
     )
     emit("tab_fidelity.tex", body)
+
+    # The latency comparison at held-constant quality, which the prose quotes.
+    for block in groups.values():
+        if block[0]["_executor"] != "broker":
+            continue
+        if all((r.get("retention") or 0) >= 1.0 for r in block):
+            by_alg = {r["algorithm"]: r for r in block}
+            if {"binomial", "chain", "flat"} <= set(by_alg):
+                _MACROS["NFidTree"] = f"{by_alg['binomial']['wall_s']:.0f}"
+                _MACROS["NFidChain"] = f"{by_alg['chain']['wall_s']:.0f}"
+                _MACROS["NFidFlat"] = f"{by_alg['flat']['wall_s']:.0f}"
+                _MACROS["NFidSpeedup"] = f"{by_alg['chain']['wall_s'] / max(by_alg['binomial']['wall_s'], 1e-9):.1f}"
 
 
 # --------------------------------------------------------------- software table
@@ -502,7 +587,9 @@ def summary_macros() -> None:
     macros.append(rf"\newcommand{{\NTranslationConfigs}}{{{len(tr)}}}")
     for name, value in sorted(_MACROS.items()):
         macros.append(rf"\newcommand{{\{name}}}{{{value}}}")
-    for name in ("NModelConfigs", "NModelAgreement", "NModelDepthAgreement", "NEagerLimit", "NUslFit"):
+    for name in ("NModelConfigs", "NModelAgreement", "NModelDepthAgreement", "NEagerLimit", "NUslFit",
+                 "NSemTime", "NSemTokens", "NSemPrice", "NSemCalls", "NCoordTime", "NCoordTokens",
+                 "NFidTree", "NFidChain", "NFidFlat", "NFidSpeedup"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))

@@ -396,3 +396,134 @@ def test_optimal_fanin_tracks_the_context_budget():
     # It never returns something unusable.
     assert optimal_fanin(1_000, 100_000) == 2
     assert optimal_fanin(10**9, 1) == 32
+
+
+# ---------------------------------------------------------------------------
+# The allreduce divergence hazard.
+# ---------------------------------------------------------------------------
+
+
+def _order_sensitive_op() -> ampi.Op:
+    """A deterministic stand-in for a lossy, order-sensitive semantic merge.
+
+    Keeps only the first two contributions it ever sees, in the order it saw them,
+    which is a caricature of a summariser with a fixed output budget: it drops
+    input, and *which* input it drops depends on the fold order. Deterministic, so
+    the divergence it exposes is a property of the algorithm rather than of a model.
+    """
+
+    def fn(a, b, _ctx):
+        merged = (a if isinstance(a, list) else [a]) + (b if isinstance(b, list) else [b])
+        return merged[:2]
+
+    return ampi.Op(
+        "LOSSY_MERGE", fn, commutative=False, associativity=Associativity.APPROX
+    )
+
+
+@pytest.mark.parametrize("size", [4, 8])
+def test_reduce_bcast_allreduce_never_diverges(tmp_path, size):
+    """One rank computes the result and broadcasts it, so agreement is agreement."""
+
+    def rank_main(comm):
+        return comm.allreduce([comm.rank], _order_sensitive_op(), algorithm="reduce_bcast")
+
+    job = ampi.launch(rank_main, size=size, root=tmp_path / f"rb{size}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    values = [o.value for o in job.outcomes]
+    assert all(v == values[0] for v in values), f"reduce_bcast must not diverge, got {values}"
+
+
+@pytest.mark.parametrize("size", [4, 8])
+def test_canonical_operand_order_removes_fold_order_divergence(tmp_path, size):
+    """Recursive doubling agrees even for a lossy operator -- by construction.
+
+    The textbook worry about an independent-fold allreduce is that each rank folds
+    in its own arrival order, so with a non-associative operator the p ranks end up
+    with p different answers to the question they just agreed on. That worry is
+    real, and it is *eliminated* by a one-line discipline: at every pairwise
+    exchange, order the operands by rank rather than by arrival. Both partners then
+    evaluate the identical expression tree, so a deterministic operator -- however
+    lossy or order-sensitive -- gives every rank the same result.
+
+    This costs nothing and it is the same reasoning MPI uses to permit trees for
+    operators declared non-commutative. It is worth a test because the property is
+    invisible: an implementation that folded by arrival order would pass every
+    correctness test that uses an exact operator.
+    """
+
+    def rank_main(comm):
+        return comm.allreduce([comm.rank], _order_sensitive_op(), algorithm="recursive_doubling")
+
+    job = ampi.launch(rank_main, size=size, root=tmp_path / f"rd{size}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    values = [o.value for o in job.outcomes]
+    assert len({tuple(v) for v in values}) == 1, f"canonical ordering should prevent divergence, got {values}"
+
+
+@pytest.mark.parametrize("size", [4, 8])
+def test_nondeterministic_operator_diverges_under_independent_folds(tmp_path, size):
+    """The hazard that ordering cannot fix, and the reason for the default.
+
+    Canonical operand ordering makes every rank evaluate the same *expression*. It
+    cannot make them get the same *answer*, because a semantic operator implemented
+    by a model returns something different every time it is called. Under
+    ``recursive_doubling`` each rank evaluates that expression itself, so the
+    population diverges; under ``reduce_bcast`` exactly one rank evaluates it and
+    the others receive the result by handle, so they are byte-identical.
+
+    This is why a lossy operator defaults to ``reduce_bcast``, at a cost of a factor
+    of two in rounds, and why the runtime flags the other combination rather than
+    forbidding it -- a harness whose operator happens to be deterministic should
+    still be allowed the faster algorithm.
+    """
+    counter = {"n": 0}
+
+    def fn(a, b, _ctx):
+        # Nondeterministic in the same way a model is: same inputs, different output.
+        counter["n"] += 1
+        merged = (a if isinstance(a, list) else [a]) + (b if isinstance(b, list) else [b])
+        return [*merged[:2], f"call{counter['n']}"]
+
+    nondet = ampi.Op("NONDET_MERGE", fn, commutative=False, associativity=Associativity.APPROX)
+
+    def rd_main(comm):
+        return comm.allreduce([comm.rank], nondet, algorithm="recursive_doubling")
+
+    job = ampi.launch(rd_main, size=size, root=tmp_path / f"nd{size}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    values = [tuple(o.value) for o in job.outcomes]
+    assert len(set(values)) > 1, f"independent folds of a nondeterministic operator must diverge, got {values}"
+
+    fabric = ampi.Fabric(tmp_path / f"nd{size}")
+    flags = [
+        e["payload"].get("divergence_risk")
+        for e in fabric.events(kinds=["coll.allreduce"])
+        if "divergence_risk" in e["payload"]
+    ]
+    assert flags and all(flags), "the combination must be flagged in the trace"
+
+    def rb_main(comm):
+        return comm.allreduce([comm.rank], nondet, algorithm="reduce_bcast")
+
+    job2 = ampi.launch(rb_main, size=size, root=tmp_path / f"nd2{size}")
+    assert job2.ok, [o.traceback for o in job2.outcomes if not o.ok]
+    values2 = [tuple(o.value) for o in job2.outcomes]
+    assert len(set(values2)) == 1, f"reduce_bcast must deliver one value to everyone, got {values2}"
+
+
+@pytest.mark.parametrize("size", [4, 8])
+def test_exact_operator_is_safe_under_either_algorithm(tmp_path, size):
+    """With an exact operator the choice is a pure latency decision."""
+    results: dict[str, list] = {}
+    for alg in ("reduce_bcast", "recursive_doubling"):
+
+        def rank_main(comm, alg=alg):
+            return comm.allreduce({f"k{comm.rank}": comm.rank}, ampi.UNION, algorithm=alg)
+
+        job = ampi.launch(rank_main, size=size, root=tmp_path / f"ex{size}{alg}")
+        assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+        values = [o.value for o in job.outcomes]
+        assert all(v == values[0] for v in values), f"{alg} diverged on an exact operator"
+        results[alg] = values[0]
+    assert results["reduce_bcast"] == results["recursive_doubling"]

@@ -197,7 +197,11 @@ def microbench_steps(*, ranks: int, prefix: str) -> list[Step]:
     for name, extra, p in (
         ("pingpong", ["--bench", "pingpong"], 2),
         ("collectives", ["--bench", "collectives"], ranks),
-        ("fidelity", ["--bench", "fidelity"], ranks),
+        # A saturating configuration: enough items per rank, and a tight enough merge
+        # budget, that the operator must discard. Without saturation every algorithm
+        # retains everything and the depth effect is unobservable.
+        ("fidelity", ["--bench", "fidelity", "--facts", "12", "--merge-budget", "450",
+                      "--algorithms", "chain,flat,binomial,kary", "--fanin", "4"], ranks),
         ("faults", ["--bench", "faults"], ranks),
     ):
         root = REPO / "runs" / f"{prefix}-{name}"

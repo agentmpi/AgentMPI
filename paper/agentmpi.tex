@@ -641,14 +641,32 @@ non-idempotent merge applied twice double-counts.
 
 \subsection{The allreduce divergence hazard}
 
-\code{reduce\_bcast} computes one result and broadcasts it, so every rank holds a
-byte-identical value. \code{recursive\_doubling} has each rank compute the result
-itself: latency-optimal in MPI, and a trap here, because under a lossy operator each
-rank performs its own fold sequence, so the $p$ results differ and \textbf{the
-population silently disagrees about the value it just agreed on}. \ampi{} permits
-it, records a divergence-risk flag, and defaults lossy operators to
-\code{reduce\_bcast} --- a factor of two in rounds to buy the property that
-``agreement'' means agreement.
+\code{reduce\_bcast} computes one result and broadcasts it; \code{recursive\_doubling}
+has each rank compute the result itself, which is latency-optimal in MPI. The
+difference matters here, but not for the reason one would first assume, and the
+distinction is worth drawing precisely because it separates a hazard that can be
+engineered away from one that cannot.
+
+The obvious worry is that under an independent-fold algorithm each rank folds in its
+own \emph{arrival order}, so a non-associative operator yields $p$ different answers.
+That worry is real and it is removable: ordering the operands of every pairwise
+combine by \emph{rank} rather than by arrival makes both partners evaluate the
+identical expression tree, at no cost. It is the same reasoning MPI uses to permit
+trees for operators declared non-commutative, and with it a
+\code{recursive\_doubling} allreduce over a deterministic operator --- however lossy
+or order-sensitive --- gives every rank the same result. We verify this, because the
+property is invisible to any test that uses an exact operator.
+
+What ordering cannot fix is that a semantic operator is \emph{nondeterministic}:
+every rank evaluates the same expression and gets different text. So the population
+still diverges under \code{recursive\_doubling}, and \textbf{silently disagrees
+about the value it just agreed on} --- but the cause is the operator, not the
+algorithm. The only remedy is for exactly one rank to evaluate and the rest to
+receive the result by handle, which is what \code{reduce\_bcast} does. \ampi{}
+therefore defaults lossy operators to \code{reduce\_bcast}, paying a factor of two
+in rounds to buy the property that agreement means agreement, and \emph{flags}
+rather than forbids the alternative, since a harness whose operator happens to be
+deterministic should still be allowed the faster algorithm.
 
 \subsection{Scan, and topologies}
 
@@ -1021,9 +1039,25 @@ Karp--Flatt metric agrees: it does not grow with $p$.
 \paragraph{The coordination machinery has a measured price.} Reading
 \cref{tab:translation} as a cost table rather than a quality table: relative to
 translating with neither mechanism, adding the glossary \code{allreduce} and the
-halo exchange costs 76\% more wall time and 159\% more tokens. That is what
-agreement costs, quantified, and it is the number a harness author needs before
-deciding to pay it.
+halo exchange costs \NCoordTime\% more wall time and \NCoordTokens\% more tokens.
+That is what agreement costs, quantified, and it is the number a harness author
+needs before deciding to pay it.
+
+\paragraph{Exact operators are worth reaching for, and the margin is large.} The
+same glossary agreement performed by a semantic \code{allreduce} --- an
+LLM-implemented merge --- rather than by the exact, idempotent \code{UNION} cost
+$\NSemTime\times$ the wall time, $\NSemTokens\times$ the tokens and
+$\NSemPrice\times$ the price, and produced glossaries of the same size with
+identical measured quality. It also raised the agent-call count from 24 to
+\NSemCalls, because a semantic reduction adds one model invocation per tree node on
+top of the per-section work. This is the strongest practical result in the
+experiment and it is a direct analogue of preferring \code{MPI\_SUM} to a
+user-defined operator: when a combination is genuinely set-like, an exact operator is
+not merely cheaper but exactly reproducible, whereas the semantic version is neither.
+Choosing \code{recursive\_doubling} over \code{reduce\_bcast} for the exact operator,
+by contrast, changed almost nothing (158\,s versus 167\,s), which is what the cost
+model predicts when $p$ is small enough that a factor of two in rounds is within
+run-to-run variance.
 
 \paragraph{An honest negative result.} On this text, they did not have to. All
 configurations achieved perfect entity consistency, including the one with no
@@ -1094,9 +1128,35 @@ items that survived --- a positional unfairness \code{MPI\_SUM} cannot exhibit.}
 \label{tab:fidelity}
 \end{table*}
 
-\Cref{tab:fidelity} tests the central prediction of \cref{sec:coll}: since all three
-algorithms perform $p-1$ operator applications, retention differences must be
-attributable to fold depth.
+\Cref{tab:fidelity} tests the central prediction of \cref{sec:coll}: since all
+algorithms perform the same number of operator applications, retention differences
+must be attributable to fold depth.
+
+\paragraph{The depth penalty is conditional, and the condition is capacity.} Our
+first configuration --- eight ranks contributing four identified items each, merged
+under a 900-token budget --- produced \emph{perfect} retention for all three binary
+algorithms, with zero fabricated identifiers, whether the fold depth was 3 or 7. The
+reason is straightforward once seen: thirty-two short items fit the output budget, so
+the operator was never forced to discard anything, and an operator that discards
+nothing is lossless at any depth.
+
+This is a more useful claim than the one we set out to test. \textbf{Fold depth
+penalises fidelity only when the reduction is capacity-bound}, so the first question
+a harness author should ask is not which tree to use but whether their reduction is
+saturated. If it is not, the shallowest tree is free and the fidelity argument is
+moot; if it is, depth is the quantity to minimise. \Cref{tab:fidelity} therefore
+reports a deliberately saturating configuration alongside the unsaturated one.
+
+\paragraph{At equal quality, the tree wins outright on latency.} The unsaturated
+configuration is still informative, because it isolates the cost axis with quality
+held fixed at $1.0$: the binomial tree completed in \NFidTree\,s where the serial
+chain took \NFidChain\,s and the flat reduction \NFidFlat\,s, all performing exactly
+seven operator applications --- a $\NFidSpeedup\times$ latency reduction for free.
+That flat is the \emph{slowest} despite needing one communication round is the cost
+model's prediction confirmed: all seven applications execute serially at the root, so
+its critical path is $7\alpha$ rather than $\lceil\log_2 8\rceil\alpha$. The
+manager-summarises-everything pattern is the worst of the three on wall time and has
+no compensating advantage on quality.
 
 \subsection{Simulated scaling}
 
