@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -223,7 +224,19 @@ def main() -> int:
                "string", "vector", "error", "integration")
     e2p = Path(args.e2)
     e2 = json.loads(e2p.read_text()) if e2p.exists() else {"arms": {}}
-    m.add("eTwoSuite", e2.get("suite_size"))
+    # The suite size is a static property of the grading suite, so read it from
+    # the suite itself rather than waiting for a run to report it.
+    suite_size = e2.get("suite_size")
+    if suite_size is None:
+        try:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent
+                                   / "experiments" / "e2_codev"))
+            import grade as _grade  # type: ignore
+
+            suite_size = len(_grade.CASES)
+        except Exception:
+            suite_size = None
+    m.add("eTwoSuite", suite_size)
     for arm, tag in (("ampi", "Ampi"), ("naive", "Naive")):
         a = (e2.get("arms") or {}).get(arm)
         m.add(f"eTwo{tag}Pass", a["passed"] if a else None)
