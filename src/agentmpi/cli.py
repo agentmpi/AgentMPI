@@ -43,6 +43,7 @@ from pathlib import Path
 from typing import Any
 
 from . import cost as cost_mod
+from . import tokens as _tokens
 from . import executor as broker_mod
 from . import ft as ft_mod
 from . import rma as rma_mod
@@ -488,6 +489,39 @@ def _lenient_json(text: str) -> Any:
     return text
 
 
+def cmd_tokens(args: argparse.Namespace) -> int:
+    """Report the token count of a candidate answer under the runtime's own counter.
+
+    This exists because of a measured failure. A contract may bound an artifact at
+    ``max_tokens``, and the runtime checks it -- but the rank producing the artifact had
+    no way to measure it, so it could only guess and leave a safety margin. Two ranks
+    reported exactly this: one estimated conservatively and submitted 25 of 50 items
+    where the budget allowed more, and one reverse-engineered the counter from reported
+    prompt sizes and fitted 34 of 36 instead of 27. Both under-filled, and the resulting
+    retention figure is a lower bound on what the budget permitted rather than a
+    measurement of the operator's judgement.
+
+    The asymmetry was ours to fix: a budget is only actionable if the party subject to it
+    can evaluate it, and the runtime already had the counter. Exposing it means the rank
+    and the checker agree by construction, which matters more than either being exactly
+    right about a provider's tokeniser.
+    """
+    payload: Any
+    if args.file:
+        text = Path(args.file).read_text(encoding="utf-8")
+    else:
+        text = sys.stdin.read()
+    payload = _lenient_json(text) if args.json else text
+    n = _tokens.count(payload)
+    out: dict[str, Any] = {"tokens": n, "exact": _tokens.COUNTER.exact, "chars": len(text)}
+    if args.budget is not None:
+        out["budget"] = args.budget
+        out["fits"] = n <= args.budget
+        out["headroom"] = args.budget - n
+    _out(out)
+    return 0 if (args.budget is None or n <= args.budget) else 1
+
+
 def cmd_worker(args: argparse.Namespace) -> int:
     rank = args.rank if args.rank is not None else int(os.environ.get("AMPI_RANK", "-1"))
     if rank < 0:
@@ -554,6 +588,16 @@ def cmd_worker(args: argparse.Namespace) -> int:
                             "meta": json.loads(row["meta"] or "{}"),
                             "submit": _done_cmd(fabric.root, rank, aid).replace("<RESULT_FILE>", str(rfile)),
                             "give_up": _fail_cmd(fabric.root, rank, aid),
+                            # A budget the producer cannot measure is a budget it must
+                            # guess at, and ranks guess low. Hand over the exact command
+                            # that evaluates a candidate under the same counter the
+                            # contract will use.
+                            "check_size": (
+                                f'ampi tokens --file "{rfile}" --json --budget {max_tokens}'
+                                if (max_tokens := (json.loads(row["contract"]).get("max_tokens")
+                                                   if row["contract"] else None))
+                                else None
+                            ),
                             "prompt": prompt if args.inline else None,
                         }
                     )
@@ -737,6 +781,12 @@ def build_parser() -> argparse.ArgumentParser:
     wu = wsub.add_parser("unlock")
     wu.add_argument("slot")
     q.set_defaults(func=cmd_win)
+
+    q = sub.add_parser("tokens", help="count tokens in a candidate answer, optionally against a budget")
+    q.add_argument("--file", help="file to measure (default: stdin)")
+    q.add_argument("--json", action="store_true", help="parse as JSON first, so formatting is not counted")
+    q.add_argument("--budget", type=int, help="max_tokens to compare against; exit 1 if exceeded")
+    q.set_defaults(func=cmd_tokens)
 
     q = sub.add_parser("worker", help="act as an agent rank")
     q.add_argument("--rank", type=int)

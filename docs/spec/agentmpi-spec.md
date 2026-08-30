@@ -308,6 +308,20 @@ kinds agree and the receiver's `required` set is a subset of the sender's. Only
 invocation MUST validate the agent's output and MAY retry with the diagnosis
 appended.
 
+**Evaluability.** An implementation that enforces a volume bound MUST also expose the
+means to evaluate it, and a task carrying a bounded contract SHOULD carry the concrete
+invocation that performs the check.
+
+> **Rationale.** A constraint the constrained party cannot evaluate is not a constraint
+> but a guess, and parties guess conservatively. In our own experiments a contract bounded
+> a rank's output at 450 tokens and the runtime checked it, while the rank had no way to
+> measure a candidate; one rank submitted half the items it could have and said so, and
+> another reverse-engineered the counter from prompt sizes the runtime had incidentally
+> reported, then fitted a quarter more content. The runtime owned the counter, used it to
+> accept or reject, and did not expose it. Whether the counter matches a particular
+> provider's tokeniser matters far less than the producer and the checker using the same
+> one, which exposing it guarantees.
+
 > **Rationale.** MPI datatypes do two jobs. The first is *matching*: a type signature
 > on each side, checked at runtime, which turns a class of silent corruption into a
 > loud error. The agent analogue is immediate — an agent routinely returns prose where

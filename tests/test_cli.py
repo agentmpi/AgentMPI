@@ -324,3 +324,67 @@ def test_campaign_recipes_contain_the_named_steps():
     for steps in (software_steps(ranks=8, prefix="x", rounds=2), translation_steps(ranks=8, words=600, prefix="x")):
         roots = [str(s.root) for s in steps]
         assert len(roots) == len(set(roots)), [r for r in roots if roots.count(r) > 1]
+
+
+def test_tokens_command_lets_a_rank_measure_its_own_budget(tmp_path, capsys):
+    """A budget the producer cannot measure is a budget it must guess at.
+
+    Two ranks reported guessing low: one submitted 25 of 50 items where the budget
+    allowed more, and one reverse-engineered the counter from reported prompt sizes to
+    fit 34 instead of 27. The runtime had the counter all along and did not expose it,
+    so the measured retention was a lower bound on what the budget permitted rather than
+    a measurement of the operator's judgement.
+    """
+    payload = {"findings": [f"[F-0-{i}] serial {100000 + i} checksum ABCD" for i in range(20)]}
+    path = tmp_path / "cand.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    assert main(["tokens", "--file", str(path), "--json", "--budget", "10000"]) == 0
+    ok = json.loads(capsys.readouterr().out)
+    assert ok["fits"] is True and ok["headroom"] == 10000 - ok["tokens"]
+
+    # Exceeding the budget is a non-zero exit, so a worker can branch on it in a shell.
+    assert main(["tokens", "--file", str(path), "--json", "--budget", "5"]) == 1
+    bad = json.loads(capsys.readouterr().out)
+    assert bad["fits"] is False and bad["headroom"] < 0
+
+    # And the count must agree with what a Contract would enforce, or the rank and the
+    # checker disagree and the exercise is pointless.
+    contract = ampi.Contract(name="X", kind="json", required=("findings",), max_tokens=ok["tokens"])
+    assert contract.check(payload) == []
+    tighter = ampi.Contract(name="X", kind="json", required=("findings",), max_tokens=ok["tokens"] - 1)
+    assert tighter.check(payload), "the CLI count and the contract check must be the same measure"
+
+
+def test_task_json_offers_a_size_check_when_a_budget_exists(tmp_path, capsys):
+    """The worker is handed the exact command that evaluates its candidate."""
+    root = tmp_path / "job"
+    assert main(["--root", str(root), "init", "--size", "1"]) == 0
+    capsys.readouterr()
+
+    fabric = ampi.Fabric(root)
+    blob = fabric.blobs.put("do the thing")
+    bounded = ampi.Contract(name="Bounded", kind="json", required=("x",), max_tokens=450)
+    import time
+
+    with fabric.write() as cur:
+        cur.execute(
+            "INSERT INTO agent_calls(rank, ctx, kind, label, state, prompt_digest, contract,"
+            " prompt_tokens, created_at, incarnation, attempt) VALUES(0,0,'task','t','pending',?,?,?,?,1,1)",
+            (blob.digest, json.dumps(bounded.to_json()), blob.tokens, time.time()),
+        )
+    assert main(["--root", str(root), "worker", "--rank", "0", "next", "--timeout", "2", "--poll", "0.1"]) == 0
+    task = json.loads(capsys.readouterr().out)
+    assert task["check_size"] and "--budget 450" in task["check_size"]
+    assert task["result_file"] in task["check_size"]
+
+    # No budget on the contract means no size check to offer.
+    with fabric.write() as cur:
+        cur.execute(
+            "INSERT INTO agent_calls(rank, ctx, kind, label, state, prompt_digest, prompt_tokens,"
+            " created_at, incarnation, attempt) VALUES(0,0,'task','u','pending',?,?,?,1,1)",
+            (blob.digest, blob.tokens, time.time()),
+        )
+    assert main(["--root", str(root), "worker", "--rank", "0", "next", "--timeout", "2", "--poll", "0.1"]) == 0
+    task2 = json.loads(capsys.readouterr().out)
+    assert task2["check_size"] is None

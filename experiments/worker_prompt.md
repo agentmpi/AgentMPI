@@ -60,10 +60,15 @@ Work loop. Repeat up to {MAX_TASKS} times:
    - Write the result with a file-writing tool, not by echoing into a shell, so
      that quoting cannot corrupt it.
 
-4. Submit by running the exact command from the "submit" field.
+4. If the task JSON has a "check_size" command, run it before submitting. It reports
+   whether your answer fits the contract's token budget under the same counter the
+   runtime will use, and exits non-zero if it does not. Adjust and re-check rather than
+   guessing: ranks that guessed left a large margin and under-filled the budget.
+
+5. Submit by running the exact command from the "submit" field.
    Confirm the output says "status": "done".
 
-5. Return to step 1.
+6. Return to step 1.
 
 Efficiency matters. One task is one shell call to get it, one file read, one file
 write, and one shell call to submit. Do not poll the broker in a tight loop, do not
@@ -85,6 +90,11 @@ worker in a collective-heavy phase spends most of its time waiting for peers.
 outlive the job. Four consecutive idle windows (roughly sixteen minutes without
 work) is comfortably longer than the slowest collective and short enough that the
 population winds down on its own.
+
+**`check_size` handed over too.** A budget the producer cannot measure is a budget it
+must guess at, and ranks guess low. The runtime owns the token counter and uses it to
+accept or reject, so it also hands over the command that evaluates a candidate against it.
+A constraint the constrained party cannot evaluate is not a constraint but a guess.
 
 **`submit` handed over verbatim.** Early runs lost completed work because agents
 reconstructed the submission command and got a flag wrong. Emitting the exact
