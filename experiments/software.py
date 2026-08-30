@@ -187,14 +187,32 @@ Return ONLY a JSON object:
 
 
 def prompt_implement(mod: dict[str, Any], spec: str, deps: dict[str, Any], own_iface: Any, round_no: int, failures: list[dict[str, Any]], reviews: list[Any]) -> str:
-    dep_text = (
-        "\n\n".join(
+    # Distinguish "has no dependencies" from "has dependencies whose interfaces are
+    # unavailable". An earlier version printed the former in both cases, so in the
+    # no-shared-interfaces condition a module like `api`, whose entire job is tying the
+    # other modules together, was told it had no dependencies. That is false, and it
+    # changes behaviour: the owner of `api` reported resolving each pipeline stage by
+    # name at call time because the prompt implied there was nothing to depend on, and
+    # its reviewers objected to exactly that. A condition that withholds information
+    # must say so; it must not misstate the structure.
+    declared = list(mod["deps"])
+    if deps:
+        dep_text = "\n\n".join(
             f"### {name} ({next(m['path'] for m in MODULES if m['name'] == name)})\n"
             + json.dumps(iface, indent=2, ensure_ascii=False)
             for name, iface in sorted(deps.items())
         )
-        or "(this module has no dependencies)"
-    )
+    elif declared:
+        dep_text = (
+            "NOT AVAILABLE. This module depends on "
+            + ", ".join(f"`{next(m['path'] for m in MODULES if m['name'] == d)}`" for d in declared)
+            + ", and you must import and use them, but their authors' published interfaces "
+            "have not been shared with you in this configuration. Infer what you can from "
+            "the specification. Do not pretend the dependencies do not exist, and do not "
+            "reimplement their responsibilities in your own file."
+        )
+    else:
+        dep_text = "(this module genuinely has no dependencies)"
     fail_text = ""
     if failures:
         lines = [
