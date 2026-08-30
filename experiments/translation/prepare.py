@@ -11,7 +11,6 @@ from typing import Any
 
 from agentmpi import Runtime
 
-
 SOURCE_URL = "https://www.gutenberg.org/files/11/11-0.txt"
 SESSION = "alice-es"
 TRANSLATORS = tuple(range(1, 11))
