@@ -152,13 +152,25 @@ def table_model_validation() -> None:
 
 
 def _tr_results() -> list[tuple[str, dict[str, Any]]]:
-    out = []
+    """Translation results belonging to the largest single campaign.
+
+    Filtering by campaign label is not cosmetic. Smoke-test runs use the same
+    result schema, and mixing a 0.1-second synthetic run into a strong-scaling
+    table silently produces a speedup of five thousand. Selecting the label with
+    the most configurations keeps the comparison within one population and one
+    prompt version, which is also the only way the ablations are comparable.
+    """
+    by_label: dict[str, list[tuple[str, dict[str, Any]]]] = {}
     for f in sorted(glob.glob(str(RESULTS / "translation" / "*.json"))):
         d = load(Path(f))
         if not d or "quality" not in d:
             continue
-        out.append((Path(f).stem, d))
-    return out
+        label = str((d.get("config") or {}).get("label") or "?")
+        by_label.setdefault(label, []).append((Path(f).stem, d))
+    if not by_label:
+        return []
+    best = max(by_label, key=lambda k: (len(by_label[k]), sum(x[1]["job"]["agent_calls"] for x in by_label[k])))
+    return by_label[best]
 
 
 def table_translation() -> None:
@@ -226,6 +238,16 @@ def table_translation() -> None:
         from agentmpi.cost import fit_usl  # noqa: PLC0415
 
         sigma, kappa, r2 = fit_usl(pts)
+        # Report the fit only when it is supported. Agent latency is heavy-tailed
+        # and each point here is one trial, so a non-monotonic efficiency curve is
+        # expected and a USL fit to it would be an artefact. Saying so is better
+        # than printing a number with a negative coefficient of determination.
+        _MACROS["NUslFit"] = (
+            rf"$\sigma={sigma:.3f}$, $\kappa={kappa:.4f}$ ($R^2={r2:.3f}$)"
+            if r2 >= 0.5
+            else rf"not supported by single-trial data ($R^2={r2:.3f}$); "
+            rf"see \cref{{tab:scalingsim}} for averaged scaling"
+        )
         body = (
             "\\begin{tabular}{rrrrrrrrr}\n\\toprule\n"
             "$p$ & wall (s) & speedup & efficiency & Karp--Flatt & calls & tokens & USD & consist. \\\\\n\\midrule\n"
@@ -233,7 +255,6 @@ def table_translation() -> None:
             + "\n\\bottomrule\n\\end{tabular}"
         )
         emit("tab_translation_scaling.tex", body)
-        _MACROS["NUslFit"] = rf"$\sigma={sigma:.3f}$, $\kappa={kappa:.4f}$ ($R^2={r2:.3f}$)"
     else:
         emit("tab_translation_scaling.tex", MISSING)
 

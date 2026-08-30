@@ -400,20 +400,36 @@ def _fail_cmd(root: Path, rank: int, aid: int) -> str:
     return f'ampi --root "{root}" worker fail --rank {rank} --aid {aid} --error "<REASON>"'
 
 
-def _campaign_root(campaign: Path) -> Path | None:
-    """Resolve the fabric a campaign is currently pointing at.
+def _campaign_roots(campaign: Path) -> list[Path]:
+    """Resolve the fabrics a campaign is currently pointing at.
 
     Campaign mode exists so that one pool of long-lived agent workers can serve a
     *sequence* of jobs.  Without it, every experimental configuration needs its own
     freshly launched population, and the launch cost -- which for real agents is
     the dominant cost -- is paid again for every ablation.  This is the same reason
     HPC sites run a persistent job with many phases rather than one job per phase.
+
+    The pointer may name a fabric directly, or a directory *containing* fabrics.
+    The second form matters because a benchmark that sweeps a parameter creates one
+    fabric per point (a single fabric would make successive sweeps share a
+    communicator and therefore share collective epochs).  Rather than teach the
+    campaign driver about every benchmark's directory layout, a worker offered a
+    non-fabric directory serves any fabric one level below it.
     """
     active = campaign / "active"
     if not active.exists():
-        return None
-    text = active.read_text(encoding="utf-8").strip()
-    return Path(text) if text else None
+        return []
+    out: list[Path] = []
+    for line in active.read_text(encoding="utf-8").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        root = Path(text)
+        if (root / "fabric.sqlite").exists():
+            out.append(root)
+        elif root.is_dir():
+            out.extend(sorted(child for child in root.iterdir() if (child / "fabric.sqlite").exists()))
+    return out
 
 
 def _lenient_json(text: str) -> Any:
@@ -470,16 +486,14 @@ def cmd_worker(args: argparse.Namespace) -> int:
         raise SystemExit("no rank: pass --rank or set $AMPI_RANK")
     campaign = Path(args.campaign) if getattr(args, "campaign", None) else None
 
-    def resolve() -> Fabric | None:
+    def resolve() -> list[Fabric]:
         if campaign is None:
-            return _fabric(args)
-        root = _campaign_root(campaign)
-        if root is None or not (root / "fabric.sqlite").exists():
-            return None
-        return Fabric(root)
+            return [_fabric(args)]
+        return [Fabric(root) for root in _campaign_roots(campaign)]
 
     if args.worker_cmd == "hello":
-        fabric = resolve()
+        fabrics = resolve()
+        fabric = fabrics[0] if fabrics else None
         if fabric is None:
             _out({"status": "waiting", "rank": rank, "detail": "campaign has no active job yet"})
             return 0
@@ -503,8 +517,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
             if campaign is not None and (campaign / "stop").exists():
                 _out({"status": "exit", "rank": rank, "reason": "campaign stopped"})
                 return 0
-            fabric = resolve()
-            if fabric is not None:
+            for fabric in resolve():
                 key = str(fabric.root)
                 if key not in registered:
                     registered.add(key)
