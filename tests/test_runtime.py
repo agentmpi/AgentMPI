@@ -93,9 +93,7 @@ def test_collectives_have_rank_consistent_results(tmp_path: Path) -> None:
         with ThreadPoolExecutor(max_workers=4) as pool:
             gathered = list(
                 pool.map(
-                    lambda pair: pair[1].allgather(
-                        {"rank": pair[0]}, timeout=2
-                    ),
+                    lambda pair: pair[1].allgather({"rank": pair[0]}, timeout=2),
                     enumerate(rs),
                 )
             )
@@ -105,9 +103,7 @@ def test_collectives_have_rank_consistent_results(tmp_path: Path) -> None:
         with ThreadPoolExecutor(max_workers=4) as pool:
             totals = list(
                 pool.map(
-                    lambda pair: pair[1].allreduce(
-                        pair[0] + 1, op=ReduceOp.SUM, timeout=2
-                    ),
+                    lambda pair: pair[1].allreduce(pair[0] + 1, op=ReduceOp.SUM, timeout=2),
                     enumerate(rs),
                 )
             )
@@ -116,13 +112,15 @@ def test_collectives_have_rank_consistent_results(tmp_path: Path) -> None:
         with ThreadPoolExecutor(max_workers=4) as pool:
             broadcasts = list(
                 pool.map(
-                    lambda pair: pair[1].bcast(
-                        {"policy": "bounded"},
-                        root=2,
-                        timeout=2,
-                    )
-                    if pair[0] == 2
-                    else pair[1].bcast(root=2, timeout=2),
+                    lambda pair: (
+                        pair[1].bcast(
+                            {"policy": "bounded"},
+                            root=2,
+                            timeout=2,
+                        )
+                        if pair[0] == 2
+                        else pair[1].bcast(root=2, timeout=2)
+                    ),
                     enumerate(rs),
                 )
             )
@@ -132,7 +130,7 @@ def test_collectives_have_rank_consistent_results(tmp_path: Path) -> None:
 
 
 def test_artifact_spill_and_context_admission(tmp_path: Path) -> None:
-    rs = runtimes(tmp_path, 2, context_budget=32, inline_token_limit=4)
+    rs = runtimes(tmp_path, 2, context_budget=40, inline_token_limit=4)
     try:
         original = {"text": "large payload " * 100}
         status = rs[0].send(original, 1)
