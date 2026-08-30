@@ -655,10 +655,28 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "SELECT owner, kind, src, tag, posted_at FROM request WHERE job_id=? AND state='posted' "
         "ORDER BY owner", (rt.job_id,))
     stuck = rt.device.query(
-        "SELECT c.coll_id, c.op, c.seq, c.expected, COUNT(cc.rank) AS arrived "
+        "SELECT c.coll_id, c.comm_id, c.op, c.seq, c.expected, c.created_at, "
+        "COUNT(cc.rank) AS arrived "
         "FROM coll c LEFT JOIN coll_contrib cc ON cc.coll_id=c.coll_id "
         "WHERE c.job_id=? AND c.state='open' GROUP BY c.coll_id ORDER BY c.created_at",
         (rt.job_id,))
+    # Naming which rank has not yet entered an open collective is the whole
+    # point of the diagnostic. Seven ranks blocked in a barrier is a symptom;
+    # the actionable fact is the eighth rank that has not called it, and the
+    # per-rank sequence counters say exactly who that is.
+    for entry in stuck:
+        comm = rt.comms.get(entry["comm_id"])
+        laggards = []
+        for local in range(comm.size):
+            row = rt.device.query_one(
+                "SELECT value FROM counter WHERE job_id=? AND name=?",
+                (rt.job_id, f"collseq:{comm.comm_id}:{local}"))
+            if int(row["value"] if row else 0) < int(entry["seq"]):
+                laggards.append(local)
+        entry["not_yet_entered"] = laggards
+        entry["open_for_seconds"] = round(util.now() - entry["created_at"], 1)
+        entry["comm"] = comm.name
+        del entry["created_at"]
     pending = rt.device.query(
         "SELECT op_token, assignee, op_name, step FROM pending_op WHERE job_id=? "
         "AND state='pending'", (rt.job_id,))
@@ -670,7 +688,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
         "open_collectives": stuck,
         "pending_operator_upcalls": pending,
         "verdict": ("deadlock" if cycle else
-                    "degraded" if (rt.suspected() or rt.failed_ranks()) else "healthy"),
+                    "degraded" if (rt.suspected() or rt.failed_ranks()) else
+                    "stalled" if any(c["not_yet_entered"] and c["open_for_seconds"] > 120
+                                     for c in stuck) else "healthy"),
+        "advice": next(
+            (f"collective #{c['seq']} ({c['op']}) on {c['comm']!r} has been open for "
+             f"{c['open_for_seconds']:.0f}s; rank(s) {c['not_yet_entered']} have not "
+             "called it yet. They are not failed, only late: wait, or if they will never "
+             "call it, declare them failed and use `ampi comm-resync` or "
+             "`ampi shrink`."
+             for c in stuck if c["not_yet_entered"] and c["open_for_seconds"] > 120),
+            None),
     })
 
 
