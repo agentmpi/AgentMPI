@@ -533,6 +533,28 @@ def table_software() -> None:
     )
     emit("tab_software.tex", body)
 
+    # The parallel-versus-single comparison the prose quotes: latency bought with
+    # money, at equal quality.
+    def acc(d):
+        return d.get("acceptance_reeval") or d["acceptance"]
+
+    par = next((d for d in res if d["config"].get("ranks", 0) > 1 and d["config"].get("shared_interfaces")
+                and not d["config"].get("vague_spec")), None)
+    solo = next((d for d in res if d["config"].get("ranks") == 1 and not d["config"].get("vague_spec")), None)
+    if par and solo:
+        _MACROS["NSwSpeedup"] = f"{solo['job']['wall_s'] / max(par['job']['wall_s'], 1e-9):.2f}"
+        _MACROS["NSwEff"] = f"{100 * (solo['job']['wall_s'] / max(par['job']['wall_s'], 1e-9)) / par['config']['ranks']:.0f}"
+        _MACROS["NSwPrice"] = f"{par['job']['usd'] / max(solo['job']['usd'], 1e-9):.1f}"
+        _MACROS["NSwTokens"] = (
+            f"{(par['job']['tokens_in'] + par['job']['tokens_out']) / max(solo['job']['tokens_in'] + solo['job']['tokens_out'], 1):.1f}"
+        )
+        _MACROS["NSwParWall"] = f"{par['job']['wall_s']:.0f}"
+        _MACROS["NSwSoloWall"] = f"{solo['job']['wall_s']:.0f}"
+        _MACROS["NSwParPassed"] = f"{acc(par).get('n_passed')}/{acc(par).get('n_total')}"
+        _MACROS["NSwSoloPassed"] = f"{acc(solo).get('n_passed')}/{acc(solo).get('n_total')}"
+        _MACROS["NSwSoloCalls"] = str(solo["job"]["agent_calls"])
+        _MACROS["NSwParCalls"] = str(par["job"]["agent_calls"])
+
     lines = []
     for d in res:
         c, k = d["config"], d.get("contention") or {}
@@ -630,7 +652,9 @@ def summary_macros() -> None:
         macros.append(rf"\newcommand{{\{name}}}{{{value}}}")
     for name in ("NModelConfigs", "NModelAgreement", "NModelDepthAgreement", "NEagerLimit", "NUslFit",
                  "NSemTime", "NSemTokens", "NSemPrice", "NSemCalls", "NCoordTime", "NCoordTokens",
-                 "NFidTree", "NFidChain", "NFidFlat", "NFidSpeedup"):
+                 "NFidTree", "NFidChain", "NFidFlat", "NFidSpeedup",
+                 "NSwSpeedup", "NSwEff", "NSwPrice", "NSwTokens", "NSwParWall", "NSwSoloWall",
+                 "NSwParPassed", "NSwSoloPassed", "NSwSoloCalls", "NSwParCalls"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
