@@ -171,26 +171,24 @@ def test_collective_mismatch_is_diagnosed(make_job):
     job = make_job(3)
 
     def body(rt, r):
-        if r == 0:
-            try:
-                coll.barrier(rt, "world", timeout=5)
-                return "barrier-ok"
-            except Exception:
-                return "interrupted"
-        elif r == 1:
-            try:
-                coll.barrier(rt, "world", timeout=5)
-                return "barrier-ok"
-            except Exception:
-                return "interrupted"
-        else:
+        # Rank 2 waits so that the barrier ranks reach the slot first and it
+        # is the one told; the assertion below does not depend on winning that
+        # race, because which rank is told is a race by construction.
+        if r == 2:
             time.sleep(0.05)
-            with pytest.raises(AmpiCollectiveMismatch):
-                coll.bcast(rt, "world", 0, None, timeout=5)
-            return "diagnosed"
+        try:
+            if r == 2:
+                coll.bcast(rt, "world", 0, None, timeout=15)
+            else:
+                coll.barrier(rt, "world", timeout=15)
+        except Exception as exc:  # noqa: BLE001 - the outcome is the assertion
+            return type(exc).__name__
+        return "completed"
 
-    out = job.run_ranks(body, timeout=30)
-    assert out[2] == "diagnosed"
+    # The invariant is that the disagreement is *named* at some rank rather
+    # than silently hanging every rank, which is what MPI does here.
+    out = job.run_ranks(body, timeout=60)
+    assert "AmpiCollectiveMismatch" in out.values(), out
 
 
 # ---------------------------------------------------------------------------
@@ -309,3 +307,37 @@ def test_reduce_scatter_holds_less_than_allreduce(make_job):
         f"reduce-scatter held {scatter_peak} tokens, allreduce held {allreduce_peak}; "
         "the reduce-scatter family must hold substantially less"
     )
+
+
+def test_comm_resync_recovers_from_a_poisoned_collective_slot(make_job):
+    """Detection is not recovery.
+
+    A collective slot's operation is fixed by whichever rank arrives first, so
+    one rank issuing the wrong collective makes that slot permanently
+    unusable for everyone else. Shrinking would discard live ranks for what is
+    not a failure, so the protocol needs a way to abandon the in-flight
+    collectives and restart the sequence.
+    """
+    job = make_job(3)
+    wrong = job.runtime(0)
+    wrong.init(0)
+    right = job.runtime(1)
+    right.init(1)
+
+    # Rank 0 poisons slot 1 with a bcast where the others intend a barrier. As
+    # the root it has only sends to make, so its own call succeeds; the damage
+    # is only visible to the ranks that arrive at the slot afterwards.
+    coll.bcast(wrong, "world", 0, {"x": 1}, timeout=30)
+    with pytest.raises(AmpiCollectiveMismatch) as excinfo:
+        coll.barrier(right, "world", timeout=2)
+    assert "comm-resync" in str(excinfo.value)
+
+    admin = job.runtime(2)
+    admin.init(2)
+    result = admin.comm_resync("world")
+    assert result["abandoned"], "the poisoned slot should have been abandoned"
+
+    # Every rank now agrees on the next sequence number, so the intended
+    # collective succeeds.
+    fresh = job.run_ranks(lambda rt, r: coll.barrier(rt, "world", timeout=60)["ok"])
+    assert all(fresh.values())
