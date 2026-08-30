@@ -64,6 +64,17 @@ def _ilog2_ceil(n: int) -> int:
     return 0 if n <= 1 else (n - 1).bit_length()
 
 
+def _ilogk_ceil(n: int, k: int) -> int:
+    """ceil(log_k n), computed integrally so it is exact at the boundaries."""
+    if n <= 1:
+        return 0
+    levels, reach = 0, 1
+    while reach < n:
+        reach *= max(2, k)
+        levels += 1
+    return levels
+
+
 @dataclass
 class CollStats:
     """What a collective did, for the cost model and the trace."""
@@ -784,6 +795,7 @@ def reduce(
     timeout: float | None = 1800.0,
     mode: Mode | str = Mode.AUTO,
     label: str = "",
+    fanin: int | None = None,
 ) -> Any:
     """Combine all contributions at ``root`` with ``op``.
 
@@ -816,6 +828,15 @@ def reduce(
         "manager summarises all worker reports" harness does, and it is the
         right choice when only the root has the judgement to combine and *n* is
         small enough to fit its context.
+    ``kary``
+        A ``fanin``-ary tree in which each interior rank combines all its children
+        in a *single* application, using the operator's variadic kernel.  ``p−1``
+        messages, ``⌈log_k p⌉`` rounds, and fold depth ``⌈log_k p⌉``.  This is the
+        algorithm the agent setting actually wants, and it is not the algorithm MPI
+        would choose: MPI's binary trees follow from processes being single-ported,
+        whereas an agent's binding constraint is context, so ``k`` should be as
+        large as the budget admits (:func:`agentmpi.ops.optimal_fanin`).  For
+        ``p=64`` the fold depth falls from 6 at ``k=2`` to 2 at ``k=8``.
     """
     p, r = comm.size, comm.rank
     if algorithm is None:
@@ -921,6 +942,58 @@ def reduce(
             mask <<= 1
         tr.stats.fold_depth = depth
         tr.stats.rounds = _ilog2_ceil(p)
+        result = acc if vr == 0 else None
+
+    elif algorithm == "kary":
+        # A k-ary tree, which is the right shape here and the wrong shape in MPI.
+        #
+        # MPI's collectives are binary because a process is single-ported: two
+        # incoming messages cost two transfers regardless of topology, so a wider
+        # node buys nothing.  An agent rank has no port count -- a prompt carries k
+        # inputs as easily as two -- and with a variadic operator it combines all k
+        # in ONE application.  Fold depth therefore drops from ceil(log2 p) to
+        # ceil(log_k p): for p=64, from 6 to 2 at k=8.  Since a lossy operator's
+        # quality decays in depth, the harness wants the *largest* k its context
+        # budget admits, which is the reverse of MPI's preference.
+        k = max(2, int(fanin or 2))
+        vr = (r - root) % p
+        acc, weight, depth = payload, 1, 0
+        stride = 1
+        while stride < p:
+            group_index = (vr // stride) % k
+            if group_index != 0:
+                parent_v = vr - group_index * stride
+                comm._csend(
+                    {"acc": acc, "depth": depth, "weight": weight, "vr": vr},
+                    (parent_v + root) % p,
+                    f"{itag}:{stride}",
+                    mode=mode,
+                    timeout=timeout,
+                )
+                tr.sent(_tok(comm, acc))
+                acc = None
+                break
+            # Collect from every child in this level, then combine once.
+            children = [vr + j * stride for j in range(1, k) if vr + j * stride < p]
+            incoming: list[Any] = []
+            child_depth = depth
+            for child_v in children:
+                got = comm._crecv((child_v + root) % p, f"{itag}:{stride}", timeout=timeout, admit=False)
+                incoming.append(got["acc"])
+                child_depth = max(child_depth, int(got["depth"]))
+                weight += int(got["weight"])
+            if incoming:
+                depth = child_depth + 1
+                ctx = _reduce_ctx(comm, depth, weight)
+                acc = op.combine([acc, *incoming], ctx)
+                # A non-variadic operator degrades to a left fold, which spends the
+                # depth the wide tree was meant to save; record which happened.
+                tr.stats.extra["variadic"] = op.variadic is not None
+                depth = max(depth, ctx.depth)
+            stride *= k
+        tr.stats.fold_depth = depth
+        tr.stats.rounds = _ilogk_ceil(p, k)
+        tr.stats.extra["fanin"] = k
         result = acc if vr == 0 else None
     else:
         raise AmpiUsageError("unknown reduce algorithm", algorithm=algorithm)

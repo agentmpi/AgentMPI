@@ -392,12 +392,20 @@ def cmd_win(args: argparse.Namespace) -> int:
 #: observed in practice: an agent that has to *construct* the submission command
 #: from remembered flags gets it wrong, and then its work is lost even though the
 #: work itself was fine.
+#:
+#: Note the argument order.  ``--rank`` is an option of the ``worker`` subcommand,
+#: not of ``done``, so it must precede ``done``.  An earlier version of these
+#: builders emitted the flag after the subcommand and every worker in the first
+#: experimental campaign hit the resulting parse error.  They all recovered, but
+#: only because they could read the error text and retry -- which is precisely the
+#: failure this mechanism exists to prevent.  ``test_cli.py`` now round-trips both
+#: strings through the real parser so the defect cannot recur.
 def _done_cmd(root: Path, rank: int, aid: int) -> str:
-    return f'ampi --root "{root}" worker done --rank {rank} --aid {aid} --file <RESULT_FILE>'
+    return f'ampi --root "{root}" worker --rank {rank} done --aid {aid} --file <RESULT_FILE>'
 
 
 def _fail_cmd(root: Path, rank: int, aid: int) -> str:
-    return f'ampi --root "{root}" worker fail --rank {rank} --aid {aid} --error "<REASON>"'
+    return f'ampi --root "{root}" worker --rank {rank} fail --aid {aid} --error "<REASON>"'
 
 
 def _campaign_roots(campaign: Path) -> list[Path]:

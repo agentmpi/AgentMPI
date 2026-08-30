@@ -108,17 +108,32 @@ population and communicate with it privately, a collective operation, a shared
 region with defined concurrency semantics, or a defined behaviour when a
 participant disappears.
 
-The consequences are documented. A taxonomy of 200+ failed multi-agent traces
-attributes most failures not to model capability but to specification and
-inter-agent coordination~\cite{mast,mastneurips}. Practitioners report that
-multi-agent architectures frequently underperform a single agent, and attribute
-this to context fragmentation and lost information between
+The consequences are documented, and --- more usefully --- they are documented in
+terms a message-passing specification already defines. The MAST taxonomy of failed
+multi-agent traces attributes failures to specification and inter-agent
+coordination rather than to model capability~\cite{mast,mastneurips}, and roughly
+42\% of its observed failures fall in categories that name MPI mechanisms directly:
+step repetition (17.1\%, an idempotence property), termination-unaware and
+premature termination (17.6\%, a barrier and agreement property), history loss and
+resets (5.7\%, a durable log), and withheld or ignored input (1.8\%, delivery
+semantics). We are careful about the complement: reasoning--action mismatch (14.0\%)
+and disobeying the task specification (11.0\%) are \emph{not} protocol-addressable,
+and no communication layer will fix them.
+
+Independent evidence points the same way. Mieczkowski et al.\ analyse language-model
+teams explicitly as distributed systems and find Amdahl's law bounding team
+speedup, decentralised teams reaching a median speedup below unity --- slower than a
+single agent --- and concurrent-write conflicts producing several times more failed
+tests than a coordinated arrangement~\cite{lmteams26}. Practitioners report the same
+outcome and attribute it to context fragmentation and information lost between
 agents~\cite{cognitiondont,anthropicmas}. Long-context degradation and multi-turn
-drift are measured and
-substantial~\cite{liu24lostinmiddle,labanlost,chromarot}. Error cascades and
-diversity collapse are reproducible~\cite{diversitycollapse}. These are not model
-problems. They are the problems a communication protocol exists to solve, and in
-1993 the parallel-computing community had all of them too.
+drift are measured and substantial~\cite{liu24lostinmiddle,labanlost,chromarot},
+and dense communication topologies are shown to \emph{cause} premature convergence,
+which argues for scoped sharing as a per-operation choice rather than for more
+sharing~\cite{diversitycollapse}.
+
+These are not model problems. They are the problems a communication protocol exists
+to solve, and in 1993 the parallel-computing community had all of them too.
 
 \subsection{This paper}
 
@@ -161,17 +176,30 @@ payload threshold under eager transport and completes at every size under
 rendezvous (\cref{sec:ptp}, \cref{tab:transport}).
 
 \paragraph{C2: reduction is lossy in depth, so algorithm choice is a quality
-decision.} MPI requires reduction operators to be associative and then reorders
-freely; the resulting non-reproducibility of floating-point \code{MPI\_SUM} is
-tolerated because it is bounded by rounding error~\cite{Demmel15,IntelCNR}. An
-operator implemented by a language model is not associative and is lossy, and its
-loss compounds with the \emph{depth} of the reduction rather than the number of
-applications. We make algebraic strength part of an operator's declaration, use it
-to constrain algorithm selection, and report fold depth from every reduction. A
-non-obvious consequence: because a binomial tree has depth $\lceil\log_2 p\rceil$
-while a serial chain has depth $p-1$, the tree is better on fidelity \emph{and}
-latency --- but only because broadcasts forward content-addressed handles, so
-relaying cannot corrupt (\cref{sec:coll}).
+decision --- and the optimal tree is not binary.} MPI requires reduction operators
+to be associative and then reorders freely; the resulting non-reproducibility of
+floating-point \code{MPI\_SUM} is tolerated because it is bounded by rounding
+error~\cite{Demmel15,IntelCNR}. An operator implemented by a language model is not
+associative and is lossy, and its loss compounds with the \emph{depth} of the
+reduction rather than the number of applications. We make algebraic strength part
+of an operator's declaration, use it to constrain algorithm selection, and report
+fold depth from every reduction.
+
+Two consequences follow, and the second was not what we expected. First, a binomial
+tree at depth $\lceil\log_2 p\rceil$ beats a serial chain at depth $p-1$ on
+fidelity \emph{and} latency --- but only because broadcasts forward
+content-addressed handles, so relaying cannot corrupt. Second, and more
+interestingly: \textbf{binary is the wrong arity.} Every logarithmic collective in
+MPI descends from processes being \emph{single-ported} --- a process participates in
+one transfer at a time, so a wider tree node buys nothing. An agent rank has no
+port count. A prompt carries eight reports as easily as two, and merging eight in
+one call is one lossy re-encoding rather than seven. The binding constraint becomes
+the receiving rank's context budget, giving an optimal fan-in
+$k^{*}=\lfloor C(1-h)/s\rfloor$ and a fold depth of $\lceil\log_{k^{*}} p\rceil$.
+At $p=64$, widening from $k{=}2$ to $k{=}8$ takes the fold depth from 6 to 2
+\emph{at an identical message count}, since every non-root rank sends exactly once
+whatever the arity. So the agent setting should prefer the \emph{widest} feasible
+tree where MPI prefers the narrowest (\cref{sec:coll}, \cref{tab:fanin}).
 
 \paragraph{C3: the dominant failure is silent corruption, not crash.} A rank that
 returns a confident wrong answer is invisible to timeouts, retries and schema
@@ -314,11 +342,25 @@ without invoking any model.
 An agent is never required to remember protocol state. It receives handles: a rank
 number, a communicator id, a window slot, a digest, an invocation id. We take this
 further than seems necessary --- where an agent must issue a command, the runtime
-emits the \emph{exact command string} rather than the parameters from which it
-could be constructed. In early runs of our experiments, completed work was lost
-because agents reconstructed a submission command and got a flag wrong. Protocol
-violation in agent populations is dominated by recall failures, so a surface
-requiring recognition rather than recall is materially more reliable.
+emits the \emph{exact command string} rather than the parameters from which it could
+be constructed. Protocol violation in agent populations is dominated by recall
+failures, so a surface requiring recognition rather than recall is materially more
+reliable.
+
+We can report a sharp, accidental experiment on precisely this point, because our
+own implementation got it wrong. In the first campaign the emitted submission
+command was itself malformed --- an option placed after the subcommand it belonged
+before --- and all nine workers in the population hit the parse error. All nine
+diagnosed it, reordered the flag, and completed their submissions, several
+independently reporting the defect back as something the runtime should fix. The
+population was robust; the mechanism was not. Two conclusions, and the second is the
+uncomfortable one. A generated command handed to an agent is executable code and
+must be tested as such, so the emitted strings are now round-tripped through the
+real argument parser in the test suite. And the recovery is not reassurance: these
+workers had shell access, could read an error, and were willing to retry. A worker
+that treated submission as fire-and-forget would have silently discarded work that
+was already correct --- which is exactly the class of failure the handle discipline
+exists to prevent, arriving through the mechanism meant to prevent it.
 
 \subsection{Protocol in the harness, not in the prompt}
 
@@ -504,13 +546,34 @@ algorithm & rounds & applications & fold depth \\
 \code{chain}    & $p-1$                  & $p-1$                 & $p-1$ \\
 \code{flat}     & $1$                    & $p-1$ (all at root)   & $p-1$ \\
 \code{binomial} & $\lceil\log_2 p\rceil$ & $p-1$                 & $\lceil\log_2 p\rceil$ \\
+\code{kary}($k$) & $\lceil\log_k p\rceil$ & $p-1$ transfers, $\lceil\frac{p-1}{k-1}\rceil$ applications & $\lceil\log_k p\rceil$ \\
 \bottomrule
 \end{tabular}
-\caption{The three reduce algorithms perform the same number of operator
-applications and differ in rounds and in fold depth. If reduction quality were
-governed by the number of applications they would score alike; if it is governed by
-depth, the tree wins decisively.}
+\caption{Reduce algorithms. The first three perform the same number of operator
+applications and differ only in rounds and fold depth: if quality were governed by
+the number of applications they would score alike, and if by depth the tree wins.
+\code{kary} additionally reduces the number of applications, because a variadic
+operator combines all $k$ children in one call.}
 \label{tab:reduce-alg}
+\end{table}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{rrrrr}
+\toprule
+fan-in $k$ & rounds & messages & fold depth & modelled $F(d)$ \\
+\midrule
+2  & 6 & 63 & 6 & 0.735 \\
+4  & 3 & 63 & 3 & 0.857 \\
+8  & 2 & 63 & 2 & 0.902 \\
+16 & 2 & 63 & 2 & 0.902 \\
+\bottomrule
+\end{tabular}
+\caption{$k$-ary reduction at $p=64$, $\delta=0.05$. The message count does not
+depend on $k$ --- every non-root rank sends exactly once --- so widening the tree is
+free in volume and pays in both latency and fidelity. This is the opposite of the
+trade MPI faces, and it follows from agent ranks not being single-ported.}
+\label{tab:fanin}
 \end{table}
 
 MPI requires associativity and then reorders freely; floating-point \code{MPI\_SUM}
@@ -529,9 +592,37 @@ speed. It holds only because of the immutability decision in
 would incur its own depth-proportional drift, and the fidelity ordering would
 reverse. \Cref{tab:fidelity} measures retention.
 
-A second effect has no MPI counterpart. A summarising operator given a fixed output
-budget compresses two inputs and sixteen inputs to the same length, so the root's
-answer over-represents whichever subtree merged last --- an unfairness
+\paragraph{Binary is the wrong arity.} The reasoning above stops one step short.
+Every $\log_2 p$ factor in MPI's collective layer descends from a single hardware
+premise: a process is \emph{single-ported}, so two incoming messages cost two
+transfers however the tree is shaped, and a wider node is pure loss. Agent ranks
+violate that premise completely. A prompt can carry $k$ artifacts as easily as two,
+and an operator with a \emph{variadic} kernel combines all $k$ in one application.
+The constraint that replaces port count is context capacity, so the optimal fan-in
+is $k^{*}=\lfloor C(1-h)/s \rfloor$ for a budget $C$, per-input size $s$, and a
+reserve fraction $h$, and the fold depth becomes $\lceil\log_{k^{*}} p\rceil$.
+
+\Cref{tab:fanin} gives the consequence. Widening from $k{=}2$ to $k{=}8$ at $p=64$
+cuts rounds and fold depth from six to two while sending exactly the same 63
+messages, because every non-root rank sends once regardless of arity. In MPI,
+widening a reduction tree trades latency against bandwidth; here it costs nothing
+and buys both latency and fidelity. \ampi{} therefore ships \code{kary} with the
+fan-in derived from the declared context budget, and \code{optimal\_fanin} caps it,
+because the relationship is not monotone in practice --- a model handed fifty
+documents in one call attends to them unevenly, so reduced depth is eventually
+offset by within-call neglect. Where that cap belongs is an empirical question and
+the benchmark measures it.
+
+\paragraph{Wide trees need variadic operators, and the runtime says so.} A $k$-ary
+tree given only a binary kernel degrades to a local left fold at each node, which
+spends exactly the $k-1$ successive applications the wide tree was meant to avoid.
+\ampi{} records which path was taken, because the failure is silent otherwise: the
+message count and round count look correct while the fold depth quietly reverts to
+$p-1$.
+
+\paragraph{A third effect has no MPI counterpart.} A summarising operator given a
+fixed output budget compresses two inputs and sixteen inputs to the same length, so
+the root's answer over-represents whichever subtree merged last --- an unfairness
 \code{MPI\_SUM} cannot exhibit, since it weights every contribution equally by
 construction. \ampi{} therefore exposes the number of leaves an accumulator
 represents so a budget can be allocated proportionally, and reports per-rank
@@ -1110,12 +1201,52 @@ organisations~\cite{a2adefs}; ANP, ACP and Coral address discovery and
 routing~\cite{anpwp,coral}. Surveys confirm the
 division~\cite{yangsurvey,ehteshamsurvey}. These are complementary and orthogonal:
 they connect \emph{systems}, whereas \ampi{} is what one writes a system
-\emph{with}. Classical agent communication languages --- KQML, FIPA-ACL, the Contract
-Net Protocol, blackboard architectures, Linda tuple
+\emph{with}. Two details make the orthogonality sharper than it first appears. MCP's
+current revision moved deliberately \emph{away} from shared state, making requests
+stateless and self-contained with per-request capability negotiation, specifically to
+avoid stateful load balancing~\cite{mcpspec2026,mcpsep2322}; it is a tool protocol
+hardening into statelessness, not drifting toward agent-to-agent. And A2A's
+\code{contextId} is a correlation identifier rather than a membership set: its unit
+of coordination is the bilateral task, with retry and circuit-breaking explicitly
+left to the client~\cite{a2adefs,a2alifeoftask}. Neither has a group, and without a
+group there is no collective.
+
+Classical agent communication languages --- KQML, FIPA-ACL, the Contract Net
+Protocol, blackboard architectures, Linda tuple
 spaces~\cite{kqml,fipaacl,contractnet,hearsay,carriero89-linda,jade} --- are the true
 ancestors, and modern protocols are rediscovering them; notably, Linda's tuple space
 is a shared-memory abstraction with no epochs, which is precisely the gap
 \cref{sec:rma} fills.
+
+\paragraph{The closest prior work, and the objection it raises.} Mieczkowski et
+al.~\cite{lmteams26} is simultaneously our strongest motivation and the paper a
+reviewer will ask about. It validates the distributed-systems analogy empirically ---
+Amdahl bounds, sub-unity speedup for decentralised teams, concurrent-write conflicts
+as a dominant failure --- and it is the work we would cite to justify the whole
+enterprise. It produces analysis and design guidance, not an interface. Our claim is
+therefore narrower and more specific than ``agent teams are distributed systems'':
+it is that a particular thirty-year-old interface transfers, that three named
+modifications are forced, and that the modifications are measurable. We are also
+aware of at least one independent design sketch proposing MPI-shaped primitives for
+agents (communicators, deterministic reduce, one-sided put/get, shrink and agree) in
+a project issue tracker rather than a publication; we claim priority on none of the
+vocabulary, only on the specification, the implementation, and the measurements.
+
+\paragraph{Reduction cost in MPI's own literature.} Two results deserve particular
+credit because they anticipate our concerns from inside MPI. The commutativity flag
+on \code{MPI\_Op\_create} is already an algorithm-selection gate rather than
+documentation, which is exactly the mechanism we generalise to a three-valued
+associativity declaration. And Tr\"aff's recent scan work is explicitly motivated by
+operators whose \emph{application} is expensive, minimising the number of operator
+applications subject to a bound on rounds~\cite{traff25exscan} --- the closest thing
+in the MPI literature to an algorithm designed for an LLM cost model, and the same
+objective our \code{kary} reduction optimises. On reproducibility, the contrast
+between Intel's conditional numerical reproducibility (reproducible only at a fixed
+thread count) and ReproBLAS's binned accumulator (reproducible regardless of order or
+process count)~\cite{IntelCNR,ReproBLAS,Demmel15} makes the design argument for us:
+fix the \emph{operator}, not the order --- which is why \cref{sec:coll} pushes
+harnesses toward exact, order-independent operators like \code{UNION} wherever the
+combination is genuinely set-like.
 
 \paragraph{Agent failure and context.} The MAST taxonomy attributes multi-agent
 failures largely to specification and inter-agent

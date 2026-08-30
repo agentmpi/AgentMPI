@@ -201,6 +201,50 @@ def _log2c(p: int) -> int:
     return 0 if p <= 1 else (p - 1).bit_length()
 
 
+#: Fan-in assumed by the tabulated ``kary`` cost entry. Chosen as a value a
+#: 128k-token context comfortably admits for ~1k-token payloads.
+DEFAULT_FANIN = 8
+
+
+def _logkc(p: int, k: int) -> int:
+    """ceil(log_k p), computed integrally."""
+    if p <= 1:
+        return 0
+    levels, reach = 0, 1
+    while reach < p:
+        reach *= max(2, k)
+        levels += 1
+    return levels
+
+
+def predict_kary(p: int, n_tokens: int, k: int, params: "CostParams | None" = None, *, op_cost_tokens: int = 0):
+    """Cost of a k-ary reduction for an explicit fan-in.
+
+    Exposed separately because the tabulated entry fixes one k, whereas the
+    interesting question is how cost and fidelity move *with* k. Message count is
+    invariant in k -- every non-root rank sends exactly once -- so the whole effect
+    of widening the tree is on rounds and depth, which is why it is close to free.
+    """
+    params = params or CostParams()
+    depth = _logkc(p, k)
+    time_s = depth * (params.fabric_s + n_tokens * params.beta_in_s_per_token)
+    time_s += depth * params.message_time(op_cost_tokens or n_tokens * k)
+    price = params.message_price((p - 1) * n_tokens, (p - 1) * (op_cost_tokens or n_tokens))
+    return Prediction(
+        op="reduce",
+        algorithm=f"kary(k={k})",
+        p=p,
+        n_tokens=n_tokens,
+        rounds=depth,
+        messages=p - 1,
+        volume_tokens=(p - 1) * n_tokens,
+        time_s=time_s,
+        price_usd=price,
+        fold_depth=depth,
+        fidelity=params.fidelity(depth),
+    )
+
+
 #: Closed-form cost expressions for every implemented algorithm.
 #:
 #: Each entry maps ``(op, algorithm)`` to a function of ``(p, n)`` returning
@@ -228,6 +272,16 @@ FORMULAS: dict[tuple[str, str], Any] = {
     ("reduce", "chain"): lambda p, n: (p - 1, p - 1, (p - 1) * n, p - 1),
     ("reduce", "flat"): lambda p, n: (1, p - 1, (p - 1) * n, p - 1),
     ("reduce", "binomial"): lambda p, n: (_log2c(p), p - 1, (p - 1) * n, _log2c(p)),
+    # A k-ary tree with a variadic operator: same message count as the binary tree,
+    # but the fold depth is log_k p rather than log2 p, because an interior rank
+    # combines all its children in one application. DEFAULT_FANIN is the value
+    # tabulated here; use predict_kary() for a specific k.
+    ("reduce", "kary"): lambda p, n: (
+        _logkc(p, DEFAULT_FANIN),
+        p - 1,
+        (p - 1) * n,
+        _logkc(p, DEFAULT_FANIN),
+    ),
     ("allreduce", "reduce_bcast"): lambda p, n: (2 * _log2c(p), 2 * (p - 1), 2 * (p - 1) * n, _log2c(p)),
     # Recursive-doubling allreduce with the standard non-power-of-two correction.
     # The lowest 2*rem ranks pair up first so that a power-of-two set remains; each

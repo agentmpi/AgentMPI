@@ -283,3 +283,116 @@ def test_collectives_are_isolated_from_user_traffic(tmp_path):
 
     job = ampi.launch(rank_main, size=4, root=tmp_path / "iso")
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+
+# ---------------------------------------------------------------------------
+# k-ary reduction: the shape the agent setting wants and MPI does not.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("size", SIZES)
+@pytest.mark.parametrize("fanin", [2, 3, 4, 8])
+def test_kary_reduce_matches_serial_fold(tmp_path, size, fanin):
+    """Every fan-in must still produce the reference fold for an exact operator."""
+    expected = ampi.SUM.fold(range(size))
+
+    def rank_main(comm):
+        out = comm.reduce(comm.rank, ampi.SUM, root=0, algorithm="kary", fanin=fanin)
+        if comm.rank == 0:
+            assert out == expected, (fanin, out, expected)
+        return out
+
+    job = ampi.launch(rank_main, size=size, root=tmp_path / f"k{size}x{fanin}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+
+@pytest.mark.parametrize("size", [4, 8, 16])
+@pytest.mark.parametrize("fanin", [2, 4, 8])
+def test_kary_reduce_preserves_rank_order(tmp_path, size, fanin):
+    """Rank order must survive a wide tree, not just a binary one."""
+    expected = "".join(f"[{i}]" for i in range(size))
+
+    def rank_main(comm):
+        out = comm.reduce(f"[{comm.rank}]", ampi.CONCAT, root=0, algorithm="kary", fanin=fanin)
+        if comm.rank == 0:
+            assert out == expected, (fanin, out, expected)
+        return out
+
+    job = ampi.launch(rank_main, size=size, root=tmp_path / f"ko{size}x{fanin}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+
+@pytest.mark.parametrize("size", [8, 16, 27, 32])
+def test_wider_fanin_reduces_fold_depth_at_equal_message_count(tmp_path, size):
+    """The whole point: widening the tree costs no extra messages.
+
+    Every non-root rank sends exactly once regardless of fan-in, so the entire
+    effect of widening is on rounds and fold depth. For a lossy operator that is a
+    pure gain, which is why the agent setting should prefer the widest feasible
+    tree where MPI prefers the narrowest.
+    """
+    from agentmpi.cost import _logkc
+
+    observed: dict[int, tuple[int, int]] = {}
+    for fanin in (2, 4, 8):
+
+        def rank_main(comm, fanin=fanin):
+            comm.reduce(1, ampi.SUM, root=0, algorithm="kary", fanin=fanin)
+            st = algorithms.LAST_STATS.get(comm.rt.wrank)
+            return (comm.rt.cost.n_messages_sent, st.fold_depth if st else 0)
+
+        job = ampi.launch(rank_main, size=size, root=tmp_path / f"kd{size}x{fanin}")
+        assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+        msgs = sum(o.value[0] for o in job.outcomes if o.value)
+        depth = max(o.value[1] for o in job.outcomes if o.value)
+        observed[fanin] = (msgs, depth)
+        assert msgs == size - 1, f"fanin={fanin}: {msgs} messages, expected {size - 1}"
+        assert depth == _logkc(size, fanin), f"fanin={fanin}: depth {depth} != ceil(log_{fanin} {size})"
+
+    assert observed[8][1] <= observed[4][1] <= observed[2][1]
+    assert observed[8][1] < observed[2][1], observed
+    assert observed[2][0] == observed[8][0], "message count must not depend on fan-in"
+
+
+def test_variadic_operator_folds_in_one_application(tmp_path):
+    """A variadic kernel combines k inputs at depth 1; a binary one costs k-1."""
+    calls: dict[str, int] = {"binary": 0, "variadic": 0}
+
+    def binary_fn(a, b, _ctx):
+        calls["binary"] += 1
+        return f"({a}+{b})"
+
+    def variadic_fn(values, _ctx):
+        calls["variadic"] += 1
+        return "(" + "+".join(str(v) for v in values) + ")"
+
+    wide = ampi.Op(
+        "WIDE",
+        binary_fn,
+        commutative=False,
+        associativity=Associativity.APPROX,
+        variadic=variadic_fn,
+    )
+    narrow = ampi.Op("NARROW", binary_fn, commutative=False, associativity=Associativity.APPROX)
+
+    ctx = ampi.ReduceContext(rank=0)
+    assert wide.combine(["a", "b", "c", "d"], ctx) == "(a+b+c+d)"
+    assert calls["variadic"] == 1 and calls["binary"] == 0
+
+    calls["binary"] = 0
+    ctx2 = ampi.ReduceContext(rank=0)
+    narrow.combine(["a", "b", "c", "d"], ctx2)
+    assert calls["binary"] == 3, "a binary kernel needs k-1 applications"
+    assert ctx2.depth == 3, "and it spends the depth the wide tree would have saved"
+
+
+def test_optimal_fanin_tracks_the_context_budget():
+    from agentmpi.ops import optimal_fanin
+
+    # A large budget with small payloads admits a wide tree.
+    assert optimal_fanin(128_000, 1_000) == 32
+    # A tight budget with large payloads forces a narrow one.
+    assert optimal_fanin(32_000, 4_000) == 6
+    # It never returns something unusable.
+    assert optimal_fanin(1_000, 100_000) == 2
+    assert optimal_fanin(10**9, 1) == 32

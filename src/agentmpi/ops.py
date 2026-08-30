@@ -113,9 +113,44 @@ class Op:
     identity: Any = None
     #: Estimated token cost of one application; used by the cost model.
     cost_tokens: int = 0
+    #: Optional *variadic* kernel: combine a whole list in one application.
+    #:
+    #: This is the field that makes wide reduction trees worth having, and it has
+    #: no MPI counterpart.  MPI's collective algorithms are built on the assumption
+    #: that a process is *single-ported* -- it can be involved in one transfer at a
+    #: time -- which is what makes a binary tree optimal and gives every textbook
+    #: collective its ``log2 p`` factor.  An agent is not single-ported: a prompt
+    #: can carry eight reports as easily as two, and merging eight in one call is
+    #: one lossy re-encoding rather than seven.  So when a variadic kernel exists,
+    #: a *k*-ary tree reduces the fold depth from ``log2 p`` to ``log_k p`` at no
+    #: extra cost in applications, and the binding constraint on *k* becomes the
+    #: receiving rank's context budget rather than its port count.  See
+    #: :func:`optimal_fanin`.
+    variadic: Callable[[list[Any], "ReduceContext"], Any] | None = None
 
     def __call__(self, acc: Any, val: Any, ctx: ReduceContext | None = None) -> Any:
         return self.fn(acc, val, ctx or ReduceContext(rank=-1))
+
+    def combine(self, values: list[Any], ctx: ReduceContext) -> Any:
+        """Combine ``values`` in as few applications as the operator allows.
+
+        With a variadic kernel this is one application at depth 1.  Without one it
+        degrades to a left fold, which is correct but costs ``len(values) - 1``
+        successive applications -- and for a lossy operator that is exactly the
+        depth the wide tree was meant to avoid, so the runtime records which path
+        was taken.
+        """
+        if not values:
+            return self.identity
+        if len(values) == 1:
+            return values[0]
+        if self.variadic is not None:
+            return self.variadic(values, ctx)
+        acc = values[0]
+        for i, v in enumerate(values[1:], start=1):
+            ctx.depth = ctx.depth + (1 if self.lossy else 0)
+            acc = self.fn(acc, v, ctx)
+        return acc
 
     @property
     def tree_legal(self) -> bool:
@@ -248,6 +283,7 @@ def semantic_op(
     associativity: Associativity = Associativity.APPROX,
     output_tokens: int = 1200,
     contract: Any = None,
+    variadic_prompt: str | None = None,
 ) -> Op:
     """Build a reduction operator whose kernel is an agent invocation.
 
@@ -282,6 +318,26 @@ def semantic_op(
         )
         return ctx.agent(rendered, label=f"reduce:{name}:d{ctx.depth}", contract=contract, max_tokens=budget)
 
+    variadic: Callable[[list[Any], ReduceContext], Any] | None = None
+    if variadic_prompt is not None:
+
+        def _variadic(values: list[Any], ctx: ReduceContext) -> Any:
+            if ctx.agent is None:
+                raise AmpiUsageError("variadic semantic operator requires an agent executor", op=name)
+            budget = max(300, int(output_tokens * (1 + 0.25 * max(0, ctx.depth))))
+            inputs = "\n\n".join(f"--- INPUT {i} ---\n{_render(v)}" for i, v in enumerate(values))
+            rendered = variadic_prompt.format(
+                inputs=inputs, n=len(values), depth=ctx.depth, weight=ctx.weight, budget=budget
+            )
+            return ctx.agent(
+                rendered,
+                label=f"reduce:{name}:k{len(values)}:d{ctx.depth}",
+                contract=contract,
+                max_tokens=budget,
+            )
+
+        variadic = _variadic
+
     return Op(
         name=name,
         fn=_fn,
@@ -289,7 +345,36 @@ def semantic_op(
         associativity=associativity,
         idempotent=False,
         cost_tokens=output_tokens,
+        variadic=variadic,
     )
+
+
+def optimal_fanin(context_budget: int, payload_tokens: int, *, overhead: float = 0.25, cap: int = 32) -> int:
+    r"""The widest reduction fan-in a rank's context can absorb.
+
+    For MPI, the optimal reduction tree is binary because a process is
+    single-ported: two incoming messages cost two transfers whatever the topology,
+    so there is nothing to gain from a wider node and something to lose in
+    serialisation. An agent rank has no port count. What it has is a context
+    budget, and the number of inputs it can combine in a single application is
+
+    .. math:: k^{*} = \left\lfloor \frac{C\,(1-h)}{s} \right\rfloor
+
+    for a budget :math:`C`, a per-input size :math:`s`, and a fraction :math:`h`
+    reserved for instructions and the output. Since the fold depth of a *k*-ary
+    tree is :math:`\lceil \log_k p \rceil`, and for a lossy operator quality decays
+    in depth, the harness should choose the *largest* feasible *k* rather than the
+    smallest --- the opposite of MPI's preference. Going from :math:`k=2` to
+    :math:`k=8` over 64 ranks takes the depth from 6 to 2.
+
+    ``cap`` exists because the relationship is not monotone in practice: a model
+    given fifty documents to merge in one call attends to them unevenly, so the
+    gain from reduced depth is eventually offset by within-call neglect. The cap is
+    a policy choice, and the benchmark measures where it should sit.
+    """
+    usable = max(1.0, context_budget * (1.0 - overhead))
+    k = int(usable // max(1, payload_tokens))
+    return max(2, min(cap, k))
 
 
 def _render(value: Any) -> str:

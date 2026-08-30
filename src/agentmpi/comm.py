@@ -1077,8 +1077,17 @@ class Communicator:
     def allgather(self, payload: Any, *, algorithm: str | None = None, tag_hint: str = "allgather", **kw: Any) -> list[Any]:
         return algorithms.allgather(self, payload, algorithm=algorithm, tag_hint=tag_hint, **kw)
 
-    def reduce(self, payload: Any, op: Op | str = "SUM", root: int = 0, *, algorithm: str | None = None, **kw: Any) -> Any:
-        return algorithms.reduce(self, payload, get_op(op), root, algorithm=algorithm, **kw)
+    def reduce(
+        self,
+        payload: Any,
+        op: Op | str = "SUM",
+        root: int = 0,
+        *,
+        algorithm: str | None = None,
+        fanin: int | None = None,
+        **kw: Any,
+    ) -> Any:
+        return algorithms.reduce(self, payload, get_op(op), root, algorithm=algorithm, fanin=fanin, **kw)
 
     def allreduce(self, payload: Any, op: Op | str = "SUM", *, algorithm: str | None = None, **kw: Any) -> Any:
         return algorithms.allreduce(self, payload, get_op(op), algorithm=algorithm, **kw)
