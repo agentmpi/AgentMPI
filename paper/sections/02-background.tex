@@ -1,0 +1,157 @@
+\section{Background: why MPI worked}
+\label{sec:background}
+
+MPI is often described as a library of communication functions. It is more
+useful, for our purposes, to read it as a set of decisions about
+\emph{what to standardise and what to leave alone}. This section extracts the
+decisions we inherit. Readers who know MPI can skip to
+\Cref{sec:mismatch}; readers who know agent systems and not MPI will find
+that most of what follows describes problems they have already met.
+
+\subsection{The standard is not an implementation}
+
+The Forum standardised an interface and refused to standardise
+behaviour below it~\cite{mpiforum1994mpi1}. \mpiop{Bcast} says what every
+rank ends up holding; it says nothing about the schedule. MPICH and Open MPI
+between them implement at least five broadcast algorithms and choose among
+them at runtime by message size, communicator size and
+topology~\cite{thakur2005optimization,chan2007collective}. Applications
+written in 1996 got faster in 2016 without being touched.
+
+This is the decision that separates a protocol from a framework, and it is
+the one the agent ecosystem has not yet made. A harness written against
+AutoGen's group chat encodes a scheduling policy in the application; a
+harness written against \mpiop{Bcast} encodes an intent.
+
+\subsection{Communicators, contexts, and safe composition}
+\label{sec:bg-contexts}
+
+A communicator pairs an ordered group of ranks with an opaque
+\emph{communication context}. Two properties follow. First, a rank is
+addressed by its index \emph{within the communicator}, so a subgroup can be
+written as if it were the whole world. Second, and much more importantly, a
+message sent on one communicator can never be matched by a receive on
+another.
+
+The second property is what made MPI libraries possible. Zipcode's designers
+had identified the problem directly: a library that posts a wildcard receive
+can consume a message the application sent to itself, and no discipline in
+tag allocation fixes it once two independently written libraries are
+involved~\cite{skjellum1994zipcode}. \mpiop{Comm\_dup} makes the fix a
+one-liner: a library duplicates the communicator it is handed and is
+thereafter immune.
+
+Multi-agent frameworks are, almost uniformly, back in the pre-context world.
+The shared conversation buffer is a flat tag space, and a sub-agent that
+reads ``the last message'' has no way to know whether it was addressed to
+it. This is not a hypothetical: it is one of the failure classes the MAST
+taxonomy names~\cite{cemri2025mast}.
+
+\subsection{A small orthogonal core, plus a large convenience layer}
+
+MPI-1's point-to-point layer is, in principle, four calls. Everything
+else---the other three send modes, the nonblocking forms, the persistent
+requests, and every collective---could be written on top. The Forum included
+them anyway, for a reason that generalises: a collective operation
+\emph{states an intent} that the implementation can exploit, while the
+hand-rolled equivalent states a schedule that it cannot. An \mpiop{Allreduce}
+can be a recursive-doubling butterfly; a loop of sends and receives that
+computes the same thing cannot be.
+
+\subsection{Collective algorithms and their cost model}
+
+Collective algorithm design is where MPI's engineering depth lies. The
+standard cost model is Hockney's: a message of $n$ bytes between two ranks
+costs $\alpha + n\beta$, with $\alpha$ the latency and $\beta$ the
+reciprocal bandwidth~\cite{hockney1994communication}; LogP and its
+descendants refine it with overhead and gap
+terms~\cite{Culler1993,Alexandrov1995}. In this model,
+broadcast by binomial tree costs $\lceil\log_2 p\rceil(\alpha + n\beta)$
+while van de Geijn's scatter-then-allgather costs roughly
+$(\log_2 p + p - 1)\alpha + 2\frac{p-1}{p}n\beta$, so the tree wins for
+small messages and the scatter/allgather form wins for large
+ones~\cite{thakur2005optimization,chan2007collective}. Allreduce shows the
+same structure: recursive doubling costs $\log_2 p$ rounds but moves $n$
+bytes in each, while Rabenseifner's reduce-scatter-plus-allgather moves
+$2\frac{p-1}{p}n$ bytes in $2\log_2 p$
+rounds~\cite{rabenseifner2004optimization}. The ring allreduce, later
+rediscovered by the deep-learning community, is bandwidth-optimal and
+latency-terrible: $2(p-1)$ rounds~\cite{Patarasuk2009}.
+
+Every one of these trade-offs is a statement about the relative size of
+$\alpha$ and $\beta$. \Cref{sec:cost} shows what happens when the constants
+change by six orders of magnitude.
+
+\subsection{One-sided operations}
+
+MPI-2 added remote memory access because two-sided messaging forces the
+receiver to participate in every transfer, and there are algorithms where
+only the initiator knows what it needs~\cite{mpiforum1997mpi2}. A rank
+exposes a \emph{window}; peers put, get and accumulate into it within
+synchronisation epochs---collective \mpiop{Win\_fence}, scoped
+post/start/complete/wait, or passive-target lock/unlock. MPI-3 tightened the
+memory model and added atomics and shared-memory
+windows~\cite{dinan2016rma}.
+
+The agent analogue is the shared scratchpad that every framework has and
+none of them specifies. What MPI-2 supplies and the scratchpads do not is
+epochs: a defined moment before which writes are not visible and after which
+they are. Without one, a reader sees a torn state and reasons confidently
+about half an answer.
+
+\subsection{Collective I/O}
+
+Naive parallel I/O collapses: a thousand ranks each writing a small
+unaligned piece of a shared file produce a thousand conflicting requests.
+ROMIO's two-phase I/O redistributes data to a small set of aggregators so
+that each issues one large contiguous write~\cite{thakur1999romio}. An
+agent harness writing to a shared repository has the same problem with a
+worse failure mode: twenty agents each committing a two-line edit produce
+merge conflicts, and a merge conflict costs an agent turn.
+
+\subsection{Fault tolerance: ULFM}
+
+MPI's position from 1994 until today is that after a process failure the
+state of MPI is undefined, with \mpiop{ERRORS\_ARE\_FATAL} the default. On a
+machine whose mean time between failures is days and whose jobs checkpoint
+anyway, that was defensible. The User Level Failure Mitigation
+proposal adds the minimum viable set of primitives on
+top~\cite{bland2012ulfm,Bland2013a}: \mpiop{Comm\_revoke} invalidates a
+communicator everywhere, so that a rank blocked on a peer that will never
+send gets an error instead of waiting forever; \mpiop{Comm\_shrink} builds a
+new communicator over the survivors and must be an agreement, since two
+ranks that disagreed about who died would build different worlds; and
+\mpiop{Comm\_agree} is a fault-tolerant agreement, which the FLP result tells
+us requires a failure detector~\cite{fischer1985impossibility}. ULFM's
+design principle---\emph{the library should not recover for you, it should
+make recovery writable}---is one we adopt verbatim.
+
+The earlier FT-MPI took a different line, offering a \code{REBUILD} mode
+that respawned failed ranks and preserved their
+indices~\cite{Fagg2000}. For MPI that was expensive, because a rank's state
+is gigabytes of application memory. \Cref{sec:ft} argues that for agents it
+is the right default, because a rank's state is a prompt and a checkpoint.
+
+\subsection{Tooling: PMPI and MPI\_T}
+
+MPI standardised a name-shifted profiling interface in 1994: every
+\mpiop{X} has a weak symbol over \code{PMPI\_X}, so a tool can interpose
+without touching any implementation. An entire ecosystem---mpiP, TAU,
+Score-P, Vampir, Jumpshot---exists because of that one
+decision~\cite{shende2006tau,knupfer2012scorep}. MPI-3 added \mpiop{T} for
+reading and writing an implementation's internal control and performance
+variables~\cite{islam2016mpit}. Agent frameworks have nothing comparable;
+observability is per-framework and incompatible. We treat both as part of
+the protocol rather than as implementation features, for the same reason the
+Forum did.
+
+\subsection{The process manager is out of scope}
+
+Finally, MPI says almost nothing about how processes start. Launch and
+wire-up belong to a process manager speaking a separate
+protocol---PMI, and later PMIx, which exists precisely because exchanging
+endpoint information among $10^5$ ranks through an argument list does not
+work~\cite{castain2018pmix}. The separation is why the same MPI library runs
+under Slurm, under a laptop, and under schedulers that did not exist when it
+was written. \ampi{} draws the same line, and \Cref{sec:impl} shows what
+lies on each side of it.

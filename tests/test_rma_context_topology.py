@@ -180,9 +180,27 @@ def test_safe_fanout_and_reduction_planning():
     assert safe_fanout(budget=10_000, item_tokens=1_000) == 10
     plan = plan_reduction(n=64, item_tokens=1000, budget=10_000, output_tokens=800)
     assert plan.feasible
-    assert plan.fanout == 10
-    assert plan.rounds == 2
-    assert plan.peak_ingest < 10_000
+    # A degree-10 tree would finish in 2 rounds but costs the root
+    # 9 * 2 * 1000 = 18000 tokens cumulatively, over budget. The planner must
+    # trade a round for capacity.
+    assert plan.fanout == 4
+    assert plan.rounds == 3
+    assert plan.peak_ingest <= 10_000
+
+
+def test_reduction_planning_accounts_for_cumulative_not_per_round_ingest():
+    """The root of a depth-d tree pays d rounds of fan-in, not one."""
+    per_round = plan_reduction(n=64, item_tokens=1000, budget=10_000,
+                               output_tokens=1000)
+    assert per_round.feasible
+    assert per_round.peak_ingest == (per_round.fanout - 1) * per_round.rounds * 1000
+    assert per_round.peak_ingest <= 10_000
+
+
+def test_reduction_becomes_infeasible_when_even_a_binary_tree_will_not_fit():
+    plan = plan_reduction(n=1024, item_tokens=4000, budget=10_000, output_tokens=4000)
+    assert not plan.feasible
+    assert "binary tree" in plan.reason
 
 
 def test_non_contracting_operator_makes_a_deep_tree_infeasible():

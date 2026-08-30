@@ -129,7 +129,7 @@ def comm_agree(
     # Deriving the round from a shared counter in the key-value store instead
     # would be a read-then-write race, and two ranks landing on different
     # rounds would each wait forever for votes the other posted elsewhere.
-    round_id = _next_coll_id(comm)
+    round_id = _next_coll_id(comm, "agree")
     base = f"agree/{comm.context}/{round_id}"
     rt.device.kv_put(f"{base}/vote/{comm.rank}", json.dumps(
         {"value": value, "ts": time.time()}))

@@ -291,23 +291,54 @@ def plan_reduction(
     """
     if n <= 0:
         return ReductionPlan(n, 1, 0, 0, False, "empty communicator")
+    if n == 1:
+        return ReductionPlan(1, 1, 0, item_tokens, True)
     out = item_tokens if output_tokens is None else output_tokens
-    k = safe_fanout(budget, max(item_tokens, out), working_set)
-    if k < 2 and n > 1:
+    m = max(item_tokens, out)
+
+    if item_tokens + working_set > budget:
         return ReductionPlan(
             n, 1, 0, item_tokens, False,
             f"a single contribution of {item_tokens} tokens does not fit a "
             f"{budget}-token budget (working set {working_set})",
         )
-    if out > item_tokens and n > k:
-        # Non-contracting operator over a multi-level tree: ingest grows.
+    if out > item_tokens and n > safe_fanout(budget, m, working_set):
         return ReductionPlan(
-            n, k, 0, out, False,
+            n, 1, 0, out, False,
             "reduction operator is not contracting (output bound exceeds input "
-            "bound), so a multi-level tree has unbounded peak ingest; declare a "
+            "bound), so a multi-level tree has unbounded ingest; declare a "
             "bounded output type or use a flat reduction",
         )
-    rounds = max(int(math.ceil(math.log(n, k))), 1) if n > 1 else 0
+
+    # Choose the tree degree by *cumulative* ingest at the root, not by
+    # per-round ingest.  This is the distinction that makes capacity planning
+    # for agents unlike anything in MPI.  An MPI rank that receives k-1
+    # buffers per round reuses the same memory every round, so its peak is
+    # one round's worth and depth is free.  An agent retains everything it
+    # reads, so the root of a depth-d tree pays (k-1)*d contributions over
+    # the life of the reduction.  Planning against the per-round figure
+    # yields trees that look feasible, run two rounds, and then exhaust the
+    # root -- which is exactly the failure this planner exists to prevent.
+    best: tuple[int, int, int] | None = None
+    for k in range(2, n + 1):
+        rounds = max(int(math.ceil(math.log(n, k) - 1e-9)), 1)
+        cumulative = (k - 1) * rounds * m + working_set
+        if cumulative > budget:
+            continue
+        candidate = (rounds, cumulative, k)
+        if best is None or candidate[:2] < best[:2]:
+            best = candidate
+    if best is None:
+        binary_cost = max(int(math.ceil(math.log2(n))), 1) * m
+        return ReductionPlan(
+            n, 2, 0, binary_cost, False,
+            f"no tree degree fits: even a binary tree over {n} ranks costs "
+            f"{binary_cost} tokens of cumulative ingest at the root, over the "
+            f"{budget}-token budget; lower the operator's output bound or add "
+            f"a pre-aggregation stage",
+        )
+    rounds, cumulative, k = best
+
     schedule: list[list[tuple[int, list[int]]]] = []
     active = list(range(n))
     while len(active) > 1:
@@ -315,13 +346,11 @@ def plan_reduction(
         next_active: list[int] = []
         for i in range(0, len(active), k):
             group = active[i: i + k]
-            parent = group[0]
-            round_pairs.append((parent, group[1:]))
-            next_active.append(parent)
+            round_pairs.append((group[0], group[1:]))
+            next_active.append(group[0])
         schedule.append(round_pairs)
         active = next_active
-    peak = max(item_tokens, (k - 1) * max(item_tokens, out) + working_set)
-    return ReductionPlan(n, k, len(schedule), peak, True, schedule=schedule)
+    return ReductionPlan(n, k, len(schedule), cumulative, True, schedule=schedule)
 
 
 def peak_ingest_bcast(n: int, degree: int, item_tokens: int) -> int:

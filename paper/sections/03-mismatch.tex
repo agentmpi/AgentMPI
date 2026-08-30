@@ -1,0 +1,180 @@
+\section{Why an agent is not a rank}
+\label{sec:mismatch}
+
+The interesting part of this work is not the parts of MPI that transfer
+unchanged---those are numerous but unsurprising---but the four places where
+the executor's nature forces the design to differ. We state each mismatch
+precisely, because each one is the justification for a specific protocol
+feature in \Cref{sec:design}, and because a design that borrows MPI's
+vocabulary without acknowledging them would inherit the wrong semantics
+along with the right ones.
+
+\subsection{M1: context is consumed, not occupied}
+\label{sec:m1}
+
+An MPI receive buffer is reusable. A rank can receive a terabyte over a
+job's lifetime while never holding more than a megabyte at once, because
+the memory occupied by message $k$ is available again for message $k+1$.
+Memory pressure is a function of the \emph{peak live set}, and the standard
+consequence is that a collective's memory cost is analysed per round.
+
+Every token an agent reads enters its context and stays there. A rank that
+receives 200 messages of 5{,}000 tokens has spent a million tokens whether
+or not it needed two of them simultaneously. Pressure is a function of
+\emph{cumulative ingest}. Three consequences follow, and all three are
+protocol-visible:
+
+\begin{itemize}
+\item A receive is not a data movement but an irreversible allocation
+against a quota, so it needs \emph{admission control}: the runtime must
+decide whether a payload may enter before materialising it
+(\Cref{sec:design-p2p}).
+\item Continuing past the quota requires rewriting history---replacing a
+span of consumed context with a smaller summary of it. This is a garbage
+collector whose liveness analysis is semantic, so the protocol supplies the
+mechanism and accounting and the harness supplies the policy.
+\item Collective feasibility becomes a first-class question. An MPI
+collective is always feasible; it may be slow, but no rank is \emph{unable}
+to hold its share. \op{Allgather} over $p$ agents requires every rank to
+ingest $(p-1)s$ tokens by definition, so it stops working at
+$p > C/s$ regardless of algorithm. The runtime must be able to say so before
+the job spends anything.
+\end{itemize}
+
+There is a second-order effect that surprised us and that
+\Cref{sec:cost-cumulative} develops: because ingest accumulates across
+\emph{rounds}, the depth of a reduction tree is not free. An MPI rank that
+receives $k-1$ buffers per round reuses the same memory every round, so its
+peak is one round's worth and depth costs only latency. An agent root of a
+depth-$d$ tree pays $(k-1)d$ contributions over the reduction's life.
+Planning a tree against the per-round figure produces schedules that look
+feasible, run two rounds, and then exhaust the root.
+
+\subsection{M2: reduction operators are semantic}
+\label{sec:m2}
+
+\mpiop{SUM} is associative, commutative, and output-size-preserving.
+Floating-point addition is not exactly associative, and MPI's community has
+long accepted the resulting last-bit non-reproducibility as the price of
+letting the implementation reassociate freely.
+
+Agent operators fail all three properties, and the failures are not in the
+last bit:
+
+\begin{itemize}
+\item ``Concatenate in rank order'' is associative but not commutative.
+\item ``Take a majority vote'' is commutative but \emph{not} associative: a
+pairwise tree of votes computes something different from a flat vote over
+the same inputs, and which answer wins depends on the number of ranks.
+\item ``Summarise these two summaries'' is approximately associative at
+best, and its output must be strictly smaller than its input or a tree of
+depth $d$ produces an output of size $2^d$.
+\item ``Merge these two drafts'' is none of the above.
+\end{itemize}
+
+So a protocol that wants to choose collective schedules on the
+application's behalf must be \emph{told} the operator's algebra, and must
+refuse schedules the algebra does not license. \mpiop{Op\_create} already
+takes a \code{commute} flag for exactly this reason; \ampi{} needs that flag
+and two more---idempotency, which determines tolerance of duplicate
+delivery, and an output bound, which determines the legal tree depth
+(\Cref{sec:ops}).
+
+A related consequence: operator application is itself an agent turn. It
+costs seconds and money and can fail. Reductions therefore need retry,
+memoisation, and contract validation at every internal node---machinery that
+in MPI would be absurd and here is unavoidable.
+
+\subsection{M3: failure is not fail-stop}
+\label{sec:m3}
+
+ULFM's model is binary: a rank is alive or it has failed, and failure is
+detected because the process is gone. Agents fail in at least four
+distinguishable ways, and the distinctions matter because the correct
+response differs:
+
+\begin{description}[leftmargin=1.4em,style=nextline]
+\item[Crashed] the process is gone. Detected by absence of heartbeat;
+respond by replacing or shrinking.
+\item[Stalled] the process is healthy and making no progress---looping on a
+tool call, retrying a rate-limited endpoint, or re-reading its own output.
+Indistinguishable from a working agent by any liveness test, and
+indistinguishable from a \emph{slow} agent without a progress signal.
+\item[Drifted] the process returns output that violates the contract it was
+given: wrong schema, wrong language, a summary where a patch was expected.
+Perfectly alive, perfectly prompt, and useless. Detected only by validating
+content.
+\item[Bankrupt] the process has exhausted its token or currency budget.
+Deterministic, predictable, and invisible to every failure detector in the
+distributed-systems literature, because no classical process runs out of
+money.
+\end{description}
+
+Conflating these produces the two pathologies every practitioner reports:
+killing a slow-but-working agent because it looked dead, and waiting forever
+for a fast-but-broken one because it looked alive. The protocol therefore
+needs two independent timeouts---liveness and progress---and a
+content-level error class alongside the transport-level ones.
+
+There is also an asymmetry in the other direction, and it is favourable.
+Restarting an MPI rank is expensive: its state is the application's memory,
+which is why coordinated checkpointing and the entire literature on
+message-logging and the domino effect
+exist~\cite{Elnozahy2002,Chandy1985}. An agent rank's recoverable state is
+its role, its checkpoint, and the messages it has acknowledged---kilobytes.
+So the balance between ULFM's \emph{shrink} (cheap for the runtime,
+expensive for the application, whose data distribution was written against
+the old indices) and FT-MPI's \emph{rebuild} (expensive for the runtime,
+free for the application) tips the other way, and \Cref{sec:ft} makes
+replacement the recommended path.
+
+Finally, the classical recovery technique of message-log replay depends on
+the piecewise-deterministic assumption: re-executing a process from a
+checkpoint with the same message sequence reproduces its
+behaviour~\cite{Alvisi1995}. Agents violate this outright. Our substitute is
+content-addressed memoisation, which gives up bitwise reproduction and keeps
+the property that actually matters: a re-executed rank tells its peers the
+same thing it told them before.
+
+\subsection{M4: the cost model inverts}
+\label{sec:m4}
+
+In HPC, $\alpha \approx 1\,\mu s$, $\beta^{-1} \approx 10\,\mathrm{GB/s}$,
+and a floating-point operation costs a fraction of a nanosecond. Every
+collective algorithm in \Cref{sec:background} is a trade between the
+$\alpha$ term and the $\beta$ term, and computation is nowhere in the
+analysis because it is free relative to communication.
+
+For agents: transmitting a message is a file write or an HTTP round
+trip---microseconds to milliseconds. Producing the message is an inference
+call: tens of seconds and, at current prices, cents to dollars. The ratio
+between the cost of moving a payload and the cost of creating it is between
+$10^5$ and $10^7$, and it points the opposite way.
+
+Three consequences:
+
+\begin{enumerate}
+\item \textbf{Latency-optimal algorithms win essentially everywhere.} The
+HPC crossover at which bandwidth-optimal ring algorithms overtake
+logarithmic ones does not appear, because the bandwidth term is negligible.
+A ring allreduce over 64 agents costs 126 sequential turns; recursive
+doubling costs 6. \Cref{sec:eval-micro} measures this.
+\item \textbf{The right unit of cost is the turn, not the second.} Wall
+clock varies by model, provider and time of day; rounds on the critical path
+do not. We report both, and treat rounds as the invariant.
+\item \textbf{Redundant computation is the thing to avoid.} Chatty protocols
+are fine; recomputing an agent's output is not. This is why memoisation is a
+protocol concern here and a curiosity in MPI.
+\end{enumerate}
+
+\subsection{What the mismatches do not change}
+
+It is worth being explicit about the negative result, because it is the
+paper's main structural claim. None of M1--M4 touches the matching
+semantics, the communicator/context construction, the group algebra, the
+topology interface, the collective \emph{catalogue}, the epoch structure of
+one-sided operations, the two-phase I/O idea, the shape of
+revoke/shrink/agree, or the profiling interface. Those transfer verbatim.
+The mismatches bear on the type system, the operator algebra, algorithm
+selection, and the failure lattice---four well-localised places. A
+message-passing interface for agents is mostly MPI.

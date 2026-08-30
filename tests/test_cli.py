@@ -20,9 +20,23 @@ import pytest
 AMPI = [sys.executable, "-m", "agentmpi.cli"]
 
 
+def clean_env(**overrides: str) -> dict[str, str]:
+    """A child environment with no inherited AgentMPI identity.
+
+    A rank's identity lives in environment variables, which makes it easy to
+    inherit one by accident -- from a parent shell, a CI runner, or another
+    rank's session. Tests must never do that: a leaked AMPI_SIZE turns a
+    four-rank job into a thirteen-rank one that waits forever for peers that
+    do not exist.
+    """
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    env.update(overrides)
+    return env
+
+
 def run_ampi(root: Path, rank: int, *args: str, timeout: float = 120,
              check: bool = True) -> subprocess.CompletedProcess:
-    env = {**os.environ, "AMPI_ROOT": str(root), "AMPI_RANK": str(rank)}
+    env = clean_env(AMPI_ROOT=str(root), AMPI_RANK=str(rank))
     proc = subprocess.run(AMPI + list(args), capture_output=True, text=True,
                           env=env, timeout=timeout)
     if check and proc.returncode != 0:
@@ -38,14 +52,16 @@ def run_dir(tmp_path: Path) -> Path:
     root = tmp_path / "run"
     proc = subprocess.run(AMPI + ["init", "--root", str(root), "--ranks", "4",
                                   "--label", "clitest"],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60,
+                          env=clean_env())
     assert proc.returncode == 0, proc.stderr
     return root
 
 
 def test_init_and_info(run_dir: Path):
     proc = subprocess.run(AMPI + ["info", "--root", str(run_dir)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60,
+                          env=clean_env())
     info = json.loads(proc.stdout)
     assert info["size"] == 4
     assert info["label"] == "clitest"
@@ -205,6 +221,12 @@ def test_progress_and_status(run_dir: Path):
     assert status["turn"] == 2
     assert "peers" in status and len(status["peers"]) == 4
 
+    observed = json.loads(subprocess.run(
+        AMPI + ["peers", "--root", str(run_dir)], capture_output=True, text=True,
+        timeout=60, env=clean_env()).stdout)
+    assert observed["size"] == 4
+    assert observed["turns_total"] >= 2
+
 
 def test_checkpoint_and_restore(run_dir: Path):
     run_ampi(run_dir, 3, "checkpoint", "--json", json.dumps({"chapter": 7, "done": True}))
@@ -217,7 +239,8 @@ def test_trace_summary(run_dir: Path):
     run_ampi(run_dir, 0, "send", "--dest", "1", "--tag", "1", "--text", "x")
     run_ampi(run_dir, 1, "recv", "--source", "0", "--tag", "1", "--timeout", "30")
     proc = subprocess.run(AMPI + ["trace", "summary", "--root", str(run_dir)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60,
+                          env=clean_env())
     report = json.loads(proc.stdout)
     assert report["messages"] >= 1
     assert report["tokens_sent"] > 0
@@ -230,7 +253,8 @@ def test_launchplan_emits_one_prompt_per_rank(run_dir: Path, tmp_path: Path):
     out = tmp_path / "launch"
     proc = subprocess.run(AMPI + ["launchplan", "--root", str(run_dir),
                                   "--program", str(program), "--out", str(out)],
-                          capture_output=True, text=True, timeout=60)
+                          capture_output=True, text=True, timeout=60,
+                          env=clean_env())
     assert proc.returncode == 0, proc.stderr
     plan = json.loads((out / "plan.json").read_text())
     assert len(plan) == 4

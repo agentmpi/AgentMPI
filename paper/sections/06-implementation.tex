@@ -1,0 +1,132 @@
+\section{Reference implementation}
+\label{sec:impl}
+
+\ampi{} is implemented in about 6{,}500 lines of dependency-free Python,
+with 260 tests. The architecture borrows from MPICH and Open MPI, for the
+reason those projects give: the layering is what lets the semantics outlive
+any particular transport.
+
+\subsection{Layering}
+
+\begin{description}[leftmargin=1.2em,style=nextline]
+\item[Device interface] The analogue of MPICH's Abstract Device
+Interface~\cite{balaji2020mpich}. A device provides an at-least-once
+message channel, a content-addressed blob store, a key-value store with
+compare-and-swap, an append-only journal, and a clock. Notably it need
+\emph{not} provide ordered delivery, connection state, or a broadcast
+medium---the assumptions that make MPI devices hard to port. Everything
+above the line is transport-independent, and the same test suite runs over
+every device.
+
+\item[Matching engine] Posted-receive and unexpected queues, MPI's
+non-overtaking rule, deduplication, epoch filtering. Knows nothing about how
+bytes move; this is the separation MPICH's repeated ADI refactors argue for.
+
+\item[Communicators, collectives, RMA, I/O, fault tolerance] The protocol
+proper, written against the matching engine.
+
+\item[Profiler] Name-shifted interception of every operation, streaming to
+the journal rather than buffering---if a rank dies, a buffered trace dies
+with it, and the failure you most wanted to see is the one you lose.
+\end{description}
+
+Two devices are implemented. The \textbf{journal} device uses a shared
+directory: message queues are directories, a send is one atomic
+\code{rename}, a receive is a directory listing, and only compare-and-swap
+needs exclusion. It requires nothing but a POSIX-ish filesystem, which is
+deliberate---the ranks of an \ampi{} job are frequently processes we do not
+control, each of which can run a shell command but cannot be handed a
+socket. A directory is the lowest common denominator, as TCP was for early
+MPI. The \textbf{inproc} device is the Nemesis analogue: identical
+semantics, no syscalls, used for the test suite and for scaling studies
+where filesystem latency would obscure the protocol's own costs.
+
+\subsection{Consumption, not polling, is what commits}
+
+One design point took us two attempts and is worth reporting, because it is
+forced by an assumption most message-passing runtimes do not have to
+question.
+
+In a conventional runtime a rank is one process, so polling a message and
+matching it are separated by microseconds and it is harmless to treat the
+first as committing the second. An \ampi{} rank is frequently a
+\emph{sequence} of short-lived processes---an agent that runs \code{ampi
+recv}, thinks for two minutes, then runs \code{ampi send}---and every one of
+them polls, matches at most one message, and exits. Our first implementation
+marked messages consumed at poll time, so a process that polled six messages
+and matched one silently destroyed the other five.
+
+The fix is to separate the two: polling is speculative and in-process,
+consumption is explicit and durable. That in turn requires per-rank
+consumption state to survive across processes, and doing so naively---a set
+of consumed message identifiers---would grow without bound. We keep instead
+a per-\code{(context, source, destination)} watermark plus a small set of
+out-of-order exceptions above it, compacted after every consumption, which
+is $O(1)$ per peer in the common in-order case. The same durable state
+carries the send sequence counters and the collective counter, which is what
+lets a stateless endpoint sit in front of a stateful protocol.
+
+\subsection{The command-line binding}
+
+The binding that matters is not the Python one. \code{ampi} is a
+command-line tool exposing every operation, so that
+
+\begin{quote}
+\emph{anything that can run a shell command can be an \ampi{} rank.}
+\end{quote}
+
+A rank's entire identity is two environment variables, \code{AMPI\_ROOT} and
+\code{AMPI\_RANK}; everything else---the group, the rank table, the peers'
+capabilities, the epoch---is discovered from the run directory at
+\op{Init}, which is PMIx's design~\cite{castain2018pmix} scaled down.
+Blocking operations block, which is what an agent wants: \code{ampi recv}
+returns when the message arrives, and until then the agent is waiting at a
+shell prompt.
+
+\begin{figure}[t]
+\begin{lstlisting}[language=ampishell]
+# rank 3 of a 13-rank translation job
+export AMPI_ROOT=/runs/book AMPI_RANK=3
+
+ampi bcast   --root 0 --out spec.md
+ampi scatter --root 0 --type json --out chunk.json
+# ... read the chunk, propose terminology ...
+ampi scan --exclusive --op ampi_first \
+          --file proposal.json --type json --out prefix.json
+# ... translate, adopting prefix.json ...
+ampi gather  --root 0 --file result.json --type json
+ampi progress
+\end{lstlisting}
+\caption{A complete rank program. Every line is a shell command, so the
+executor can be a coding agent, a script, or a person. Errors are structured
+JSON on stderr with a machine-readable \code{error} field, so an agent can
+branch on \op{ERR\_TIMEOUT} versus \op{ERR\_REVOKED} without parsing prose.}
+\label{fig:cli}
+\end{figure}
+
+This is the same bet MPI made on having bindings for the languages people
+actually used. An agent protocol with only a Python binding is a Python
+framework; a rank implemented by a coding agent, a shell script and a Python
+program are indistinguishable on the wire and interoperate in one job.
+
+\subsection{The launcher is out of scope}
+
+\ampi{} specifies the wire-up and declines to specify the launch. A launch
+plan is a run directory plus one prompt per rank; how those prompts become
+running agents is the launcher's business. In our experiments the launcher
+is Cursor's subagent API; it could be containers, serverless functions, or
+people. \Cref{sec:discussion} reports what happened when the launcher turned
+out to have a concurrency limit we had not accounted for.
+
+\subsection{Observability}
+
+Every operation emits enter/leave states and matched send/receive arrows,
+following OTF2's and SLOG-2's event model, with token and currency counters
+on every event. From that stream the tooling computes the standard MPI
+views---a communication matrix, a Gantt timeline, per-operation time
+breakdowns---plus two that are specific to this setting: cumulative context
+pressure per rank over time, and a critical path measured in \emph{turns}
+rather than seconds. The turn-based critical path is the more useful number,
+because the ratio of total turns to critical-path turns is the harness's
+achievable parallelism and does not depend on how fast the model happened to
+be that day.

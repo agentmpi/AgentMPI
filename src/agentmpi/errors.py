@@ -128,6 +128,31 @@ class NondeterminismError(AmpiError):
     error_class = ErrorClass.ERR_NONDETERMINISM
 
 
+class CollectiveMismatchError(AmpiError):
+    """Peers disagree about which collective is which.
+
+    MPI requires every rank to issue collectives on a communicator in the
+    same order, and every MPI implementation relies on it: the n-th
+    collective's traffic is separated from the (n+1)-th by a counter that is
+    assumed to be replicated.  A rank that skips one desynchronises the
+    counter, and from then on it labels its messages with tags nobody is
+    listening for.  The job does not fail, it *hangs*, and no rank can see
+    why, because each one is correctly waiting for a message that will never
+    be sent.
+
+    In MPI this is a programmer error caught by inspection or by a tool such
+    as MUST.  With agents it is an ordinary runtime event -- the executor is
+    a language model that may decide a step looks unnecessary -- so the
+    protocol has to detect it in band.  We do, by carrying the collective's
+    name and sequence number in every internal envelope and comparing them
+    against what this rank actually executed at that sequence number.  A
+    permanent hang becomes an error that names both parties and both
+    operations.
+    """
+
+    error_class = ErrorClass.ERR_COLL_MISMATCH
+
+
 # --------------------------------------------------------------------------
 # Error handlers (MPI_Comm_set_errhandler)
 # --------------------------------------------------------------------------

@@ -78,6 +78,11 @@ CVARS: dict[str, Cvar] = {
         Cvar("ampi_gap_timeout_s", 30.0, float,
              "How long the matching engine holds a sequence gap before skipping "
              "it, trading the non-overtaking guarantee for liveness."),
+        Cvar("ampi_coll_mismatch_grace_s", 3.0, float,
+             "How long to accumulate evidence before reporting that peers "
+             "disagree about the collective sequence.  Detection is symmetric, "
+             "so a single disagreeing message cannot tell you whether you or "
+             "your peer skipped a step; a brief wait buys a majority."),
         Cvar("ampi_coll_algorithm", "auto", str,
              "Force a collective algorithm, overriding the decision function."),
         Cvar("ampi_max_retries", 2, int,

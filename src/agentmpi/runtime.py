@@ -36,6 +36,7 @@ from typing import Any, Iterable
 from .comm import Communicator
 from .constants import (
     CONTEXT_WORLD,
+    TAG_UB,
     DEAD_STATES,
     Datatype,
     RankState,
@@ -46,6 +47,7 @@ from .datatypes import TypeDescriptor, TypeRegistry, lookup
 from .envelope import Envelope
 from .errors import (
     AmpiError,
+    CollectiveMismatchError,
     ArgError,
     BudgetError,
     CommError,
@@ -155,6 +157,8 @@ class Runtime:
         # non-overtaking and collective tag separation cannot live in memory.
         self.send_seq: dict[str, int] = {}
         self.coll_counter: dict[str, int] = {}
+        self.coll_log: dict[str, dict[int, str]] = {}
+        self._mismatch_since: dict[str, float] = {}
         self.persist_state = device.name != "inproc"
         if self.persist_state:
             self._load_state()
@@ -176,6 +180,8 @@ class Runtime:
             return
         self.send_seq = {k: int(v) for k, v in data.get("send_seq", {}).items()}
         self.coll_counter = {k: int(v) for k, v in data.get("coll_counter", {}).items()}
+        self.coll_log = {ctx: {int(k): v for k, v in log.items()}
+                         for ctx, log in data.get("coll_log", {}).items()}
         self.turn = int(data.get("turn", 0))
         for key, value in data.get("consumed", {}).items():
             ctx, src, dst = key.rsplit("|", 2)
@@ -209,6 +215,8 @@ class Runtime:
         self.device.kv_put(self._state_key(), json.dumps({
             "send_seq": self.send_seq,
             "coll_counter": self.coll_counter,
+            "coll_log": {ctx: {str(k): v for k, v in log.items()}
+                         for ctx, log in self.coll_log.items()},
             "consumed": consumed,
             "turn": self.turn,
             "budget": self.budget.snapshot(),
@@ -396,6 +404,7 @@ class Runtime:
 
         if is_revoked(comm):
             return
+        self.detect_collective_mismatch(comm)
         newly = self.detect_failures(comm) - comm.failed
         if not newly:
             return
@@ -405,6 +414,87 @@ class Runtime:
             self.matching.forget_rank(comm.context, local)
             self.profiler.note("peer failure detected", peer=local,
                                world=comm.world(local), comm=comm.name)
+
+    #: How many past collectives to remember per communicator.  Bounded
+    #: because the log exists to diagnose a peer that is a few operations out
+    #: of step, not to keep a full history.
+    COLL_LOG_DEPTH = 64
+
+    def record_collective(self, context: str, cid: int, name: str) -> None:
+        log = self.coll_log.setdefault(context, {})
+        log[cid] = name
+        if len(log) > self.COLL_LOG_DEPTH:
+            for stale in sorted(log)[: len(log) - self.COLL_LOG_DEPTH]:
+                log.pop(stale, None)
+
+    def detect_collective_mismatch(self, comm: Communicator) -> None:
+        """Raise if a peer's collective sequence disagrees with ours.
+
+        The check is cheap and exact.  Every internal envelope carries the
+        name and sequence number of the collective that produced it.  If a
+        peer sends us ``(#4, "exscan")`` and we executed ``#4`` as
+        ``"scatterv"``, then that peer has skipped a collective, its counter
+        is behind ours, and from here on it will label every message with a
+        tag we are not listening for.  Waiting is futile, and MPI's usual
+        remedy -- read the program and see that the calls line up -- does not
+        apply when the caller is a language model that decided a step looked
+        unnecessary.
+
+        A peer that is *ahead* of us is not an error: its messages sit
+        unmatched until we catch up, which is ordinary pipelining and which
+        MPI explicitly permits. Only a disagreement about an operation we
+        have already performed is diagnostic.
+        """
+        log = self.coll_log.get(comm.context)
+        if not log:
+            return
+        disagreeing: dict[int, tuple[int, str]] = {}
+        for env in self.matching.iter_unexpected(comm.context):
+            if env.tag < TAG_UB:
+                continue
+            cid, name = env.meta.get("i"), env.meta.get("c")
+            if cid is None or name is None:
+                continue
+            mine = log.get(int(cid))
+            if mine is None or mine == name:
+                continue
+            disagreeing[env.source] = (int(cid), name)
+        if not disagreeing:
+            self._mismatch_since.pop(comm.context, None)
+            return
+
+        # Wait a moment before reporting. The first disagreeing message
+        # arrives before the others, and raising on it would leave us with a
+        # sample of one, which cannot distinguish "I skipped a step" from
+        # "one peer skipped a step". A short grace period costs nothing --
+        # the job is already wedged -- and buys a majority.
+        first = self._mismatch_since.setdefault(comm.context, time.time())
+        if time.time() - first < float(self.cvars["ampi_coll_mismatch_grace_s"]):
+            return
+
+        # Detection is symmetric: each side sees the other disagreeing, and
+        # neither is locally distinguishable from the culprit. A majority
+        # settles it. If two or more peers agree with each other and not with
+        # us, we are the rank that skipped a step, and we are the one that has
+        # to resynchronise -- so the error says so, rather than leaving every
+        # participant to blame every other.
+        peers = sorted(disagreeing)
+        cid, peer_op = disagreeing[peers[0]]
+        mine = log.get(cid, "?")
+        agreeing_peers = [p for p, (c, n) in disagreeing.items()
+                          if c == cid and n == peer_op]
+        minority = len(agreeing_peers) >= 2
+        who = ("this rank" if minority
+               else f"rank {peers[0]} or this rank")
+        raise CollectiveMismatchError(
+            f"collective #{cid} was issued as {mine!r} here and as "
+            f"{peer_op!r} by rank(s) {agreeing_peers}; {who} skipped or added "
+            f"a collective, so the tags no longer line up and no further "
+            f"collective on this communicator can complete",
+            peer=peers[0], peers=agreeing_peers, cid=cid,
+            peer_op=peer_op, local_op=mine, local_is_minority=minority,
+            comm=comm.name,
+        )
 
     def note_progress(self) -> None:
         """Record that this rank advanced.  Drives stall detection."""
@@ -440,6 +530,17 @@ class Runtime:
         headroom = max(self.budget.headroom - 64, 32)
         text = env.inline or (self.device.get_blob(env.blob) if env.blob else "")
         digest = DIGESTS["head_tail"](text, headroom)
+        if datatype.base in (Datatype.JSON, Datatype.TOOLCALL):
+            # A digested JSON document is no longer a JSON document.  Rather
+            # than hand the receiver something that will not parse, wrap the
+            # digest in a well-formed envelope that says plainly what was
+            # done: the contract survives, and the loss is visible instead of
+            # showing up later as a parse error nobody can explain.
+            digest = json.dumps(
+                {"_ampi_digest": digest, "_ampi_original_tokens": tokens,
+                 "_ampi_reason": "receiver context budget"},
+                ensure_ascii=False,
+            )
         from .tokens import message_tokens
 
         new_tokens = message_tokens(digest)

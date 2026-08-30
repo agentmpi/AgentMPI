@@ -129,6 +129,7 @@ class Communicator:
         self._send_seq: dict[int, int] = {}
         self._topology: Any = None
         self._coll_counter = 0
+        self._active_coll: tuple[str, int] | None = None
 
     # -- identity ----------------------------------------------------------
     @property
@@ -373,6 +374,13 @@ class Communicator:
             provenance=tuple(provenance) or (f"r{self.rank}",),
             meta=dict(meta or {}),
         )
+        active = getattr(self, "_active_coll", None)
+        if tag >= TAG_UB and active is not None:
+            # Stamp internal traffic with the collective's name and sequence
+            # number so that a peer which has fallen out of step is detected
+            # rather than silently waited for.
+            env.meta.setdefault("c", active[0])
+            env.meta.setdefault("i", active[1])
         payload = text
         if len(text) > self.runtime.cvars["ampi_eager_chars"] or md is SendMode.BUFFERED:
             env.blob = self.runtime.device.put_blob(text)

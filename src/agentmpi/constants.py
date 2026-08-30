@@ -194,6 +194,7 @@ class ErrorClass(enum.IntEnum):
     ERR_NONDETERMINISM = 105  # replay diverged beyond the declared tolerance
     ERR_TIMEOUT = 106
     ERR_UNSUPPORTED = 107
+    ERR_COLL_MISMATCH = 108
 
 
 ERROR_STRINGS: Final[dict[int, str]] = {
@@ -222,6 +223,7 @@ ERROR_STRINGS: Final[dict[int, str]] = {
     ErrorClass.ERR_NONDETERMINISM: "replay diverged",
     ErrorClass.ERR_TIMEOUT: "operation timed out",
     ErrorClass.ERR_UNSUPPORTED: "operation not supported by this device",
+    ErrorClass.ERR_COLL_MISMATCH: "peers disagree about the collective sequence",
 }
 
 

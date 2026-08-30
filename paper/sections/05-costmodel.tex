@@ -1,0 +1,210 @@
+\section{A cost model for agent collectives}
+\label{sec:cost}
+
+Collective algorithm selection is an optimisation problem, and changing the
+objective changes the answer. This section states \ampi{}'s objective, works
+out what it implies for the standard algorithms, and derives the one
+constraint that has no MPI analogue.
+
+\subsection{The model}
+
+MPI's working model is Hockney's: a point-to-point message of $n$ bytes
+costs $\alpha + n\beta$~\cite{hockney1994communication}. Computation is
+omitted because it is negligible. For agents we need three terms, and the
+one MPI omits dominates:
+
+\begin{equation}
+T \;=\; \gamma R \;+\; \alpha M \;+\; \beta N
+\label{eq:cost}
+\end{equation}
+
+where $R$ is the number of \textbf{rounds} on the critical path (a round
+being one agent turn: read the inputs, think, emit), $M$ the number of
+messages, $N$ the number of tokens moved, and
+
+\begin{itemize}
+\item $\gamma$ is the cost of one agent turn: $10$--$100$ seconds and, at
+2026 frontier-model prices, $10^{-2}$--$10^{0}$ currency units;
+\item $\alpha$ is the per-message transport cost: $10^{-4}$--$10^{-2}$
+seconds for a filesystem or HTTP hop;
+\item $\beta$ is the per-token transport cost, effectively $10^{-7}$
+seconds.
+\end{itemize}
+
+So $\gamma/\alpha \in [10^3, 10^6]$ and $\gamma/(\beta \cdot 10^4) \approx
+10^5$. Communication is free; turns are everything. \Cref{eq:cost} is
+therefore, to within a rounding error,
+
+\begin{equation}
+T \approx \gamma R.
+\label{eq:cost-simple}
+\end{equation}
+
+Two secondary objectives remain, and both are budgets rather than costs:
+total tokens ingested (which is money, and also context) and total turns
+(which is money). We report all three.
+
+\subsection{What \texorpdfstring{$T \approx \gamma R$}{T = gamma R} does to
+algorithm selection}
+
+\Cref{tab:rounds} gives round counts for the standard algorithms.
+Under \Cref{eq:cost-simple} the column that matters is the first, and the
+consequences are stark.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Rounds on the critical path and per-rank ingest, $p$ ranks,
+contribution size $s$ tokens. Under $T \approx \gamma R$ the leftmost
+column decides wall-clock and the rightmost decides feasibility.}
+\label{tab:rounds}
+\begin{tabular}{@{}llll@{}}
+\toprule
+\textbf{Collective} & \textbf{Algorithm} & \textbf{Rounds} & \textbf{Peak ingest}\\
+\midrule
+Barrier & linear & $2$ & $0$\\
+        & dissemination & $\lceil\log_2 p\rceil$ & $0$\\
+\midrule
+Bcast & flat & $1$ & $s$\\
+      & binomial & $\lceil\log_2 p\rceil$ & $s$\\
+      & chain & $p-1$ & $s$\\
+\midrule
+Gather & flat & $1$ & $(p-1)s$ at root\\
+       & binomial & $\lceil\log_2 p\rceil$ & $(p/2)s$ at root\\
+\midrule
+Allgather & ring & $p-1$ & $(p-1)s$\\
+          & rec.\ doubling & $\lceil\log_2 p\rceil$ & $(p-1)s$\\
+          & Bruck & $\lceil\log_2 p\rceil$ & $(p-1)s$\\
+\midrule
+Reduce & flat & $1$ & $(p-1)s$ at root\\
+       & $k$-ary tree & $\lceil\log_k p\rceil$ & $(k-1)\lceil\log_k p\rceil\,m$\\
+\midrule
+Allreduce & ring & $2(p-1)$ & $s$\\
+          & rec.\ doubling & $\lceil\log_2 p\rceil$ & $s\log_2 p$\\
+          & reduce+bcast & $\lceil\log_k p\rceil{+}\lceil\log_2 p\rceil$ & tree\\
+\midrule
+Scan & chain & $p-1$ & $s$\\
+     & Hillis--Steele & $\lceil\log_2 p\rceil$ & $s\log_2 p$\\
+\midrule
+Alltoall & pairwise & $p-1$ & $(p-1)s$\\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{The bandwidth-optimal crossover disappears.}
+In MPI, ring allreduce is preferred at large message sizes because it is
+bandwidth optimal: it moves $2\frac{p-1}{p}n$ bytes against recursive
+doubling's $n\log_2 p$~\cite{rabenseifner2004optimization,Patarasuk2009}.
+Under \Cref{eq:cost-simple} that advantage is worth nothing, while its
+$2(p-1)$ rounds against $\log_2 p$ costs everything: at $p=64$, 126 turns
+versus 6, or roughly twenty minutes versus one. There is no message size at
+which the ring wins, and \Cref{sec:eval-micro} confirms the crossover does
+not appear.
+
+\paragraph{Flat algorithms become attractive again.}
+Symmetrically, a flat broadcast---the root sends $p-1$ messages---costs one
+round, against $\log_2 p$ for a tree. In MPI the flat form is dismissed
+because the root serialises $p-1$ sends, each costing $\alpha$; here those
+sends are file writes and the root's cost is one turn regardless. The tree
+is preferable only when the root's *sending* is itself a turn (a refracting
+broadcast) or when message fan-out is rate-limited. Our decision function
+selects flat for $p \le 4$ and binomial above, and the honest statement is
+that the crossover is set by provider concurrency limits rather than by the
+cost model.
+
+\paragraph{Scan is the highest-leverage collective.}
+A harness with a carried dependency---each worker needs something every
+earlier worker decided---is usually written as a chain, at $p-1$ turns. As a
+prefix scan it is $\lceil\log_2 p\rceil$. At $p=12$ that is 4 rounds instead
+of 11; at $p=64$, 6 instead of 63. Nothing else in the catalogue offers that
+factor, and it applies to a structure (shared conventions established
+incrementally) that appears in almost every non-trivial agent workload.
+
+\subsection{Feasibility: the constraint MPI does not have}
+\label{sec:cost-cumulative}
+
+Every MPI collective is feasible. Under M1 (\Cref{sec:m1}) that stops being
+true, and feasibility must be checked before cost.
+
+Let $C$ be a rank's usable context budget---its window less the reserve it
+needs for its own reasoning and output. Then:
+
+\begin{observation}[Allgather is intrinsically limited]
+\op{Allgather} requires every rank to ingest $(p-1)s$ tokens, by definition
+and not by algorithm. It is therefore infeasible for
+$p > 1 + C/s$, and no choice of schedule helps. With $C = 80{,}000$ and
+$s = 2{,}000$, that is $p = 41$.
+\end{observation}
+
+This is worth stating because ``let every agent see every draft'' is the
+first thing a harness author reaches for, and it has a hard ceiling that
+arrives sooner than intuition suggests. \op{Allreduce} with a contracting
+operator is the scalable replacement, and the runtime says so by name when
+it predicts the overflow.
+
+The reduction case is more subtle, and it is where we made a mistake worth
+recording. A $k$-ary reduction tree over $p$ ranks has depth
+$d=\lceil\log_k p\rceil$, and each interior node receives $k-1$
+contributions \emph{per round}. In MPI the memory cost is one round's worth,
+$(k-1)m$, because the buffers are reused; depth costs only latency. We
+initially planned trees against that figure. It is wrong:
+
+\begin{observation}[Tree depth costs context]
+An agent retains everything it reads, so the root of a depth-$d$ $k$-ary
+tree ingests
+\begin{equation}
+I_{\mathrm{root}} = (k-1)\,d\,m
+= (k-1)\lceil\log_k p\rceil\, m
+\label{eq:cumulative}
+\end{equation}
+tokens over the life of the reduction, where $m$ is the operator's output
+bound. Planning against the per-round figure $(k-1)m$ yields schedules that
+look feasible, run two rounds, and exhaust the root.
+\end{observation}
+
+\Cref{eq:cumulative} is not monotone in $k$, which makes the planning
+problem genuinely non-trivial: increasing $k$ raises the per-round fan-in
+but lowers the depth. The planner therefore searches $k \in [2,p]$ for the
+schedule minimising $d$ subject to $I_{\mathrm{root}} \le C$, breaking ties
+on $I_{\mathrm{root}}$. A worked example: $p=64$, $m=1000$, $C=10{,}000$. A
+degree-10 tree finishes in 2 rounds but costs the root
+$9 \times 2 \times 1000 = 18{,}000$ tokens---over budget. Degree 4 costs
+$3 \times 3 \times 1000 = 9{,}000$ in 3 rounds, and is selected. The
+protocol trades one round for feasibility, which is exactly the trade a
+harness author cannot make by hand because they cannot see the constant.
+
+Finally, the operator's contraction is what makes any of this possible:
+
+\begin{observation}[Non-contracting operators forbid deep trees]
+If the operator's output is no smaller than its inputs, $m$ grows with
+depth, $I_{\mathrm{root}}$ grows super-linearly, and only a flat reduction
+is safe. A flat reduction costs the root $(p-1)s$, so the whole reduction is
+limited to $p \le 1 + C/s$ ranks.
+\end{observation}
+
+This is why \ampi{} requires an operator to declare an output bound rather
+than inferring one: the declaration is what turns an unbounded reduction
+into a bounded one, and the runtime cannot discover it by observation
+without first running the thing it is trying to plan.
+
+\subsection{What the model does not capture}
+
+Three caveats, stated because we rely on the model in \Cref{sec:eval}.
+
+First, $\gamma$ is not constant. An agent turn's duration grows with input
+length and output length, so a rank deep in a reduction tree, holding more
+context, is slower. The model treats $\gamma$ as a constant and therefore
+under-predicts the cost of context-heavy schedules---in the direction that
+makes our capacity-aware planning look \emph{less} valuable than it is.
+
+Second, turn durations are heavy-tailed. A collective's cost is the
+\emph{maximum} over participants, not the mean, so $\gamma$ in
+\Cref{eq:cost} should be read as a high quantile and the gap between mean
+and max widens with $p$. This is the standard tail-at-scale
+effect~\cite{Dean2013}, and it is the argument for \op{Waitsome} over
+\op{Waitall} wherever the harness can proceed with partial results.
+
+Third, the model says nothing about quality. A schedule that is cheaper may
+produce a worse answer---a deeper reduction tree summarises more
+aggressively and loses more---so cost and quality must be reported together.
+\Cref{sec:eval} does.

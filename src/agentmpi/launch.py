@@ -71,9 +71,10 @@ yourself, and do not try to talk to other ranks except through `ampi`.
 - size: {size}
 - role: {role}
 
-These are already exported in your shell:
+**Run this first, in every shell you open:**
 
 ```
+export PATH="{bindir}:$PATH"
 export AMPI_ROOT="{root}"
 export AMPI_RANK="{rank}"
 export AMPI_SIZE="{size}"
@@ -129,6 +130,7 @@ def render_prompt(spec: LaunchSpec, program_text: str) -> str:
     return PROMPT_TEMPLATE.format(
         rank=spec.rank, size=spec.size, last=spec.size - 1, role=spec.role,
         root=spec.root, program=program_text,
+        bindir=spec.env.get("AMPI_BIN", "/workspace/bin"),
     )
 
 
@@ -143,7 +145,9 @@ def build_specs(
             rank=rank, root=root, size=manifest.size,
             role=entry.get("role", "worker"), model=entry.get("model", "unknown"),
             program=program,
-            env={"AMPI_ROOT": root, "AMPI_RANK": str(rank), "AMPI_SIZE": str(manifest.size)},
+            env={"AMPI_ROOT": root, "AMPI_RANK": str(rank),
+                 "AMPI_SIZE": str(manifest.size),
+                 "AMPI_BIN": os.environ.get("AMPI_BIN", "/workspace/bin")},
         ))
     return specs
 

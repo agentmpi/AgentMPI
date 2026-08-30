@@ -99,7 +99,9 @@ from .ft import (
 from .group import Group, RankSpec, RankTable
 from .ops import (
     CONCAT,
+    FIRST,
     LAND,
+    LAST,
     LOR,
     MAX,
     MAX_BY_SCORE,
@@ -152,6 +154,8 @@ AMPI_DIGEST = DIGEST
 AMPI_NULL = NULL
 AMPI_CONCAT = CONCAT
 AMPI_UNION = UNION
+AMPI_FIRST = FIRST
+AMPI_LAST = LAST
 AMPI_VOTE = VOTE
 AMPI_SUM = SUM
 AMPI_MAX = MAX
@@ -183,9 +187,9 @@ __all__ = [
     "Envelope", "Status",
     # ops
     "Op", "op_create", "semantic_op", "summarize_op", "SemanticOpRegistry",
-    "CONCAT", "UNION", "VOTE", "SUM", "MAX", "MIN", "LAND", "LOR", "MERGE_JSON",
+    "CONCAT", "UNION", "FIRST", "LAST", "VOTE", "SUM", "MAX", "MIN", "LAND", "LOR", "MERGE_JSON",
     "MAX_BY_SCORE", "PATCH_MERGE",
-    "AMPI_CONCAT", "AMPI_UNION", "AMPI_VOTE", "AMPI_SUM", "AMPI_MAX", "AMPI_MIN",
+    "AMPI_CONCAT", "AMPI_UNION", "AMPI_FIRST", "AMPI_LAST", "AMPI_VOTE", "AMPI_SUM", "AMPI_MAX", "AMPI_MIN",
     "AMPI_LAND", "AMPI_LOR", "AMPI_MAXLOC", "AMPI_PATCH_MERGE", "AMPI_MERGE_JSON",
     # context
     "ContextBudget", "plan_reduction", "safe_fanout", "ReductionPlan",

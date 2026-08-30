@@ -1,0 +1,164 @@
+\section{Introduction}
+
+In April 1992, forty-odd people met in Williamsburg, Virginia, because
+distributed-memory parallel computing had a portability
+problem~\cite{dongarra1993mpi1draft,walker1992standards}. Every vendor
+shipped a message-passing library---NX on Intel machines, Vertex on nCUBE,
+CMMD on the Connection Machine---and every research group shipped
+another---PVM, p4, Chameleon, Zipcode, PARMACS, Express,
+TCGMSG, CHIMP~\cite{geist1994pvm,butler1994p4,skjellum1994zipcode,bomans1990parmacs}.
+The libraries were not merely different in spelling. They differed in what a
+message \emph{was}, in whether a receive could match on a wildcard, in
+whether a collective operation existed at all. A parallel application was
+tied to a machine, and a parallel \emph{library} was almost impossible to
+write, because a library and its caller shared one flat tag space and could
+silently steal each other's messages.
+
+The MPI Forum's answer, standardised in MPI-1.0 in May
+1994~\cite{mpiforum1994mpi1,dongarra1996cacm}, was not a better library. It
+was a \emph{specification}: a fixed vocabulary of communication operations
+with precise semantics, no implementation, and no opinion about what the
+ranks computed. Thirty years and five major revisions later, essentially
+every distributed-memory scientific code in production speaks
+it~\cite{bernholdt2020survey,gropp2001learning}.
+
+\subsection{The same problem, again}
+
+Multi-agent systems built on large language models are in the position
+distributed-memory computing occupied in 1992. There are many frameworks,
+each with its own model of what an agent is and how agents
+communicate. AutoGen rewrote itself around an actor model; LangGraph
+compiles a state machine over a shared, checkpointed state object; CrewAI
+composes roles and tasks; the OpenAI Agents SDK passes control by handoff;
+MetaGPT and ChatDev encode a software-company org
+chart~\cite{wu2023autogen,langgraphdocs2026,crewaidocs2026,openaiagentssdk2026,hong2023metagpt,qian2023chatdev}.
+A harness written for one is a rewrite for another, and the reason is
+familiar: each of them fuses three separable concerns---what the agents do,
+how they are scheduled, and how they exchange information---into one
+artifact.
+
+The protocols that have appeared to address agent interoperability do not
+close this gap, and mostly do not try to. MCP standardises how one client
+reaches one server's tools, resources and
+prompts~\cite{mcpspec2026}. A2A standardises how one agent discovers and
+delegates a task to another, with agent cards, tasks and
+artifacts~\cite{a2adocs2026v1}. ACP and ANP occupy adjacent
+positions~\cite{acpdocs2026,anp2026}. All of them are, in the vocabulary of
+this paper, \emph{point-to-point}: a client, a server, a request, a
+response. None of them has a notion of a group, a collective operation, a
+barrier, a consistency model for shared state, or a defined outcome when a
+participant dies mid-operation. They are the agent world's sockets. What is
+missing is its MPI.
+
+That absence has a measurable cost. The largest empirical study of
+multi-agent LLM failures to date, which analyses 200+ traces across seven
+frameworks, finds that the majority of failures are not reasoning failures
+at all but \emph{coordination} failures: agents that disobey a specification
+they were given, that lose track of what a peer already decided, that drop a
+step because they never learned another agent had finished, that terminate
+prematurely, or that never verify an artifact anyone
+produced~\cite{cemri2025mast}. Practitioners report the same thing from the
+other direction: Cognition's widely-read argument against multi-agent
+architectures is essentially that context does not propagate reliably
+between agents and that conflicting implicit decisions
+compound~\cite{cognition2025dontbuild}, while Anthropic's report on a
+production multi-agent research system spends most of its engineering
+discussion on exactly these problems---coordination, state, and
+recovery---rather than on prompting~\cite{anthropic2025multiagent}.
+
+Those are not new problems. They are, respectively, contract violation,
+cache coherence, synchronisation, termination detection, and validation. A
+field that has been solving them for forty years has names for all of them.
+
+\subsection{What we take from MPI, and what we cannot}
+
+This paper asks what happens if the analogy is taken seriously and pushed as
+far as it will go. The answer is: much further than we expected, and then it
+breaks in four specific and interesting places.
+
+What transfers is most of MPI's structure, and in particular its single best
+idea. A communicator is a group plus an opaque \emph{context}, and the
+context guarantees that a message sent on one communicator cannot be
+received on another. That property is what made MPI \emph{libraries}
+possible: before it, libraries reserved tag ranges by convention, and two
+libraries that disagreed produced silent, intermittent
+corruption~\cite{skjellum1994zipcode,gropp2001learning}. Multi-agent systems
+are in the pre-context era today---the dominant designs are a shared
+conversation buffer every participant reads and writes, or handoffs
+addressed by agent name---and they exhibit exactly the failure the Forum
+identified in 1993.
+
+What does not transfer is the assumption that a rank is a cheap,
+deterministic, fail-stop process with reusable memory. Concretely:
+
+\begin{enumerate}
+\item \textbf{Context is consumed, not occupied.} An MPI rank may receive a
+terabyte over a job's life while never holding more than a megabyte; memory
+pressure is a function of the peak live set. Every token an agent reads is
+retained for the rest of the conversation, so pressure is a function of
+\emph{cumulative ingest}. The right systems analogue is not \code{malloc}
+but a quota with admission control.
+
+\item \textbf{Reduction operators are semantic.} \mpiop{SUM} is
+associative, commutative, and output-size-preserving. ``Merge these two
+drafts'' is none of the three, and getting it wrong does not produce a
+rounding difference, it produces a different document.
+
+\item \textbf{Failure is not fail-stop.} Agents crash, but they also stall
+while looking perfectly alive, return confidently malformed output, and run
+out of money. Conflating these produces the two classic pathologies of agent
+harnesses: killing a slow-but-working agent, and waiting forever for a
+fast-but-broken one.
+
+\item \textbf{The cost model inverts.} In HPC a message costs microseconds
+and a floating-point operation costs sub-nanoseconds, so one optimises
+communication. An agent turn costs tens of seconds and real money, while a
+message is a file write. Communication is nearly free and computation is
+nearly everything.
+\end{enumerate}
+
+Each of these forces a specific, minimal change to the MPI design rather
+than a wholesale redesign, and \Cref{sec:mismatch,sec:design} develop them
+in turn.
+
+\subsection{Contributions}
+
+\begin{itemize}
+\item \textbf{A protocol.} \ampi{} (\Cref{sec:design}): communicators with
+isolated contexts, groups, token-bounded contract-carrying datatypes, four
+send modes including one that completes on \emph{ingestion}, the full
+collective catalogue with declared operator algebra, one-sided windows with
+reference-by-default reads and a bounded retrieval read, collective
+artifact I/O, a failure lattice with revoke/shrink/agree/replace, a
+name-shifted profiling interface and a control/performance variable
+interface.
+
+\item \textbf{A cost model} (\Cref{sec:cost}) in which the dominant term is
+agent turns on the critical path and feasibility is a hard constraint, and
+the demonstration that this inverts several of MPI's standard algorithm
+choices.
+
+\item \textbf{Two results about operator algebra} that we did not
+anticipate. A capacity-aware reduction tree must be planned against the
+root's \emph{cumulative} ingest, not its per-round ingest, because an agent
+cannot free a buffer (\Cref{sec:cost}); and a prefix scan over shared naming
+decisions requires a \emph{non-commutative} merge operator, because a
+commutative one cannot express precedence and therefore leaves participants
+disagreeing about what they agreed on (\Cref{sec:ops}).
+
+\item \textbf{An implementation} (\Cref{sec:impl}) with a swappable device
+layer and a command-line binding, so that any process able to run a shell
+command is a rank---which is what makes the protocol usable by agents that
+have no library bindings and never will.
+
+\item \textbf{An evaluation with genuine multi-agent runs}
+(\Cref{sec:eval}): a twelve-rank book translation, an eight-module
+collaborative software build judged by a frozen integration suite, and
+fault-injection runs, together with microbenchmarks to 128 ranks.
+\end{itemize}
+
+We also report, in \Cref{sec:discussion}, a coordination failure we caused
+ourselves: a launcher concurrency limit interacting with a collective's
+all-participants requirement produced a deadlock that no rank could observe
+locally. It is a good advertisement for the protocol's own diagnostics, and
+a reminder that the hard part of a multi-agent system is not the agents.

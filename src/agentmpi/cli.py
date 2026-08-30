@@ -424,6 +424,47 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_peers(args: argparse.Namespace) -> int:
+    """Read-only view of the job, without joining it.
+
+    Distinct from ``status`` on purpose.  ``status`` is a rank reporting on
+    itself and therefore joins the job, publishes a heartbeat, and persists
+    protocol counters; running it from a monitoring script would have that
+    script impersonate a rank that already exists.  Observation must not
+    perturb the thing observed, so ``peers`` opens the device and reads.
+    """
+    from .transport import JournalDevice
+
+    root = args.run_root or os.environ.get("AMPI_ROOT")
+    if not root:
+        raise SystemExit("error: --root or $AMPI_ROOT is required")
+    device = JournalDevice(root, owner="observer")
+    manifest = RunManifest.load(Path(root) / RUN_MANIFEST)
+    now = time.time()
+    rows = []
+    for rank in range(manifest.size):
+        raw = device.kv_get(f"hb/{rank}")
+        health = json.loads(raw) if raw else None
+        rows.append({
+            "rank": rank,
+            "state": (health or {}).get("state", "unseen"),
+            "turn": (health or {}).get("turn"),
+            "tokens": (health or {}).get("tokens"),
+            "pressure": (health or {}).get("pressure"),
+            "age_s": round(now - float(health["ts"]), 1) if health else None,
+        })
+    alive = [r for r in rows if r["age_s"] is not None and r["age_s"] < 120]
+    print(json.dumps({
+        "run": manifest.run_id, "size": manifest.size,
+        "seen": sum(1 for r in rows if r["age_s"] is not None),
+        "recent": len(alive),
+        "turns_total": sum(r["turn"] or 0 for r in rows),
+        "tokens_total": sum(r["tokens"] or 0 for r in rows),
+        "peers": rows,
+    }, indent=2))
+    return 0
+
+
 def cmd_checkpoint(args: argparse.Namespace) -> int:
     from .ft import checkpoint, restore
 
@@ -700,6 +741,10 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("status", help="this rank's state and its view of its peers")
     common(sp)
     sp.set_defaults(func=cmd_status)
+
+    sp = sub.add_parser("peers", help="read-only view of every rank (does not join)")
+    common(sp, needs_rank=False)
+    sp.set_defaults(func=cmd_peers)
 
     sp = sub.add_parser("checkpoint", help="save or restore this rank's state")
     common(sp)

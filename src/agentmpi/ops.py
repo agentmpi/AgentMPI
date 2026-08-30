@@ -157,6 +157,43 @@ def _union_merge(a: Any, b: Any) -> Any:
     return out
 
 
+def _first_wins(a: Any, b: Any) -> Any:
+    """Key-wise merge in which the *left* operand wins every conflict."""
+    return {**(b or {}), **(a or {})}
+
+
+FIRST = Op(
+    name="AMPI_FIRST",
+    fn=_first_wins,
+    commute=False,
+    idempotent=True,
+    associative=True,
+    identity={},
+    doc="Key-wise merge, earliest contributor wins.  Associative and "
+        "idempotent but deliberately NOT commutative, and the distinction is "
+        "load bearing.  A prefix scan whose operator is commutative cannot "
+        "express precedence: if two ranks independently propose a value for "
+        "the same key, a commutative merge has no basis for choosing between "
+        "them, so different ranks can end up with different prefixes and the "
+        "very disagreement the scan was supposed to remove survives it. "
+        "AMPI_FIRST gives the earliest rank authority, which makes the scan's "
+        "result a function of rank order alone and therefore identical "
+        "everywhere.  This is the operator to use for shared naming "
+        "decisions, schema choices, and any other convention that merely "
+        "needs to be agreed rather than to be right.",
+)
+
+LAST = Op(
+    name="AMPI_LAST",
+    fn=lambda a, b: {**(a or {}), **(b or {})},
+    commute=False,
+    idempotent=True,
+    associative=True,
+    identity={},
+    doc="Key-wise merge, latest contributor wins; the mirror of AMPI_FIRST, "
+        "for conventions that should be overridden by later revisions.",
+)
+
 UNION = Op(
     name="AMPI_UNION",
     fn=_union_merge,
@@ -361,8 +398,8 @@ def summarize_op(
 
 BUILTIN_OPS: dict[str, Op] = {
     op.name.lower(): op
-    for op in (CONCAT, MERGE_JSON, UNION, VOTE, MAX_BY_SCORE, SUM, MAX, MIN,
-               LAND, LOR, PATCH_MERGE)
+    for op in (CONCAT, MERGE_JSON, UNION, FIRST, LAST, VOTE, MAX_BY_SCORE,
+               SUM, MAX, MIN, LAND, LOR, PATCH_MERGE)
 }
 BUILTIN_OPS.update({k.removeprefix("ampi_"): v for k, v in list(BUILTIN_OPS.items())})
 

@@ -1,0 +1,369 @@
+\section{The \ampi{} protocol}
+\label{sec:design}
+
+\ampi{} specifies an interface and a set of semantics; it specifies neither
+an implementation nor a policy for what agents do. This section presents the
+protocol; \Cref{sec:impl} presents our reference implementation of it.
+
+Names follow MPI's, deliberately: an operation that behaves like
+\mpiop{Bcast} is called \op{Bcast}, and one that behaves differently gets a
+different name. \Cref{tab:catalogue} summarises the surface.
+
+\begin{table*}[t]
+\centering
+\small
+\caption{The \ampi{} operation catalogue, with the MPI operation each
+derives from and the semantic change, if any. ``---'' means the semantics
+are MPI's, read over agent payloads.}
+\label{tab:catalogue}
+\begin{tabular}{@{}p{0.20\textwidth}p{0.17\textwidth}p{0.57\textwidth}@{}}
+\toprule
+\textbf{\ampi{}} & \textbf{From} & \textbf{Change} \\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Identity and groups}}\\
+\op{Init}, \op{Finalize} & \mpiop{Init} & Idempotent and resumable; late join is normal, not exceptional.\\
+\op{Comm\_rank}, \op{Comm\_size} & same & ---\\
+\op{Comm\_dup} & same & ---; derives the new context id deterministically, so no extra round trip.\\
+\op{Comm\_split} & same & ---\\
+\op{Comm\_split\_type} & \mpiop{COMM\_TYPE\_SHARED} & Splits by shared \emph{model}, provider, host or context store rather than shared memory.\\
+\op{Group\_*} & same & Adds capability predicates; ranks are heterogeneous by construction.\\
+\op{Intercomm\_create} & same & ---\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Types}}\\
+\op{Type\_contract} & --- & New. Attaches a checkable schema; violation is a transport-level error class.\\
+\op{Type\_bounded} & --- & New. Attaches a token bound and a digest function.\\
+\op{Type\_struct}, \op{Type\_contiguous} & same & Bounds compose.\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Point to point}}\\
+\op{Send}/\op{Recv}/\op{Isend}/\op{Irecv} & same & Receive performs admission control and contract checking.\\
+\op{Ssend} & \mpiop{Ssend} & Completes on \emph{ingestion} by the peer, not on the receive having begun.\\
+\op{Bsend}, \op{Rsend} & same & ---\\
+\op{Mprobe}/\op{Mrecv} & same & ---\\
+\op{Psend\_init}/\op{Pready} & MPI-4 partitioned & ---; maps onto incremental generation.\\
+\op{Waitsome} & same & Promoted: heavy-tailed turn times make it the default idiom.\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Collectives}}\\
+\op{Barrier} & same & Rootless by default; a rooted barrier makes the root a single point of failure at the worst moment.\\
+\op{Bcast} & same & Optional \emph{refracting} relay: interior nodes may transform the payload for their subtree.\\
+\op{Scatter}/\op{Scatterv}/\op{Gather}/\op{Gatherv} & same & Payloads travel by reference; materialisation is explicit.\\
+\op{Allgather} & same & ---, but the runtime reports infeasibility, since peak ingest is $(p{-}1)s$ by definition.\\
+\op{Reduce}/\op{Allreduce}/\op{Reduce\_scatter} & same & Operators declare algebra; illegal schedules are refused.\\
+\op{Scan}/\op{Exscan} & same & ---; the primitive that breaks carried dependencies.\\
+\op{Alltoall} & same & ---\\
+\op{Neighbor\_*} & MPI-3 & ---\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{One sided}}\\
+\op{Win\_create}, \op{Put}, \op{Accumulate} & same & ---\\
+\op{Get} & \mpiop{Get} & Returns a \emph{reference}; materialisation is a separate, charged operation.\\
+\op{Win\_query} & --- & New. Bounded retrieval read, for windows larger than any reader.\\
+\op{Win\_fence}, PSCW, lock/unlock & same & Locks are leased, so a dead holder cannot wedge the run.\\
+\op{Fetch\_and\_op}, \op{Compare\_and\_swap} & same & ---\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{I/O and faults}}\\
+\op{File\_write\_at\_all} & MPI-IO two-phase & ---; aggregation eliminates merge conflicts rather than seek overhead.\\
+\op{Comm\_revoke}/\op{shrink}/\op{agree} & ULFM & ---\\
+\op{Comm\_replace} & FT-MPI \code{REBUILD} & Promoted to the recommended path: rank state is kilobytes.\\
+\op{Checkpoint}/\op{Restore} & --- & Uncoordinated; the durable journal removes the domino effect.\\
+\midrule
+\multicolumn{3}{@{}l}{\emph{Tools}}\\
+\code{PAMPI\_*} & PMPI & ---\\
+\op{T} cvars/pvars & \mpiop{T} & Adds policy knobs (contract strictness, budgets) alongside performance knobs.\\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Ranks, groups, communicators}
+
+A \emph{rank} is an identity, not a process: an index within a communicator,
+plus a \code{RankSpec} recording role, model, provider, host, context store,
+capacity, price and tool permissions. MPI needs no such record because ranks
+are fungible; \ampi{} ranks are heterogeneous by construction, and both
+\op{Comm\_split\_type} and cost-aware algorithm selection consult it.
+
+Groups are local, ordered sets of ranks with the usual algebra
+(\code{incl}, \code{excl}, union, intersection, difference, translation) plus
+capability predicates. Keeping groups separate from communicators is worth
+more here than in MPI: a harness can retain the pre-failure membership and
+compute exactly which ranks were lost without any communication.
+
+A communicator is a group plus a context, with MPI's guarantee: a message
+sent on one is never matched on another. \op{Comm\_dup} is the composition
+primitive of \Cref{sec:bg-contexts} and costs nothing---we derive the child
+context id deterministically from the parent's context and its collective
+counter, which is legitimate because the standard already requires
+collectives to be issued in a consistent order on every rank, and which
+removes a round trip from the most frequently used operation in any layered
+harness.
+
+\op{Comm\_split\_type} deserves a note. MPI-3 added
+\mpiop{COMM\_TYPE\_SHARED} so a program could discover which ranks share
+physical memory and specialise. The agent analogue is the set of ranks
+sharing a resource with coherent cost: the same model (a handoff costs no
+re-grounding), the same provider quota (they contend), or the same context
+store (they can exchange references instead of content). Placing the chatty
+part of a computation inside such an island is the same optimisation.
+
+\subsection{Datatypes: contract and bound}
+
+An MPI datatype answers one question: how are these bytes laid out? That
+suffices because sender and receiver are the same deterministic program. An
+\ampi{} datatype answers three:
+
+\begin{enumerate}
+\item \textbf{Layout}: how is the payload rendered into a prompt?
+\item \textbf{Contract}: what may the receiver assume, and how is that
+checked on arrival? A JSON type carries a schema; a patch type checks that
+it is a unified diff; user validators compose.
+\item \textbf{Bound}: how many tokens may an instance cost, and how is an
+oversized instance reduced?
+\end{enumerate}
+
+The third is the load-bearing one, and it exists because of M1. MPI's
+\code{count} and \code{datatype} let a receiver size a buffer, and an
+oversized message is a program error
+(\mpiop{ERR\_TRUNCATE}). In \ampi{} the receiver's buffer is its context
+window: small, permanently consumed, and shared with everything else the
+agent is doing. So the bound travels with the type, and the runtime is
+empowered to \emph{reduce} an oversized payload rather than reject it. A
+type declares itself lossy or not; a lossy type carries a digest function; a
+non-lossy type that does not fit raises \op{ERR\_CONTEXT\_OVERFLOW}.
+
+Making the bound part of the type---rather than a parameter of each
+call---is what lets the runtime predict a collective's peak ingest before
+any data exists, which is the precondition for capacity-aware algorithm
+selection (\Cref{sec:cost}).
+
+\subsection{Point-to-point}
+\label{sec:design-p2p}
+
+Matching is MPI's, including the rules that carry the semantic weight: a
+receive matches on \code{(context, source, tag)} with wildcards for source
+and tag; \textbf{non-overtaking} holds between a pair on a communicator;
+unmatched arrivals and unmatched receives are queued. Three rules are added,
+all forced by the executor:
+
+\begin{itemize}
+\item \textbf{Deduplication.} Delivery is at-least-once---a retried send, a
+resurrected rank replaying its log---so a message is matched at most once
+per idempotency key.
+\item \textbf{Epoch filtering.} After a shrink, messages sent in a previous
+epoch by ranks that no longer exist must not match, or a recovered run
+consumes stale work.
+\item \textbf{Admission control.} A match completes only if the payload fits
+the receiver's budget; otherwise it is digested (if the type permits) or
+fails recoverably.
+\end{itemize}
+
+There is one further departure, in the non-overtaking rule itself. MPI can
+assume the network eventually delivers everything. \ampi{} cannot: the rank
+that owes us sequence $k$ may be dead, and blocking forever on a message
+with no sender is the failure mode we are trying to eliminate. The matching
+engine therefore holds a sequence gap for a bounded time and then advances
+past it, recording the skip in the trace. This is a deliberate, visible
+weakening of a guarantee in exchange for liveness, and we prefer it stated
+in the protocol over discovered in production.
+
+The four send modes are MPI's, but \op{Ssend} is strictly stronger than
+\mpiop{Ssend}. MPI's synchronous send completes when the matching receive
+has \emph{begun}; \ampi{}'s completes when the destination has
+\emph{ingested} the message into its context. The stronger form is the
+useful one: a handoff protocol needs to know that a peer has been told
+something, not that a buffer was drained.
+
+Partitioned communication (MPI-4) maps onto agents unusually well. A
+generating agent produces output incrementally; a consumer that waits for
+the whole document idles for the entire generation. \op{Psend\_init} plus
+\op{Pready} lets the consumer start on section one while section two is
+being written, converting a serial dependency into a pipeline.
+
+\subsection{Collectives and the algebra of operators}
+\label{sec:ops}
+
+The catalogue is MPI's. What is new is that an operator must declare its
+algebra, and that the runtime enforces it.
+
+An \op{Op} carries: \code{commute}, \code{associative}, \code{idempotent},
+and \code{output\_tokens}, an optional bound on its output size. From these
+the runtime derives which schedules are legal:
+
+\begin{itemize}
+\item A \textbf{non-associative} operator (a vote) may only be evaluated by
+a flat reduction. Reassociating it changes the answer, and a protocol whose
+answer depends on the rank count is not one anybody can build on. MPI
+silently reassociates and accepts a last-bit discrepancy; \ampi{} refuses,
+because the discrepancy is not in the last bit.
+\item A \textbf{non-contracting} operator (output no smaller than input)
+may not be used in a multi-level tree, whose peak ingest would grow with
+depth. The runtime says so, and names the fix.
+\item A \textbf{commutative, idempotent, contracting} operator admits any
+tree and tolerates duplicate delivery. Under at-least-once delivery this is
+the class to prefer, and the protocol makes that visible rather than
+folkloric.
+\end{itemize}
+
+Operators also come in an $n$-ary form, which is preferred when the inputs
+fit. This is not an optimisation but a quality decision: an agent asked to
+merge eight drafts at once does a better job than one asked to merge two at
+a time three times, because pairwise merging discards cross-cutting
+information at every step.
+
+\paragraph{A commutative merge cannot express precedence.}
+We expected the natural operator for reconciling shared naming decisions to
+be a union. It is not, and the reason is instructive. Consider a book
+translated by $p$ agents that must agree on how to render each recurring
+proper noun. Expressed as an exclusive scan, chunk $i$ receives the merged
+decisions of chunks $0..i-1$ and adopts them. With a commutative union
+operator, two chunks that independently propose different renderings for the
+same name both contribute, and a later chunk's prefix contains
+\emph{both}---with no basis for choosing. Different ranks then see different
+prefixes, choose differently, and the disagreement the scan existed to
+remove survives it. We measured 0.82 declared consistency with a union
+operator where the protocol could have delivered 1.0.
+
+The fix is a deliberately \emph{non-commutative} operator, \op{FIRST}: a
+key-wise merge in which the left operand wins. It is associative and
+idempotent, so every tree shape and any amount of duplicate delivery give
+the same result, but it is not commutative, and that is exactly what makes
+the prefix a function of rank order alone and therefore identical
+everywhere. With \op{FIRST} the same experiment yields 1.0
+(\Cref{sec:eval-translation}).
+
+We state the general principle, because it applies to any shared convention
+an agent team must settle---schema choices, naming, file layout, API shape:
+
+\begin{principle}
+A collective that exists to make participants \emph{agree} requires an
+operator that can express precedence, and precedence is inexpressible in a
+commutative operator. Commutativity is the wrong default for consensus even
+though it is the right default for aggregation.
+\end{principle}
+
+\paragraph{Refracting broadcast.}
+In MPI an interior node of a broadcast tree forwards bytes verbatim. An
+agent interior node can also \emph{adapt} the payload for its subtree:
+translate it, specialise it, compress it. \op{Bcast} accepts an optional
+relay function, giving the same logarithmic schedule with a transformation
+at each level. This is strictly more expressive and strictly more dangerous,
+and the protocol makes the danger visible rather than preventing it: every
+envelope carries a provenance chain, so a receiver can see how many times
+its copy was rewritten.
+
+\subsection{One-sided operations: the blackboard}
+\label{sec:design-rma}
+
+The most common complaint about multi-agent systems is that agents cannot
+see what other agents learned. Every framework's answer is a shared
+scratchpad, and every one of them is an unsynchronised shared-memory system:
+no epochs, no consistency model, no atomicity, no bound on growth. Those are
+the problems MPI-2's RMA chapter is about.
+
+\ampi{} windows provide put, get, accumulate, get-accumulate,
+fetch-and-op and compare-and-swap, under the three MPI synchronisation
+regimes (collective fence, scoped post/start/complete/wait, passive-target
+lock/unlock). Atomicity is what makes a blackboard safe for concurrent
+writers, and it is what every hand-rolled scratchpad lacks: two agents that
+both append to a findings list with read-then-write will lose one of the
+findings, intermittently, and the harness will look like a model quality
+problem.
+
+Two departures. First, \op{Get} returns a \emph{reference}, not content. An
+MPI \mpiop{Get} of a megabyte costs microseconds and no lasting resource; an
+agent reading a megabyte has spent a third of its working life.
+Materialisation is a separate operation with a visible price, so a rank can
+hold a working set of hundreds of window entries for a few dozen tokens and
+pay only for what it reads. The window's \emph{index}---every key with its
+size, version and owner, but no content---is correspondingly cheap, which
+means a rank can know what exists even when it could not possibly read it
+all.
+
+Second, \op{Win\_query} has no MPI counterpart and is necessary for a
+structural reason: the window may be orders of magnitude larger than any
+participant's context, so ``read the shared state'' cannot mean ``read all
+of it''. The operation returns the highest-scoring entries that fit a token
+budget, together with an explicit list of what was omitted, so the caller
+knows it received a projection rather than the truth. We take this to be the
+correct systems framing of what the retrieval-augmented-generation
+literature has been building: not a way to make a model smarter, but the
+read operation of a shared memory whose readers are smaller than it is.
+
+Locks are leased. An agent that dies holding a lock must not stop the run,
+and the lease expiry is recorded in the trace as a stolen lock---a far
+better outcome than an unexplained hang. Locking is per-key rather than
+per-window, because a whole-window lock serialises the entire team behind
+whichever agent is currently thinking, which can be minutes.
+
+\subsection{Collective I/O}
+
+\op{File\_write\_at\_all} is ROMIO's two-phase collective write with the
+motivation changed. Phase one redistributes: every rank ships its
+contribution to the aggregator responsible for the file. Phase two writes:
+the aggregator assembles the contributions in rank order and performs one
+atomic publish. In MPI this exists to turn many small unaligned writes into
+one large aligned one; here it exists so that exactly one writer touches
+each artifact and there is therefore no merge conflict to resolve. File
+views let a rank declare the region it owns, and overlapping views are
+reported at declaration time rather than discovered as a conflict later.
+
+\subsection{The failure model}
+\label{sec:ft}
+
+The lattice of M3 is protocol-visible: a rank is \code{active},
+\code{blocked}, \code{failed}, \code{stalled}, \code{drifted},
+\code{bankrupt}, \code{evicted} or \code{finalized}, and the error classes
+follow---\op{ERR\_PROC\_FAILED} and \op{ERR\_REVOKED} from ULFM, plus
+\op{ERR\_STALLED}, \op{ERR\_CONTRACT}, \op{ERR\_DRIFT} and
+\op{ERR\_BUDGET}.
+
+Detection uses two independent signals. A \emph{heartbeat} says the process
+exists; a \emph{progress} report says it is getting somewhere. A detector
+built on the first alone cannot see a healthy infinite loop; one built on
+the second alone cannot distinguish a long turn from a dead process. Ranks
+that can run a background thread heartbeat continuously; ranks that cannot
+(an agent whose only interface is a shell, invoking the protocol once per
+operation) fall back to inferring liveness from activity, and the runtime
+reports which mode a rank is in so the harness can set the timeout
+accordingly rather than guessing. We regard this as an honest limitation
+rather than a solved problem, and \Cref{sec:eval-faults} measures its cost.
+
+Recovery is ULFM's, with one addition. \op{Comm\_revoke} invalidates a
+communicator everywhere, converting a deadlock into an error; it is the one
+thing an application genuinely cannot build for itself, because a rank
+blocked on a peer that will never send has no way to notice on its own. Our
+devices make propagation reliable for free: the revocation is a durable
+record, so it survives the revoker. \op{Comm\_agree} is a two-phase
+early-returning agreement whose decision is written with compare-and-swap,
+so a second decider cannot overwrite one that peers have already read.
+\op{Comm\_shrink} agrees on the survivor set first and \emph{intersects}
+rather than unions the proposals, because a rank some survivors will not
+talk to must be treated as dead.
+
+The addition is \op{Comm\_replace}: respawn the failed ranks, keeping their
+indices. A shrink renumbers everything, which is correct and painful,
+because the harness's data distribution---``rank $i$ owns chapter
+$i$''---was written against the old indices. An agent rank's state is a role
+and a checkpoint, so replacement is cheap and preserves the distribution.
+The protocol does not know how to create an agent; \code{spawn} is supplied
+by the executor backend, exactly as MPI defers to a process manager.
+
+Checkpoints are local and \emph{uncoordinated}. Coordinated checkpointing
+exists because uncoordinated checkpointing plus message replay can cascade
+into the domino effect~\cite{Chandy1985,Elnozahy2002}, and that argument
+depends on replay being the only way to reconstruct a lost message. Here it
+is not: every message ever sent is durable and content-addressed in the
+journal, so a restarted rank reads what it missed instead of forcing peers
+to resend. Removing the need for coordination removes the domino effect with
+it, and is the largest simplification the durable-journal design buys.
+
+\subsection{Tools}
+
+\ampi{} specifies its profiling interface as part of the protocol. Every
+operation is routed through a profiler emitting a documented event
+stream---enter/leave states and matched send/receive arrows, following
+OTF2's and SLOG-2's model, with token and currency counters on every
+event~\cite{knupfer2012scorep}. That model is what makes Gantt timelines,
+communication matrices and critical-path analysis possible, and it transfers
+unchanged. \op{T} exposes control variables (the eager limit in tokens,
+collective algorithm selection, contract strictness, budgets) and
+performance variables (tokens sent and ingested, turns, rounds, digests,
+stalls, cache hit rate, spend). Both exist because the alternative---per
+framework, incompatible, bolted on---is where the field is now.

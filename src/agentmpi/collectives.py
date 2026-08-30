@@ -60,19 +60,32 @@ _PHASE_BITS = 5
 _COLL_BASE = int(InternalTag.COLL)
 
 
-def _next_coll_id(comm) -> int:
-    """Advance this communicator's collective counter.
+def _next_coll_id(comm, name: str = "?") -> int:
+    """Advance this communicator's collective counter and record what it was.
 
     Kept in durable runtime state for the same reason as the message
     sequence counter: when each collective is a separate ``ampi`` invocation,
     an in-memory counter would restart at zero every time and successive
     collectives would collide on the same tag.
+
+    Recording the *name* alongside the number is what makes a skipped
+    collective diagnosable.  Every internal envelope carries the pair, and a
+    rank that receives ``(#4, "exscan")`` when it executed ``#4`` as
+    ``"scatterv"`` knows immediately that a peer has fallen out of step --
+    rather than waiting forever for a tag that peer will never use.
     """
     key = comm.context
     nxt = comm.runtime.coll_counter.get(key, 0) + 1
     comm.runtime.coll_counter[key] = nxt
     comm._coll_counter = nxt
+    comm.runtime.record_collective(comm.context, nxt, name)
+    comm._active_coll = (name, nxt)
     return nxt
+
+
+def _coll_meta(comm, cid: int) -> dict[str, Any]:
+    name, _ = getattr(comm, "_active_coll", ("?", cid))
+    return {"c": name, "i": cid}
 
 
 def _tag(coll_id: int, phase: int = 0) -> int:
@@ -89,6 +102,7 @@ def _tag(coll_id: int, phase: int = 0) -> int:
 
 
 def _emit(comm, op: str, algorithm: str, steps: int, t0: float, **detail: Any) -> None:
+    comm._active_coll = None
     comm.runtime.profiler.emit(
         Event(kind="coll", ts=time.time(), rank=comm.runtime.world_rank, op=op,
               context=comm.context, algorithm=algorithm, dur=time.time() - t0,
@@ -295,7 +309,7 @@ def barrier(comm, *, algorithm: CollAlgorithm | str = CollAlgorithm.AUTO,
     if p == 1:
         return
     sel = select_algorithm("barrier", p, 0, comm.runtime.budget.headroom, requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "barrier")
     steps = 0
     if sel.algorithm is CollAlgorithm.DISSEMINATION:
         distance = 1
@@ -362,7 +376,7 @@ def bcast(
     item_tokens = _tokens_of(value) if rank == root else 0
     sel = select_algorithm("bcast", p, item_tokens, comm.runtime.budget.headroom,
                            requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "bcast")
     steps = 0
     depth = 0
 
@@ -461,7 +475,7 @@ def _scatter_impl(comm, values, root, datatype, algorithm, timeout, variable):
     item_tokens = max((_tokens_of(v) for v in (values or [])), default=0)
     sel = select_algorithm("scatter", p, item_tokens, comm.runtime.budget.headroom,
                            requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "scatterv" if variable else "scatter")
     mine: Any = None
     steps = 0
 
@@ -547,7 +561,7 @@ def gather(
     item_tokens = _tokens_of(value)
     sel = select_algorithm("gather", p, item_tokens, comm.runtime.budget.headroom,
                            requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "gather")
     steps = 0
     result: list[Any] | None = None
 
@@ -624,7 +638,7 @@ def allgather(
                         f"p={p} is not a power of two; Bruck's algorithm gives the "
                         f"same logarithmic round count without a remainder phase",
                         sel.predicted_steps, sel.predicted_peak_ingest, sel.feasible)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "allgather")
     steps = 0
 
     if sel.algorithm is CollAlgorithm.RECURSIVE_DOUBLING and (p & (p - 1)) == 0:
@@ -693,7 +707,7 @@ def allgather_raw(comm, value: Any) -> list[Any]:
     p, rank = comm.size, comm.rank
     if p == 1:
         return [value]
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "allgather_raw")
     slots: dict[int, Any] = {rank: value}
     for r in range(p):
         if r != rank:
@@ -733,7 +747,7 @@ def reduce(
     item_tokens = _tokens_of(value)
     sel = select_algorithm("reduce", p, item_tokens, comm.runtime.budget.headroom,
                            op=operation, requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "reduce")
     steps = 0
     result: Any = None
 
@@ -816,7 +830,7 @@ def allreduce(
     item_tokens = _tokens_of(value)
     sel = select_algorithm("allreduce", p, item_tokens, comm.runtime.budget.headroom,
                            op=operation, requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "allreduce")
     steps = 0
 
     if sel.algorithm is CollAlgorithm.RECURSIVE_DOUBLING and (p & (p - 1)) == 0 \
@@ -882,7 +896,7 @@ def reduce_scatter(
     t0 = time.time()
     if p == 1:
         return values[0]
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "reduce_scatter")
     inbox: list[Any] = [values[rank]]
     for r in range(p):
         if r != rank:
@@ -922,7 +936,7 @@ def alltoall(
     item_tokens = max((_tokens_of(v) for v in values), default=0)
     sel = select_algorithm("alltoall", p, item_tokens, comm.runtime.budget.headroom,
                            requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "alltoall")
     received: list[Any] = [None] * p
     received[rank] = values[rank]
     steps = 0
@@ -984,7 +998,7 @@ def scan(
                       operation=operation.name)
     sel = select_algorithm("scan", p, _tokens_of(value), comm.runtime.budget.headroom,
                            op=operation, requested=algorithm)
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "scan" if inclusive else "exscan")
     steps = 0
 
     if sel.algorithm is CollAlgorithm.CHAIN:
@@ -1069,7 +1083,7 @@ def neighbor_allgather(
 
     srcs, dsts = neighbors_of(comm)
     t0 = time.time()
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "neighbor_allgather")
     for d in dsts:
         comm.send(value, d, _tag(cid, 0), datatype)
     got: dict[int, Any] = {}
@@ -1092,7 +1106,7 @@ def neighbor_alltoall(
         raise ArgError("one value per outgoing neighbour is required",
                        got=len(values), degree=len(dsts))
     t0 = time.time()
-    cid = _next_coll_id(comm)
+    cid = _next_coll_id(comm, "neighbor_alltoall")
     for v, d in zip(values, dsts):
         comm.send(v, d, _tag(cid, 0), datatype)
     got: dict[int, Any] = {}
