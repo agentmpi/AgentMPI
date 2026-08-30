@@ -1,4 +1,4 @@
-# AgentMPI 1.0 — Protocol Specification
+# AgentMPI 0.1 — Draft Protocol Specification
 
 This document is the language-independent specification. The Python package
 `agentmpi` and the `python -m agentmpi` CLI are bindings, not the protocol.
@@ -10,7 +10,7 @@ matching, progress, and failure rules below.
 Copied from the MPI Forum's 1994 goals and rewritten for executors that
 think, forget, and die:
 
-| MPI 1.0 goal | AgentMPI 1.0 goal |
+| MPI 1.0 goal | AgentMPI 0.1 goal |
 |---|---|
 | Application programming interface, not a compiler | Interface for harness authors, not a framework or runtime product |
 | Efficient communication; overlap compute and transfer | Eager/rendezvous split so large artifacts never enter a prompt |

@@ -1,7 +1,7 @@
 export default function SpecPage() {
   return (
     <main className="mx-auto w-full max-w-3xl flex-1 px-4 py-10 md:px-6">
-      <p className="text-xs uppercase tracking-[0.2em] text-accent">AgentMPI 1.0</p>
+      <p className="text-xs uppercase tracking-[0.2em] text-accent">AgentMPI 0.1 draft</p>
       <h1
         className="mt-3 text-4xl font-semibold"
         style={{ fontFamily: "var(--font-source-serif), Georgia, serif" }}
