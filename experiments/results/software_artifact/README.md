@@ -10,7 +10,7 @@ than one task can run, so the scheduling policy is reproducible.
 From the project directory:
 
 ```console
-python -m minidag examples/build.json --jobs 2
+python3 -m minidag examples/build.json --jobs 2
 ```
 
 The installed console script is equivalent:
@@ -31,12 +31,12 @@ Input is UTF-8 JSON with this shape:
   "tasks": [
     {
       "name": "compile",
-      "command": ["python", "-c", "print('compiled')"],
+      "command": ["python3", "-c", "print('compiled')"],
       "deps": []
     },
     {
       "name": "test",
-      "command": ["python", "-c", "print('tested')"],
+      "command": ["python3", "-c", "print('tested')"],
       "deps": ["compile"]
     }
   ]
@@ -68,14 +68,14 @@ graph = Graph()
 graph.add(
     Task(
         name="compile",
-        command=("python", "-c", "print('compiled')"),
+        command=("python3", "-c", "print('compiled')"),
         deps=(),
     )
 )
 graph.add(
     Task(
         name="test",
-        command=("python", "-c", "print('tested')"),
+        command=("python3", "-c", "print('tested')"),
         deps=("compile",),
     )
 )
