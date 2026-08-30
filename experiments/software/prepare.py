@@ -10,7 +10,6 @@ from typing import Any
 
 from agentmpi import Runtime
 
-
 SESSION = "dag-dev"
 SIZE = 13
 INTEGRATOR = 12
@@ -18,8 +17,13 @@ INTERFACE = {
     "project": "minidag",
     "goal": "A dependency-free Python 3.11 library and CLI for deterministic DAG execution.",
     "public_api": {
-        "minidag.graph.Task": "frozen dataclass(name: str, command: tuple[str, ...], deps: tuple[str, ...])",
-        "minidag.graph.Graph": "add(task), validate(), topological_order(), ready(completed, running)",
+        "minidag.graph.Task": (
+            "frozen dataclass(name: str, command: tuple[str, ...], "
+            "deps: tuple[str, ...])"
+        ),
+        "minidag.graph.Graph": (
+            "add(task), validate(), topological_order(), ready(completed, running)"
+        ),
         "minidag.parser.load": "load(path: Path) -> Graph from strict JSON",
         "minidag.scheduler.Scheduler": "claim(), complete(name, success), snapshot()",
         "minidag.executor.execute": "execute(graph, jobs=1) -> RunResult",
@@ -181,7 +185,10 @@ minidag = "minidag.cli:main"
             "dependency_tag": "DONE",
             "review_tag": "REVIEW",
             "final_tag": "FINAL",
-            "locking": "Every file mutation uses an AgentMPI lease lock named file:<relative-path>.",
+            "locking": (
+                "Every mutation uses an AgentMPI lease lock named "
+                "file:<relative-path>."
+            ),
         },
     }
     manifest_path.parent.mkdir(parents=True, exist_ok=True)

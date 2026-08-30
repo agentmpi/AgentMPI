@@ -9,9 +9,9 @@ import time
 from pathlib import Path
 from typing import Any
 
-from agentmpi import Runtime
-
 from prepare import SESSION
+
+from agentmpi import Runtime
 
 
 def command_result(command: list[str], cwd: Path) -> dict[str, Any]:
