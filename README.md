@@ -2,27 +2,23 @@
 
 **Agent Message Passing Interface** — a portable protocol for writing multi-agent harnesses, in the tradition of MPI.
 
-This is not a multi-agent product. It is the interface people use to write their own: point-to-point matching, binomial-tree broadcast, Bruck barrier and allgather, recursive-doubling allreduce, RMA windows and locks, communicator split/spawn, ULFM-shaped revoke/agree/shrink, and a context-token budget so a rank can fail with OOM instead of silently overflowing.
+This is not a multi-agent product. It is the interface people use to write their own: point-to-point matching, collectives, RMA windows and locks, communicator split/spawn, ULFM-shaped revoke/agree/shrink, and a context-token budget so a rank can fail with OOM instead of silently overflowing.
 
-## Repository layout
+Two reference bindings ship in this repository:
 
-| Path | What |
-|---|---|
-| `agentmpi/` | Reference implementation (Python API + CLI) |
-| `spec/AGENTMPI.md` | Language-independent protocol |
-| `paper/agentmpi.md` | First academic paper |
-| `experiments/` | Harnesses: translation, collab kvstore, fault study, 100-rank scale |
-| `tests/` | Algorithm and collective tests |
-| `web/` | Results dashboard |
+| Binding | Path | Fabric | Role |
+|---|---|---|---|
+| Filesystem / algorithmic | `agentmpi/` | POSIX mailboxes, binomial/Bruck/doubling collectives | Default SPMD API (`COMM_WORLD.send`, `bcast`, …) |
+| SQLite / durable | `src/agentmpi/` | WAL database, no resident broker | Inspectable semantic oracle, independent processes |
 
-## Install and test
+The protocol is transport-neutral (`SPEC.md`, `spec/AGENTMPI.md`). A harness can map the same calls to files, SQLite, NATS, Kafka, or gRPC.
+
+## Quick start (filesystem binding)
 
 ```bash
 python3 -m pip install -e ".[dev]"
 python3 -m pytest tests/ -q
 ```
-
-## Write a harness
 
 ```python
 from agentmpi import Init, Finalize, COMM_WORLD
@@ -33,8 +29,6 @@ COMM_WORLD.gather(work(mine), root=0)
 COMM_WORLD.barrier()
 Finalize()
 ```
-
-Or launch ranks as processes:
 
 ```bash
 python3 -m agentmpi.runtime -n 8 -- python3 my_harness.py
@@ -48,10 +42,9 @@ python3 -m agentmpi send --dest 0 --tag 2 --file result.json
 python3 -m agentmpi barrier
 ```
 
-## Reproduce the experiments
+## Reproduce the filesystem experiments
 
 ```bash
-python3 experiments/data/build_corpus.py   # already shipped as experiments/data/aesop_fables.json
 python3 experiments/microbench.py
 python3 experiments/translation/harness.py -n 16 --limit 64
 python3 experiments/collab/harness.py
@@ -59,14 +52,14 @@ python3 experiments/fault/harness.py
 python3 experiments/scale/harness.py -n 100
 ```
 
-## Dashboard
+SQLite-binding experiments and the 100-process / fail-stop scripts live under `scripts/` and `experiments/translation`, `experiments/software`.
 
-```bash
-cd web && npm install && npm run dev -- --port 43147 --hostname 127.0.0.1
-```
+## Paper and dashboard
+
+- Narrative paper: `paper/agentmpi.md`
+- Conference LaTeX draft: `paper/main.tex`
+- Dashboard: `cd web && npm install && npm run dev` (port 43147)
 
 ## Why this exists
 
-MPI is the thing HPC authors write against so they are not also inventing a network stack. Multi-agent authors are still inventing the network stack — in every framework, every time, and usually without a matching rule, a lock, or a story for executor death. AgentMPI is the missing layer. MCP is tools. A2A is pairwise discovery. This is SPMD message passing.
-
-See `paper/agentmpi.md` for the history, the algorithms, and the measurements.
+MPI is the thing HPC authors write against so they are not also inventing a network stack. Multi-agent authors are still inventing the network stack — in every framework, every time, and usually without a matching rule, a lock, or a story for executor death. MCP is tools. A2A is pairwise discovery. AgentMPI is SPMD message passing.
