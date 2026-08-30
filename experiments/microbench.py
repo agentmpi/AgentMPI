@@ -323,6 +323,35 @@ Return ONLY a JSON object: {{"title": "<short>", "findings": ["[F-x-y] <item>", 
 
 {inputs}"""
 
+def merge_contract(budget: int) -> ampi.Contract:
+    """The merge contract, with the token budget *enforced* rather than advised.
+
+    An earlier version omitted ``max_tokens``, so the budget existed only as a sentence
+    in the prompt. It was therefore not a constraint, and the population treated it as
+    one: measured across ten merges, eight exceeded the stated 450-token budget, by up to
+    55%. Combined with re-encoding (see :func:`agentmpi.experiments.common.make_fact_report`),
+    that is the full explanation for why retention never fell -- an operator that may both
+    compress *and* overflow is never forced to discard anything.
+
+    With ``max_tokens`` on the contract the runtime checks the output, rejects it, and
+    retries with the diagnosis appended --- the ordinary failure-class-F3 path. Only then
+    is the budget a budget. The mechanism was there the whole time and the harness did not
+    use it, which is the same mistake this paper accuses agent frameworks of making.
+    """
+    return ampi.Contract(
+        name="MergedReport",
+        kind="json",
+        required=("title", "findings"),
+        nonempty=("findings",),
+        max_tokens=budget,
+        semantics=(
+            "findings must contain complete, verbatim items. If they do not all fit in "
+            "max_tokens, omit whole items rather than abbreviating or re-encoding any."
+        ),
+    )
+
+
+#: Kept for call sites that do not enforce a budget.
 MERGE_CONTRACT = ampi.Contract(
     name="MergedReport", kind="json", required=("title", "findings"), nonempty=("findings",)
 )
@@ -367,7 +396,7 @@ def bench_fidelity(cfg: argparse.Namespace) -> dict[str, Any]:
             commutative=False,
             associativity=Associativity.APPROX,
             output_tokens=cfg.merge_budget,
-            contract=MERGE_CONTRACT,
+            contract=merge_contract(cfg.merge_budget),
             # Only the k-ary algorithm can use the variadic kernel, but attaching it
             # unconditionally keeps the operator identical across algorithms so the
             # comparison isolates the tree shape.
@@ -460,8 +489,9 @@ def _fixed_budget_merge(budget: int) -> Any:
         return ctx.agent(
             MERGE_PROMPT.format(left=json.dumps(a, ensure_ascii=False), right=json.dumps(b, ensure_ascii=False), budget=budget),
             label=f"merge:d{ctx.depth}",
-            contract=MERGE_CONTRACT,
+            contract=merge_contract(budget),
             max_tokens=budget,
+            retries=3,
         )
 
     return _fn
@@ -479,8 +509,9 @@ def _fixed_budget_merge_k(budget: int) -> Any:
         return ctx.agent(
             MERGE_PROMPT_K.format(inputs=inputs, n=len(values), budget=budget, depth=ctx.depth, weight=ctx.weight),
             label=f"merge:k{len(values)}:d{ctx.depth}",
-            contract=MERGE_CONTRACT,
+            contract=merge_contract(budget),
             max_tokens=budget,
+            retries=3,
         )
 
     return _fn

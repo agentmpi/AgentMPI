@@ -527,3 +527,62 @@ def test_exact_operator_is_safe_under_either_algorithm(tmp_path, size):
         assert all(v == values[0] for v in values), f"{alg} diverged on an exact operator"
         results[alg] = values[0]
     assert results["reduce_bcast"] == results["recursive_doubling"]
+
+
+def test_contract_max_tokens_is_what_makes_a_budget_real(tmp_path):
+    """A budget in a prompt is advice; a budget in a contract is enforced.
+
+    Our reduction-fidelity experiment set a 450-token output budget in the prompt and
+    passed it to the executor as a hint. Eight of ten merges overran it, by up to 55%,
+    because a hint is not a constraint -- and an operator free to both compress and
+    overflow is never forced to discard, which is why retention never fell.
+
+    The runtime had the enforcement all along: a `max_tokens` bound on a Contract is
+    checked at the boundary and a violation is rejected and retried with the diagnosis.
+    This test pins that difference, because the failure is silent from the outside: an
+    unenforced budget produces plausible output that is simply too big.
+    """
+    budget = 60
+    oversized = {"summary": "word " * 400}
+
+    advisory = ampi.Contract(name="Summary", kind="json", required=("summary",))
+    enforced = ampi.Contract(name="Summary", kind="json", required=("summary",), max_tokens=budget)
+
+    assert advisory.check(oversized) == [], "an advisory contract cannot see the overrun"
+    problems = enforced.check(oversized)
+    assert problems and "max_tokens" in problems[0], problems
+
+    # And end to end: the runtime must reject and retry, then raise if the executor
+    # never complies, rather than silently accepting an over-budget artifact.
+    attempts: list[int] = []
+
+    def stubborn(prompt: str, **_kw):
+        attempts.append(1)
+        return oversized
+
+    def rank_main(comm):
+        with pytest.raises(ampi.AmpiError):
+            comm.agent("summarise", contract=enforced, retries=3)
+        return len(attempts)
+
+    job = ampi.launch(
+        rank_main, size=1, root=tmp_path / "budget", executor_factory=lambda r: stubborn, timeout=60
+    )
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    assert job.value(0) == 3, f"expected 3 attempts, got {job.value(0)}"
+
+    # A compliant executor succeeds on the first attempt.
+    attempts.clear()
+
+    def compliant(prompt: str, **_kw):
+        attempts.append(1)
+        return {"summary": "short enough"}
+
+    job2 = ampi.launch(
+        lambda comm: comm.agent("summarise", contract=enforced, retries=3),
+        size=1,
+        root=tmp_path / "budget2",
+        executor_factory=lambda r: compliant,
+        timeout=60,
+    )
+    assert job2.ok and len(attempts) == 1
