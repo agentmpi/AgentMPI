@@ -6,6 +6,7 @@ from typing import Any
 
 from .constants import (
     AMPI_ERR_ARG,
+    AMPI_ERR_STALE_INCARNATION,
     AMPI_ERR_BUDGET_EXCEEDED,
     AMPI_ERR_COLLECTIVE_MISMATCH,
     AMPI_ERR_COMM,
@@ -109,3 +110,17 @@ class AmpiProtocolViolation(AmpiError):
 
 class AmpiBudgetExceeded(AmpiError):
     error_class = AMPI_ERR_BUDGET_EXCEEDED
+
+
+class AmpiStaleIncarnation(AmpiError):
+    """Another process has since taken over this rank.
+
+    No MPI counterpart, because an MPI rank is a process and cannot be
+    impersonated.  An AgentMPI rank is a name that any process holding the job
+    directory can claim, so a blocked call left over from an abandoned attempt
+    will happily consume the next attempt's messages.  We observed exactly
+    that: a stale root from an earlier run matched the new run's contributions
+    and completed a reduction that mixed two generations of ranks.
+    """
+
+    error_class = AMPI_ERR_STALE_INCARNATION

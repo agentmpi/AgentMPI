@@ -252,18 +252,19 @@ def fig_semantic(path: str) -> None:
     ax.set_title(f"(a) evaluations, $p={configs[0].get('p', '?')}$", pad=6)
     ax.legend(frameon=False, fontsize=6.5, loc="upper center", ncol=2)
 
-    model = [(c["operator_turnaround_s"] or {}).get("total") or 0 for c in configs]
-    wall = [c.get("wall_seconds") or 0 for c in configs]
-    ax2.bar([i - 0.19 for i in x], wall, width=0.38, color=COLORS[2], label="wall clock")
-    ax2.bar([i + 0.19 for i in x], model, width=0.38, color=COLORS[4],
-            label="model time on path")
-    for i, v in enumerate(wall):
-        ax2.text(i - 0.19, v * 1.03, f"{v:.0f}", ha="center", fontsize=7)
+    total = [(c["operator_turnaround_s"] or {}).get("total") or 0 for c in configs]
+    path = [(c.get("critical_path") or {}).get("critical_path_seconds") or 0 for c in configs]
+    ax2.bar([i - 0.19 for i in x], total, width=0.38, color=COLORS[2],
+            label="all ranks")
+    ax2.bar([i + 0.19 for i in x], path, width=0.38, color=COLORS[4],
+            label="on critical path")
+    for i, v in enumerate(path):
+        ax2.text(i + 0.19, v + max(total) * 0.03, f"{v:.0f}", ha="center", fontsize=7)
     ax2.set_xticks(x)
     ax2.set_xticklabels(labels)
-    ax2.set_ylabel("seconds")
-    ax2.set_ylim(0, max(wall) * 1.22)
-    ax2.set_title("(b) time to the merged artifact", pad=6)
+    ax2.set_ylabel("model time (s)")
+    ax2.set_ylim(0, max(total) * 1.25)
+    ax2.set_title("(b) model time", pad=6)
     ax2.legend(frameon=False, fontsize=6.5, loc="upper right")
 
     ax3.bar([i - 0.19 for i in x],

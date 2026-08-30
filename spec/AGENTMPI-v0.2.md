@@ -112,10 +112,21 @@ not by inspection.
 
 | operation | meaning |
 |---|---|
-| `AMPI_Init(rank, role?, ctx_limit?)` | join the job. MUST be idempotent, so a restarted agent process can re-enter. |
+| `AMPI_Init(rank, role?, ctx_limit?)` | join the job. MUST be idempotent, and MUST increment the rank's **incarnation** (see below). |
 | `AMPI_Finalize(note?)` | leave cleanly. Distinguishable from a crash. |
 | `AMPI_Heartbeat(expect_idle?)` | assert liveness, optionally declaring a period during which the rank will be busy and silent. |
 | `AMPI_Respawn(rank)` | reset a failed rank so a replacement may take its place; increments its generation. |
+
+**Incarnation fencing.** A rank is a name, and any process holding the job can
+claim it, so a call left blocked by an abandoned attempt will happily consume a
+later attempt's messages. We observed exactly that: a stale root matched the
+next run's contributions and completed a reduction mixing two generations of
+ranks, producing a result that looked complete and was not trustworthy. Every
+`AMPI_Init` MUST therefore increment the rank's incarnation, and a long-running
+operation MUST capture the incarnation it began under and abort with
+`AMPI_ERR_STALE_INCARNATION` if it changes. This is the fencing-token pattern,
+and it is required rather than advisory because the failure it prevents is
+silent.
 
 `AMPI_Respawn` is promoted to a first-class recovery action, unlike MPI's
 vestigial `MPI_Comm_spawn`. The reason is economic: starting a process on an
@@ -372,8 +383,9 @@ them. A harness that needs that guarantee must build it above the protocol, and
 | `AMPI_ERR_COLLECTIVE_MISMATCH` | ranks issued different or misordered collectives |
 | `AMPI_ERR_DEADLOCK` | a wait-for cycle was detected |
 | `AMPI_ERR_PROTOCOL_VIOLATION` | a call was made in a state that forbids it |
+| `AMPI_ERR_STALE_INCARNATION` | another process has since claimed this rank |
 
-The last three have no MPI counterpart. MPI leaves the corresponding
+The last four have no MPI counterpart. MPI leaves the corresponding
 conditions undefined, which is a reasonable choice when participants are
 compiled programs debugged once. It is not reasonable when participants are
 language models.

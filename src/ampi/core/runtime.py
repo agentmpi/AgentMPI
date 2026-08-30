@@ -56,6 +56,7 @@ from ..constants import (
 )
 from ..errors import (
     AmpiArgError,
+    AmpiStaleIncarnation,
     AmpiCommError,
     AmpiDeadlock,
     AmpiProcFailed,
@@ -93,6 +94,9 @@ class Runtime:
         self.health_check_period = 2.0
         self._blocked_since = 0.0
         self._last_health_check = 0.0
+        # The incarnation this handle is operating under, captured at Init.
+        # None means we have not claimed the rank in this process.
+        self.incarnation: int | None = None
         self.comms = CommRegistry(device, job_id)
         self.ctx = ContextAccount(device, job_id)
         self.tracer = Tracer(device, job_id, rank)
@@ -153,7 +157,7 @@ class Runtime:
             )
             if row is None:
                 raise AmpiArgError(f"rank {rank} is not part of job {self.job_id}")
-            fields: list[str] = ["state=?", "last_heartbeat=?"]
+            fields: list[str] = ["state=?", "last_heartbeat=?", "incarnation=incarnation+1"]
             params: list[Any] = [RANK_ALIVE, util.now()]
             if row["started_at"] is None:
                 fields.append("started_at=?")
@@ -172,8 +176,11 @@ class Runtime:
                 f"UPDATE rank SET {', '.join(fields)} WHERE job_id=? AND rank=?", params
             )
             self.comms.create(f"self.{rank}", [rank])
-            self.tracer.emit("AMPI_Init", "exit", role=role, generation=row["generation"])
-            return self.rank_row(rank)
+            fresh = self.rank_row(rank)
+            self.incarnation = int(fresh["incarnation"])
+            self.tracer.emit("AMPI_Init", "exit", role=role, generation=row["generation"],
+                             incarnation=self.incarnation)
+            return fresh
 
     def finalize(self, note: str | None = None) -> dict[str, Any]:
         """AMPI_Finalize: an orderly exit, distinguishable from a crash."""
@@ -690,7 +697,29 @@ class Runtime:
             )
 
     def _sleep(self) -> None:
+        self._check_incarnation()
         time.sleep(self.poll_interval)
+
+    def _check_incarnation(self) -> None:
+        """Abort if another process has claimed this rank since we started.
+
+        Checked on every blocking poll rather than once at entry, because the
+        takeover we care about happens *while* a call is blocked: an abandoned
+        attempt's receive sits in the store and matches the next attempt's
+        messages, silently mixing two generations of ranks into one result.
+        """
+        if self.incarnation is None or self.rank is None:
+            return
+        row = self.device.query_one(
+            "SELECT incarnation FROM rank WHERE job_id=? AND rank=?", (self.job_id, self.rank))
+        if row is not None and int(row["incarnation"]) != self.incarnation:
+            raise AmpiStaleIncarnation(
+                f"rank {self.rank} has been re-initialised by another process "
+                f"(incarnation {row['incarnation']}, this call started under "
+                f"{self.incarnation}); abandoning so the newer process owns the rank",
+                rank=self.rank, started_under=self.incarnation,
+                current=int(row["incarnation"]),
+            )
 
     def _check_blocked_health(self, comm: Communicator, src: int) -> None:
         """While blocked: promote suspicions to failures and look for cycles.

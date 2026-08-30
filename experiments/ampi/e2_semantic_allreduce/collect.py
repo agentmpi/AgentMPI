@@ -81,6 +81,12 @@ def collect_one(job_dir: str, algo: str) -> dict:
             "SELECT COUNT(*) AS n, SUM(tokens) AS tok FROM message WHERE job_id=?", (job_id,))
         retention_stats = retention(dev, job_id, final)
         conformance_stats = conformance(dev, job_dir, job_id)
+        path_stats = critical_path(dev, job_id, algo, len(ranks))
+        # When ranks were admitted to the executor pool matters enormously and
+        # has nothing to do with the schedule, so report it separately rather
+        # than letting it hide inside a wall-clock number.
+        join_times = sorted(r["started_at"] for r in joined)
+        admission_spread = round(join_times[-1] - join_times[0], 1) if len(join_times) > 1 else 0.0
 
         return {
             "retention": retention_stats,
@@ -99,6 +105,8 @@ def collect_one(job_dir: str, algo: str) -> dict:
                 "values": turnarounds,
             },
             "wall_seconds": round(wall, 1) if wall else None,
+            "critical_path": path_stats,
+            "executor_admission_spread_s": admission_spread,
             "messages": messages["n"],
             "tokens_moved": messages["tok"],
             "collective_state": coll["state"] if coll else None,
@@ -129,6 +137,77 @@ RETENTION_PROBES: dict[int, tuple[str, list[str]]] = {
     6: ("7. Security", ["capability", "block quote"]),
     7: ("8. Evaluation", ["significant figures"]),
 }
+
+
+def critical_path(dev: SqliteDevice, job_id: str, algo: str, p: int) -> dict:
+    """Model time along the longest dependency chain of the reduction.
+
+    Wall clock is not a usable comparison here.  Ranks are admitted to the
+    executor pool a few at a time, so a run's elapsed time is dominated by when
+    the platform happened to schedule its agents: our linear arm stalled for
+    1570 s in the middle of the reduction waiting for a rank that could not be
+    launched, which says nothing about the schedule under test.
+
+    What is comparable is the sum of measured operator turnarounds along the
+    longest chain of *dependent* evaluations, since that is what a schedule
+    actually controls.  The dependency structure comes from the schedule
+    itself: under a linear reduction every evaluation is on the root and they
+    are strictly sequential; under a binomial tree, rank r's evaluation at
+    round k cannot start until its child's subtree is complete, and sibling
+    subtrees proceed in parallel.
+    """
+    ups = dev.query(
+        "SELECT assignee, step, created_at, settled_at FROM pending_op "
+        "WHERE job_id=? AND state='done' ORDER BY assignee, step", (job_id,))
+    if not ups:
+        return {}
+    dur: dict[tuple[int, int], float] = {}
+    for u in ups:
+        if u["settled_at"] and u["created_at"]:
+            dur[(int(u["assignee"]), int(u["step"]))] = u["settled_at"] - u["created_at"]
+
+    by_rank: dict[int, list[float]] = {}
+    for (rank, _step), d in sorted(dur.items()):
+        by_rank.setdefault(rank, []).append(d)
+
+    if algo != "binomial":
+        # Strictly sequential at the root.
+        root_chain = sum(by_rank.get(0, []))
+        return {"model": "sequential at the root",
+                "root_evaluations": len(by_rank.get(0, [])),
+                "root_model_seconds": round(root_chain, 1),
+                "critical_path_seconds": round(root_chain, 1)}
+
+    # Binomial tree rooted at 0: rank r receives from r | (1 << k) at round k,
+    # for each k where bit k of r is zero, ascending. Its j-th evaluation
+    # therefore depends on that child's whole subtree.
+    def children(rank: int) -> list[int]:
+        out = []
+        mask = 1
+        while mask < p:
+            if rank & mask:
+                break
+            child = rank | mask
+            if child < p:
+                out.append(child)
+            mask <<= 1
+        return out
+
+    def finish(rank: int) -> float:
+        """When rank finishes its subtree, in model-seconds from its own start."""
+        elapsed = 0.0
+        mine = list(by_rank.get(rank, []))
+        for j, child in enumerate(children(rank)):
+            ready = finish(child)
+            elapsed = max(elapsed, ready)
+            if j < len(mine):
+                elapsed += mine[j]
+        return elapsed
+
+    return {"model": "binomial tree; sibling subtrees overlap",
+            "root_evaluations": len(by_rank.get(0, [])),
+            "root_model_seconds": round(sum(by_rank.get(0, [])), 1),
+            "critical_path_seconds": round(finish(0), 1)}
 
 
 def conformance(dev: SqliteDevice, job_dir: str, job_id: str) -> dict:
@@ -308,7 +387,9 @@ def main() -> int:
     for c in configurations:
         print(f"{c['algo']:>10}: upcalls={c['upcalls_total']} "
               f"critical_path={c['upcalls_critical_path']} "
-              f"wall={c['wall_seconds']}s "
+              f"critpath={c['critical_path'].get('critical_path_seconds')}s "
+              f"root_model={c['critical_path'].get('root_model_seconds')}s "
+              f"admission_spread={c['executor_admission_spread_s']}s "
               f"per_rank={c['upcalls_by_rank']} "
               f"suspicions={c['suspicion_events']} "
               f"(spurious {c['spurious_condemnations']}, "

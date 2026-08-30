@@ -411,3 +411,48 @@ def test_a_returning_rank_clears_its_confirmation(make_job):
     row = rt.rank_row(1)
     assert row["state"] == "alive"
     assert row["failure_confirmed"] == 0
+
+
+def test_a_stale_process_abandons_a_rank_that_was_taken_over(make_job):
+    """A blocked call from an abandoned attempt must not consume a new one's work.
+
+    We observed this for real: a root left blocked in a receive from an earlier
+    attempt matched the next attempt's contributions and completed a reduction
+    that mixed two generations of ranks. Incarnation fencing makes the stale
+    call fail instead.
+    """
+    import threading
+
+    from ampi.errors import AmpiStaleIncarnation
+
+    job = make_job(2)
+    outcome: list[str] = []
+    started = threading.Event()
+
+    def blocked() -> None:
+        # Built inside the thread: a SQLite handle belongs to its creator.
+        stale = job.runtime(0)
+        stale.init(0)
+        assert stale.incarnation == 1
+        started.set()
+        try:
+            stale.recv("world", 1, 1, timeout=20)
+            outcome.append("received")
+        except AmpiStaleIncarnation:
+            outcome.append("fenced")
+        except Exception as exc:  # noqa: BLE001
+            outcome.append(type(exc).__name__)
+
+    thread = threading.Thread(target=blocked, daemon=True)
+    thread.start()
+
+    assert started.wait(10)
+    import time
+
+    time.sleep(0.3)
+    takeover = job.runtime(0)
+    takeover.init(0)  # a second process claims rank 0
+    assert takeover.incarnation == 2
+
+    thread.join(25)
+    assert outcome == ["fenced"], outcome
