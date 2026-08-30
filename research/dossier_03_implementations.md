@@ -80,10 +80,9 @@ MPICH's layering is legible from its prefixes [MPICH DevGuide]:
 CH4's active-message contract is small enough to copy: `am_send_hdr`, `am_isend`, `am_isendv`,
 callback-safe `*_reply` variants, `am_recv` and capability queries, against three callbacks
 (target-message, target-completion, origin). Boilerplate is *generated* from `mpi_standard_api.txt`,
-turning ~70,000 lines of hand-maintained binding code into ~5,000 lines of Python — which is what made
+turning ~70,000 lines of hand-maintained binding code into ~5,000 lines of Python, which made
 prototyping QMPI tractable [Zhou et al. 2021]. Collective dispatch ends in `MPIR_Bcast_allcomm_auto`,
-choosing "a best algorithm based on selection logic defined by a runtime json file": selection is *data*,
-not code.
+choosing "a best algorithm based on selection logic defined by a runtime json file": selection is *data*.
 
 ---
 
@@ -93,9 +92,8 @@ not code.
 
 Open MPI unions four prior codebases (LAM/MPI, LA-MPI, FT-MPI, PACX-MPI) whose teams judged their designs
 too divergent to merge [Gabriel et al. 2004; Graham et al. 2006]. Its stated goals: group similar
-functionality into distinct abstraction layers, use run-time loadable plugins and run-time parameters to
-choose among implementations of the same behavior, and avoid "allowing abstraction to get in the way of
-performance" [Squyres 2012]. The layers are **OPAL** (per-process portability — lists, IP interface
+functionality into abstraction layers, use run-time plugins and parameters to choose among implementations
+of the same behavior, and avoid "allowing abstraction to get in the way of performance" [Squyres 2012]. The layers are **OPAL** (per-process portability — lists, IP interface
 discovery, shared memory, affinity, timers), **ORTE** (launch, monitor, kill parallel jobs) and **OMPI**
 (the MPI API). Each is a standalone library, and the order OMPI → ORTE → OPAL is *enforced by the
 linker*: "applications will fail to link if one layer incorrectly attempts to use a symbol in a higher
@@ -210,7 +208,7 @@ cannot be reinitialized after `MPI_FINALIZE`" [MPI Forum 2021]. Sessions remove 
 barriers by no longer requiring all possible communication peers to be included in `MPI_COMM_WORLD`,"
 explicitly to eliminate "heroic developer efforts" [Holmes et al. 2016]. A process calls
 `MPI_Session_init`, queries the runtime for named process sets, and derives groups and then communicators,
-allocating for its actual communication requirements. `MPI_COMM_WORLD` is invalid, and **isolation** is
+allocating only for its actual peers. `MPI_COMM_WORLD` is invalid, and **isolation** is
 enforced: objects from different session handles may not be intermixed [MPI Forum 2025].
 
 ---
@@ -283,10 +281,9 @@ profiler author knows whether to wrap every binding or only the lowest-level rou
 tool defines only what it intercepts [MPI Forum 2015]. Two implementations are sanctioned: **weak
 symbols** or double compilation with link order `cc ... -lmyprof -lpmpi -lmpi`.
 
-PMPI bought an entire ecosystem — mpiP, Score-P, Extrae, TAU, MUST and ScalaTrace all interpose without
-touching application source or the MPI implementation. Its cost is **one tool at a time**: "using and
-linking more than one tool library at a time is not possible. Therefore, all of the functionality
-necessary to achieve a profiling goal must be implemented in a single tool," which "leads to monolithic
+PMPI bought an ecosystem: mpiP, Score-P, Extrae, TAU, MUST and ScalaTrace all interpose without touching
+application source or the MPI implementation. Its cost is **one tool at a time**: "using and
+linking more than one tool library at a time is not possible," which "leads to monolithic
 tool designs" [Elis 2018]. **PnMPI** answers this as a *virtualization layer over PMPI*, patching tool
 binaries' symbol tables into modules and keeping separate link stacks per MPI routine so each registered
 tool's wrapper runs in turn [Schulz & de Supinski 2005; PnMPI README]. **QMPI**, the proposed successor, "allows for
@@ -347,8 +344,8 @@ three chunks in memory, so supercomputer traces open on a laptop [Eschweiler et 
 
 ### 5.4 Correctness tools
 
-**Umpire** did centralized runtime deadlock detection, catching actual MPI-1.2 deadlocks and some
-potential ones, but centralized trace communication limited its scale [Vetter & de Supinski 2000].
+**Umpire** pioneered centralized runtime deadlock detection, but funnelling tool traces through one
+manager limited its scale [Vetter & de Supinski 2000].
 **Marmot** combined timeouts with local and global checks: it detects recv-recv but **misses** send-send
 deadlock and admits timeout false positives [Hilbrich et al. 2013]. **ISP** has a central scheduler
 re-execute *all* send/recv interleavings — best coverage, exponential cost, "not reported to scale to more
@@ -381,7 +378,7 @@ test "until the current relative standard error is smaller than a predefined max
 min/max/mean over fixed repetitions, MPIBlib stops on a confidence interval — so experimental design must
 be reported, not assumed [Hunold & Carpen-Amarie 2015].
 **NetPIPE** is a protocol-independent ping-pong evaluator [Snell et al. 1996] `[UNVERIFIED: exact venue]`;
-**IMB** provides standard point-to-point and collective metrics and **mpiBench** targets collectives
+**IMB** standardizes point-to-point and collective metrics; **mpiBench** targets collectives
 `[UNVERIFIED: methodology details for both]`.
 
 **NAS Parallel Benchmarks.** Five kernels and three pseudo-applications from CFD, given as a
@@ -435,9 +432,9 @@ rendezvous via well-known symbols in the **starter process** (`mpirun`): `MPIR_p
 `MPIR_PROCDESC` structs (`host_name`, `executable_name`, `pid`); its size;
 `MPIR_debug_state`, 0 before initialization and `MPIR_DEBUG_SPAWNED` after; and `MPIR_Breakpoint()`,
 which the starter calls to notify the tool, whereupon the tool reads `MPIR_debug_state` "to process an
-MPIR event" [ANL MPI debug]. The mechanism is crude — a well-known symbol, a breakpoint and a shared
-struct layout — and precisely because it is crude it worked across a decade of independent implementations
-and two commercial debuggers (TotalView, DDT). MPIR is now superseded by the **PMIx tools API**, "an
+MPIR event" [ANL MPI debug]. The mechanism is crude — a well-known symbol, a breakpoint, a shared struct
+layout — and that crudeness is why it survived a decade of independent implementations and two commercial
+debuggers (TotalView, DDT). MPIR is now superseded by the **PMIx tools API**, "an
 alternative and more extensible tool interface," with compatibility preserved by the **MPIR shim module**:
 a process launched *between* the debugger and `mpirun` that implements `MPIR_Breakpoint` and extracts the
 process table [mpir-to-pmix guide; Open MPI docs, mpir-tools].
@@ -445,20 +442,17 @@ process table [mpir-to-pmix guide; Open MPI docs, mpir-tools].
 ---
 ## 7. Architectural lessons transferable to a non-HPC message-passing runtime
 
-Each pattern is an instruction with a one-sentence justification and its source.
-
 1. **Define a narrow internal "device" interface, implement the user API once above it, and offer a ladder
    of such interfaces at several abstraction levels.** Third parties then replace the
    performance-critical bottom while inheriting all semantics, at their chosen effort/performance point.
    *(MPICH ADI-3 and CH3 [MPICH DevGuide; Liu et al. 2004])*
 2. **Separate the matching layer from the transport layer, allow *two* splits, and put a thin multiplexing
    layer between them.** Transports that can match should not be forced through a software matcher
-   (`ob1`/BTL versus `cm`/MTL), and the BML stripes across per-device modules so multi-rail needs no
-   protocol change. *(Open MPI [Barrett])*
+   (`ob1`/BTL versus `cm`/MTL), and a per-device multiplexer makes multi-rail need no protocol change.
+   *(Open MPI PML/BML/BTL/MTL [Barrett])*
 3. **Distinguish the plugin *instance* (module) from the plugin *implementation* (component), and enforce
    layer order mechanically.** Resource multiplicity becomes the framework's problem, and per-layer
    libraries turn an upward symbol reference into a link error. *(Open MPI MCA [Squyres 2012])*
-
 4. **Make component selection a priority-ordered query with a guaranteed fallback, and register every
    tunable constant as a named, described, discoverable run-time parameter.** A missing plugin then
    degrades rather than fails. *(Open MPI MCA [Squyres 2012])*
@@ -484,8 +478,8 @@ Each pattern is an instruction with a one-sentence justification and its source.
     2015; Islam et al. 2016])*
 11. **Model traces as states, arrows and events over a (location, time) canvas, factor display attributes
     into shared category objects, store level-of-detail previews, and keep reduction closed under the
-    format.** Previews let a viewer open a trace larger than memory, and a filtered Paraver trace is still
-    a Paraver trace. *(SLOG-2 [Jumpshot-4 docs]; OTF2 [Eschweiler et al. 2012])*
+    format.** Previews open traces larger than memory, and a filtered Paraver trace is itself a Paraver
+    trace. *(SLOG-2 [Jumpshot-4 docs]; OTF2 [Eschweiler et al. 2012])*
 12. **Build one measurement substrate for many analysis frontends, and separate tool infrastructure from
     tool policy.** Score-P exists because every tool shipped its own instrumentation, and GTI is why MUST
     outscaled its predecessors. *(Score-P [Knüpfer et al. 2012]; MUST/GTI [Hilbrich et al. 2012])*
@@ -508,7 +502,7 @@ Each pattern is an instruction with a one-sentence justification and its source.
     [Open MPI docs, coll-tuned])*
 18. **Publish a versioned ladder of benchmark sizes together with the measurement protocol.** Warmup
     counts, iteration counts and min/median/max reporting are what make numbers comparable across
-    implementations. *(OSU Micro-Benchmarks [OMB README]; NAS classes [Bailey et al. 1991]; SKaMPI
+    implementations. *(OSU Micro-Benchmarks [OMB README]; NAS classes [Bailey et al. 1995]; SKaMPI
     [Reussner et al. 1998])*
 
 ---
