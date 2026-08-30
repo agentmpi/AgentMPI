@@ -592,6 +592,69 @@ def table_software() -> None:
         emit("tab_software_contention.tex", MISSING)
 
 
+def table_module_growth() -> None:
+    """Per-module code size with and without published interfaces, against in-degree.
+
+    The global figure -- more code without the window -- is suggestive but weak, because
+    "agents wrote more code" has many explanations. Localising the growth is what makes
+    it an argument: if missing interface information is the cause, the cost must fall on
+    the modules that *consume* interfaces and not on the ones that only provide them.
+
+    That is what happens, and sharply. Modules with no upstream dependencies come out
+    byte-identical; the two modules with three dependencies each nearly double. The
+    mechanism the agents described is visible in the shape of the diff.
+    """
+    import sys
+
+    sys.path.insert(0, str(REPO / "experiments"))
+    from software import MODULES  # noqa: PLC0415 - path set above
+
+    def latest(root: Path) -> Path | None:
+        ws = root / "workspace"
+        rounds = sorted(ws.glob("round*"), key=lambda q: int(q.name.removeprefix("round") or 0))
+        return rounds[-1] if rounds else None
+
+    pairs: list[tuple[str, Path, Path]] = []
+    for shared_name, nos_name in (("real-sw-p8-full", "real-sw-p8-noshared"),
+                                  ("vague-sw-p8-vague-shared", "vague-sw-p8-vague-noshared")):
+        a, b = latest(REPO / "runs" / shared_name), latest(REPO / "runs" / nos_name)
+        if a and b and (a / "minidb").exists() and (b / "minidb").exists():
+            label = "precise specification" if "vague" not in shared_name else "vague specification"
+            pairs.append((label, a, b))
+    if not pairs:
+        emit("tab_module_growth.tex", MISSING)
+        return
+
+    deps = {m["path"].split("/")[-1]: len(m["deps"]) for m in MODULES}
+    lines: list[str] = []
+    for label, a, b in pairs:
+        lines.append(rf"\multicolumn{{5}}{{l}}{{\emph{{{label}}}}} \\")
+        tot_a = tot_b = 0
+        for f in sorted((a / "minidb").glob("*.py")):
+            if f.name == "__init__.py":
+                continue
+            la = len(f.read_text(encoding="utf-8", errors="replace").splitlines())
+            g = b / "minidb" / f.name
+            lb = len(g.read_text(encoding="utf-8", errors="replace").splitlines()) if g.exists() else 0
+            tot_a += la
+            tot_b += lb
+            ratio = (lb / la) if la else 0.0
+            bold = ratio >= 1.5
+            cell = rf"\textbf{{{ratio:.2f}}}" if bold else f"{ratio:.2f}"
+            lines.append(rf"\quad\texttt{{{tex_escape(f.name)}}} & {deps.get(f.name, 0)} & {la} & {lb} & {cell} \\")
+        lines.append(rf"\quad\emph{{total}} & & {tot_a:,} & {tot_b:,} & {tot_b / max(tot_a, 1):.2f} \\")
+        lines.append(r"\addlinespace")
+        _MACROS["NGrowthTotal" + ("Vague" if "vague" in label else "Precise")] = f"{tot_b / max(tot_a, 1):.2f}"
+
+    body = (
+        "\\begin{tabular}{lrrrr}\n\\toprule\n"
+        "module & deps & shared & no shared & ratio \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_module_growth.tex", body)
+
+
 # --------------------------------------------------------------- simulated scaling
 
 
@@ -671,7 +734,8 @@ def summary_macros() -> None:
                  "NSwSpeedup", "NSwEff", "NSwPrice", "NSwTokens", "NSwParWall", "NSwSoloWall",
                  "NSwParPassed", "NSwSoloPassed", "NSwSoloCalls", "NSwParCalls",
                  "NSwSoloDef", "NSwDefShared", "NSwDefNoshared", "NSwDefRatio",
-                 "NSwLinesShared", "NSwLinesNoshared", "NSwLinesRatio"):
+                 "NSwLinesShared", "NSwLinesNoshared", "NSwLinesRatio",
+                 "NGrowthTotalPrecise", "NGrowthTotalVague"):
         if name not in _MACROS:
             macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
     emit("macros.tex", "\n".join(macros))
@@ -690,6 +754,7 @@ def main() -> int:
         table_faults,
         table_fidelity,
         table_software,
+        table_module_growth,
         table_scaling_sim,
         summary_macros,
     ):
