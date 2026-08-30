@@ -216,19 +216,21 @@ def main() -> int:
                   cmp_["peak_rank_context_tokens"].get("ratio_naive_over_ampi"), 1)
 
     # ---- experiment 2 -----------------------------------------------------
+    # Arms that were not run still get macros, valued "n/a", so that the paper
+    # compiles from partial data with an honest gap rather than failing to build
+    # or, worse, silently omitting a column.
+    E2_CATS = ("reader", "special", "tailcall", "numeric", "list", "equality",
+               "string", "vector", "error", "integration")
     e2p = Path(args.e2)
-    if e2p.exists():
-        e2 = json.loads(e2p.read_text())
-        m.add("eTwoSuite", e2["suite_size"])
-        for arm in ("ampi", "naive"):
-            a = e2["arms"].get(arm)
-            if not a:
-                continue
-            tag = "Ampi" if arm == "ampi" else "Naive"
-            m.add(f"eTwo{tag}Pass", a["passed"])
-            m.add(f"eTwo{tag}Rate", a["pass_rate"], 3)
-            for cat, d in a["by_category"].items():
-                m.add(f"eTwo{tag}{cat.capitalize()}", d["pass_rate"], 2)
+    e2 = json.loads(e2p.read_text()) if e2p.exists() else {"arms": {}}
+    m.add("eTwoSuite", e2.get("suite_size"))
+    for arm, tag in (("ampi", "Ampi"), ("naive", "Naive")):
+        a = (e2.get("arms") or {}).get(arm)
+        m.add(f"eTwo{tag}Pass", a["passed"] if a else None)
+        m.add(f"eTwo{tag}Rate", (a["pass_rate"] if a else None), 3)
+        for cat in E2_CATS:
+            d = (a or {}).get("by_category", {}).get(cat)
+            m.add(f"eTwo{tag}{cat.capitalize()}", (d["pass_rate"] if d else None), 2)
 
     # ---- experiment 3 -----------------------------------------------------
     e3p = Path(args.e3)
