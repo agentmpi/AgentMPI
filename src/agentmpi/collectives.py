@@ -61,8 +61,18 @@ _COLL_BASE = int(InternalTag.COLL)
 
 
 def _next_coll_id(comm) -> int:
-    comm._coll_counter += 1
-    return comm._coll_counter
+    """Advance this communicator's collective counter.
+
+    Kept in durable runtime state for the same reason as the message
+    sequence counter: when each collective is a separate ``ampi`` invocation,
+    an in-memory counter would restart at zero every time and successive
+    collectives would collide on the same tag.
+    """
+    key = comm.context
+    nxt = comm.runtime.coll_counter.get(key, 0) + 1
+    comm.runtime.coll_counter[key] = nxt
+    comm._coll_counter = nxt
+    return nxt
 
 
 def _tag(coll_id: int, phase: int = 0) -> int:

@@ -78,13 +78,26 @@ class MatchingEngine:
         self.gap_timeout_s = gap_timeout_s
         self.on_arrival = on_arrival
 
-        #: Messages that have arrived but not yet been matched.
+        #: Messages that have arrived but not yet been matched.  In-process
+        #: only: a message sitting here is *not* consumed, so if the process
+        #: exits it will be re-polled by the rank's next process.
         self.unexpected: deque[Envelope] = deque()
         #: Out-of-order arrivals held back to preserve non-overtaking.
         self._reorder: dict[tuple[str, int, int], dict[int, Envelope]] = defaultdict(dict)
+        #: Next sequence number to release into the unexpected queue.
+        #: In-process only; rebuilt from the consumption watermark on restart.
         self._expected_seq: dict[tuple[str, int, int], int] = defaultdict(int)
         self._gap_since: dict[tuple[str, int, int], float] = {}
         self._seen_idem: set[str] = set()
+
+        # Durable consumption state, kept as a watermark plus a small set of
+        # out-of-order exceptions above it.  The watermark is what makes this
+        # bounded: a rank that has consumed a million in-order messages
+        # stores one integer, not a million identifiers.  MPI never needs
+        # this because an MPI rank is one process; an AgentMPI rank is a
+        # succession of processes sharing one identity.
+        self._consumed_wm: dict[tuple[str, int, int], int] = defaultdict(int)
+        self._consumed_extra: dict[tuple[str, int, int], set[int]] = defaultdict(set)
         #: Communicator epochs; messages from an older epoch are dropped.
         self.epochs: dict[str, int] = defaultdict(int)
         #: Contexts that have been revoked.
@@ -122,6 +135,10 @@ class MatchingEngine:
                 self.stats["stale_epoch"] += 1
                 continue
             key = (env.context, env.source, env.dest)
+            if self.is_consumed(key, env.seq):
+                # Already delivered to an earlier process of this rank.
+                self.stats["duplicates"] += 1
+                continue
             self._reorder[key][env.seq] = env
             if env.seq != self._expected_seq[key]:
                 self.stats["reordered"] += 1
@@ -130,17 +147,49 @@ class MatchingEngine:
         made_available += self._expire_gaps()
         return made_available
 
+    def is_consumed(self, key: tuple[str, int, int], seq: int) -> bool:
+        return seq < self._consumed_wm[key] or seq in self._consumed_extra[key]
+
+    def consume(self, env: Envelope) -> None:
+        """Record that ``env`` was matched to a receive, durably.
+
+        The watermark is compacted after every consumption, so the exception
+        set stays empty in the common in-order case and small otherwise.
+        """
+        key = (env.context, env.source, env.dest)
+        if env.seq >= self._consumed_wm[key]:
+            self._consumed_extra[key].add(env.seq)
+        extras = self._consumed_extra[key]
+        while self._consumed_wm[key] in extras:
+            extras.discard(self._consumed_wm[key])
+            self._consumed_wm[key] += 1
+        self.device.consume(self.rank, env)
+
     def _drain(self, key: tuple[str, int, int]) -> int:
-        """Release in-order prefixes of the reorder buffer."""
+        """Release the in-order prefix of the reorder buffer.
+
+        Sequence numbers already consumed by an earlier process of this rank
+        are skipped rather than waited for; without that, a restarted rank
+        would block forever on a message it had already handled.
+        """
         released = 0
         pending = self._reorder[key]
-        while self._expected_seq[key] in pending:
-            env = pending.pop(self._expected_seq[key])
-            self._expected_seq[key] += 1
-            self.unexpected.append(env)
-            if self.on_arrival is not None:
-                self.on_arrival(env)
-            released += 1
+        while True:
+            nxt = self._expected_seq[key]
+            if nxt in pending:
+                env = pending.pop(nxt)
+                self._expected_seq[key] = nxt + 1
+                self.unexpected.append(env)
+                if self.on_arrival is not None:
+                    self.on_arrival(env)
+                released += 1
+                continue
+            if self.is_consumed(key, nxt) and (
+                pending or nxt < self._consumed_wm[key]
+            ):
+                self._expected_seq[key] = nxt + 1
+                continue
+            break
         if not pending:
             self._gap_since.pop(key, None)
         return released
@@ -179,6 +228,7 @@ class MatchingEngine:
             if env.matches(source, tag, context):
                 del self.unexpected[i]
                 self.stats["matched"] += 1
+                self.consume(env)
                 return env
         return None
 

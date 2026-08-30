@@ -61,6 +61,10 @@ class InprocDevice(Device):
                 self._delivered.add(env.idem)
             yield env, env.inline
 
+    def consume(self, rank: int, env: Envelope) -> None:
+        with self._lock:
+            self._delivered.add(env.idem)
+
     def requeue(self, rank: int, env: Envelope) -> None:
         with self._lock:
             self._delivered.discard(env.idem)

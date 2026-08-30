@@ -296,8 +296,17 @@ class Communicator:
     # Point to point
     # ----------------------------------------------------------------------
     def _next_seq(self, dest: int) -> int:
-        seq = self._send_seq.get(dest, 0)
-        self._send_seq[dest] = seq + 1
+        """Next per-(context, source, destination) sequence number.
+
+        Held on the runtime rather than the communicator object so that it
+        survives across processes.  That matters because an AgentMPI rank is
+        frequently *not* a long-lived process: an agent invokes the ``ampi``
+        command once per operation, so the sequence counter that enforces
+        non-overtaking has to live in durable state, not in an object.
+        """
+        key = f"{self.context}|{dest}"
+        seq = self.runtime.send_seq.get(key, 0)
+        self.runtime.send_seq[key] = seq + 1
         return seq
 
     def _check_peer(self, rank: int, what: str) -> None:

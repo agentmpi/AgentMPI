@@ -148,8 +148,71 @@ class Runtime:
         self._comms: dict[str, Communicator] = {}
         self._last_heartbeat = 0.0
         self._failure_cache: dict[str, tuple[float, set[int]]] = {}
+
+        # Durable protocol state.  An AgentMPI rank is often a *sequence of
+        # short-lived processes* -- an agent that runs `ampi recv`, thinks,
+        # then runs `ampi send` -- so the counters that implement
+        # non-overtaking and collective tag separation cannot live in memory.
+        self.send_seq: dict[str, int] = {}
+        self.coll_counter: dict[str, int] = {}
+        self.persist_state = device.name != "inproc"
+        if self.persist_state:
+            self._load_state()
+
         self.world = self._make_world()
         self._register_pvars()
+
+    # -- durable protocol state -------------------------------------------
+    def _state_key(self) -> str:
+        return f"pstate/{self.world_rank}"
+
+    def _load_state(self) -> None:
+        raw = self.device.kv_get(self._state_key())
+        if not raw:
+            return
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return
+        self.send_seq = {k: int(v) for k, v in data.get("send_seq", {}).items()}
+        self.coll_counter = {k: int(v) for k, v in data.get("coll_counter", {}).items()}
+        self.turn = int(data.get("turn", 0))
+        for key, value in data.get("consumed", {}).items():
+            ctx, src, dst = key.rsplit("|", 2)
+            self.matching._consumed_wm[(ctx, int(src), int(dst))] = int(value["wm"])
+            self.matching._consumed_extra[(ctx, int(src), int(dst))] = set(value["extra"])
+        budget = data.get("budget") or {}
+        self.budget.ingested = int(budget.get("ingested", 0))
+        self.budget.emitted = int(budget.get("emitted", 0))
+        self.budget.compacted_away = int(budget.get("compacted_away", 0))
+        self.budget.currency_spent = float(budget.get("currency_spent", 0.0))
+
+    def save_state(self) -> None:
+        """Persist the counters a future process of this rank must inherit.
+
+        Note what is *not* saved: the unexpected-message queue.  It does not
+        need to be, because unmatched messages are still sitting in the
+        device's inbox and the ``seen`` markers are per-message; a new
+        process simply re-polls.  Durability of the transport is what lets
+        the endpoint be stateless, which is the same argument that lets an
+        HTTP server be stateless in front of a durable log.
+        """
+        if not self.persist_state:
+            return
+        consumed = {}
+        for key in set(self.matching._consumed_wm) | set(self.matching._consumed_extra):
+            ctx, src, dst = key
+            wm = self.matching._consumed_wm[key]
+            extra = sorted(self.matching._consumed_extra[key])
+            if wm or extra:
+                consumed[f"{ctx}|{src}|{dst}"] = {"wm": wm, "extra": extra}
+        self.device.kv_put(self._state_key(), json.dumps({
+            "send_seq": self.send_seq,
+            "coll_counter": self.coll_counter,
+            "consumed": consumed,
+            "turn": self.turn,
+            "budget": self.budget.snapshot(),
+        }))
 
     # -- construction ------------------------------------------------------
     def _make_world(self) -> Communicator:
@@ -357,6 +420,7 @@ class Runtime:
         if self.finalized:
             return
         self.state = RankState.FINALIZED
+        self.save_state()
         self.publish_spec()
         self.heartbeat(force=True)
         self.device.append_journal(

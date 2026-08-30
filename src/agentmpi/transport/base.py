@@ -54,6 +54,15 @@ class Device(abc.ABC):
         """
 
     @abc.abstractmethod
+    def consume(self, rank: int, env: Envelope) -> None:
+        """Durably record that ``rank`` matched ``env`` to a receive.
+
+        Separate from :meth:`poll` on purpose.  Polling is speculative and a
+        polled message may never be matched before the process exits; only
+        consumption is irreversible, and only consumption may be durable.
+        """
+
+    @abc.abstractmethod
     def requeue(self, rank: int, env: Envelope) -> None:
         """Return a message that was polled but not matched to the queue.
 

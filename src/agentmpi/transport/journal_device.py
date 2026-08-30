@@ -199,6 +199,17 @@ class JournalDevice(Device):
         _atomic_write(target / fname, env.to_json())
 
     def poll(self, rank: int) -> Iterator[tuple[Envelope, str | None]]:
+        """Yield messages this rank has not yet *consumed*.
+
+        Polling deliberately does not consume.  A rank that polls a message
+        and then exits before matching it -- which is the normal life of a
+        rank implemented as a sequence of short-lived ``ampi`` invocations --
+        must find that message again in its next process.  Consumption is a
+        separate, explicit step (:meth:`consume`), taken only when the
+        message is actually matched to a receive.  Getting this wrong is the
+        classic at-most-once-versus-at-least-once mistake, and with a durable
+        inbox there is no reason to accept message loss.
+        """
         base = self.root / "inbox"
         if not base.exists():
             return
@@ -216,8 +227,7 @@ class JournalDevice(Device):
                 idem = name.rsplit("-", 1)[-1].removesuffix(".json")
                 if idem in self._seen_cache:
                     continue
-                seen_marker = self.root / "seen" / str(rank) / idem
-                if seen_marker.exists():
+                if (self.root / "seen" / str(rank) / idem).exists():
                     self._seen_cache.add(idem)
                     continue
                 try:
@@ -230,14 +240,15 @@ class JournalDevice(Device):
                     env = Envelope.from_json(raw)
                 except json.JSONDecodeError:
                     continue
-                seen_marker.parent.mkdir(parents=True, exist_ok=True)
-                with contextlib.suppress(OSError):
-                    seen_marker.touch()
                 self._seen_cache.add(idem)
-                payload = env.inline
-                if payload is None and env.blob is not None:
-                    payload = None  # pulled lazily by the caller
-                yield env, payload
+                yield env, env.inline
+
+    def consume(self, rank: int, env: Envelope) -> None:
+        marker = self.root / "seen" / str(rank) / env.idem
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            marker.touch()
+        self._seen_cache.add(env.idem)
 
     def requeue(self, rank: int, env: Envelope) -> None:
         marker = self.root / "seen" / str(rank) / env.idem
