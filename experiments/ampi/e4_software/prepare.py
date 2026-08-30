@@ -328,7 +328,7 @@ Do not run git.
 MODULE_ORDER = ["estimate", "policy", "compact", "ledger", "planner", "cli"]
 
 
-def prepare(root: str, world_size: int = 10) -> dict:
+def prepare(root: str, world_size: int = 8) -> dict:
     job_dir = os.path.join(os.path.abspath(root), "job")
     pkg_dir = os.path.join(job_dir, "artifact")
     os.makedirs(pkg_dir, exist_ok=True)
@@ -340,7 +340,7 @@ def prepare(root: str, world_size: int = 10) -> dict:
 
     tasks: dict[int, str] = {}
     roles: dict[int, str] = {}
-    n_impl = world_size - 3
+    n_impl = world_size - 2  # one architect, one integrator, the rest implement
     for rank in range(world_size):
         scratch = os.path.join(job_dir, "ranks", str(rank))
         os.makedirs(scratch, exist_ok=True)
@@ -372,7 +372,7 @@ def prepare(root: str, world_size: int = 10) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.path.join(os.path.dirname(__file__), "runs"))
-    parser.add_argument("-n", type=int, default=10)
+    parser.add_argument("-n", type=int, default=8)
     args = parser.parse_args()
     print(json.dumps(prepare(args.root, args.n), indent=2))
     return 0

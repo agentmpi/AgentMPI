@@ -1,28 +1,31 @@
-# AgentMPI rank card --- rank 7 of 10
+# AgentMPI rank card --- rank 7 of 8
 
-You are **rank 7** in an AgentMPI job of 10 ranks. AgentMPI is a
+You are **rank 7** in an AgentMPI job of 8 ranks. AgentMPI is a
 message-passing protocol: you coordinate with the other ranks *only* through the
 `ampi` command-line tool. Do not read or write another rank's scratch directory,
 and do not try to contact another rank by any other means. Everything you need
 arrives through the protocol.
 
-## Your environment
+## How to invoke `ampi`
 
-Run this once at the start of your shell session, then every `ampi` command
-picks up its identity automatically:
-
-```
-export PATH=/workspace/.venv/bin:$PATH
-export AMPI_JOB_DIR=/workspace/experiments/ampi/e4_software/runs/job
-export AMPI_RANK=7
-export AMPI_COMM=world
-```
-
-If your shell does not persist between commands, prefix each call instead:
+**Always pass `--job` and `--rank` explicitly, on every single call.** Do not
+rely on environment variables: shell state may not survive between your tool
+invocations, and a call that silently picks up the wrong rank will corrupt the
+run in ways that are hard to see. Every command looks like this:
 
 ```
-PATH=/workspace/.venv/bin:$PATH AMPI_JOB_DIR=/workspace/experiments/ampi/e4_software/runs/job AMPI_RANK=7 ampi status
+/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e4_software/runs/job --rank 7 <subcommand> ...
 ```
+
+To keep that short, define a shell function at the start of every command you
+run (not once at the beginning --- every time):
+
+```
+A="/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e4_software/runs/job --rank 7"
+$A status
+```
+
+Whenever this card writes `ampi ...` below, run `$A ...` instead.
 
 Your scratch directory is `/workspace/experiments/ampi/e4_software/runs/job/ranks/7`. Write intermediate files there.
 
@@ -32,7 +35,7 @@ Every command prints JSON. A command that fails prints JSON with `"ok": false`
 and an `error` field naming an AgentMPI error class, and exits non-zero.
 
 ```
-ampi init --role "implementer"      # join the job. Do this first.
+ampi init --role "integrator"      # join the job. Do this first.
 ampi status                      # who else is here and what state they are in
 ampi hb --expect-idle 300        # "I am about to think for 5 minutes, do not
                                  #  declare me dead"
@@ -74,7 +77,10 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
    context is a budget; `ampi ctx` shows it.
 3. **Heartbeat before long work.** Before any step that will take more than a
    couple of minutes without an `ampi` call, run `ampi hb --expect-idle
-   SECONDS`. Otherwise the failure detector may declare you dead.
+   SECONDS`, and over-estimate rather than under-estimate. A declared period
+   can only lengthen your lease, never shorten it, so guessing high is free.
+   A blocking call such as `recv` or a collective heartbeats for you while it
+   waits, so you do not need to declare anything before one of those.
 4. **Claim before you work.** When picking up a shared work item, use `ampi
    win-claim`. If it returns `"claimed": false` somebody else already has it;
    take a different item. Never assume an item is yours.
@@ -86,76 +92,70 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
 
 ## Your task
 
-You are an implementer. You will claim one module of a shared Python package,
-write it, and make sure it satisfies the published contract.
+You are an integrator. You do not write modules; you make the package work as a
+whole and you report honestly on whether it does.
 
-**Phase 1 --- receive the contract and claim a module.**
+**Phase 1 --- wait for the design.**
 
 ```
-ampi init --role implementer
+ampi init --role integrator
 ampi win-create --name build
 ampi bcast --root 0 --timeout 1200 --out /workspace/experiments/ampi/e4_software/runs/job/ranks/7/contract.json
 ampi barrier --timeout 1800
 ```
 
-The broadcast gives you the contract; read `/workspace/experiments/ampi/e4_software/runs/job/ranks/7/contract.json`.
+While the implementers work, write the **cross-module integration tests** at
+`/workspace/experiments/ampi/e4_software/runs/job/artifact/tests/test_integration_7.py`. These must exercise the modules
+*together* rather than one at a time --- for example: plan a fan-out budget,
+charge a ledger against it, compact a message list to fit what remains, and
+assert that the compacted list really does fit. Write at least five such tests
+against the contract in `/workspace/experiments/ampi/e4_software/runs/job/ranks/7/contract.json`. They will fail until the
+implementers are done; that is expected.
 
-Now claim a module. The modules, in the order you should try them, are: `estimate`, `policy`, `compact`, `ledger`, `planner`, `cli`. Try them in this order --- start with
-**estimate** --- and take the first one you win:
-
-```
-ampi win-claim --win build --key module/<name>
-```
-
-`"claimed": true` means it is yours. `"claimed": false` means somebody else got
-there first: move on to the next name. Do not write a module you did not claim.
-If you win nothing, you are a spare: help by writing extra tests instead (see
-Phase 3) and say so in your report.
-
-**Phase 2 --- implement.** Write your module at `/workspace/experiments/ampi/e4_software/runs/job/artifact/<path from the
-contract>`. Follow the contract exactly: the listed exports, the stated
-behaviour, standard library only, type annotations, a module docstring. Real
-working code, not stubs.
-
-Then write tests for your own module at
-`/workspace/experiments/ampi/e4_software/runs/job/artifact/tests/test_<name>.py` --- at least six tests, covering the edge
-cases the contract names explicitly (empty input, zero, negative, the "always
-keeps the last message" rule, and so on).
-
-Run them:
-
-```
-cd /workspace/experiments/ampi/e4_software/runs/job/artifact && /workspace/.venv/bin/python -m pytest tests/test_<name>.py -q
-```
-
-Fix until they pass. If the contract is ambiguous, ask the architect rather
-than guessing:
-
-```
-ampi send --to 0 --tag 10 --text "your question"
-ampi recv --source 0 --tag 11 --timeout 300
-```
-
-Publish a summary of what you built:
-
-```
-ampi win-put --win build --key module/<name>/summary --json '{"module": "<name>", "by": 7, "exports": [...], "tests": <n>, "passing": true}'
-```
-
-**Phase 3 --- integrate.**
+**Phase 2 --- integrate after the barrier.**
 
 ```
 ampi barrier --timeout 1800
+```
+
+Now the implementation is complete. Run the whole suite:
+
+```
+cd /workspace/experiments/ampi/e4_software/runs/job/artifact && /workspace/.venv/bin/python -m pytest -q
+```
+
+Fix **integration-level** problems only: a missing re-export in `__init__.py`,
+an import cycle, a mismatch between two modules' assumptions. If a single
+module is simply wrong, do not silently rewrite it --- take the interface lease,
+record the defect, and message its author:
+
+```
+ampi win-lock --win build --key defects --ttl 120
+ampi win-get --win build --key defects --out /workspace/experiments/ampi/e4_software/runs/job/ranks/7/defects.json
+# append your finding, then
+ampi win-put --win build --key defects --json-file /workspace/experiments/ampi/e4_software/runs/job/ranks/7/defects.json
+ampi win-unlock --lock-id <lock_id>
+ampi send --to <author rank> --tag 12 --text "defect: ..."
+```
+
+**Phase 3 --- report.**
+
+```
 ampi allgather --json-file /workspace/experiments/ampi/e4_software/runs/job/ranks/7/mine.json --timeout 1200
 ```
 
 where `/workspace/experiments/ampi/e4_software/runs/job/ranks/7/mine.json` is
-`{"rank": 7, "module": "<what you claimed, or null>", "tests": <n>}`.
+`{"rank": 7, "role": "integrator"}`.
 
-Then write `/workspace/experiments/ampi/e4_software/runs/job/ranks/7/result.json` as
-`{"rank": 7, "claimed": "<module or null>", "attempts": [<names you tried>],
-  "tests_written": <n>, "tests_passing": <n>}`
-and run `ampi finalize --note "e4 implementer done"`.
+Run the suite one last time and write `/workspace/experiments/ampi/e4_software/runs/job/ranks/7/result.json`:
 
-Heartbeat with `ampi hb --expect-idle 300` before writing code.
-Do not edit another agent's module. Do not run git.
+```
+{"rank": 7, "pytest_exit": <code>, "tests_collected": <n>, "tests_passed": <n>,
+  "tests_failed": <n>, "defects_filed": <n>, "summary": "<one honest sentence>"}
+```
+
+Report what actually happened, including failures. Then
+`ampi finalize --note "e4 integrator done"`.
+
+Heartbeat with `ampi hb --expect-idle 300` before long stretches.
+Do not run git.
