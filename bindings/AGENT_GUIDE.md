@@ -9,33 +9,36 @@ This manual is the contract. Read it once, then work.
 
 ---
 
-## 0. The ten rules
+## 0. The rules
 
 1. **`ampi init` first, `ampi fini` last.** Nothing works before init.
 2. **Your identity is ambient.** `AMPI_RANK` and `AMPI_ROOT` are already set.
    Never pass `--rank`. Never pretend to be another rank.
-3. **Call `ampi` often.** Every call renews your *lease*. Go quiet for longer
-   than the lease and the job declares you dead and replaces you.
-4. **`AMPI_ERR_TIMEOUT` is not a failure.** It means "not yet". **Re-run the
-   identical command** to resume the same wait; your place in the queue is
-   durable. Do not change the arguments. Do not give up after one timeout.
-5. **Name your collectives.** Always pass `--label <name>` to `barrier`,
-   `bcast`, `gather`, `reduce`, `allreduce`, `scan`, `scatter`. Every rank must
-   use the *same label* for the *same* collective. This is how ranks find each
-   other.
-6. **Never invent** a rank, a tag, a label, a window name or a key that was not
+3. **Before any step that takes more than a minute, run `ampi hb --extend 900`.**
+   Every `ampi` call renews your *lease*; a step that makes no calls looks
+   identical to death. Go silent longer than your lease and the job declares you
+   dead and replaces you, discarding your work. `ampi hb` is how you say "I am
+   alive and thinking".
+4. **Blocking calls use `--timeout 120`** and retry internally (you will see
+   `AMPI_RETRY` on stderr). Set your shell tool's `block_until_ms` to 400000 so
+   the command is not backgrounded.
+5. **`AMPI_ERR_TIMEOUT` is not a failure.** It means "not yet". **Re-run the
+   identical command**; your place in the queue is durable, so retrying resumes
+   the same wait. Do it at least five more times before concluding anything is
+   wrong. Other ranks are blocked waiting for you.
+6. **Name your collectives.** Always pass `--label <name>` to `barrier`, `bcast`,
+   `gather`, `reduce`, `allreduce`, `scan`, `scatter`. Every rank must use the
+   *same label* for the *same* collective. This is how ranks find each other.
+7. **Never invent** a rank, a tag, a label, a window name or a key that was not
    given to you.
-7. **Watch your context.** Run `ampi ctx`. Large payloads arrive as *handles*
-   (`o:1a2b...`), not text. Read them with `ampi view <handle> --budget N`, and
-   only read what you need.
-8. **When output says `action_required`, do that action next.** Do not proceed
-   with anything else first.
-9. **Record your progress** with `ampi memo put <key> <value>` and in window
-   cells. If you die, your replacement reads exactly that.
-10. **Follow your task, then finalize.** Do not stop early, and do not silently
-    skip a collective — other ranks are blocked waiting for you.
-
----
+8. **Watch your context.** Run `ampi ctx`. Large payloads arrive as *handles*
+   (`o:1a2b...`), not text. Read them with `ampi view <handle> --budget N`.
+9. **When output says `action_required`, do that action next.** Nothing else
+   first.
+10. **Record your progress** with `ampi memo put <key> <value>` and in window
+    cells. If you die, your replacement reads exactly that.
+11. **Create a window before writing to it.** `ampi win create --name W` is
+    idempotent; running it when it already exists is free.
 
 ## 1. Identity and lifecycle
 
@@ -43,6 +46,7 @@ This manual is the contract. Read it once, then work.
 ampi init                 # join. Prints your rank, the world size, your role.
 ampi info                 # who am I, which communicator, how big, who has failed
 ampi ctx                  # my context budget: used / remaining
+ampi hb --extend 900      # "I am alive and about to think for a while"
 ampi fini                 # leave cleanly
 ```
 
@@ -256,7 +260,7 @@ the difference between a recoverable job and a lost one.
 ## 9. Quick reference
 
 ```
-ampi init | fini | info | ctx | man | status
+ampi init | fini | info | ctx | hb --extend S | man | status
 ampi send --to R --tag T --in @f | recv [--from R|any] [--tag T|any] [--timeout S]
 ampi probe | inbox | isend | irecv | wait REQ... | test REQ | cancel REQ
 ampi barrier|bcast|scatter|gather|allgather|reduce|allreduce|scan|exscan|alltoall

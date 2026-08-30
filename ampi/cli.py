@@ -191,6 +191,14 @@ def add_payload(p: argparse.ArgumentParser, *, required: bool = False) -> None:
 
 def add_wait(p: argparse.ArgumentParser) -> None:
     p.add_argument("--timeout", type=float, default=None, help="deadline in seconds")
+    # The pilot run taught us that agents give up retrying far earlier than they
+    # are told to: instructed to retry a timed-out call up to 20 times, one rank
+    # stopped after two and stalled its whole reduction tree. A protocol that
+    # depends on an agent's persistence is not a protocol. So the binding retries
+    # internally by default: one shell invocation now covers several deadlines,
+    # and giving up requires the agent to do nothing rather than something.
+    p.add_argument("--retries", type=int, default=2,
+                   help="extra internal attempts after a timeout (default 2)")
 
 
 def add_recvopts(p: argparse.ArgumentParser) -> None:
@@ -207,9 +215,9 @@ def mat_of(a: argparse.Namespace) -> Optional[bool]:
     return None
 
 
-def _ctx(a: argparse.Namespace, *, require_init: bool = True) -> Ctx:
+def _ctx(a: argparse.Namespace, *, require_init: bool = True, beat: bool = True) -> Ctx:
     j = open_journal(a.job_root)
-    return bind(j, rank=a.rank, comm=a.comm, require_init=require_init)
+    return bind(j, rank=a.rank, comm=a.comm, require_init=require_init, beat=beat)
 
 
 # --------------------------------------------------------------------------
@@ -288,6 +296,19 @@ def cmd_man(a: argparse.Namespace) -> Dict[str, Any]:
         if cand.exists():
             return {"body": cand.read_text(encoding="utf-8")}
     return {"body": launcher.QUICKREF}
+
+
+def cmd_hb(a: argparse.Namespace) -> Dict[str, Any]:
+    from .core import extend_lease
+
+    ctx = _ctx(a, require_init=False, beat=False)
+    with ctx.j.tx() as c:
+        res = extend_lease(ctx.j, ctx.rank, ctx.epoch, float(a.extend or 0.0), conn=c)
+    res["note"] = (
+        "your lease now lasts at least this long without another call. Run this "
+        "before any step that will take more than a minute."
+    )
+    return res
 
 
 def cmd_ctx(a: argparse.Namespace) -> Dict[str, Any]:
@@ -867,6 +888,9 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--status", default="ok")
     S("info", "my identity and the shape of the job", cmd_info)
     S("man", "print the full protocol manual", cmd_man)
+    sp = S("hb", "renew/extend my lease before a long step", cmd_hb)
+    sp.add_argument("--extend", type=float, default=600.0,
+                    help="guarantee my lease survives at least this many more seconds")
     sp = S("ctx", "my context budget", cmd_ctx)
     sp.add_argument("--grant", type=int, default=None, help="raise my budget by N tokens")
     sp.add_argument("--release", type=int, default=None, help="return N tokens after compacting")
@@ -1211,13 +1235,55 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _trace_error(a: argparse.Namespace, exc: AmpiError) -> None:
+    """Best-effort: log an error event. Never let logging mask the real error."""
+    try:
+        j = open_journal(getattr(a, "job_root", None))
+        rank = getattr(a, "rank", None)
+        if rank is None:
+            env = os.environ.get("AMPI_RANK")
+            rank = int(env) if env not in (None, "") else None
+        with j.tx() as c:
+            j.trace(
+                "error",
+                rank=rank,
+                status=exc.err_class,
+                detail={"cmd": getattr(a, "cmd", None), "message": exc.message[:200]},
+                conn=c,
+            )
+        j.close()
+    except Exception:
+        pass
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = build_parser()
     a = parser.parse_args(argv)
     as_json = bool(getattr(a, "json", False))
+    attempts = max(1, 1 + int(getattr(a, "retries", 0) or 0))
     try:
-        res = a.func(a)
+        res = None
+        for attempt in range(attempts):
+            try:
+                res = a.func(a)
+                break
+            except AmpiError as exc:
+                last = attempt == attempts - 1
+                if exc.err_class not in RETRYABLE or last:
+                    raise
+                # Progress output matters: it tells the caller's tool that the
+                # command is alive rather than hung.
+                print(
+                    f"AMPI_RETRY attempt {attempt + 1}/{attempts} after {exc.err_class}: "
+                    f"{exc.message[:120]}",
+                    file=sys.stderr, flush=True,
+                )
     except AmpiError as exc:
+        # Record the error in the trace. This is what makes retry behaviour
+        # measurable: the interesting number in an agent run is not how many
+        # calls succeeded but how many times a rank had to re-issue a
+        # deadline-bounded call, and that is invisible unless the binding logs it.
+        _trace_error(a, exc)
         payload = exc.to_dict()
         payload["retryable"] = exc.err_class in RETRYABLE
         if as_json:

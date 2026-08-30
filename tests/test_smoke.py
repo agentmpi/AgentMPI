@@ -37,7 +37,14 @@ def ampi(root: Path, rank: Optional[int], *args: str, check: bool = True) -> Dic
             f"ampi {' '.join(args)} (rank={rank}) failed rc={proc.returncode}\n"
             f"stdout: {proc.stdout}\nstderr: {proc.stderr}"
         )
-    out = proc.stdout.strip() or proc.stderr.strip()
+    # The binding prints `AMPI_RETRY` progress lines to stderr before the final
+    # payload; strip them so the JSON is parseable.
+    def _clean(text: str) -> str:
+        return "\n".join(
+            ln for ln in text.splitlines() if not ln.startswith("AMPI_RETRY")
+        ).strip()
+
+    out = _clean(proc.stdout) or _clean(proc.stderr)
     try:
         data = json.loads(out)
     except Exception:
@@ -110,7 +117,8 @@ def test_idempotent_send(job):
 
 def test_timeout_is_retryable_and_resumes(job):
     root = job(2)
-    r = ampi(root, 1, "recv", "--from", "0", "--tag", "5", "--timeout", "0.2", check=False)
+    r = ampi(root, 1, "recv", "--from", "0", "--tag", "5", "--timeout", "0.2",
+             "--retries", "0", check=False)
     assert r["err_class"] == "AMPI_ERR_TIMEOUT"
     assert r["retryable"] is True
     ampi(root, 0, "send", "--to", "1", "--tag", "5", "--in", "late")
@@ -373,7 +381,8 @@ def test_window_lock_excludes(job):
     root = job(2)
     ampi(root, 0, "win", "create", "--name", "w")
     ampi(root, 0, "win", "lock", "--win", "w", "--key", "k", "--timeout", "5")
-    busy = ampi(root, 1, "win", "lock", "--win", "w", "--key", "k", "--timeout", "0.5", check=False)
+    busy = ampi(root, 1, "win", "lock", "--win", "w", "--key", "k", "--timeout", "0.5",
+                "--retries", "0", check=False)
     assert busy["err_class"] == "AMPI_ERR_LOCK_BUSY"
     ampi(root, 0, "win", "unlock", "--win", "w", "--key", "k")
     ok = ampi(root, 1, "win", "lock", "--win", "w", "--key", "k", "--timeout", "5")
@@ -417,11 +426,13 @@ def test_failure_detection_and_shrink(job):
     failed = ampi(root, 0, "failed")
     assert failed["count"] == 1 and failed["failed"][0]["world"] == 2
 
-    r = ampi(root, 0, "recv", "--from", "2", "--tag", "1", "--timeout", "3", check=False)
+    r = ampi(root, 0, "recv", "--from", "2", "--tag", "1", "--timeout", "3",
+             "--retries", "0", check=False)
     assert r["err_class"] == "AMPI_ERR_PROC_FAILED"
 
     ampi(root, 0, "comm", "revoke", "--reason", "rank 2 died")
-    r2 = ampi(root, 1, "barrier", "--label", "afterdeath", "--timeout", "2", check=False)
+    r2 = ampi(root, 1, "barrier", "--label", "afterdeath", "--timeout", "2",
+              "--retries", "0", check=False)
     assert r2["err_class"] == "AMPI_ERR_REVOKED"
 
     with ThreadPoolExecutor(max_workers=3) as ex:
@@ -515,3 +526,34 @@ def test_ops_listing(job):
     names = {o["name"] for o in out["ops"]}
     assert {"union", "vote", "jsonmerge", "maxby", "agent:<label>"} <= names
     assert "binomial" in out["algorithms"]["reduce"]
+
+
+def test_heartbeat_extends_lease(job):
+    root = job(2)
+    out = ampi(root, 0, "hb", "--extend", "1200")
+    assert out["lease_expires_in_s"] >= 1200
+    st = ampi(root, None, "status")
+    assert st["rank_states"].get("running") == 2
+
+
+def test_internal_retry_covers_a_late_sender(job):
+    """A single blocking invocation must survive several deadlines.
+
+    This is the fix for the failure the pilot run exposed: an agent instructed to
+    retry twenty times gave up after two. With internal retries, covering a slow
+    peer requires the agent to do nothing at all.
+    """
+    import threading
+    import time as _t
+
+    root = job(2)
+
+    def late_sender():
+        _t.sleep(2.5)
+        ampi(root, 0, "send", "--to", "1", "--tag", "9", "--in", "eventually")
+
+    t = threading.Thread(target=late_sender, daemon=True)
+    t.start()
+    got = ampi(root, 1, "recv", "--from", "0", "--tag", "9", "--timeout", "1", "--retries", "6")
+    t.join(timeout=10)
+    assert got["body"] == "eventually"

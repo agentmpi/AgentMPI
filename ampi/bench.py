@@ -244,52 +244,65 @@ COLL_PLAN: List[Tuple[str, str]] = [
 
 
 def suite_collectives(a: argparse.Namespace, workdir: Path) -> Dict[str, Any]:
-    np = int(a.np)
+    """Sweep every collective, every algorithm, over a range of P.
+
+    Sweeping P rather than fixing it is the point: the paper's claim is that the
+    algorithm *ranking* differs from MPI's, and a ranking is only meaningful as a
+    function of scale. Message and token counts are reported alongside time,
+    because in AgentMPI the token counts are the durable result -- wall time on a
+    stub executor says little about a real agent run, but "this schedule moves
+    Theta(P log P) tokens and that one moves Theta(P)" holds regardless.
+    """
+    ps = [p for p in (4, 8, 16, 32, 64, 128) if p <= int(a.np)] or [int(a.np)]
     payload_tokens = 200
     payload = _payload(payload_tokens)
     rows: List[Dict[str, Any]] = []
-    for op, algo in COLL_PLAN:
-        root = _job(workdir, np, f"coll_{op}_{algo}",
-                    Config(eager_tokens=10 ** 9, ctx_budget=10 ** 9, timeout_ns=120 * 10 ** 9))
+    for np in ps:
+        for op, algo in COLL_PLAN:
+            if algo == "recursive_doubling" and (np & (np - 1)):
+                continue
+            root = _job(workdir, np, f"coll_{op}_{algo}_{np}",
+                        Config(eager_tokens=10 ** 9, ctx_budget=10 ** 9, timeout_ns=300 * 10 ** 9))
 
-        def body(ctx: Ctx, out: Dict[str, Any], op=op, algo=algo) -> None:
-            t0 = time.perf_counter()
-            if op == "barrier":
-                collectives.barrier(ctx, label="b", algo=algo, timeout_ns=120 * 10 ** 9)
-            elif op == "bcast":
-                collectives.bcast(ctx, root=0, text=(payload if ctx.crank == 0 else None),
-                                  label="b", algo=algo, timeout_ns=120 * 10 ** 9,
-                                  materialize=True)
-            elif op in ("reduce", "allreduce"):
-                collectives.reduce_(ctx, op="concat", text=payload, root=0, label="b",
-                                    algo=algo, all_=(op == "allreduce"),
-                                    timeout_ns=120 * 10 ** 9, materialize=False)
-            elif op == "allgather":
-                collectives.gather(ctx, text=payload, all_=True, label="b", algo=algo,
-                                   timeout_ns=120 * 10 ** 9)
-            out["t_s"] = time.perf_counter() - t0
+            def body(ctx: Ctx, out: Dict[str, Any], op=op, algo=algo) -> None:
+                t0 = time.perf_counter()
+                if op == "barrier":
+                    collectives.barrier(ctx, label="b", algo=algo, timeout_ns=300 * 10 ** 9)
+                elif op == "bcast":
+                    collectives.bcast(ctx, root=0, text=(payload if ctx.crank == 0 else None),
+                                      label="b", algo=algo, timeout_ns=300 * 10 ** 9,
+                                      materialize=True)
+                elif op in ("reduce", "allreduce"):
+                    collectives.reduce_(ctx, op="concat", text=payload, root=0, label="b",
+                                        algo=algo, all_=(op == "allreduce"),
+                                        timeout_ns=300 * 10 ** 9, materialize=False)
+                elif op == "allgather":
+                    collectives.gather(ctx, text=payload, all_=True, label="b", algo=algo,
+                                       timeout_ns=300 * 10 ** 9)
+                out["t_s"] = time.perf_counter() - t0
 
-        res = _run_ranks(root, np, body)
-        j = Journal(root)
-        nmsg = int(j.scalar("SELECT COUNT(*) FROM msg WHERE job=?", (j.job_id,), 0))
-        ntok = int(j.scalar("SELECT COALESCE(SUM(tokens),0) FROM msg WHERE job=?", (j.job_id,), 0))
-        ctx_tok = int(j.scalar("SELECT COALESCE(SUM(value),0) FROM counter WHERE job=? AND name='ctx_tokens'",
-                              (j.job_id,), 0))
-        j.close()
-        rows.append(
-            {
-                "op": op,
-                "algo": algo,
-                "P": np,
-                "wall_s": round(res.wall_s, 4),
-                "per_rank_s": _dist([v.get("t_s", 0.0) for v in res.per_rank.values() if "t_s" in v]),
-                "messages": nmsg,
-                "message_tokens": ntok,
-                "context_tokens": ctx_tok,
-                "errors": res.errors[:3],
-            }
-        )
-    return {"suite": "collectives", "P": np, "payload_tokens": payload_tokens, "rows": rows}
+            res = _run_ranks(root, np, body, max_threads=a.procs or min(np, 128))
+            j = Journal(root)
+            nmsg = int(j.scalar("SELECT COUNT(*) FROM msg WHERE job=?", (j.job_id,), 0))
+            ntok = int(j.scalar("SELECT COALESCE(SUM(tokens),0) FROM msg WHERE job=?", (j.job_id,), 0))
+            ctx_tok = int(j.scalar(
+                "SELECT COALESCE(SUM(value),0) FROM counter WHERE job=? AND name='ctx_tokens'",
+                (j.job_id,), 0))
+            j.close()
+            rows.append(
+                {
+                    "op": op,
+                    "algo": algo,
+                    "P": np,
+                    "wall_s": round(res.wall_s, 4),
+                    "per_rank_s": _dist([v.get("t_s", 0.0) for v in res.per_rank.values() if "t_s" in v]),
+                    "messages": nmsg,
+                    "message_tokens": ntok,
+                    "context_tokens": ctx_tok,
+                    "errors": res.errors[:3],
+                }
+            )
+    return {"suite": "collectives", "P_sweep": ps, "payload_tokens": payload_tokens, "rows": rows}
 
 
 # --------------------------------------------------------------------------

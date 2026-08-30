@@ -362,6 +362,41 @@ def finalize_rank(j: Journal, rank: int, epoch: int, *, status: str = "ok") -> N
         j.trace("finalize", rank=rank, epoch=epoch, status=status, conn=c)
 
 
+def extend_lease(
+    j: Journal, rank: int, epoch: int, seconds: float, conn: Optional[sqlite3.Connection] = None
+) -> Dict[str, Any]:
+    """Guarantee this rank's lease survives for at least ``seconds`` more.
+
+    Leases exist to detect dead agents, but an agent that is *thinking* makes no
+    runtime calls, and a long think is indistinguishable from death to a
+    timeout-based detector. The classical answer -- make the lease longer than
+    the longest legitimate pause -- is bad here, because the lease also bounds how
+    long a peer blocked in a collective waits before it can make progress.
+
+    So AgentMPI gives the agent a way to say what a timeout cannot infer: "I am
+    about to spend ten minutes on one step." This is the same move a
+    long-running task makes when it extends a distributed lock rather than
+    holding a lock long enough for its worst case, and it lets the default lease
+    stay short enough to make failure detection useful.
+    """
+    c = conn or j.conn
+    ts = now_ns()
+    want = ts + int(max(0.0, seconds) * 1_000_000_000)
+    c.execute(
+        "UPDATE rank SET last_hb_ns=?, lease_expires_ns=MAX(?, ?+lease_ns), calls=calls+1"
+        " WHERE job=? AND rank=? AND epoch=?",
+        (ts, want, ts, j.job_id, rank, epoch),
+    )
+    row = c.execute(
+        "SELECT lease_expires_ns FROM rank WHERE job=? AND rank=?", (j.job_id, rank)
+    ).fetchone()
+    return {
+        "rank": rank,
+        "lease_expires_in_s": round((int(row["lease_expires_ns"]) - ts) / 1e9, 1),
+        "extended_by_s": round(max(0.0, seconds), 1),
+    }
+
+
 def heartbeat(j: Journal, rank: int, epoch: int, conn: Optional[sqlite3.Connection] = None) -> None:
     """Renew this rank's lease. Called implicitly by every runtime entry point.
 

@@ -77,7 +77,11 @@ def win_row(j: Journal, name: str) -> sqlite3.Row:
     if row is None:
         raise WinError(
             f"no such window {name!r}",
-            hint="create it with `ampi win create --name W`, or list with `ampi win list`",
+            hint=(
+                f"run `ampi win create --name {name}` first (it is idempotent, so it is safe "
+                "even if another rank already created it), then retry this command. "
+                "`ampi win list` shows the windows that exist."
+            ),
         )
     return row
 
