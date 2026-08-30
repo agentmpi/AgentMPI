@@ -209,6 +209,15 @@ agents executed the protocol.
    more reliably than they infer a remedy from a description of the fault.
 8. **A durable protocol store must migrate on open.** Adding a column
    mid-experiment broke a running 22-rank job.
+9. **A conditional send plus an unconditional receive is a deadlock, and no
+   protocol can save you from it.** Our own harness had this bug: the integrator
+   was told to send a fix assignment *for each failure*, the others to receive
+   one, and when the tests passed four ranks waited on a message nobody would
+   send. AgentMPI cannot prevent a program bug — but the deadline-bounded receive
+   turned an unbounded hang into a stall that `ampi status` localised in one
+   command, naming the missing ranks and the tag. The harness rule is the one MPI
+   teaches about zero-length collectives: **send unconditionally, possibly
+   empty**.
 
 That 6-of-22 launch failure, incidentally, ran to completion: all six survivors
 finalised and every collective closed — scatter, an agent-evaluated allreduce,

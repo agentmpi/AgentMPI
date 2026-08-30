@@ -396,17 +396,21 @@ ampi win fence --win build --label impl-done --quorum 0.9 --timeout 150
 cd {project} && python3 tests_visible.py > {work}/failures_r1.txt 2>&1; echo "exit=$?" >> {work}/failures_r1.txt
 ampi bcast --root 0 --label failures-r1 --in @{work}/failures_r1.txt --timeout 150
 ```
-Then assign the fixes: for each failure, work out which rank's file is responsible
-and tell them:
+Then assign the fixes. **Send to every rank, including the ones with nothing to
+fix** --- an empty assignment is still an assignment, and a rank that is waiting for
+a message you decided not to send waits forever:
 ```
-ampi send --to <rank> --tag fix --in "round 1: <what is broken and the failing case>"
+for r in 1 2 3 4 5 6 7; do
+  ampi send --to $r --tag fix --in "round 1: <what is broken, or: nothing assigned to you>"
+done
 ```''' if integrator else '''Then receive the failures and check for a fix assignment:
 ```
 ampi bcast --root 0 --label failures-r1 --timeout 150 --materialize
 ampi recv --from 0 --tag fix --timeout 120 --materialize
 ```
-If the `recv` times out repeatedly (5 attempts), you have no assigned fix; read the
-broadcast failures yourself and fix anything that is clearly in *your* files.'''}
+If the `recv` times out 5 times, stop waiting: read the broadcast failures
+yourself, fix anything clearly in *your* files, and continue. Never wait
+indefinitely for a message that may not have been sent.'''}
 
 Fix what is yours. Log what you changed:
 ```
@@ -420,10 +424,15 @@ Repeat Phase 5 with the labels `failures-r2` and `fix-r2`.
 {f'''```
 cd {project} && python3 tests_visible.py > {work}/failures_r2.txt 2>&1; echo "exit=$?" >> {work}/failures_r2.txt
 ampi bcast --root 0 --label failures-r2 --in @{work}/failures_r2.txt --timeout 150
-```''' if integrator else '''```
+for r in $(seq 1 {np - 1}); do
+  ampi send --to $r --tag fix2 --in "round 2: <what is broken, or: nothing assigned to you>"
+done
+```
+Send to every rank even when there is nothing to fix.''' if integrator else '''```
 ampi bcast --root 0 --label failures-r2 --timeout 150 --materialize
 ampi recv --from 0 --tag fix2 --timeout 120 --materialize
-```'''}
+```
+If that `recv` times out 5 times, stop waiting and continue to the barrier.'''}
 ```
 ampi barrier --label fix-r2 --quorum 0.9 --timeout 150
 ```
