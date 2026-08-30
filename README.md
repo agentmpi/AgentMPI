@@ -4,14 +4,44 @@
 
 This is not a multi-agent product. It is the interface people use to write their own: point-to-point matching, collectives, RMA windows and locks, communicator split/spawn, ULFM-shaped revoke/agree/shrink, and a context-token budget so a rank can fail with OOM instead of silently overflowing.
 
-Two reference bindings ship in this repository:
+## Implementations
 
-| Binding | Path | Fabric | Role |
+| Package | Path | Fabric | Role |
 |---|---|---|---|
-| Filesystem / algorithmic | `agentmpi/` | POSIX mailboxes, binomial/Bruck/doubling collectives | Default SPMD API (`COMM_WORLD.send`, `bcast`, …) |
-| SQLite / durable | `src/agentmpi_sql/` | WAL database, no resident broker | Inspectable semantic oracle, independent processes |
+| **`ampi`** (v0.2 reference) | `src/ampi/` | abstract device interface over SQLite **or** POSIX mailboxes | The current reference runtime: collective schedules with algorithm selection, semantic operators, one-sided windows, ULFM triad, deadlock detection, PAMPI tracing |
+| `agentmpi` (v0.1 prototype) | `agentmpi/` | POSIX mailboxes | Earlier filesystem binding; retained because the v0.1 measurements cited in the paper were produced with it |
+| `agentmpi_sql` (v0.1 prototype) | `src/agentmpi_sql/` | WAL database | Earlier SQLite binding, same reason |
 
-The protocol is transport-neutral (`SPEC.md`, `spec/AGENTMPI.md`). A harness can map the same calls to files, SQLite, NATS, Kafka, or gRPC.
+The normative specification is `spec/AGENTMPI-v0.2.md`; `SPEC.md` and
+`spec/AGENTMPI.md` are the superseded 0.1 profile drafts. The protocol is
+transport-neutral: a harness can map the same calls to files, SQLite, NATS,
+Kafka, or gRPC.
+
+## Quick start (v0.2 reference runtime)
+
+```bash
+python3 -m pip install -e ".[dev,analysis]"
+python3 -m pytest tests/ -q            # 113 tests, both transports
+
+ampirun new --job /tmp/job -n 8        # create a job
+AMPI_JOB_DIR=/tmp/job AMPI_RANK=0 ampi init --role worker
+AMPI_JOB_DIR=/tmp/job AMPI_RANK=0 ampi allreduce --op AMPI_MERGE_JSON \
+    --json-file glossary.json --explain
+```
+
+`ampi plan` shows the decision function's reasoning without running anything:
+
+```bash
+ampi plan --collective allreduce -p 32 -n 127776 \
+    --op AMPI_MERGE_JSON --vector --ctx-limit 128000
+# -> chosen: rabenseifner
+#    recursive_doubling rejected: peak residency of 197033 tokens
+#    exceeds the rank context limit of 128000 tokens
+```
+
+`ampi doctor` reports wait-for cycles, stalled collectives and suspected
+failures; `ampi-analyse <jobdir>` recomputes every published metric from the
+job's trace.
 
 ## Quick start (filesystem binding)
 
@@ -42,7 +72,20 @@ python3 -m agentmpi send --dest 0 --tag 2 --file result.json
 python3 -m agentmpi barrier
 ```
 
-## Reproduce the filesystem experiments
+## Reproduce the v0.2 experiments
+
+```bash
+python3 experiments/ampi/e1_microbench/run.py            # protocol cost, collectives, residency
+python3 experiments/ampi/figures.py                      # regenerate the paper figures
+python3 experiments/ampi/e2_semantic_allreduce/prepare.py  # write rank cards for real agents
+python3 experiments/ampi/e2_semantic_allreduce/collect.py  # analyse the agent runs
+```
+
+Agent-driven experiments are launched by giving each rank card in
+`<job>/cards/rankN.md` to one Cursor subagent. The cards are committed, because
+an experiment whose agent instructions are not archived is not reproducible.
+
+## Reproduce the v0.1 filesystem experiments
 
 ```bash
 python3 experiments/microbench.py
