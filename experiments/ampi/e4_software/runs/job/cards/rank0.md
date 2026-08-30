@@ -1,28 +1,31 @@
-# AgentMPI rank card --- rank 0 of 10
+# AgentMPI rank card --- rank 0 of 8
 
-You are **rank 0** in an AgentMPI job of 10 ranks. AgentMPI is a
+You are **rank 0** in an AgentMPI job of 8 ranks. AgentMPI is a
 message-passing protocol: you coordinate with the other ranks *only* through the
 `ampi` command-line tool. Do not read or write another rank's scratch directory,
 and do not try to contact another rank by any other means. Everything you need
 arrives through the protocol.
 
-## Your environment
+## How to invoke `ampi`
 
-Run this once at the start of your shell session, then every `ampi` command
-picks up its identity automatically:
-
-```
-export PATH=/workspace/.venv/bin:$PATH
-export AMPI_JOB_DIR=/workspace/experiments/ampi/e4_software/runs/job
-export AMPI_RANK=0
-export AMPI_COMM=world
-```
-
-If your shell does not persist between commands, prefix each call instead:
+**Always pass `--job` and `--rank` explicitly, on every single call.** Do not
+rely on environment variables: shell state may not survive between your tool
+invocations, and a call that silently picks up the wrong rank will corrupt the
+run in ways that are hard to see. Every command looks like this:
 
 ```
-PATH=/workspace/.venv/bin:$PATH AMPI_JOB_DIR=/workspace/experiments/ampi/e4_software/runs/job AMPI_RANK=0 ampi status
+/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e4_software/runs/job --rank 0 <subcommand> ...
 ```
+
+To keep that short, define a shell function at the start of every command you
+run (not once at the beginning --- every time):
+
+```
+A="/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e4_software/runs/job --rank 0"
+$A status
+```
+
+Whenever this card writes `ampi ...` below, run `$A ...` instead.
 
 Your scratch directory is `/workspace/experiments/ampi/e4_software/runs/job/ranks/0`. Write intermediate files there.
 
@@ -74,7 +77,10 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
    context is a budget; `ampi ctx` shows it.
 3. **Heartbeat before long work.** Before any step that will take more than a
    couple of minutes without an `ampi` call, run `ampi hb --expect-idle
-   SECONDS`. Otherwise the failure detector may declare you dead.
+   SECONDS`, and over-estimate rather than under-estimate. A declared period
+   can only lengthen your lease, never shorten it, so guessing high is free.
+   A blocking call such as `recv` or a collective heartbeats for you while it
+   waits, so you do not need to declare anything before one of those.
 4. **Claim before you work.** When picking up a shared work item, use `ampi
    win-claim`. If it returns `"claimed": false` somebody else already has it;
    take a different item. Never assume an item is yours.
