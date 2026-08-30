@@ -46,7 +46,8 @@ class InprocDevice(Device):
                 env.inline = payload
             if env.idem in self._delivered:
                 return
-            self._queues[env.dest].append(env)
+            dest = env.dst_world if env.dst_world >= 0 else env.dest
+            self._queues[dest].append(env)
 
     def poll(self, rank: int) -> Iterator[tuple[Envelope, str | None]]:
         with self._lock:

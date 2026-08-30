@@ -137,6 +137,8 @@ def run(
             threading.Timer(kill[rank], lambda: _die(rt)).start()
         try:
             result.results[rank] = fn(rt.world)
+        except RankKilled:
+            pass          # a crashed rank reports nothing, by definition
         except BaseException:  # noqa: BLE001 - report, do not propagate
             result.errors[rank] = traceback.format_exc()
         finally:
@@ -161,17 +163,33 @@ def run(
     return result
 
 
+class RankKilled(BaseException):
+    """Raised inside a killed rank's thread to unwind it.
+
+    Derives from ``BaseException`` so that application code catching
+    ``Exception`` -- which a fault-tolerant harness certainly does -- cannot
+    accidentally swallow its own death and keep participating.
+    """
+
+
 def _die(rt: Runtime) -> None:
     """Simulate an agent that stops without announcing anything.
 
     Deliberately silent: it does not finalize, does not publish a failure,
     and does not stop heartbeating gracefully.  It simply goes quiet, which
     is what a crashed agent, a revoked API key, and a killed container all
-    look like from the outside, and the only thing the failure detector can
-    actually observe.
+    look like from the outside, and the only thing a peer can observe.
+
+    Stopping the heartbeat is not enough on its own: a Python thread cannot
+    be killed from outside, so a "dead" rank whose thread keeps running would
+    go on answering collectives and the experiment would measure nothing. We
+    therefore also set a flag that makes every subsequent protocol operation
+    on that rank raise, which unwinds its thread at the next call and is
+    behaviourally indistinguishable from a crash.
     """
     rt.stop_heartbeat()
     rt.state = RankState.FAILED
+    rt.killed = True
     rt.heartbeat = lambda force=False: None  # type: ignore[assignment]
     rt.start_heartbeat = lambda period_s=None: None  # type: ignore[assignment]
     rt.device.kv_delete(f"hb/{rt.world_rank}")

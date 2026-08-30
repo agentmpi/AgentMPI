@@ -63,6 +63,14 @@ class Envelope:
     dest: int
     tag: int
     seq: int
+    src_world: int = -1
+    dst_world: int = -1
+    """Routing addresses.  ``source`` and ``dest`` are ranks *within the
+    communicator*, which is what matching and ordering are defined over; the
+    device, however, owns one inbox per physical rank and must be told the
+    world rank.  On ``AMPI_COMM_WORLD`` the two coincide, which is why
+    conflating them survives every test that uses only the world
+    communicator -- and breaks the moment a job shrinks or splits."""
     datatype: str = Datatype.TEXT.value
     mode: str = SendMode.STANDARD.value
     tokens: int = 0

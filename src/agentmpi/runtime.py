@@ -132,6 +132,7 @@ class Runtime:
         self.turn = 0
         self.started_at = time.time()
         self.finalized = False
+        self.killed = False
         self.state = RankState.INIT
 
         self.budget = ContextBudget(
@@ -399,6 +400,10 @@ class Runtime:
         on its next poll, which is what turns an unbreakable wait into a
         recoverable ``AMPI_ERR_REVOKED``.
         """
+        if self.killed:
+            from .sim import RankKilled
+
+            raise RankKilled(f"rank {self.world_rank} is dead")
         self.heartbeat()
         from .ft import is_revoked
 

@@ -190,7 +190,8 @@ class JournalDevice(Device):
     def post(self, env: Envelope, payload: str) -> None:
         if env.blob is None and payload:
             env.inline = payload
-        target = self._inbox(env.context, env.dest)
+        target = self._inbox(env.context, env.dst_world if env.dst_world >= 0
+                             else env.dest)
         target.mkdir(parents=True, exist_ok=True)
         # Sortable name: the sequence number first so that a directory
         # listing is already in per-source order, which makes the common

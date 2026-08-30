@@ -327,6 +327,10 @@ class Communicator:
             raise TagError("tag outside the valid range", tag=tag, tag_ub=TAG_UB)
 
     def _check_live(self) -> None:
+        if getattr(self.runtime, "killed", False):
+            from .sim import RankKilled
+
+            raise RankKilled(f"rank {self.runtime.world_rank} is dead")
         if self.freed:
             raise CommError("operation on a freed communicator", comm=self.name)
         if self.revoked:
@@ -362,6 +366,8 @@ class Communicator:
             context=self.context,
             source=self.rank,
             dest=dest,
+            src_world=self.runtime.world_rank,
+            dst_world=self.world(dest),
             tag=tag,
             seq=self._next_seq(dest),
             datatype=dt.name,

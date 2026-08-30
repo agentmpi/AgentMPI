@@ -329,3 +329,53 @@ def test_comm_split_by_color():
     size, members, _ = r.results[0]
     assert size == 3
     assert members == [6, 3, 0]  # ordered by key = -rank
+
+
+# ------------------------------------------- sub-communicator addressing
+
+def test_collectives_work_on_a_split_communicator():
+    """Regression: sub-communicator messages must reach the right inbox.
+
+    Envelopes carry communicator-local ranks, because that is what matching
+    and ordering are defined over, but the device owns one inbox per
+    *physical* rank. On AMPI_COMM_WORLD the two numberings coincide, so
+    conflating them passes every test that uses only the world communicator
+    -- and silently misroutes every message the moment a job splits or
+    shrinks. This test uses a split whose local ranks differ from the world
+    ranks, so the two numberings cannot be confused.
+    """
+
+    def body(comm):
+        sub = comm.split(color=comm.rank % 2, key=0)
+        assert sub is not None
+        # Local rank differs from world rank for the odd-coloured group.
+        total = sub.allreduce(comm.rank, ampi.SUM, timeout=60)
+        gathered = sub.allgather(comm.rank, timeout=60)
+        sub.barrier(timeout=60)
+        return (sub.size, sub.rank, comm.rank, total, gathered)
+
+    r = sim.run(8, body, timeout=120)
+    r.raise_errors()
+    for world in range(8):
+        size, local, rank, total, gathered = r.results[world]
+        expected_members = [w for w in range(8) if w % 2 == world % 2]
+        assert size == 4
+        assert gathered == expected_members
+        assert total == sum(expected_members)
+        assert local == expected_members.index(world)
+
+
+def test_point_to_point_on_a_split_communicator():
+    def body(comm):
+        sub = comm.split(color=comm.rank // 4, key=0)
+        assert sub is not None
+        if sub.rank == 0:
+            for peer in range(1, sub.size):
+                comm_msg, _ = sub.recv(peer, 11, timeout=60)
+            return "root-ok"
+        sub.send(f"hello from world {comm.rank}", 0, 11)
+        return "sent"
+
+    r = sim.run(8, body, timeout=120)
+    r.raise_errors()
+    assert r.results[0] == "root-ok" and r.results[4] == "root-ok"
