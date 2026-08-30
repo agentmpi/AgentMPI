@@ -67,7 +67,14 @@ CASES: list[tuple[str, str, str, dict[str, Any], Any]] = [
         {"a": 3, "b": "x", "c": None}, {"a": 4, "b": "z", "c": 5.25}]),
     ("select_cols", "parser", "SELECT b, a FROM t", T_BASIC,
      [{"b": "x", "a": 1}, {"b": "y", "a": 2}, {"b": "x", "a": 3}, {"b": "z", "a": 4}]),
-    ("keywords_case_insensitive", "tokens", "select A from t where A = 2", T_BASIC, [{"a": 2}]),
+    # The spec says keywords are case-insensitive and identifiers are case-sensitive,
+    # so this case must vary only the keywords. An earlier version wrote the column
+    # as `A`, which contradicted the specification it was testing; the agent
+    # population implemented the spec correctly and the suite marked it wrong. The
+    # oracle can be the defective party, which is worth remembering before trusting
+    # a pass rate.
+    ("keywords_case_insensitive", "tokens", "SeLeCt a FrOm t WhErE a = 2", T_BASIC, [{"a": 2}]),
+    ("identifiers_case_sensitive", "planner", "SELECT A FROM t", T_BASIC, "QueryError"),
     ("string_literal_escape", "tokens", "SELECT 'it''s' AS s FROM t LIMIT 1", T_BASIC, [{"s": "it's"}]),
     ("alias_with_as", "parser", "SELECT a AS num FROM t LIMIT 2", T_BASIC, [{"num": 1}, {"num": 2}]),
     ("alias_without_as", "parser", "SELECT a num FROM t LIMIT 1", T_BASIC, [{"num": 1}]),

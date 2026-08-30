@@ -452,11 +452,23 @@ def table_fidelity() -> None:
 
 
 def table_software() -> None:
-    res = []
+    """Software-experiment results for the largest single campaign.
+
+    Filtered by campaign label for the same reason as the translation table: a
+    synthetic smoke run shares the result schema, and a row of stub modules scoring
+    zero next to a real population scoring full marks invites exactly the wrong
+    reading.
+    """
+    by_label: dict[str, list[dict[str, Any]]] = {}
     for f in sorted(glob.glob(str(RESULTS / "software" / "*.json"))):
         d = load(Path(f))
         if d and "acceptance" in d:
-            res.append(d)
+            by_label.setdefault(str((d.get("config") or {}).get("label") or "?"), []).append(d)
+    res = (
+        max(by_label.values(), key=lambda rows: (len(rows), sum(r["job"]["agent_calls"] for r in rows)))
+        if by_label
+        else []
+    )
     if not res:
         emit("tab_software.tex", MISSING)
         emit("tab_software_contention.tex", MISSING)
@@ -475,8 +487,12 @@ def table_software() -> None:
 
     lines = []
     for d in sorted(res, key=lambda x: (-(x["config"].get("ranks") or 0), not x["config"].get("shared_interfaces"))):
-        a, j, c = d["acceptance"], d["job"], d["config"]
-        rounds = d.get("per_round") or []
+        # Prefer the offline re-evaluation: it scores every configuration against the
+        # *same* oracle, which the in-run numbers do not, because the oracle was
+        # corrected partway through the campaign.
+        a = d.get("acceptance_reeval") or d["acceptance"]
+        j, c = d["job"], d["config"]
+        rounds = (d.get("acceptance_reeval") or {}).get("per_round") or d.get("per_round") or []
         traj = " / ".join(str(r.get("n_passed") or 0) for r in rounds)
         lines.append(
             rf"{label(c)} & {c.get('ranks')} & {fmt(a.get('importable'))} & "

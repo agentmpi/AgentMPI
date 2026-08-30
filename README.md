@@ -48,14 +48,26 @@ substance:
    and a ring exchange that stalls above a payload threshold under eager transport
    completes at every size under rendezvous.
 
-2. **Reduction is lossy in depth, so algorithm choice is a quality decision.** A
-   reduction operator implemented by a language model is not associative, and its
-   loss compounds with the *depth* of the reduction tree rather than the number of
-   applications. Operators therefore declare their algebraic strength, the runtime
-   refuses a tree for a non-associative operator, and every reduction reports its
-   fold depth. Because a binomial tree has depth `log2 p` where a serial chain has
-   `p-1`, the tree wins on fidelity *and* latency — but only because broadcasts
-   forward immutable content-addressed handles, so relaying cannot corrupt.
+2. **Reduction is lossy in depth, so algorithm choice is a quality decision — and
+   binary is the wrong arity.** A reduction operator implemented by a language model
+   is not associative, and its loss compounds with the *depth* of the reduction tree
+   rather than the number of applications. Operators therefore declare their
+   algebraic strength, the runtime refuses a tree for a non-associative operator, and
+   every reduction reports its fold depth.
+
+   The non-obvious part: every `log2 p` factor in MPI's collective layer descends
+   from processes being **single-ported**, so a wider tree node buys nothing. An
+   agent rank has no port count — a prompt carries eight artifacts as easily as two,
+   and a *variadic* operator merges all eight in one application. The binding
+   constraint becomes the context budget, giving `k* = floor(C(1-h)/s)` and a fold
+   depth of `log_k p`. At `p=64`, widening from `k=2` to `k=8` cuts fold depth from
+   6 to 2 **at an identical message count**, since every non-root rank sends exactly
+   once whatever the arity. So this setting wants the *widest* feasible tree where
+   MPI wants the narrowest.
+
+   None of this works unless broadcast is lossless, which is why artifacts are
+   immutable and content-addressed: a tree forwards handles, so relaying cannot
+   corrupt.
 
 3. **The dominant failure is silent corruption, not crash.** A rank that returns a
    confident wrong answer is invisible to timeouts, retries and schema checks. It
@@ -219,6 +231,35 @@ The modules are written to be read. Each opens with the design argument for what
 it contains — what MPI does, why, whether it transfers, and what had to change —
 because a protocol whose rationale is not written down gets reimplemented wrongly.
 `algorithms.py` and `ops.py` are the two worth reading first.
+
+## Some measured findings
+
+From runs with real agent populations, all reported in the paper with the code that
+produced them:
+
+- **Strong scaling** on parallel translation: 3.46× speedup at `p=8` on identical
+  total work. The Universal Scalability Law fit is `σ=0.220, κ=0.0000` (R²=0.873) —
+  substantial contention, but a *zero* coherency term, meaning the coordination cost
+  is a constant serial fraction rather than a ceiling. A positive `κ` is the
+  signature of an all-to-all conversation and the reason group-chat architectures
+  stop scaling.
+- **Exact operators beat semantic ones by a wide margin.** The same glossary
+  agreement performed by an LLM merge instead of the exact, idempotent `UNION` cost
+  6.9× the wall time and 1.4× the price, and produced identical measured quality.
+- **Coordination has a price worth knowing**: the glossary allreduce plus halo
+  exchange cost 76% more wall time and 159% more tokens than doing neither. On our
+  text they bought nothing measurable, because the entities were famous enough that
+  models render them identically without coordination. We report that rather than
+  swapping the metric.
+- **The depth penalty is conditional on capacity.** When a reduction is not
+  capacity-bound, every algorithm retains everything and fold depth is irrelevant —
+  but the tree is still 2.2× faster at identical quality. Ask whether your reduction
+  is saturated before optimising its shape.
+- **Context safety has a sharp threshold**: an all-eager ring exchange fails above
+  the unexpected-message budget with a reported `ERR_CONTEXT_OVERFLOW`, while
+  rendezvous completes at every size.
+- **Model and implementation agree exactly** on message counts and fold depths
+  across 278 collective configurations — after the cross-check found four real bugs.
 
 ## Status
 

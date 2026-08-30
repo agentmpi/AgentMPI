@@ -251,17 +251,37 @@ def run_acceptance(workdir: Path, timeout: float = 180.0) -> dict[str, Any]:
         )
     except subprocess.TimeoutExpired:
         return {"importable": False, "import_error": "acceptance suite timed out", "n_total": 0, "n_passed": 0, "cases": [], "timeout": True}
-    out = proc.stdout.strip()
-    try:
-        return json.loads(out[out.rfind("{") :]) if out else {"importable": False, "import_error": proc.stderr[-2000:], "n_total": 0, "n_passed": 0, "cases": []}
-    except json.JSONDecodeError:
-        return {
-            "importable": False,
-            "import_error": (proc.stderr or out)[-2000:],
-            "n_total": 0,
-            "n_passed": 0,
-            "cases": [],
-        }
+    report = parse_report(proc.stdout, proc.stderr)
+    report.setdefault("cases", [])
+    return report
+
+
+def parse_report(stdout: str, stderr: str = "") -> dict[str, Any]:
+    """Parse the suite's JSON report from its stdout.
+
+    The suite prints exactly one JSON object, so this is ``json.loads``. It is a
+    named function with a test because an earlier version sliced from
+    ``out.rfind("{")`` -- the *last* brace in the output, which lands inside a nested
+    per-case object and never parses. Every run was then reported as unimportable
+    with zero passes, and because this report is exactly what the harness scatters
+    back to the population as the definition of done, the agents were told a build
+    that passed 58 of 59 cases had failed to import and spent a repair round on a
+    phantom. A bug in the plumbing around an oracle is as damaging as a bug in the
+    oracle.
+    """
+    out = (stdout or "").strip()
+    if not out:
+        return {"importable": False, "import_error": (stderr or "")[-2000:], "n_total": 0, "n_passed": 0}
+    for candidate in (out, out[out.find("{") :] if "{" in out else ""):
+        if not candidate:
+            continue
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+    return {"importable": False, "import_error": out[-2000:], "n_total": 0, "n_passed": 0}
 
 
 def write_tree(workdir: Path, files: dict[str, str]) -> None:

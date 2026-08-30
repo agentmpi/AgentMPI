@@ -174,3 +174,41 @@ def test_doctor_reports_an_incomplete_collective(tmp_path, capsys):
     report = json.loads(capsys.readouterr().out)
     kinds = {f["issue"] for f in report["findings"]}
     assert any("fail_stop" in k or "collective" in k for k in kinds), report
+
+
+def test_acceptance_report_parsing():
+    """The suite's report must survive the trip back into the harness.
+
+    An earlier version sliced from the *last* brace in the output, which lands inside
+    a nested per-case object and never parses, so every run was reported as
+    unimportable with zero passes. That report is what the harness scatters back to
+    the population as the definition of done, so the agents were told a passing build
+    had failed and spent a repair round on nothing. A bug in the plumbing around an
+    oracle is as damaging as a bug in the oracle, and neither is visible without a
+    test like this one.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
+    from software import parse_report  # noqa: PLC0415 - path set above
+
+    report = {
+        "importable": True,
+        "n_total": 2,
+        "n_passed": 1,
+        "cases": [
+            {"name": "a", "passed": True},
+            {"name": "b", "passed": False, "reason": "expected {'x': 1}, got {'x': 2}"},
+        ],
+    }
+    payload = json.dumps(report)
+    assert parse_report(payload)["n_passed"] == 1
+    assert parse_report(payload + "\n")["n_total"] == 2
+    assert parse_report("warning: something\n" + payload)["importable"] is True
+    # Nested braces in the trailing case must not confuse it.
+    assert parse_report(payload)["cases"][1]["reason"].endswith("got {'x': 2}")
+    # Genuine failures still report as failures.
+    assert parse_report("")["importable"] is False
+    assert parse_report("", "Traceback ...")["import_error"] == "Traceback ..."
+    assert parse_report("total garbage")["importable"] is False
