@@ -1,0 +1,515 @@
+"""Generate the paper's tables and figures from the result JSON.
+
+No number in the paper is transcribed by hand. Every table under
+``paper/generated/`` is produced by this script from files in ``results/``, so a
+number in the PDF can be traced to the run that produced it, and re-running the
+experiments updates the paper. Transcription is the most common source of wrong
+numbers in systems papers and it is entirely avoidable.
+
+Usage::
+
+    python3 scripts/make_tables.py            # regenerate everything present
+    python3 scripts/make_tables.py --check    # fail if a required input is missing
+"""
+
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import math
+from pathlib import Path
+from typing import Any
+
+REPO = Path(__file__).resolve().parent.parent
+RESULTS = REPO / "results"
+OUT = REPO / "paper" / "generated"
+
+MISSING = r"\emph{(not measured in this run)}"
+
+#: Single-value macros collected by the table builders and emitted together, so
+#: the paper can refer to a measured number inside a caption -- where an
+#: ``\input`` would be fragile under hyperref.
+_MACROS: dict[str, str] = {}
+
+
+# --------------------------------------------------------------------- helpers
+
+
+def load(path: Path) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def emit(name: str, body: str) -> None:
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / name).write_text(body.rstrip() + "\n", encoding="utf-8")
+    print(f"  wrote {name}")
+
+
+def tex_escape(s: str) -> str:
+    for a, b in (("\\", r"\textbackslash{}"), ("_", r"\_"), ("%", r"\%"), ("&", r"\&"), ("#", r"\#"), ("$", r"\$")):
+        s = s.replace(a, b)
+    return s
+
+
+def fmt(x: Any, nd: int = 2, dash: str = "--") -> str:
+    if x is None:
+        return dash
+    if isinstance(x, bool):
+        return r"\checkmark" if x else r"$\times$"
+    if isinstance(x, (int,)) and not isinstance(x, bool):
+        return f"{x:,}"
+    if isinstance(x, float):
+        if x != x or math.isinf(x):
+            return dash
+        return f"{x:,.{nd}f}"
+    return tex_escape(str(x))
+
+
+# ------------------------------------------------------------ cost model table
+
+
+def table_cost_formulas() -> None:
+    """Closed-form cost of every implemented algorithm."""
+    import sys
+
+    sys.path.insert(0, str(REPO / "src"))
+    from agentmpi.cost import FORMULAS  # noqa: PLC0415 - path set above
+
+    rows = []
+    for (op, alg) in sorted(FORMULAS):
+        f = FORMULAS[(op, alg)]
+        cells = []
+        for p in (8, 64):
+            r, m, v, d = f(p, 1)
+            cells.append((int(r), int(m), int(d)))
+        rows.append(
+            rf"{tex_escape(op)} & \texttt{{{tex_escape(alg)}}} & {cells[0][0]} & {cells[0][1]} & {cells[0][2]} "
+            rf"& {cells[1][0]} & {cells[1][1]} & {cells[1][2]} \\"
+        )
+    body = (
+        "\\begin{tabular}{llrrrrrr}\n\\toprule\n"
+        "& & \\multicolumn{3}{c}{$p=8$} & \\multicolumn{3}{c}{$p=64$} \\\\\n"
+        "\\cmidrule(lr){3-5}\\cmidrule(lr){6-8}\n"
+        "collective & algorithm & rounds & msgs & depth & rounds & msgs & depth \\\\\n\\midrule\n"
+        + "\n".join(rows)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_cost_formulas.tex", body.replace("cmidrule(lr)", "cmidrule(lr)"))
+
+
+# ------------------------------------------------------- model validation table
+
+
+def table_model_validation() -> None:
+    data = None
+    for cand in ("free-collectives", "free-all", "mb-smoke-all"):
+        d = load(RESULTS / "microbench" / f"{cand}.json")
+        if d and "collectives" in (d.get("benches") or {}):
+            data = d["benches"]["collectives"]
+            break
+    if not data:
+        emit("tab_model_validation.tex", MISSING)
+        return
+    rows = data["rows"]
+    by_op: dict[str, dict[str, Any]] = {}
+    for r in rows:
+        if not r.get("ok"):
+            continue
+        b = by_op.setdefault(r["op"], {"n": 0, "msg_ok": 0, "depth_ok": 0, "algs": set(), "ps": set()})
+        b["n"] += 1
+        b["msg_ok"] += 1 if r["messages_match"] else 0
+        b["depth_ok"] += 1 if r["fold_depth_match"] else 0
+        b["algs"].add(r["algorithm"])
+        b["ps"].add(r["p"])
+    lines = []
+    for op in sorted(by_op):
+        b = by_op[op]
+        lines.append(
+            rf"{tex_escape(op)} & {len(b['algs'])} & {len(b['ps'])} & {b['n']} & "
+            rf"{b['msg_ok']}/{b['n']} & {b['depth_ok']}/{b['n']} \\"
+        )
+    body = (
+        "\\begin{tabular}{lrrrrr}\n\\toprule\n"
+        "collective & algorithms & sizes & configs & message count & fold depth \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\midrule\n"
+        + rf"\textbf{{total}} & & & {data['n_configurations']} & "
+        + rf"{int(data['message_count_agreement'] * data['n_configurations'])}/{data['n_configurations']} & "
+        + rf"{int(data['fold_depth_agreement'] * data['n_configurations'])}/{data['n_configurations']} \\"
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_model_validation.tex", body)
+    _MACROS["NModelConfigs"] = str(data["n_configurations"])
+    _MACROS["NModelAgreement"] = f"{100 * data['message_count_agreement']:.0f}"
+    _MACROS["NModelDepthAgreement"] = f"{100 * data['fold_depth_agreement']:.0f}"
+
+
+# ------------------------------------------------------------- translation table
+
+
+def _tr_results() -> list[tuple[str, dict[str, Any]]]:
+    out = []
+    for f in sorted(glob.glob(str(RESULTS / "translation" / "*.json"))):
+        d = load(Path(f))
+        if not d or "quality" not in d:
+            continue
+        out.append((Path(f).stem, d))
+    return out
+
+
+def table_translation() -> None:
+    res = _tr_results()
+    if not res:
+        emit("tab_translation.tex", MISSING)
+        emit("tab_translation_scaling.tex", MISSING)
+        return
+
+    def label(cfg: dict[str, Any]) -> str:
+        bits = []
+        bits.append("glossary" if cfg.get("glossary") else "\\textbf{no glossary}")
+        bits.append("halo" if cfg.get("halo") else "\\textbf{no halo}")
+        if cfg.get("glossary_op") == "semantic":
+            bits.append("semantic merge")
+        if cfg.get("allreduce_alg") == "recursive_doubling":
+            bits.append("rec.\\ doubling")
+        return ", ".join(bits)
+
+    ablations = [(n, d) for n, d in res if d["config"].get("ranks") == max(x[1]["config"].get("ranks", 0) for x in res)]
+    lines = []
+    for _, d in sorted(ablations, key=lambda kv: (not kv[1]["config"].get("glossary"), not kv[1]["config"].get("halo"))):
+        q, j, c = d["quality"], d["job"], d["config"]
+        lines.append(
+            rf"{label(c)} & {fmt(q['consistency'], 3)} & {q['n_divergent_entities']}/{q['n_shared_entities']} & "
+            rf"{fmt(q['rendering_verified'], 3)} & {fmt(q['paragraph_fidelity'], 3)} & "
+            rf"{fmt(q['target_script_ratio'], 3)} & {fmt(j['wall_s'], 0)} & {j['agent_calls']} & "
+            rf"{fmt(j['tokens_in'] + j['tokens_out'])} & {fmt(j['usd'], 3)} \\"
+        )
+    body = (
+        "\\begin{tabular}{lrrrrrrrrr}\n\\toprule\n"
+        "configuration & consist. & diverg. & verified & para. & CJK & wall (s) & calls & tokens & USD \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_translation.tex", body)
+
+    # strong scaling
+    scal = {}
+    for _, d in res:
+        c = d["config"]
+        if c.get("glossary") and c.get("halo") and c.get("glossary_op") == "union" and c.get("allreduce_alg") == "reduce_bcast":
+            scal[c["ranks"]] = d
+    if len(scal) >= 2:
+        base = scal.get(1) or scal[min(scal)]
+        t1 = base["job"]["wall_s"]
+        p1 = base["config"]["ranks"]
+        lines = []
+        pts: list[tuple[int, float]] = []
+        for p in sorted(scal):
+            d = scal[p]
+            t = d["job"]["wall_s"]
+            sp = (t1 * p1) / t if t else 0.0
+            eff = sp / p
+            pts.append((p, sp))
+            kf = ((1 / sp - 1 / p) / (1 - 1 / p)) if p > 1 and sp > 0 else 0.0
+            lines.append(
+                rf"{p} & {fmt(t, 0)} & {fmt(sp, 2)} & {fmt(eff, 2)} & {fmt(kf, 3)} & "
+                rf"{d['job']['agent_calls']} & {fmt(d['job']['tokens_in'] + d['job']['tokens_out'])} & "
+                rf"{fmt(d['job']['usd'], 3)} & {fmt(d['quality']['consistency'], 3)} \\"
+            )
+        import sys
+
+        sys.path.insert(0, str(REPO / "src"))
+        from agentmpi.cost import fit_usl  # noqa: PLC0415
+
+        sigma, kappa, r2 = fit_usl(pts)
+        body = (
+            "\\begin{tabular}{rrrrrrrrr}\n\\toprule\n"
+            "$p$ & wall (s) & speedup & efficiency & Karp--Flatt & calls & tokens & USD & consist. \\\\\n\\midrule\n"
+            + "\n".join(lines)
+            + "\n\\bottomrule\n\\end{tabular}"
+        )
+        emit("tab_translation_scaling.tex", body)
+        _MACROS["NUslFit"] = rf"$\sigma={sigma:.3f}$, $\kappa={kappa:.4f}$ ($R^2={r2:.3f}$)"
+    else:
+        emit("tab_translation_scaling.tex", MISSING)
+
+    # calibration
+    best = max(res, key=lambda kv: kv[1]["job"]["agent_calls"])[1]
+    cal = best["calibration"]
+    body = (
+        "\\begin{tabular}{lrl}\n\\toprule\nparameter & value & meaning \\\\\n\\midrule\n"
+        rf"$\alpha_{{p50}}$ & {fmt(cal.get('alpha_p50'), 1)} s & median agent invocation latency \\" "\n"
+        rf"$\alpha_{{p99}}$ & {fmt(cal.get('alpha_p99'), 1)} s & tail latency \\" "\n"
+        rf"$\beta^{{-1}}$ & {fmt(cal.get('tokens_per_s'), 1)} tok/s & marginal output rate \\" "\n"
+        rf"$\alpha/\beta$ & {fmt(cal.get('alpha_beta_crossover_tokens'), 0)} tok & latency/volume crossover \\" "\n"
+        rf"fabric & {fmt(cal.get('fabric_s'), 4)} s & per-operation protocol cost \\" "\n"
+        rf"$\alpha/\text{{fabric}}$ & {fmt((cal.get('alpha_p50') or 0) / (cal.get('fabric_s') or 1), 0)}$\times$ & agent cost over protocol cost \\"
+        "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_calibration.tex", body)
+
+
+# ---------------------------------------------------------------- transport table
+
+
+def table_transport() -> None:
+    d = load(RESULTS / "microbench" / "free-transport.json") or load(RESULTS / "microbench" / "free-all.json")
+    b = (d or {}).get("benches", {}).get("transport")
+    if not b:
+        emit("tab_transport.tex", MISSING)
+        return
+    by_n: dict[int, dict[str, Any]] = {}
+    for r in b["rows"]:
+        by_n.setdefault(r["n_tokens"], {})[r["mode"]] = r
+    lines = []
+    for n in sorted(by_n):
+        e = by_n[n].get("eager", {})
+        rz = by_n[n].get("rendezvous", {})
+        lines.append(
+            rf"{n:,} & {fmt(e.get('completed'))} & {tex_escape(', '.join(e.get('error_classes') or []) or '--')} & "
+            rf"{fmt(e.get('max_context_used'))} & {fmt(rz.get('completed'))} & {fmt(rz.get('max_context_used'))} & "
+            rf"{fmt(rz.get('tokens_deferred'))} \\"
+        )
+    limit = b["rows"][0].get("unexpected_limit")
+    body = (
+        "\\begin{tabular}{rccrccr}\n\\toprule\n"
+        "& \\multicolumn{3}{c}{eager} & \\multicolumn{3}{c}{rendezvous} \\\\\n"
+        "\\cmidrule(lr){2-4}\\cmidrule(lr){5-7}\n"
+        "payload (tok) & completes & error & max ctx & completes & max ctx & tok deferred \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_transport.tex", body)
+    _MACROS["NEagerLimit"] = f"{limit:,}" if limit else "--"
+
+
+# ------------------------------------------------------------------ faults table
+
+
+def table_faults() -> None:
+    d = load(RESULTS / "microbench" / "free-faults.json") or load(RESULTS / "microbench" / "free-all.json")
+    b = (d or {}).get("benches", {}).get("faults")
+    if not b:
+        emit("tab_faults.tex", MISSING)
+        return
+    lines = []
+    for r in b["rows"]:
+        lines.append(
+            rf"\texttt{{{tex_escape(r['policy'])}}} & {fmt(r['all_completed'])} & {fmt(r['detect_p50_s'], 2)} & "
+            rf"{fmt(r['detected_correctly'])} & {fmt(r['shrink_p50_s'], 3)} & {fmt(r['agree_consistent'])} \\"
+        )
+    body = (
+        "\\begin{tabular}{lccccc}\n\\toprule\n"
+        "policy & survivors complete & detect (s) & absentees named & shrink (s) & agreement consistent \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_faults.tex", body)
+
+
+# --------------------------------------------------------------- fidelity table
+
+
+def table_fidelity() -> None:
+    rows: list[dict[str, Any]] = []
+    for f in sorted(glob.glob(str(RESULTS / "microbench" / "*fidelity*.json"))):
+        d = load(Path(f))
+        b = (d or {}).get("benches", {}).get("fidelity")
+        if b:
+            rows.extend(b["rows"])
+    if not rows:
+        emit("tab_fidelity.tex", MISSING)
+        return
+    lines = []
+    for r in sorted(rows, key=lambda x: (x.get("weighted_budget", False), -(x.get("fold_depth") or 0))):
+        lines.append(
+            rf"\texttt{{{tex_escape(r['algorithm'])}}} & {r.get('p')} & {r.get('fold_depth')} & {r.get('rounds')} & "
+            rf"{fmt(r.get('retention'), 3)} & {fmt(r.get('retention_stdev'), 3)} & "
+            rf"{fmt(r.get('rank_position_correlation'), 3)} & {r.get('n_hallucinated_ids', 0)} & "
+            rf"{fmt(r.get('wall_s'), 0)} & {fmt(r.get('tokens_out_total'))} & "
+            rf"{'yes' if r.get('weighted_budget') else 'no'} \\"
+        )
+    body = (
+        "\\begin{tabular}{lrrrrrrrrrl}\n\\toprule\n"
+        "algorithm & $p$ & depth & rounds & retention & sd & rank corr. & halluc. & wall (s) & out tok & weighted \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_fidelity.tex", body)
+
+
+# --------------------------------------------------------------- software table
+
+
+def table_software() -> None:
+    res = []
+    for f in sorted(glob.glob(str(RESULTS / "software" / "*.json"))):
+        d = load(Path(f))
+        if d and "acceptance" in d:
+            res.append(d)
+    if not res:
+        emit("tab_software.tex", MISSING)
+        emit("tab_software_contention.tex", MISSING)
+        return
+
+    def label(c: dict[str, Any]) -> str:
+        if c.get("ranks") == 1:
+            return "single agent ($p{=}1$)"
+        bits = []
+        bits.append("shared interfaces" if c.get("shared_interfaces") else "\\textbf{no shared interfaces}")
+        if not c.get("locks"):
+            bits.append("\\textbf{no locks}")
+        if not c.get("review"):
+            bits.append("\\textbf{no review}")
+        return ", ".join(bits)
+
+    lines = []
+    for d in sorted(res, key=lambda x: (-(x["config"].get("ranks") or 0), not x["config"].get("shared_interfaces"))):
+        a, j, c = d["acceptance"], d["job"], d["config"]
+        rounds = d.get("per_round") or []
+        traj = " / ".join(str(r.get("n_passed") or 0) for r in rounds)
+        lines.append(
+            rf"{label(c)} & {c.get('ranks')} & {fmt(a.get('importable'))} & "
+            rf"{a.get('n_passed') or 0}/{a.get('n_total') or 0} & {fmt(a.get('pass_rate'), 3)} & "
+            rf"{tex_escape(traj)} & {fmt(j['wall_s'], 0)} & {j['agent_calls']} & "
+            rf"{fmt(j['tokens_in'] + j['tokens_out'])} & {fmt(j['usd'], 3)} \\"
+        )
+    body = (
+        "\\begin{tabular}{lrccrlrrrr}\n\\toprule\n"
+        "configuration & $p$ & imports & passed & rate & per round & wall (s) & calls & tokens & USD \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_software.tex", body)
+
+    lines = []
+    for d in res:
+        c, k = d["config"], d.get("contention") or {}
+        if not k:
+            continue
+        lines.append(
+            rf"{label(c)} & {k.get('n_locks', 0)} & {k.get('n_contended', 0)} & {fmt(k.get('total_lock_wait_s'), 2)} & "
+            rf"{fmt(k.get('max_lock_wait_s'), 2)} & {k.get('n_puts', 0)} & {k.get('n_stale_writes', 0)} & "
+            rf"{fmt(k.get('stale_write_rate'), 3)} & {k.get('n_accumulates', 0)} \\"
+        )
+    if lines:
+        body = (
+            "\\begin{tabular}{lrrrrrrrr}\n\\toprule\n"
+            "configuration & locks & contended & wait (s) & max wait & puts & stale & stale rate & accum. \\\\\n\\midrule\n"
+            + "\n".join(lines)
+            + "\n\\bottomrule\n\\end{tabular}"
+        )
+        emit("tab_software_contention.tex", body)
+    else:
+        emit("tab_software_contention.tex", MISSING)
+
+
+# --------------------------------------------------------------- simulated scaling
+
+
+def table_scaling_sim() -> None:
+    d = load(RESULTS / "microbench" / "free-scaling.json") or load(RESULTS / "microbench" / "free-all.json")
+    b = (d or {}).get("benches", {}).get("scaling")
+    if not b:
+        emit("tab_scaling_sim.tex", MISSING)
+        emit("tab_crossovers.tex", MISSING)
+        return
+    sizes = [8, 32, 128, 512, 1024]
+    lines = []
+    for op, rows in sorted(b["studies"].items()):
+        by_alg: dict[str, dict[int, float]] = {}
+        for r in rows:
+            by_alg.setdefault(r["algorithm"], {})[r["p"]] = r["makespan_s"]
+        for alg in sorted(by_alg):
+            cells = " & ".join(fmt(by_alg[alg].get(p), 0) for p in sizes)
+            lines.append(rf"{tex_escape(op)} & \texttt{{{tex_escape(alg)}}} & {cells} \\")
+    body = (
+        "\\begin{tabular}{ll" + "r" * len(sizes) + "}\n\\toprule\n"
+        "collective & algorithm & " + " & ".join(f"$p{{=}}{p}$" for p in sizes) + " \\\\\n\\midrule\n"
+        + "\n".join(lines)
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_scaling_sim.tex", body)
+
+    seen: dict[tuple[str, int], str] = {}
+    lines = []
+    for c in b.get("crossovers", []):
+        key = (c["op"], c["n_tokens"])
+        if seen.get(key) == c["best_time"]:
+            continue
+        seen[key] = c["best_time"]
+        lines.append(
+            rf"{tex_escape(c['op'])} & {c['n_tokens']:,} & {c['p']} & \texttt{{{tex_escape(c['best_time'])}}} & "
+            rf"\texttt{{{tex_escape(c['best_volume'])}}} & \texttt{{{tex_escape(c['best_fidelity'])}}} \\"
+        )
+    body = (
+        "\\begin{tabular}{lrrlll}\n\\toprule\n"
+        "collective & tokens & from $p$ & best (time) & best (volume) & best (fidelity) \\\\\n\\midrule\n"
+        + "\n".join(lines[:40])
+        + "\n\\bottomrule\n\\end{tabular}"
+    )
+    emit("tab_crossovers.tex", body)
+
+
+# ----------------------------------------------------------------- summary stats
+
+
+def summary_macros() -> None:
+    """Single-number macros the prose refers to, so the prose cannot drift."""
+    macros: list[str] = []
+    tr = _tr_results()
+    n_calls = sum(d["job"]["agent_calls"] for _, d in tr)
+    sw_calls = 0
+    for f in glob.glob(str(RESULTS / "software" / "*.json")):
+        d = load(Path(f))
+        if d:
+            sw_calls += d.get("job", {}).get("agent_calls", 0)
+    mb_calls = 0
+    for f in glob.glob(str(RESULTS / "microbench" / "*.json")):
+        d = load(Path(f))
+        for b in (d or {}).get("benches", {}).values():
+            for r in (b or {}).get("rows", []) if isinstance(b, dict) else []:
+                mb_calls += r.get("agent_calls_total") or 0
+    macros.append(rf"\newcommand{{\NAgentCallsTranslation}}{{{n_calls:,}}}")
+    macros.append(rf"\newcommand{{\NAgentCallsSoftware}}{{{sw_calls:,}}}")
+    macros.append(rf"\newcommand{{\NAgentCallsMicro}}{{{mb_calls:,}}}")
+    macros.append(rf"\newcommand{{\NAgentCallsTotal}}{{{n_calls + sw_calls + mb_calls:,}}}")
+    macros.append(rf"\newcommand{{\NTranslationConfigs}}{{{len(tr)}}}")
+    for name, value in sorted(_MACROS.items()):
+        macros.append(rf"\newcommand{{\{name}}}{{{value}}}")
+    for name in ("NModelConfigs", "NModelAgreement", "NModelDepthAgreement", "NEagerLimit", "NUslFit"):
+        if name not in _MACROS:
+            macros.append(rf"\newcommand{{\{name}}}{{{MISSING}}}")
+    emit("macros.tex", "\n".join(macros))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--check", action="store_true")
+    ap.parse_args()
+    print("generating paper tables from results/ ...")
+    for fn in (
+        table_cost_formulas,
+        table_model_validation,
+        table_translation,
+        table_transport,
+        table_faults,
+        table_fidelity,
+        table_software,
+        table_scaling_sim,
+        summary_macros,
+    ):
+        try:
+            fn()
+        except Exception as exc:  # a missing input must not stop the rest
+            print(f"  !! {fn.__name__}: {exc!r}")
+    print("done")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

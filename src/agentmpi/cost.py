@@ -229,9 +229,29 @@ FORMULAS: dict[tuple[str, str], Any] = {
     ("reduce", "flat"): lambda p, n: (1, p - 1, (p - 1) * n, p - 1),
     ("reduce", "binomial"): lambda p, n: (_log2c(p), p - 1, (p - 1) * n, _log2c(p)),
     ("allreduce", "reduce_bcast"): lambda p, n: (2 * _log2c(p), 2 * (p - 1), 2 * (p - 1) * n, _log2c(p)),
-    ("allreduce", "recursive_doubling"): lambda p, n: (_log2c(p), p * _log2c(p), p * _log2c(p) * n, _log2c(p)),
+    # Recursive-doubling allreduce with the standard non-power-of-two correction.
+    # The lowest 2*rem ranks pair up first so that a power-of-two set remains; each
+    # pair costs two sends, the reduced set costs pof2*log2(pof2), and the ranks
+    # that sat out are sent the answer at the end.  The naive p*log2(p) figure is
+    # wrong by up to 25% at non-power-of-two sizes, which are the common case for
+    # agent populations.
+    ("allreduce", "recursive_doubling"): lambda p, n: (
+        _log2c(p),
+        3 * (p - (1 << (p.bit_length() - 1))) + (1 << (p.bit_length() - 1)) * (p.bit_length() - 1),
+        (3 * (p - (1 << (p.bit_length() - 1))) + (1 << (p.bit_length() - 1)) * (p.bit_length() - 1)) * n,
+        _log2c(p),
+    ),
     ("scan", "chain"): lambda p, n: (p - 1, p - 1, (p - 1) * n, p - 1),
-    ("scan", "recursive_doubling"): lambda p, n: (_log2c(p), p * _log2c(p), p * _log2c(p) * n, _log2c(p)),
+    # Hillis-Steele prefix: in round k the ranks with r + 2^k >= p have no
+    # destination, so the message count is p*ceil(log2 p) minus the sum of the
+    # skipped sends, sum_k 2^k = 2^ceil(log2 p) - 1.  The naive p*log(p) figure
+    # over-counts by nearly p, which matters at the sizes where scan is used.
+    ("scan", "recursive_doubling"): lambda p, n: (
+        _log2c(p),
+        p * _log2c(p) - ((1 << _log2c(p)) - 1),
+        (p * _log2c(p) - ((1 << _log2c(p)) - 1)) * n,
+        _log2c(p),
+    ),
     ("alltoall", "pairwise"): lambda p, n: (p - 1, p * (p - 1), p * (p - 1) * n, 0),
     ("alltoall", "linear"): lambda p, n: (1, p * (p - 1), p * (p - 1) * n, 0),
     ("alltoall", "bruck"): lambda p, n: (_log2c(p), p * _log2c(p), p * _log2c(p) * n * p / 2, 0),

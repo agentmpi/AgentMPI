@@ -384,7 +384,12 @@ def bcast(
                 tr.sent(_tok(comm, result))
             mask >>= 1
         tr.stats.rounds = _ilog2_ceil(p)
-        tr.stats.fold_depth = depth
+        # A broadcast performs no operator applications, so its fold depth is zero
+        # by definition; the distance from the root is recorded separately.  The
+        # distinction matters because fold depth is the fidelity-relevant quantity,
+        # and a broadcast is drift-free at any tree depth precisely because it
+        # forwards immutable handles rather than re-generated content.
+        tr.stats.fold_depth = 0
         tr.stats.extra["tree_depth"] = depth
 
     elif algorithm == "chain":
@@ -979,9 +984,12 @@ def allreduce(
     if algorithm == "reduce_bcast":
         red_alg = "chain" if op.associativity is Associativity.NONE else None
         val = reduce(comm, payload, op, 0, algorithm=red_alg, timeout=timeout, mode=mode, label=label)
+        # Read the reduce's fold depth *before* the broadcast overwrites LAST_STATS;
+        # the broadcast contributes no folds and would otherwise report zero.
+        reduce_depth = LAST_STATS.get(comm.rt.wrank, tr.stats).fold_depth
         out = bcast(comm, val, 0, timeout=timeout, mode=mode, label=label)
         tr.stats.rounds = 2 * _ilog2_ceil(p)
-        tr.stats.fold_depth = LAST_STATS.get(comm.rt.wrank, tr.stats).fold_depth
+        tr.stats.fold_depth = reduce_depth
         stats = tr.finish(label=label, op=op.name, divergence_risk=False)
         _record(comm, stats)
         return out

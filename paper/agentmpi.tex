@@ -1,0 +1,1134 @@
+% AgentMPI: A Message Passing Interface for Multi-Agent Harness Development
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.75in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{microtype}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{graphicx}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage[hidelinks]{hyperref}
+\usepackage[capitalise,noabbrev]{cleveref}
+\usepackage{balance}
+\usepackage{flushend}
+
+\lstset{
+  basicstyle=\ttfamily\scriptsize,
+  keywordstyle=\bfseries,
+  commentstyle=\itshape\color{gray!70!black},
+  columns=fullflexible,
+  breaklines=true,
+  frame=none,
+  aboveskip=4pt, belowskip=4pt,
+  showstringspaces=false,
+  language=Python,
+  morekeywords={def,for,if,else,with,return,while,in,not,and,or,None,True,False}
+}
+
+\usepackage{amsthm}
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{plain}
+\newtheorem{proposition}{Proposition}
+
+\newcommand{\ampi}{\textsc{AgentMPI}}
+\newcommand{\code}[1]{\texttt{\small #1}}
+\input{generated/macros}
+
+\title{\textbf{\ampi{}: A Message Passing Interface for\\Multi-Agent Harness Development}}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Multi-agent systems built on large language models are written the way parallel
+programs were written before 1994: every project invents its own communication
+mechanism, and none of them compose. We argue that the field needs what MPI gave
+parallel computing --- not a framework, but a \emph{library-level protocol} with
+scoped communication contexts, typed transfers, collective operations with
+explicit algorithms, one-sided shared state with epochs, and failure mitigation
+--- and we show that MPI's abstractions transfer with three specific, load-bearing
+modifications.
+
+First, the receiving agent's context window is a scarce, overcommitted buffer, so
+the eager/rendezvous distinction that MPI hides as an implementation detail must
+become semantically visible; making it visible turns MPI's notion of an
+\emph{unsafe program} into a precise and checkable notion of \emph{context
+safety}. Second, reduction operators implemented by a language model are not
+associative and are \emph{lossy in proportion to the depth of the reduction},
+which makes collective-algorithm selection a quality decision rather than only a
+cost decision --- with the surprising consequence that the logarithmic-depth tree
+wins on fidelity as well as latency, provided broadcasts forward immutable
+content-addressed handles rather than regenerated text. Third, the dominant agent
+failure is not the crash MPI's fault-tolerance work assumes but a well-formed,
+confident, wrong answer; this is the analogue of silent data corruption, for which
+the correct response is verification rather than checkpointing.
+
+We specify \ampi{}, implement it in 6\,900 lines of Python with all collectives
+built over point-to-point so that their structure is observable, and validate the
+implementation against closed-form cost models on \NModelConfigs{}
+collective configurations with \NModelAgreement\%
+agreement on message counts and fold depths. We evaluate with real agent
+populations on two tasks chosen to bracket the coupling spectrum: parallel
+translation of a book, where the dependence is weak but global, and collaborative
+implementation of a specified software system against a fixed acceptance suite,
+where it is not.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:intro}
+
+In 1993 there was roughly one message-passing library per parallel machine. PVM,
+p4, Chameleon, PARMACS, Express, Zipcode, NX/2 and CMMD each solved the same
+problem differently, and a program written for one had to be rewritten for the
+next~\cite{walker92,geist94-pvm,butler94-p4,calkin94-parmacs,express92,skjellum90}.
+The MPI Forum's response was not a better library but a \emph{specification}: a
+portable interface that vendors could implement well and that application and
+library authors could target once~\cite{mpiforum94,dongarra96}. Two decades of
+scientific software rest on that decision.
+
+Multi-agent systems built on language models are at the same point.
+AutoGen, MetaGPT, ChatDev, CAMEL, LangGraph, CrewAI and their successors each
+supply a coordination model, and a harness written against one cannot be moved to
+another or composed with
+another~\cite{wu24autogen,hong24metagpt,qian24chatdev,li23camel,langgraph,crewai}.
+The protocols that have emerged --- MCP, A2A, ACP, ANP --- are, on inspection,
+about a different problem: MCP standardises agent-to-\emph{tool} access, and A2A
+standardises task delegation \emph{across organisational
+boundaries}~\cite{mcpspec2026,a2adefs,anpwp,coral}. Neither provides what an
+author of a multi-agent \emph{program} needs: a way to name a subset of the
+population and communicate with it privately, a collective operation, a shared
+region with defined concurrency semantics, or a defined behaviour when a
+participant disappears.
+
+The consequences are documented. A taxonomy of 200+ failed multi-agent traces
+attributes most failures not to model capability but to specification and
+inter-agent coordination~\cite{mast,mastneurips}. Practitioners report that
+multi-agent architectures frequently underperform a single agent, and attribute
+this to context fragmentation and lost information between
+agents~\cite{cognitiondont,anthropicmas}. Long-context degradation and multi-turn
+drift are measured and
+substantial~\cite{liu24lostinmiddle,labanlost,chromarot}. Error cascades and
+diversity collapse are reproducible~\cite{diversitycollapse}. These are not model
+problems. They are the problems a communication protocol exists to solve, and in
+1993 the parallel-computing community had all of them too.
+
+\subsection{This paper}
+
+We ask what MPI actually contributes, transplant what transfers, and are explicit
+about what does not.
+
+What transfers, and matters more than expected:
+\begin{itemize}\itemsep2pt
+\item \textbf{The communicator}, MPI's pair of a process group and an opaque
+communication context. It exists because a library and its caller could otherwise
+collide on an integer tag. The agent version of that collision is not
+hypothetical: it is a reviewer's critique reaching the wrong author, and the
+single-shared-conversation architecture makes it certain (\cref{sec:model}).
+\item \textbf{Derived datatypes.} Their under-appreciated purpose is describing a
+\emph{projection} of data so it can be communicated without being copied. In the
+agent setting this is the mechanism by which a rank receives what it needs out of
+a 400k-token artifact rather than the artifact (\cref{sec:ptp}).
+\item \textbf{Neighbourhood collectives on a virtual topology.} An all-to-all
+conversation over $p$ agents costs $\Theta(p^2)$ messages; over a ring or review
+graph the same information costs $\Theta(p)$ (\cref{sec:coll}).
+\item \textbf{One-sided operations with epochs and the \code{SEPARATE} memory
+model.} Every multi-agent system grows a shared scratchpad and gets its
+concurrency wrong the same way. MPI-3 supplies both the vocabulary and the fix
+(\cref{sec:rma}).
+\item \textbf{ULFM's \code{revoke}/\code{shrink}/\code{agree}}, whose least
+obvious member, \code{revoke}, is the one that makes recovery possible at all
+(\cref{sec:ft}).
+\end{itemize}
+
+What must change, and why the changes are the technical contribution:
+
+\paragraph{C1: context is the scarce buffer, and transport mode must be visible.}
+MPI chooses between eager and rendezvous transfer invisibly, because both deliver
+the same bytes. For an agent rank they do not have the same effect: an eager
+payload enters the agent's context window and a rendezvous envelope does not.
+Making the mode explicit lets us restate MPI's discipline of the \emph{safe
+program} --- one that does not depend on buffering --- as \emph{context safety},
+and to show experimentally that the same ring-exchange program fails above a
+payload threshold under eager transport and completes at every size under
+rendezvous (\cref{sec:ptp}, \cref{tab:transport}).
+
+\paragraph{C2: reduction is lossy in depth, so algorithm choice is a quality
+decision.} MPI requires reduction operators to be associative and then reorders
+freely; the resulting non-reproducibility of floating-point \code{MPI\_SUM} is
+tolerated because it is bounded by rounding error~\cite{Demmel15,IntelCNR}. An
+operator implemented by a language model is not associative and is lossy, and its
+loss compounds with the \emph{depth} of the reduction rather than the number of
+applications. We make algebraic strength part of an operator's declaration, use it
+to constrain algorithm selection, and report fold depth from every reduction. A
+non-obvious consequence: because a binomial tree has depth $\lceil\log_2 p\rceil$
+while a serial chain has depth $p-1$, the tree is better on fidelity \emph{and}
+latency --- but only because broadcasts forward content-addressed handles, so
+relaying cannot corrupt (\cref{sec:coll}).
+
+\paragraph{C3: the dominant failure is silent corruption, not crash.} A rank that
+returns a confident wrong answer is invisible to timeouts, retries and schema
+checks. It is the analogue of silent data corruption, and HPC's answer to that is
+not checkpoint/restart --- which preserves the corruption faithfully --- but
+algorithm-based fault tolerance~\cite{huang84abft}. We give a six-class failure
+model, pair each class with the only detector that can see it, and make
+verification a first-class protocol concept (\cref{sec:ft}).
+
+\paragraph{C4: protocol in the harness, not in the prompt.} Because an agent's
+working memory is lossy and its instances are ephemeral, no protocol state may
+live in the agent. An agent holds only handles; every \ampi{} call is made by
+trusted host-side code, and the model is invoked as a kernel that transforms
+artifacts (\cref{sec:model}).
+
+\subsection{Contributions}
+\begin{enumerate}\itemsep2pt
+\item A specification of \ampi{} (\cref{sec:model}--\cref{sec:cost}), written in
+the MPI standard's style with explicit rationale, covering communicators,
+point-to-point transfer with contracts and views, twelve collectives with
+declared algorithms, one-sided windows with epochs and leases, a failure model
+with mitigations, and a three-axis cost model.
+\item A reference implementation in which every collective is built over
+point-to-point, so message counts, rounds and fold depths are observable, together
+with closed-form cost formulas for all 27 implemented (collective, algorithm)
+pairs and a validation showing exact agreement on
+\NModelConfigs{} configurations.
+\item Two end-to-end experiments with real agent populations that bracket the
+coupling spectrum, plus microbenchmarks establishing the calibration constants,
+the context-safety threshold, fault-recovery costs and reduction fidelity.
+\item A calibrated discrete-event simulator, validated against measured runs, that
+extrapolates collective cost to populations larger than can be run.
+\end{enumerate}
+
+\section{Background: what MPI contributes}
+\label{sec:background}
+
+\subsection{The standardisation decision}
+
+MPI-1 was drafted between late 1992 and May 1994 by a forum of vendors, national
+laboratories and universities~\cite{mpiforum93,mpiforum94}. It defined an
+\emph{interface}, not an implementation, and it deliberately omitted much: no
+explicit shared memory, no parallel I/O, no dynamic process creation, and no fault
+tolerance. Those arrived in MPI-2 (one-sided operations,
+\code{MPI\_Comm\_spawn}, MPI-IO)~\cite{mpi20}, MPI-3 (nonblocking and
+neighbourhood collectives, a redesigned one-sided interface, shared-memory
+windows, matched probes)~\cite{mpi31,Hoefler-MPI3-overview,hoefler15-rma,MPI31-mprobe},
+and MPI-4 (persistent collectives, partitioned communication,
+sessions)~\cite{mpi40}. The omissions are as instructive as the inclusions: by
+declining to be a language, to guarantee buffering, or to handle faults, MPI-1
+stayed small enough that every vendor implemented it within two
+years~\cite{snir96-whybig,snir96-buffering}.
+
+\subsection{The four ideas worth stealing}
+
+\paragraph{Communicators separate the message space from the address space.}
+A communicator is a group plus an opaque context, and \code{MPI\_Comm\_dup} exists
+to manufacture a fresh context so that a library can communicate without
+interference from its caller~\cite{mpiforum94,gropp99}. This is what makes
+parallel libraries composable, and composability is exactly what current agent
+frameworks lack.
+
+\paragraph{Datatypes do two jobs.} The first is matching: a type signature on both
+sides, checked at runtime, converting silent corruption into a loud error. The
+second, and the one that motivated the design, is describing non-contiguous data
+so that a boundary can be communicated without packing a
+copy~\cite{MPI-datatypes,Traff99,Reussner00}.
+
+\paragraph{Collectives are algorithms, and the algorithm matters.} MPI's
+collective layer is built over point-to-point, and decades of work
+characterise which algorithm wins in which regime under the Hockney
+$\alpha$--$\beta$ model and its refinements
+LogP/LogGP~\cite{Hockney94,Culler93,Alexandrov97,ThakurRabenseifnerGropp05,Rabenseifner04,Bruck97,Chan07,Sanders09}.
+The results are quantitative: binomial-tree broadcast at
+$\lceil\log_2 p\rceil(\alpha+n\beta)$ versus flat broadcast at
+$(p-1)(\alpha+n\beta)$; Bruck's algorithm trading volume for rounds; Rabenseifner's
+reduce-scatter-plus-allgather allreduce.
+
+\paragraph{Safety is a property of programs, not implementations.} MPI declines to
+guarantee that a program depending on buffering will work, because such programs
+run on one implementation and deadlock on another~\cite{snir96-buffering}. Naming
+the hazard and pushing it to the programmer, with \code{MPI\_Sendrecv} as the
+remedy, is a design pattern we reuse directly.
+
+\subsection{What MPI gets wrong for this setting}
+
+MPI's fault-tolerance posture is that after an error its state is undefined and
+the default handler aborts. FT-MPI~\cite{fagg00-ftmpi} and then
+ULFM~\cite{bouteiller22} supply mitigation primitives, but they assume fail-stop
+processes. MPI also has no notion of a receive buffer that cannot be resized, no
+notion of an operator that is only approximately associative, and no vocabulary
+for a participant that answers confidently and wrongly. Those gaps are what
+\cref{sec:ptp}--\cref{sec:ft} fill.
+
+\section{The \ampi{} model}
+\label{sec:model}
+
+\subsection{Ranks are roles; incarnations are sessions}
+
+A job has $p$ ranks, fixed at creation. A rank is a \emph{durable role} defined by
+its number, mailbox, context budget and accounting. Its embodiment is an
+\emph{incarnation}: one agent session bound to it for a bounded interval under a
+lease. The mapping is one-to-many over time and exactly-one at any instant.
+
+In MPI a rank \emph{is} a process, and the identification is harmless because MPI
+processes live for the whole job. Agent sessions do not: they end at a timeout, at
+context exhaustion, or at the host's discretion. Tying rank identity to session
+identity would force a communicator rebuild on every such event and invalidate the
+harness's mapping from rank to work --- and for agents that mapping is expensive,
+because ``rank 7 owns the parser'' is baked into prompts and artifacts. Separating
+them makes session termination ordinary and recoverable: the rank persists, its
+durable mailbox persists, and a fresh incarnation resumes it. This is the virtual
+actor discipline~\cite{bernstein14orleans} grafted onto MPI's static rank space.
+
+\subsection{Artifacts are immutable and content-addressed}
+
+Everything crossing a communicator is an immutable byte string addressed by the
+SHA-256 of its canonical serialisation. Three consequences are normative, and the
+first is the one the design depends on:
+
+\begin{quote}
+\emph{A tree broadcast forwards digests, never regenerated content.}
+\end{quote}
+
+The obvious agent implementation of tree broadcast --- ``tell your children what I
+told you'' --- is a game of telephone whose corruption grows with depth, which
+would confine the protocol to flat, root-centred patterns and make the root a
+bottleneck at every scale. Forwarding handles makes a
+$\lceil\log_2 p\rceil$-depth broadcast deliver byte-identical content to every
+rank. It also draws the line that \cref{sec:coll} rests on: \textbf{broadcast can
+be lossless because it does not transform; reduction cannot be, because it must.}
+
+The second consequence is that admitting the same digest twice to a rank's context
+costs the budget once, which matters because broadcast-then-echo is pervasive. The
+third is that the event log plus the artifact store suffice to replay the protocol
+without invoking any model.
+
+\subsection{Agents hold only handles}
+
+An agent is never required to remember protocol state. It receives handles: a rank
+number, a communicator id, a window slot, a digest, an invocation id. We take this
+further than seems necessary --- where an agent must issue a command, the runtime
+emits the \emph{exact command string} rather than the parameters from which it
+could be constructed. In early runs of our experiments, completed work was lost
+because agents reconstructed a submission command and got a flag wrong. Protocol
+violation in agent populations is dominated by recall failures, so a surface
+requiring recognition rather than recall is materially more reliable.
+
+\subsection{Protocol in the harness, not in the prompt}
+
+\ampi{} supports two harness styles. In the \emph{harness-side} (SPMD) style the
+author writes a \code{rank\_main} executed once per rank by trusted host-side code;
+every \ampi{} call is made by that code and the model is invoked only through
+\code{comm.agent}. In the \emph{agent-side} style the model itself issues protocol
+operations through a command-line interface.
+
+\begin{lstlisting}
+def rank_main(comm):
+    # decompose: variable-sized blocks, by handle
+    mine = comm.scatterv(work if comm.rank == 0 else None, root=0)
+    # agree a glossary: exact, idempotent, tree-parallel
+    terms = comm.agent(extract_prompt(mine), contract=TERMSHEET)
+    glossary = comm.allreduce(terms, ampi.UNION)
+    out = comm.agent(translate_prompt(mine, glossary),
+                     contract=TRANSLATION)
+    # reconcile seams with immediate neighbours only
+    topo = ampi.cart_create(comm, dims=[comm.size], periods=[False])
+    left, right = ampi.halo_exchange(topo, head(out), tail(out))
+    out = comm.agent(revise_prompt(out, left, right))
+    # collect by handle: the root never admits p*n tokens
+    return comm.gather(out, root=0, mode=Mode.RENDEZVOUS)
+\end{lstlisting}
+
+The distinction is substantive. In the agent-side style, protocol conformance is a
+property of model behaviour, and a rank that forgets to enter a barrier does not
+merely give a worse answer --- it prevents the population from making progress.
+Confining the protocol to host-side code makes conformance a property of the
+runtime. We support the agent-side style because it is sometimes the only option,
+and because the difference is measurable.
+
+\subsection{Protocol state lives outside the agents}
+
+MPI keeps protocol state in process memory, which is exactly as reliable as the
+process. For agent ranks that assumption fails twice over: the agent's working
+memory is a lossy context window, and the agent instance routinely disappears. So
+\ampi{} keeps every byte of protocol state --- posted receives, unexpected
+messages, window contents, communicator contexts, leases --- in an external store
+with ACID semantics, and a rank can be killed between any two calls and rebuilt
+from that store alone. The reference fabric is SQLite in WAL mode plus a
+content-addressed blob store; that is a correctness choice, not a performance one,
+and \cref{sec:eval-micro} shows the per-operation protocol cost is roughly four
+orders of magnitude below an agent invocation, so it is free.
+
+\section{Point-to-point and context safety}
+\label{sec:ptp}
+
+\subsection{Ordering, matching, contracts}
+
+\ampi{} keeps MPI's non-overtaking guarantee: two messages from the same rank to
+the same rank on the same communicator that both match a receive are received in
+send order. The reference implementation orders by a monotone message id, giving
+the stronger global-FIFO property, which is worth having because agent harnesses
+are debugged by reading traces.
+
+A \emph{contract} is a typed description with a structural part (required keys,
+non-empty keys, token bounds, regular expressions) and a semantic part (a
+natural-language postcondition carried to the consumer). Matching follows MPI: a
+send's and a receive's contracts match iff their names and kinds agree and the
+receiver's required set is a subset of the sender's; only those fields participate
+in matching, so a receiver may legally under-specify.
+
+Separating \emph{required} (key present) from \emph{non-empty} (key present and
+carries a value) sounds pedantic and is not. In an early version we conflated
+them, and a term sheet for a book section containing no proper nouns --- a correct
+answer --- was rejected, making the rank retry, exhaust its retries, raise, and
+abandon peers already blocked in a collective. One over-strict contract field
+produced a whole-population hang.
+
+\subsection{Views: the datatype idea that matters}
+
+A \emph{view} names a projection of an artifact without materialising it:
+\code{contiguous}, \code{vector(offset,count,stride)}, \code{indexed},
+\code{keys}, \code{jsonpath}, \code{head}, \code{tail}, \code{digest\_only}. This
+is MPI's second datatype job --- \code{MPI\_Type\_vector} exists so a program can
+send a boundary column without packing a copy --- and it is the job every agent
+framework omits. \code{vector} expresses a block-cyclic decomposition (give rank
+$r$ every $p$-th chapter) with no coordinator materialising the whole.
+\code{head}/\code{tail} have no MPI analogue; they are the escape hatch that makes
+budget compliance always achievable, and because a silent truncation is a
+correctness hazard the runtime traces when they fire.
+
+\subsection{Transport modes and eager credit}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lll}
+\toprule
+mode & payload delivered & charged to context \\
+\midrule
+\code{EAGER} & yes & yes \\
+\code{RENDEZVOUS} & envelope only & no \\
+\code{SYNCHRONOUS} & yes, after match & yes \\
+\code{AUTO} & by eager limit & as chosen \\
+\bottomrule
+\end{tabular}
+\caption{Transport modes. MPI hides this choice because both modes deliver the
+same bytes; here they differ in whether the receiving agent's context is consumed,
+so the choice is semantic.}
+\label{tab:modes}
+\end{table}
+
+A rendezvous envelope carries the digest, token count, contract and a one-line
+\emph{synopsis}. The synopsis is not decoration: without it the receiver must
+fetch in order to decide whether to fetch.
+
+Every rank publishes an \emph{unexpected-message budget}: a bound in tokens on the
+volume of unmatched eager messages it accepts. A sender that would exceed the
+destination's budget blocks, and raises \code{ERR\_CONTEXT\_OVERFLOW} if it cannot
+proceed by its deadline. Both the stall and its resolution are traced.
+
+\subsection{Context safety}
+
+\begin{definition}
+A program is \emph{context-safe} if it completes for every assignment of
+unexpected-message budgets, however small.
+\end{definition}
+
+\begin{proposition}
+A program in which every rank sends before any rank receives is context-safe iff
+its payloads travel \code{RENDEZVOUS}.
+\end{proposition}
+
+This is a direct transplant of MPI's safe-program discipline, and the agent version
+is sharper. In MPI, exceeding the eager pool deadlocks or exhausts memory; here the
+scarce buffer is the receiving agent's context, and exceeding it silently degrades
+the agent's output. Making the budget explicit and blocking on it converts an
+invisible quality failure into a reported, attributable stall --- which is the most
+useful thing a protocol can do about it, because the harness can then narrow a view
+and retry. \cref{tab:transport} measures both halves.
+
+\section{Collectives and the algebra of semantic reduction}
+\label{sec:coll}
+
+Every collective is expressed over point-to-point, so its message count, rounds and
+fold depth are observable. We deliberately do not short-circuit collectives through
+the fabric as a shared variable: the value of the abstraction is that the
+\emph{shape} of the communication determines cost and quality, and a centralised
+implementation would hide exactly those effects. The one exception is the
+arrival-counting barrier, which is centralised precisely because it must be able to
+\emph{name} the ranks that did not arrive.
+
+\subsection{Barriers must have a policy}
+
+An unconditional barrier is a liveness bug waiting to happen: the probability that
+all $p$ agent ranks arrive within a fixed window falls with $p$, and ``the agents
+are waiting for each other'' is the most frequently reported multi-agent
+pathology~\cite{mast}. Every \ampi{} barrier carries a deadline and one of five
+policies: \code{WAIT} (MPI semantics; debugging only), \code{RAISE},
+\code{PROCEED} (continue with those who arrived, report absentees), \code{SHRINK},
+\code{REVOKE}. The policy is the harness author's declaration of what a missing
+participant \emph{means}: a missing chapter degrades a translation, a missing
+module kills a build.
+
+\subsection{Operators declare their algebra}
+
+An operator declares commutativity, associativity in
+$\{\textsc{exact},\textsc{approx},\textsc{none}\}$, idempotence, and an identity.
+The runtime enforces:
+
+\begin{itemize}\itemsep2pt
+\item \textsc{none} permits only the serial chain; requesting a tree is an error,
+not a silent quality regression.
+\item A non-commutative operator is evaluated in rank order. A binomial tree
+satisfies this only when the root is rank 0; for any other root the runtime
+\emph{refuses} the tree rather than silently evaluating in rotated order.
+\item The serial left fold is the reference semantics: for an \textsc{exact}
+operator every algorithm must reproduce it, and our test suite checks this across
+nine population sizes and every algorithm.
+\item Every reduction reports the \emph{fold depth} it induced.
+\end{itemize}
+
+\subsection{Fidelity decays in depth, not in width}
+
+\begin{table}[t]
+\centering\small
+\begin{tabular}{lccc}
+\toprule
+algorithm & rounds & applications & fold depth \\
+\midrule
+\code{chain}    & $p-1$                  & $p-1$                 & $p-1$ \\
+\code{flat}     & $1$                    & $p-1$ (all at root)   & $p-1$ \\
+\code{binomial} & $\lceil\log_2 p\rceil$ & $p-1$                 & $\lceil\log_2 p\rceil$ \\
+\bottomrule
+\end{tabular}
+\caption{The three reduce algorithms perform the same number of operator
+applications and differ in rounds and in fold depth. If reduction quality were
+governed by the number of applications they would score alike; if it is governed by
+depth, the tree wins decisively.}
+\label{tab:reduce-alg}
+\end{table}
+
+MPI requires associativity and then reorders freely; floating-point \code{MPI\_SUM}
+is consequently not bitwise reproducible, and this is tolerated because the
+discrepancy is bounded by rounding error~\cite{Demmel15}. An operator implemented
+by a language model is worse in four ways: it is not associative, it is lossy, it is
+expensive, and it is non-deterministic. Crucially its loss compounds with the
+\emph{depth} of the reduction, because depth counts how many times an item is
+re-summarised on the way to the root. Modelling surviving fidelity of a $d$-deep
+fold as $F(d)=(1-\delta)^d$ for a measured per-application loss $\delta$,
+\cref{tab:reduce-alg} predicts that the tree dominates.
+
+This inverts the usual expectation that parallel aggregation trades quality for
+speed. It holds only because of the immutability decision in
+\cref{sec:model}: were interior ranks relaying regenerated text, a tree broadcast
+would incur its own depth-proportional drift, and the fidelity ordering would
+reverse. \Cref{tab:fidelity} measures retention.
+
+A second effect has no MPI counterpart. A summarising operator given a fixed output
+budget compresses two inputs and sixteen inputs to the same length, so the root's
+answer over-represents whichever subtree merged last --- an unfairness
+\code{MPI\_SUM} cannot exhibit, since it weights every contribution equally by
+construction. \ampi{} therefore exposes the number of leaves an accumulator
+represents so a budget can be allocated proportionally, and reports per-rank
+retention so the unfairness is visible rather than inferred.
+
+\subsection{Prefer exact operators}
+
+\code{UNION} --- set union, or key-wise union with deterministic conflict retention
+--- is exact, associative, commutative and idempotent. A glossary merged with
+\code{UNION} is byte-identical at every rank regardless of tree shape; a glossary
+merged by an agent is not. Harnesses should prefer exact operators wherever the
+combination is genuinely set-like, exactly as an MPI programmer prefers
+\code{MPI\_SUM} to a user-defined operator. Idempotence additionally matters
+because a rank may be re-executed after a suspected but unconfirmed failure, and a
+non-idempotent merge applied twice double-counts.
+
+\subsection{The allreduce divergence hazard}
+
+\code{reduce\_bcast} computes one result and broadcasts it, so every rank holds a
+byte-identical value. \code{recursive\_doubling} has each rank compute the result
+itself: latency-optimal in MPI, and a trap here, because under a lossy operator each
+rank performs its own fold sequence, so the $p$ results differ and \textbf{the
+population silently disagrees about the value it just agreed on}. \ampi{} permits
+it, records a divergence-risk flag, and defaults lossy operators to
+\code{reduce\_bcast} --- a factor of two in rounds to buy the property that
+``agreement'' means agreement.
+
+\subsection{Scan, and topologies}
+
+Scan is the most under-used collective for agent work. A task with sequential
+dependence but parallel bulk --- translate chapter $i$ consistently with names
+established in $0..i{-}1$; write a section that must not contradict earlier ones ---
+\emph{is} a prefix computation. Running it sequentially costs $p$ agent latencies;
+ignoring the dependence produces inconsistent output. Hillis--Steele recursive
+doubling delivers every prefix in $\lceil\log_2 p\rceil$ rounds at the price of
+$p\log p$ operator applications: it trades \emph{more} operator work for
+\emph{fewer} rounds, the opposite of the usual trade, and the right direction
+whenever per-invocation latency dominates (\cref{sec:cost}).
+
+A virtual topology restricts who may communicate with whom, and that restriction is
+the main lever on the quadratic blow-up that kills multi-agent systems. A full
+conversation over $p$ agents costs $\Theta(p^2)$ messages and $\Theta(p^2 n)$
+tokens; over a ring or a degree-2 review graph the same information costs
+$\Theta(p)$ and $\Theta(pn)$. Our test suite measures the gap directly: at $p=8$ a
+pairwise alltoall sends 56 messages where a degree-2 neighbourhood allgather sends
+16. Halo exchange is the most valuable non-obvious transfer from HPC: a task whose
+parts each depend on their neighbours \emph{looks} sequential, and expressed as a
+stencil it is one barrier-separated parallel step plus a constant-degree boundary
+exchange.
+
+\section{One-sided state: the shared blackboard}
+\label{sec:rma}
+
+Every multi-agent system grows a shared scratchpad --- a design document, a
+glossary, an interface file, a task board --- and every one gets the concurrency
+wrong the same way: two agents read it, both edit a private copy, and the second
+write discards the first's work. MPI-3's one-sided chapter supplies the
+vocabulary~\cite{hoefler15-rma,dinan16-rma}.
+
+A \emph{window} is a named, explicitly created region over a communicator, divided
+into \emph{slots}; slots rather than byte offsets are the unit of locking and
+versioning, because the natural granularity of agent-shared state is ``the section
+about error handling'', not ``bytes 4096--8191''. The operations that matter are
+distinguished precisely:
+
+\begin{itemize}\itemsep2pt
+\item \code{put} --- blind overwrite: the operation that loses work. With
+\code{expect\_version} it becomes a compare-and-swap.
+\item \code{accumulate(op)} --- atomic read-modify-write, so concurrent
+contributions combine instead of clobbering. \emph{No lock is needed.} The operator
+must be exact: the read-modify-write happens inside an atomic section and an
+implementation cannot hold one across a model call.
+\item \code{compare\_and\_swap}, \code{fetch\_and\_op} --- optimistic concurrency
+and atomic counters; the latter is how a harness implements dynamic
+self-scheduling, which matters more for agents than for CPUs because per-item cost
+varies by an order of magnitude.
+\item \code{lock}/\code{unlock} with a \emph{lease}, \code{fence} (collective epoch
+boundary), \code{sync} (discard private copies).
+\end{itemize}
+
+\paragraph{\code{SEPARATE} is the right default.} MPI-3 distinguishes a
+\emph{unified} model, in which a rank always sees the latest value, from a
+\emph{separate} model, in which each rank has a private copy reconciled only at
+synchronisation points. For an agent the private copy is not a hardware artefact:
+it is the copy of the document sitting in the agent's context from ten minutes ago,
+and it \emph{is} stale, because peers have edited it since. \code{sync} is
+``re-read before you edit''. \ampi{} therefore defaults to \code{SEPARATE}, tracks
+each rank's observed version per slot, and records a \textbf{staleness violation}
+when a rank writes from a version that is no longer current.
+
+Recording the violation is more valuable than preventing it. A harness that
+legitimately overwrites must still be able to, so refusing the write would break
+correct programs; staying silent would reproduce the lost-update bug. Our test
+suite asserts the \emph{failure}: eight ranks that read, modify and blindly write a
+shared document produce a final value with fewer than eight contributions, and the
+runtime counts the stale writes that caused it. The same test with
+\code{accumulate} loses nothing and records zero stale writes.
+
+Leases have no MPI counterpart because a dead MPI process takes the job with it.
+Here, a lock held by a vanished agent would deadlock the window forever, so every
+lock is leased and reclamation is traced --- a held-then-stolen lock is exactly the
+situation in which two agents believe they own the same file.
+
+\paragraph{Semantic updates serialise, and the trace says so.} A harness needing
+judgement in a combine must \code{lock}, \code{get}, reason, \code{put} with
+\code{expect\_version}, \code{unlock}. Making that explicit is the point: a harness
+that puts a semantic critical section on its critical path has built a sequential
+program with extra steps, and the trace shows it as lock wait time.
+
+\section{Failure model and fault tolerance}
+\label{sec:ft}
+
+\begin{table*}[t]
+\centering\small
+\begin{tabular}{llll}
+\toprule
+class & description & detector & mitigation \\
+\midrule
+F1 fail-stop & crashed, killed, past a hard deadline & lease expiry & re-incarnate, or shrink \\
+F2 fail-slow & alive but past its latency budget & deadline from the run's own distribution & hedge with a duplicate \\
+F3 fail-noisy & violates its structural contract & contract check & retry with the diagnosis \\
+F4 fail-plausible & well-formed, confident, wrong & \textbf{independent verification only} & replicate and compare; oracle \\
+F5 fail-greedy & exhausted its context budget & context accounting & rendezvous transport plus views \\
+F6 adversarial & deliberate protocol deviation & --- & out of scope \\
+\bottomrule
+\end{tabular}
+\caption{The \ampi{} failure model. MPI's fault-tolerance work assumes F1;
+importing that assumption is why much agent-reliability engineering consists of
+retry loops that cannot help. F4 is the load-bearing row.}
+\label{tab:failures}
+\end{table*}
+
+\subsection{Six classes, and why F4 dominates}
+
+\Cref{tab:failures} gives the model. The row that matters is F4. A rank returning a
+confident wrong answer is undetectable by any amount of timeout tuning, retry logic
+or schema validation, because none of those examine whether the answer is
+\emph{right}. It is the exact analogue of silent data corruption, and HPC's answer
+to silent data corruption is not checkpoint/restart --- which preserves the
+corruption faithfully --- but algorithm-based fault tolerance: carry redundant
+information that lets the computation check
+itself~\cite{huang84abft}. Consequently \ampi{} makes verification a first-class
+concept, and we argue the quantity to optimise is the \emph{verification budget},
+not the checkpoint interval that Daly's formula
+optimises~\cite{daly06checkpoint}.
+
+Detection is by lease, and is \emph{eventually perfect} rather than perfect: a slow
+rank is indistinguishable from a dead one. FLP says consensus is unattainable with
+an unreliable detector in an asynchronous system~\cite{fischer85flp}, and we take
+the same escape as HPC --- assume partial synchrony with a known lease bound, accept
+that an expired lease \emph{declares} a rank dead whether or not it is, and use
+\code{revoke} to make the declaration self-fulfilling so the population's view
+stays consistent even when the detector was wrong~\cite{chandra96failuredetectors}.
+Straggler thresholds are derived from the run's own latency distribution, because
+the median-to-tail spread of an agent invocation is routinely an order of magnitude
+and is driven by output length rather than queueing~\cite{dean13tail}; a fixed
+timeout is either useless or harmful.
+
+\subsection{Revoke, shrink, agree}
+
+\code{revoke} makes a communicator permanently unusable for \emph{every} member;
+operations already blocked inside a collective raise \code{ERR\_REVOKED}. This is
+ULFM's least obvious and most necessary primitive. Without it, a rank that notices
+a failure cannot rescue the others, because they are all blocked waiting for the
+dead peer --- and it cannot first reach agreement, because the group is broken.
+Revocation is irreversible: a communicator that could be un-revoked would let two
+ranks disagree about whether it is usable. Implementing this correctly required a
+subtlety worth recording --- a blocked call must consult shared state rather than a
+cached flag, or it never learns it has been revoked.
+
+\code{shrink} builds a communicator over the survivors, renumbered contiguously.
+\code{shrink\_in\_place} instead marks ranks inactive and keeps the numbering ---
+FT-MPI's \code{BLANK} mode rather than its \code{SHRINK} mode~\cite{fagg00-ftmpi}
+--- and is often the better trade here, because renumbering invalidates a
+rank-to-work mapping that is expensive to recompute.
+
+\code{agree} returns the conjunction over live ranks, consistently: either every
+survivor returns the same value or all raise. This is what makes ``did the
+integration step succeed?'' answerable when some builders died mid-step; an
+allreduce over logical AND would hang.
+
+\subsection{Redundancy and supervision}
+
+\code{replicate\_and\_compare} reports the modal answer, the number of distinct
+answers, and the consensus fraction, comparing on a harness-supplied projection
+because byte equality is meaningless for prose. One caution: replicating a language
+model does not give independent failures, since correlated errors are the norm.
+Agreement is evidence, not proof, which is why the consensus fraction is reported
+rather than a bare boolean.
+
+MPI contributes the communication algebra and has no recovery policy; Erlang/OTP
+contributes the recovery discipline and no collectives~\cite{armstrong03erlang}. The
+two are orthogonal --- each field solved what the other ignored --- and \ampi{}
+takes both, implementing OTP's \code{one\_for\_one}, \code{one\_for\_all} and
+\code{rest\_for\_one} strategies bounded by a restart intensity. The bound matters
+especially here: an unbounded restart loop converts a local fault into a cost
+overrun.
+
+\subsection{The rule harness authors break}
+
+\begin{quote}
+\emph{A local failure must not remove a rank from a collective.}
+\end{quote}
+
+A rank that cannot compute its contribution must still enter the collective,
+contributing a degraded value or an identity element, and record the degradation.
+This is the rule most easily violated and most expensive to violate: if a local
+exception propagates out of \code{rank\_main}, that rank never reaches the
+collective its peers are already blocked inside, and one recoverable local failure
+becomes a whole-population hang. We hit exactly this in our own translation harness
+before adding the \code{safe\_agent} wrapper. Escalation must be a deliberate
+decision made by a barrier policy or a supervisor, never an accident of exception
+propagation.
+
+\section{Cost model}
+\label{sec:cost}
+
+Volume is measured in tokens; a message of $n$ tokens costs
+\[ T(n)=\alpha+n\beta, \qquad C(n)=n\gamma . \]
+Three properties distinguish this from Hockney's model.
+
+\paragraph{$\alpha$ is enormous, so rounds matter more than volume.} For MPI,
+$\alpha$ is microseconds and bandwidth gigabytes per second, so the ratio rewards
+reducing message volume. For agent ranks we measure $\alpha_{p50}$ in the tens of
+seconds and effective bandwidth in the tens of tokens per second, so the ratio
+rewards reducing \emph{rounds}, and latency-optimal algorithms win over a wider
+range of sizes than in MPI. \Cref{tab:calibration} gives the measured constants;
+the crossover $\alpha/\beta$ lands at a few hundred tokens --- the size of a typical
+agent artifact --- so neither term may be neglected.
+
+\paragraph{Price is an independent axis.} Wall time and money are not proportional:
+running $p$ ranks divides time by up to $p$ and divides price by nothing, and
+coordination messages are pure added price. A harness has two objectives, and we
+report both everywhere.
+
+\paragraph{Fidelity is a third axis.} $F(d)=(1-\delta)^d$, as in \cref{sec:coll}.
+
+We report Amdahl speedup, where the serial fraction $f$ is dominated by phases that
+must be done by one rank --- plan, integrate, arbitrate --- and those do not
+shrink~\cite{amdahl67}; the Universal Scalability Law
+$S(p)=p/(1+\sigma(p-1)+\kappa p(p-1))$, whose \emph{coherency} term $\kappa$ is
+positive by construction for an all-to-all conversation, so its throughput has a
+maximum and then declines~\cite{gunther07usl}; and Karp--Flatt, which reveals a
+growing coordination cost that a plain speedup plot hides~\cite{karp90metric}.
+
+\section{Implementation}
+\label{sec:impl}
+
+The reference implementation is 6\,900 lines of Python 3.11 with no third-party
+dependencies. Layers: a durable fabric (SQLite in WAL mode with
+\code{BEGIN IMMEDIATE} writers and jittered retry, plus a content-addressed blob
+store with fsync-and-rename); a transport with matching, non-overtaking sequence
+numbers and eager credit; communicators; twelve collectives with 27 algorithms;
+windows; fault tolerance; a cost model and calibrated simulator; and a CLI so an
+external agent can act as a rank.
+
+Executors are pluggable, mirroring MPI's separation of interface from process
+manager: a deterministic function, a calibrated simulator, a recorded replay, and a
+\emph{broker} that publishes invocations for external workers to claim. The broker
+is a \emph{pull} queue, because a pushed invocation would require the harness to
+know how to start an agent and would couple it to a vendor; pulling lets the
+population be launched, scaled and re-incarnated entirely outside the harness,
+which is required because an agent session's lifetime is controlled by its host.
+The queue is per rank, because a rank is a durable role with accumulated state.
+
+\paragraph{Tracing is unconditional} and in the same transaction as the state change
+it describes. MPI's tooling interfaces are opt-in and out-of-band, which is
+reasonable when a run can be repeated cheaply. An agent run cannot: it is expensive
+and not reproducible, so a bug that was not traced cannot be investigated.
+
+\paragraph{Bugs the design caught.} Building the cost model and the implementation
+independently and cross-checking them found four real defects: a binomial scatter
+whose parent was computed from the highest rather than the lowest set bit (so it
+disagreed with the broadcast tree and deadlocked for $p\geq4$); a chain reduce that
+folded from $\text{root}+1$ and so broke rank order for non-commutative operators;
+an allreduce that reported the broadcast's fold depth instead of the reduction's;
+and two cost formulas that over-counted messages at non-power-of-two sizes by up to
+25\%. An implementation whose measured counts disagree with its own model has a bug
+in one of the two, and having both is how the discrepancy gets found.
+
+\section{Evaluation}
+\label{sec:eval}
+
+We evaluate four questions. \textbf{Q1}: does the implementation match its cost
+model? \textbf{Q2}: do the protocol mechanisms behave as specified under context
+pressure and failure? \textbf{Q3}: does an \ampi{} harness deliver a useful
+parallel speedup on a weakly coupled task, and do its coordination mechanisms
+matter? \textbf{Q4}: does it help on a strongly coupled task, where naive
+parallelism fails?
+
+All agent-executed runs use a population of real agent workers claiming invocations
+from the broker; the worker bootstrap prompt is in the artifact and mentions
+neither collectives nor the experiment (\cref{sec:model}). Protocol-level results
+(Q1, Q2) use deterministic executors so that they are free and regression-testable.
+Every quality number is computed by code from the agents' artifacts, never from a
+model's opinion of its own output; model-judged scores would make a comparison
+between protocol variants unreplicable.
+
+\subsection{Q1: model validation}
+\label{sec:eval-micro}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_model_validation}
+\caption{Measured versus closed-form message counts and fold depths, over every
+implemented (collective, algorithm) pair at population sizes 2--16.}
+\label{tab:model}
+\end{table}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_calibration}
+\caption{Cost-model constants calibrated from the translation runs. The last row is
+the ratio of an agent invocation to a protocol operation, and it is why keeping
+protocol state in a durable external store is free.}
+\label{tab:calibration}
+\end{table}
+
+\Cref{tab:model} compares measured message counts and fold depths against the
+closed-form formulas. \Cref{tab:calibration} gives the calibrated constants. The
+$\alpha$-to-fabric ratio is the design's licence: the protocol's per-operation cost
+is negligible against an agent invocation, so durability, tracing and contract
+checking can all be unconditional.
+
+\subsection{Q2: context safety and failure recovery}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_transport}
+\caption{Ring exchange in which every rank sends before any rank receives, at
+$p=8$ with an unexpected-message budget of \NEagerLimit{}
+tokens. Eager transport completes only while the payload fits the budget; rendezvous
+completes at every size.}
+\label{tab:transport}
+\end{table}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_faults}
+\caption{One rank of eight fails silently before a barrier. \code{WAIT} is MPI's
+only option and never completes.}
+\label{tab:faults}
+\end{table}
+
+\Cref{tab:transport} confirms the context-safety proposition with a sharp
+threshold, and shows the failure is \emph{reported} as
+\code{ERR\_CONTEXT\_OVERFLOW} rather than manifesting as a hang or a silent
+truncation. \Cref{tab:faults} shows that \code{WAIT} and \code{RAISE} do not let the
+survivors complete, while \code{PROCEED} and \code{SHRINK} do, correctly name the
+absentee, and reach consistent agreement.
+
+\subsection{Q3: parallel book translation}
+
+\begin{table*}[t]
+\centering\scriptsize
+\input{generated/tab_translation}
+\caption{Translation ablations at the largest population, with real agent ranks.
+``consist.'' is the fraction of entities rendered identically by every section that
+rendered them; ``verified'' is the fraction of reported renderings that actually
+occur in the reporting section's text, which is a direct measurement of
+fail-plausible behaviour.}
+\label{tab:translation}
+\end{table*}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_translation_scaling}
+\caption{Strong scaling: identical total work, decreasing population. USL fit:
+\NUslFit.}
+\label{tab:trscaling}
+\end{table}
+
+Translating a book looks embarrassingly parallel and is not: sections disagree about
+proper nouns, drift in register, and show visible seams. The dependence is weak but
+real, and has the shape of a stencil --- mostly local work, a little that must be
+globally consistent, a little that must agree with immediate neighbours. Our harness
+is the corresponding HPC decomposition (\cref{sec:model}): \code{scatterv},
+agent-local term extraction, \code{allreduce} with \code{UNION} to agree a glossary
+in $2\lceil\log_2 p\rceil$ rounds with no coordinator reading any section,
+translation, \code{halo\_exchange} on a 1-D Cartesian topology to reconcile seams,
+and \code{gather} by handle so the root never admits $pn$ tokens.
+
+\Cref{tab:translation} reports the ablations and \cref{tab:trscaling} the strong
+scaling.
+
+\paragraph{An honest negative result.} On this text the glossary \code{allreduce}
+did not improve entity consistency, because the pre-registered entities are famous
+enough that competent models render them identically without coordination. This is
+worth stating plainly: a coordination mechanism only pays where the agents would
+otherwise disagree, and our consistency metric is insensitive on canonical
+entities. It also tells a harness author something useful --- pay for agreement on
+the terms that are genuinely ambiguous, not on the ones everybody already knows.
+\Cref{sec:limitations} discusses the design of a more sensitive replication.
+
+\subsection{Q4: collaborative software development}
+
+\begin{table*}[t]
+\centering\scriptsize
+\input{generated/tab_software}
+\caption{Collaborative implementation of the \code{minidb} SQL engine against a
+fixed 59-case acceptance suite written before the run. ``per round'' is the number
+of cases passing after each integration round.}
+\label{tab:software}
+\end{table*}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_software_contention}
+\caption{Contention on the shared interface window.}
+\label{tab:contention}
+\end{table}
+
+The complement to translation. Eight agents each handed one module of a
+specification produce eight modules that do not compose, because each invented its
+neighbours' interfaces. The harness is organised around exactly that failure:
+\code{bcast} the specification; publish interfaces into a window slot per module and
+\code{fence}; read dependencies' interfaces in a fresh access epoch; implement;
+\code{barrier}; run the acceptance suite at rank 0; \code{scatter} per-module blame
+(not broadcast everything --- a rank should receive its own failures);
+\code{neighbor\_allgather} for degree-2 cross review; renegotiate an interface under
+an exclusive lock; \code{agree} on whether the build is green.
+
+The oracle is a 59-case acceptance suite written before the run and never shown to
+the agents as a target to optimise, run out of process because generated code can
+hang or exhaust memory. It is also our model of verification (\cref{sec:ft}): each
+case is an independent check that a confident output actually behaves as specified.
+
+\Cref{tab:software} reports pass rates and \cref{tab:contention} the window
+contention, which bounds the achievable speedup Amdahl-style.
+
+\subsection{Reduction fidelity}
+
+\begin{table*}[t]
+\centering\scriptsize
+\input{generated/tab_fidelity}
+\caption{Fact retention of a semantic reduction. Each rank contributes a report of
+uniquely identified factual items; retention is counted mechanically at the root.
+``rank corr.'' is the correlation between a rank's index and the fraction of its
+items that survived --- a positional unfairness \code{MPI\_SUM} cannot exhibit.}
+\label{tab:fidelity}
+\end{table*}
+
+\Cref{tab:fidelity} tests the central prediction of \cref{sec:coll}: since all three
+algorithms perform $p-1$ operator applications, retention differences must be
+attributable to fold depth.
+
+\subsection{Simulated scaling}
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_scaling_sim}
+\caption{Simulated collective makespan (seconds) with parameters calibrated from the
+measured runs, median of 32 trials. Latency is drawn log-normally, because agent
+latency is right-skewed and a collective's completion time is a maximum over ranks.}
+\label{tab:scalingsim}
+\end{table}
+
+No agent-systems paper can afford a 1024-rank experiment, and none should pretend
+otherwise. HPC's honest answer is to build a discrete-event simulator of the
+communication pattern, calibrate it against a real run at an affordable size, and
+extrapolate~\cite{Hoefler10loggopsim}. \Cref{tab:scalingsim} is that
+extrapolation, and \cref{tab:crossovers} the resulting algorithm-selection
+crossovers --- the classical form of a collective-tuning result, now with a fidelity
+column that has no MPI counterpart.
+
+\begin{table}[t]
+\centering\scriptsize
+\input{generated/tab_crossovers}
+\caption{Algorithm recommendations under three objectives. Where the time-optimal
+and fidelity-optimal choices differ, the harness author has a decision to make that
+MPI never presents.}
+\label{tab:crossovers}
+\end{table}
+
+\section{Discussion and limitations}
+\label{sec:limitations}
+
+\paragraph{Scale.} Our real-agent populations are single-digit, because the
+concurrency limit of our agent host bound them, and because the campaign structure
+--- one persistent worker pool serving a whole ablation ladder --- trades population
+size for the ability to run many configurations against the same agents. Larger
+populations are reported only as calibrated simulation and labelled as such. The
+protocol-level results are size-independent and validated to $p=32$.
+
+\paragraph{The insensitive metric.} As noted in Q3, our entity-consistency metric
+saturates on famous proper nouns. A more sensitive replication should ask each rank
+to report renderings for \emph{every} proper noun it used rather than a
+pre-registered list, and score consistency over terms reported by two or more
+ranks; rare names diverge where famous ones do not. We report the saturated result
+rather than substituting the metric after seeing the data.
+
+\paragraph{One model family.} All agent ranks were served by one model family, so we
+cannot separate protocol effects from model idiosyncrasies, and the correlated-failure
+caution in \cref{sec:ft} applies to our own replication results.
+
+\paragraph{Token counting.} Where provider usage was unavailable we used a
+documented estimator; every conclusion depending on exact counts is drawn from
+ratios rather than absolute values.
+
+\paragraph{Fabric as a fate-sharing point.} The reference fabric is a single durable
+store, so \code{agree} routes agreement through a reliable service rather than
+circumventing FLP. The specification states that requirement rather than hiding it;
+a distributed fabric would need real consensus.
+
+\paragraph{What we would change.} The context budget is currently a scalar. Real
+agents have structured contexts --- system prompt, tool definitions, conversation,
+retrieved documents --- with very different eviction economics, and a protocol that
+modelled the structure could make better admission decisions.
+
+\section{Related work}
+\label{sec:related}
+
+\paragraph{MPI and its lineage.} We build directly on the MPI standard and its
+algorithmic
+literature~\cite{mpiforum94,mpi31,mpi40,ThakurRabenseifnerGropp05,Chan07,Bruck97,Rabenseifner04},
+its one-sided
+design~\cite{hoefler15-rma,dinan16-rma,gerstenberger14}, and its fault-tolerance
+line~\cite{fagg00-ftmpi,bouteiller22}. Our departures are catalogued in
+\cref{sec:intro}.
+
+\paragraph{Other parallel models.} BSP's superstep discipline~\cite{valiant90bsp} is
+the ancestor of our barrier-separated phases; Pregel applies it to
+graphs~\cite{malewicz10pregel}. The actor
+model~\cite{hewitt73actor,agha86actors} and Erlang/OTP~\cite{armstrong03erlang}
+supply supervision, which MPI lacks and which we adopt wholesale; Orleans supplies
+the virtual-actor idea behind rank incarnations~\cite{bernstein14orleans}. CSP
+contributes the rendezvous channel~\cite{hoare78csp}.
+MapReduce and Spark show how restricting expressiveness buys
+recoverability~\cite{dean04mapreduce,zaharia12rdd}; we make the opposite trade and
+pay for it with an explicit failure model. Task-graph
+runtimes~\cite{bauer12legion,moritz18ray} and pipeline
+parallelism~\cite{huang19gpipe} inform our topology work.
+
+\paragraph{Agent frameworks.} AutoGen, MetaGPT, ChatDev, CAMEL, LangGraph and CrewAI
+each supply a coordination model, and each is a framework rather than a
+protocol: they own the control flow, and a harness written against one cannot be
+composed with
+another~\cite{wu24autogen,hong24metagpt,qian24chatdev,li23camel,langgraph,crewai}.
+None provides scoped communication contexts, collectives with selectable algorithms,
+one-sided state with defined concurrency semantics, or a specified behaviour when a
+participant disappears. Durable-execution systems~\cite{temporal} give reliable
+step execution but no communication algebra.
+
+\paragraph{Agent protocols.} MCP standardises agent-to-tool
+access~\cite{mcpspec2026}; A2A standardises task delegation across
+organisations~\cite{a2adefs}; ANP, ACP and Coral address discovery and
+routing~\cite{anpwp,coral}. Surveys confirm the
+division~\cite{yangsurvey,ehteshamsurvey}. These are complementary and orthogonal:
+they connect \emph{systems}, whereas \ampi{} is what one writes a system
+\emph{with}. Classical agent communication languages --- KQML, FIPA-ACL, the Contract
+Net Protocol, blackboard architectures, Linda tuple
+spaces~\cite{kqml,fipaacl,contractnet,hearsay,carriero89-linda,jade} --- are the true
+ancestors, and modern protocols are rediscovering them; notably, Linda's tuple space
+is a shared-memory abstraction with no epochs, which is precisely the gap
+\cref{sec:rma} fills.
+
+\paragraph{Agent failure and context.} The MAST taxonomy attributes multi-agent
+failures largely to specification and inter-agent
+coordination~\cite{mast,mastneurips}; practitioner reports converge on context
+fragmentation~\cite{cognitiondont,anthropicmas,anthropicctxeng,lcbenchmark}.
+Long-context degradation is
+measured~\cite{liu24lostinmiddle,labanlost,chromarot}, as are error cascades and
+diversity collapse~\cite{diversitycollapse}. Agent-OS work treats context as a
+managed resource~\cite{memgpt,aios}; serving systems schedule agent
+workloads~\cite{parrot,autellix,teola}. Our contribution relative to all of these is
+to make context an \emph{accounted protocol resource} with a transport-mode policy,
+rather than a memory-management strategy inside one agent.
+
+\paragraph{Multi-agent translation and coding.} Multi-agent literary translation has
+been studied~\cite{transagentstacl,transagentsdemo}, and coding benchmarks are
+standard~\cite{jimenez24swebench}. We use both as \emph{vehicles} for measuring
+protocol mechanisms, not as targets; our harnesses are deliberately simple so that
+ablations isolate the coordination primitive rather than prompt engineering.
+
+\section{Conclusion}
+
+The multi-agent field is rediscovering, application by application, the problems the
+MPI Forum solved once for parallel computing. We have shown that MPI's core
+abstractions --- communicators, typed transfers with projections, collectives with
+selectable algorithms, one-sided state with epochs, and failure mitigation ---
+transfer to agent populations, and that three modifications are forced and
+consequential: transport mode must be semantically visible because context is the
+scarce buffer; reduction operators must declare their algebra because fidelity
+decays in fold depth; and fault tolerance must be built around verification because
+the dominant failure is silent corruption rather than crash. What makes the
+transplant work is one decision that MPI never had to make and that agent frameworks
+never make: artifacts are immutable and content-addressed, which is why broadcast can
+be logarithmic and lossless while reduction cannot.
+
+We do not claim \ampi{}'s spelling is right. MPI's was not right either in 1994, and
+the value of the Forum was the process, not the first draft. We claim that the
+\emph{shape} of the problem is the same one message passing already solved, and that
+a field currently shipping one coordination mechanism per project should look at what
+happened after 1994.
+
+\balance
+\bibliographystyle{plain}
+\bibliography{agentmpi}
+
+\end{document}
