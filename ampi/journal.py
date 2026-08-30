@@ -480,7 +480,38 @@ class Journal:
                 "INSERT OR IGNORE INTO meta(k,v) VALUES('protocol',?)",
                 (PROTOCOL_VERSION,),
             )
+        else:
+            self._migrate()
         self._job_id = job_id
+
+    #: Columns added after the initial schema, with their definitions. Applied on
+    #: open so that a job already in flight keeps working across a runtime
+    #: upgrade. This is not hypothetical politeness: adding the two-phase
+    #: detector's `suspect_ns` column mid-experiment broke a live 22-rank run
+    #: whose agents were still executing, and the only honest fix is that a
+    #: journal written by an older runtime must remain readable.
+    _ADDED_COLUMNS = (
+        ("rank", "suspect_ns", "INTEGER NOT NULL DEFAULT 0"),
+    )
+
+    def _migrate(self) -> None:
+        for table, column, decl in self._ADDED_COLUMNS:
+            try:
+                cols = {
+                    r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")
+                }
+            except sqlite3.Error:  # pragma: no cover - table absent
+                continue
+            if not cols or column in cols:
+                continue
+            with contextlib.suppress(sqlite3.Error):
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        with contextlib.suppress(sqlite3.Error):
+            self.conn.execute(
+                "INSERT INTO meta(k,v) VALUES('schema_version',?)"
+                " ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                (str(SCHEMA_VERSION),),
+            )
 
     # ---------------------------------------------------------------- misc
     def close(self) -> None:
