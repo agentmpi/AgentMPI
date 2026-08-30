@@ -971,7 +971,45 @@ Following MPI's practice of standardising only what is understood, this version
 omits: automatic context compaction policy; semantic verification of results;
 cost- or model-aware scheduling; inter-communicators; persistent collectives;
 partitioned communication; sessions; a full non-power-of-two recursive-halving
-reduce-scatter; agent-evaluated `reduce_scatter`; and any notion of agent
-capability advertisement or discovery. Each is a research question, and a
-standard that answers a research question prematurely is worse than one that
+reduce-scatter; and agent-evaluated `reduce_scatter`. Each is a research question,
+and a standard that answers a research question prematurely is worse than one that
 leaves a hook.
+
+### One omission we now believe was a mistake
+
+This version also omits **interface advertisement and discovery**, and the
+evidence against that decision is strong enough to record here rather than defend.
+
+In a controlled comparison, a team of eight agents given the protocol's messages
+and windows but *no* prescribed coordination phase rebuilt the missing mechanism
+themselves, immediately and almost unanimously. Beginning about thirteen minutes
+in, and within roughly ninety seconds of one another, seven of the eight
+independently sent an identical interface-declaration message to every peer — a
+hand-rolled allgather. The integrator then published an agreed interface into a
+window and broadcast integration status twice. Every consumer additionally built
+*runtime discovery*: probing a producer's exported handlers with synthetic inputs
+and settling the calling convention by majority vote over the results, resolving
+class names by searching several plausible spellings across two peers' modules,
+and validating a candidate environment frame by binding a probe into it. The
+shipped source carried roughly five times as many probe- and detection-related
+identifiers as the arm that had a negotiated contract, and about twice the total
+lines for the same externally-graded behaviour. Two of the eight introduced
+defects *inside* their own detection logic, one of them in the interaction between
+two ranks' detectors, reproducible only for the first special form evaluated in a
+fresh process.
+
+A protocol whose users independently reimplement a mechanism, at double the cost
+and with defects in the reimplementation, is a protocol missing that mechanism.
+
+A future version SHOULD therefore provide both halves of what those agents built,
+because the two arms demonstrate that they are complementary rather than
+alternatives:
+
+* **Declaration.** An operation to publish a typed interface into a window, keyed
+  by its provider, so that "what do you export" has an answer that does not
+  require a message round-trip or a guess.
+* **Verification.** A way for a consumer to check a declaration against the
+  provider's actual behaviour. Declaration alone reproduces the failure of S7.3 —
+  a single agreed artefact can be internally inconsistent. Verification alone
+  cannot be inconsistent but pushes the whole cost into every consumer. The union
+  is what the observed agents approximated by doing both by hand.

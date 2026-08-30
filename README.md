@@ -199,12 +199,30 @@ self-report); none did without it. Peak context in one rank: 8,661 tokens versus
 897, because the unprotocolled coordinator materialised every translation.
 
 **E2, eight agents building a Scheme interpreter.** Both arms passed **174/174**
-held-out cases, so that instrument measured neither. The ablated arm also
-*spontaneously recreated the protocol's mechanisms* — unprompted, its agents built
-`contract` and `decisions` windows with cells named `interface` and
-`eval-protocol` — and reached the same score for a third of the wall time and a
-fifth of the context. We take that as evidence the abstraction matches the problem
-and as a caution against selling it as a capability.
+held-out cases, so that instrument measured neither. The ablated arm did something more
+striking than tie. Beginning ~13 minutes in and within about **ninety seconds of
+one another, seven of the eight ranks each sent an identical interface
+declaration to every peer** — a hand-rolled allgather, unprompted. The integrator
+then published an agreed `interface` cell into a window and broadcast integration
+status twice. In total: 18 all-to-all broadcasts and 12 window cells, against the
+protocol arm's 3, because the protocol arm had `bcast` and `allreduce` and did not
+need to build them. Seven of eight agents independently converging on "broadcast
+what you provide, publish the agreement into shared state, broadcast integration
+status" is evidence the *abstraction* fits the problem — and the sharpest possible
+caution against overselling, since these mechanisms are clearly what agents reach
+for when they are absent.
+
+It then invented one the protocol **doesn't** have: instead of agreeing interfaces
+in advance, every consumer *discovered* its producer's real interface at runtime —
+probing handlers with synthetic inputs and settling the calling convention by
+majority vote over the results. That cannot produce the contradiction an
+agreement-by-reduction can (see below), but it cost 54 probe/detect identifiers
+against 10, ~2× the lines for the same graded behaviour, and two defects located
+*inside the probing logic*, one of them in the interaction between two ranks'
+detectors. A protocol whose users reimplement a mechanism, at double the cost and
+with bugs in the reimplementation, is missing that mechanism — so the spec's
+Appendix B now records interface advertisement as an omission we got wrong, and
+what both halves of the fix should look like.
 
 To separate the arms we used **differential testing**: 2500 programs generated
 from a grammar written against the spec, run under both interpreters and compared

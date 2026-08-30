@@ -770,3 +770,24 @@ def test_cart_shift_reports_absent_neighbours_explicitly(job):
     assert "source" in first and first["source"] is None
     assert "none" in first["source_str"]
     assert last["dest"] is None and "none" in last["dest_str"]
+
+
+def test_spec_records_the_omission_we_got_wrong():
+    """Appendix B must keep the evidence, not just the decision.
+
+    The strongest evidence we have for any feature is one we left out: deprived of
+    interface advertisement, seven of eight agents rebuilt it within ninety
+    seconds of each other and every consumer rebuilt discovery by probing. A
+    specification that lists an omission without the evidence against it invites
+    the same mistake next revision.
+    """
+    spec = (REPO / "spec" / "AgentMPI-0.1.md").read_text(encoding="utf-8")
+    assert "One omission we now believe was a mistake" in spec
+    for required in ("interface advertisement", "Declaration", "Verification"):
+        assert required in spec, f"Appendix B lost its discussion of {required!r}"
+    # The omission list must no longer claim discovery is merely a research question.
+    omissions = spec[spec.index("## Appendix B"):]
+    head = omissions[: omissions.index("### One omission")]
+    assert "capability advertisement" not in head, (
+        "capability advertisement is still listed as a plain deliberate omission"
+    )

@@ -73,6 +73,7 @@ def main() -> int:
     ap.add_argument("--e3", default="results/e3_metrics.json")
     ap.add_argument("--e2b", default="results/e2_behaviour.json")
     ap.add_argument("--e2d", default="results/e2_differential.json")
+    ap.add_argument("--e2e", default="results/e2_emergence.json")
     ap.add_argument("--out", default="paper/results.tex")
     args = ap.parse_args()
     m = Macros()
@@ -274,6 +275,12 @@ def main() -> int:
         m.add("diffAgreeError", agree_e)
         m.add("diffDisagreeValue", d["outcomes"].get("disagree_value", 0))
         m.add("diffDisagreeStatus", d["outcomes"].get("disagree_error_vs_value", 0))
+
+    # ---- experiment 2, emergent coordination -------------------------------
+    e2e = Path(args.e2e)
+    if e2e.exists():
+        for k, v in (json.loads(e2e.read_text()).get("macros") or {}).items():
+            m.add(k, v)
 
     # ---- experiment 3 -----------------------------------------------------
     e3p = Path(args.e3)
