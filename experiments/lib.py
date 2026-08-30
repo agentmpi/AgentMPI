@@ -167,33 +167,54 @@ def launch_plan(manifest: Dict[str, Any], out: Path) -> Path:
 
 PROTOCOL_DISCIPLINE = """### How to use `ampi` reliably (read this carefully; it is short)
 
-- `ampi` is already on your PATH and your identity is already in the environment.
-  **Never pass `--rank`.** Run commands from any directory.
-- **Blocking calls: use `--timeout 120` and set the Shell tool's `block_until_ms`
-  to 400000.** The command retries internally (you will see `AMPI_RETRY` lines on
-  stderr), so one invocation covers up to ~6 minutes of waiting.
-- If a command still ends in `AMPI_ERR_TIMEOUT`, **re-run the identical command**.
-  That is the designed behaviour, not a failure: your place in the queue is
-  durable, so retrying resumes the same wait rather than restarting it. Do this at
-  least 5 more times before you conclude anything is wrong. Ranks are blocked
-  waiting for you; giving up early is the single worst thing you can do.
-- **Before any step that will take you more than a minute** (translating a
-  section, writing a module, doing a merge), run `ampi hb --extend 900`. This tells
-  the job you are alive and thinking. If you go silent longer than your lease, you
-  will be declared dead and replaced, and your work will be thrown away.
-- **Every collective needs `--label`, and every rank must use the same label for
-  the same collective.** The labels are given to you. Do not invent labels.
-- If a command's output contains `action_required`, do that action *before*
-  anything else.
-- On `AMPI_ERR_PROC_FAILED`, `AMPI_ERR_REVOKED` or `AMPI_ERR_FENCED`, follow the
-  `hint:` line. `AMPI_ERR_FENCED` means you have been replaced: stop immediately
-  and say so.
-- Create a window before writing to it: `ampi win create --name W` is idempotent
-  and safe even if another rank already created it.
-- Run `ampi ctx` occasionally. Above 70% of budget, stop materialising payloads
-  and use `ampi view <handle> --budget 400`.
-- Record progress with `ampi memo put <key> <value>` after each phase. If you die,
-  your replacement reads exactly those memos.
+**1. Pin your identity on every command. This is the most important rule.** The
+shell session may be shared with other agents, and `AMPI_RANK` has been observed
+changing between one call and the next. Set it inline every time, and assert it:
+
+```bash
+AMPI_ROOT=<your job root> AMPI_RANK=<your rank> ampi <cmd> --expect-rank <your rank>
+```
+
+Every command echoes `[acting as rank N of job J]` — **read it**. A command that
+fails with `AMPI_ERR_IDENTITY` means your environment drifted; the hint names the
+rank you actually hold credentials for. `ampi whoami --expect-rank N` is a cheap
+one-command check.
+
+**2. Blocking calls.** Always pass `--timeout 120`. The command retries
+internally (you will see `AMPI_RETRY` on stderr), so one invocation may block for
+several minutes; set your shell tool's `block_until_ms` to 400000. If it still
+ends in `AMPI_ERR_TIMEOUT`, **re-run the identical command** — your place in the
+queue is durable, so retrying resumes the same wait rather than restarting it. Do
+this at least 5 more times before concluding anything is wrong. Other ranks are
+blocked waiting for you.
+
+**3. Before any step taking over a minute**, run `ampi hb --extend 900`, and
+again every few minutes while you work.
+
+**4. Every collective needs `--label`**, and every rank must use the same label
+for the same collective. The labels are given to you. Do not invent labels.
+
+**5. If output contains `action_required`, do that before anything else.**
+
+**6. Do not wait forever for a message that may not have been sent.** If a `recv`
+fails five times, check `ampi inbox` and `ampi status`, then continue without it
+and record that in your report.
+
+**7. Read `dropped=[...]`** in collective output: it names peers whose
+contribution the collective completed without. Report it.
+
+**8. Errors prescribe.** Follow the `hint:` line. `AMPI_ERR_FENCED` means you
+were declared dead and possibly replaced: run `ampi recover` to see whether a
+successor exists, and continue only if none does.
+
+**9. Watch your context.** `ampi ctx`. Above 70%, stop materialising payloads:
+use `ampi view <handle> --budget 400`, or `ampi view <handle> --op full --out
+<path>` to save a payload to disk for free.
+
+**10. Use `--in @file`, not `--in "..."`, for anything long** — your shell runs
+backticks inside double quotes.
+
+**11. Record progress** with `ampi memo put <key> <value>` after each phase.
 """
 
 

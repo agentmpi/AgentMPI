@@ -743,16 +743,24 @@ class Journal:
 
 
 def find_root(start: Optional[str] = None) -> Path:
-    """Locate the job root by walking up from ``start`` looking for ``.ampi``.
+    """Locate the job root, preferring an explicit argument over the environment.
 
     Mirrors how ``git`` finds its repository: agents run commands from wherever
     they happen to be, and requiring them to track an absolute path is a
-    reliability liability. ``AMPI_ROOT`` overrides the search.
+    reliability liability.
+
+    The precedence order is deliberate and was corrected after a real incident.
+    An explicit ``start`` (from ``--job-root``) wins over ``AMPI_ROOT``, because
+    an agent that has noticed its environment drifting needs a way to override
+    it; the original order made ``--job-root`` silently useless in exactly that
+    situation, which is when it is most needed.
     """
+    if start:
+        return Path(start).resolve()
     env = os.environ.get("AMPI_ROOT")
     if env:
         return Path(env).resolve()
-    cur = Path(start or os.getcwd()).resolve()
+    cur = Path(os.getcwd()).resolve()
     for cand in [cur, *cur.parents]:
         if (cand / STATE_DIR / "journal.db").exists():
             return cand

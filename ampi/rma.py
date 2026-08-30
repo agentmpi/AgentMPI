@@ -83,7 +83,11 @@ def create(ctx: Ctx, name: str, *, model: str = "unified", meta: Optional[Dict[s
     j = ctx.j
     existing = j.q1("SELECT * FROM win WHERE job=? AND name=?", (j.job_id, name))
     if existing is not None:
-        return {"win": str(existing["id"]), "name": name, "created": False}
+        # `created=false` was read as a failure by several agents. Say what
+        # happened instead of what did not.
+        return {"win": str(existing["id"]), "name": name, "created": False,
+                "existed": True,
+                "note": f"window {name!r} already existed; you are attached to it"}
     wid = "w:" + uuid.uuid4().hex[:10]
     with j.tx() as c:
         c.execute(

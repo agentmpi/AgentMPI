@@ -84,6 +84,7 @@ def _render_text(res: Dict[str, Any]) -> str:
     nxt = res.get("next")
     hint = res.get("hint")
     skip = {"body", "directive", "note", "next", "hint"}
+    skip = skip | {"_identity"}
     keys = [k for k in _ORDER if k in res and k not in skip]
     keys += [k for k in res if k not in keys and k not in skip]
     kv: List[str] = []
@@ -97,10 +98,16 @@ def _render_text(res: Dict[str, Any]) -> str:
             kv.append(f"{k}={'true' if v else 'false'}")
         else:
             kv.append(f"{k}={v}")
+    ident = res.pop("_identity", None)
     if kv:
         lines.append("AMPI_SUCCESS " + "  ".join(kv))
     else:
         lines.append("AMPI_SUCCESS")
+    # Every command echoes who it acted as. Agents asked for this repeatedly and
+    # they were right: when identity is ambient, the only defence against it
+    # having changed is being told, on every call, who you just were.
+    if ident:
+        lines.append(f"[acting as rank {ident['rank']} of job {ident['job']}]")
     if body is not None:
         lines.append(BODY_OPEN)
         lines.append(body if isinstance(body, str) else json.dumps(body, indent=2, ensure_ascii=False))
@@ -177,7 +184,17 @@ def add_common(p: argparse.ArgumentParser) -> None:
     # The job's filesystem root is `--job-root`, and is almost never needed
     # because it is discovered from $AMPI_ROOT or by walking up from the cwd.
     p.add_argument("--job-root", dest="job_root", default=None,
-                   help="job root directory (default: $AMPI_ROOT, or found by walking up)")
+                   help="job root directory; takes precedence over $AMPI_ROOT")
+    # Identity assertions. Ambient identity is still the default -- an agent should
+    # not have to thread its rank through every call -- but in our multi-agent runs
+    # the host's shell sessions were shared and AMPI_RANK was silently rewritten
+    # between calls, so every agent's first `init` ran as somebody else. There was
+    # no way to say "I intend to be rank 5, fail if the environment disagrees."
+    # Now there is, and the rank prompts require it.
+    p.add_argument("--expect-rank", dest="expect_rank", type=int, default=None,
+                   help="fail with AMPI_ERR_IDENTITY unless the ambient rank is this")
+    p.add_argument("--expect-job", dest="expect_job", default=None,
+                   help="fail with AMPI_ERR_IDENTITY unless the journal is this job")
     p.add_argument("--json", action="store_true", help="machine-readable output")
 
 
@@ -214,7 +231,11 @@ def mat_of(a: argparse.Namespace) -> Optional[bool]:
 
 def _ctx(a: argparse.Namespace, *, require_init: bool = True, beat: bool = True) -> Ctx:
     j = open_journal(a.job_root)
-    return bind(j, rank=a.rank, comm=a.comm, require_init=require_init, beat=beat)
+    return bind(
+        j, rank=a.rank, comm=a.comm, require_init=require_init, beat=beat,
+        expect_rank=getattr(a, "expect_rank", None),
+        expect_job=getattr(a, "expect_job", None),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -228,8 +249,13 @@ def cmd_init(a: argparse.Namespace) -> Dict[str, Any]:
     if rank < 0:
         raise ArgError("cannot tell which rank you are",
                        hint="set AMPI_RANK in the environment, or pass --rank R")
+    from .core import assert_identity
+
+    assert_identity(j, rank, expect_rank=getattr(a, "expect_rank", None),
+                    expect_job=getattr(a, "expect_job", None))
     reinit = bool(a.reinit or os.environ.get("AMPI_REINIT"))
-    info = init_rank(j, rank, agent_id=a.agent_id, role=a.role, reinit=reinit)
+    info = init_rank(j, rank, agent_id=(a.agent_id or os.environ.get("AMPI_AGENT_ID")),
+                     role=a.role, reinit=reinit)
     members = comm_members(j, a.comm)
     out: Dict[str, Any] = {
         "protocol": PROTOCOL_VERSION,
@@ -283,6 +309,49 @@ def cmd_info(a: argparse.Namespace) -> Dict[str, Any]:
         "failed_ranks": failed_ranks(ctx.j, a.comm),
         "root": str(ctx.j.root),
     }
+
+
+def cmd_whoami(a: argparse.Namespace) -> Dict[str, Any]:
+    """Report and optionally assert the caller's identity.
+
+    A one-command answer to "am I who I think I am", which is the question an
+    agent in a shared environment most needs to be able to ask cheaply.
+    """
+    j = open_journal(a.job_root)
+    env_rank = os.environ.get("AMPI_RANK")
+    rank = a.rank if a.rank is not None else (int(env_rank) if env_rank not in (None, "") else None)
+    out: Dict[str, Any] = {
+        "job": j.job_id,
+        "root": str(j.root),
+        "ambient_rank": rank,
+        "env_AMPI_RANK": env_rank,
+        "env_AMPI_ROOT": os.environ.get("AMPI_ROOT"),
+        "env_AMPI_TOKEN_set": bool(os.environ.get("AMPI_TOKEN")),
+    }
+    if rank is None:
+        out["note"] = "AMPI_RANK is not set; no ambient identity"
+        return out
+    from .core import assert_identity
+
+    assert_identity(j, rank, expect_rank=a.expect_rank, expect_job=a.expect_job)
+    row = j.q1("SELECT state, epoch, role, calls FROM rank WHERE job=? AND rank=?",
+               (j.job_id, rank))
+    if row is not None:
+        out.update({"state": str(row["state"]), "epoch": int(row["epoch"]),
+                    "role": row["role"], "calls": int(row["calls"])})
+    inits = int(j.scalar("SELECT COUNT(*) FROM event WHERE job=? AND rank=? AND kind='init'",
+                         (j.job_id, rank), 0))
+    out["inits_seen"] = inits
+    if inits > 1:
+        out["warning"] = (
+            f"rank {rank} has been initialised {inits} times. If you did not retry, "
+            "another agent has acted as you, or you are acting as another agent."
+        )
+    out["next"] = (
+        "pass --expect-rank on every command, and prefix AMPI_RANK/AMPI_ROOT inline "
+        "rather than relying on the shell session to keep them"
+    )
+    return out
 
 
 def cmd_man(a: argparse.Namespace) -> Dict[str, Any]:
@@ -758,6 +827,22 @@ def cmd_view(a: argparse.Namespace) -> Dict[str, Any]:
     v = views.render_view(ctx.j, a.handle, spec)
     from .core import ctx_charge
 
+    if a.out:
+        # Writing to disk costs no context, because nothing enters the window.
+        # Several agents worked around the absence of this by reaching into the
+        # object store directly rather than pay to see what was already a file.
+        Path(a.out).parent.mkdir(parents=True, exist_ok=True)
+        Path(a.out).write_text(v["body"], encoding="utf-8")
+        return {
+            "handle": a.handle,
+            "view": v["id"],
+            "op": spec["op"],
+            "payload_tokens": int(meta["tokens"]),
+            "view_tokens": v["tokens"],
+            "context_charged": 0,
+            "written": a.out,
+            "note": "written to disk; nothing entered your context",
+        }
     with ctx.j.tx() as c:
         ctx_charge(ctx.j, ctx.rank, ctx.epoch, v["tokens"], conn=c, force=True, what="view")
     return {
@@ -884,6 +969,7 @@ def build_parser() -> argparse.ArgumentParser:
     sp = S("fini", "leave the job (AMPI_Finalize)", cmd_fini)
     sp.add_argument("--status", default="ok")
     S("info", "my identity and the shape of the job", cmd_info)
+    S("whoami", "who am I, and assert it", cmd_whoami)
     S("man", "print the full protocol manual", cmd_man)
     sp = S("hb", "renew/extend my lease before a long step", cmd_hb)
     sp.add_argument("--extend", type=float, default=600.0,
@@ -1185,6 +1271,8 @@ def build_parser() -> argparse.ArgumentParser:
                     help="head:800 | tail:400 | headtail:800 | lines:10-40 | keys:a,b | "
                          "grep:PATTERN | outline | shape | stat | chunk:2/8 | full")
     sp.add_argument("--budget", type=int, default=None)
+    sp.add_argument("--out", default=None,
+                    help="write the view to this path instead of your context (free)")
     sp = S("obj", "payload metadata, or save it to disk", cmd_obj)
     sp.add_argument("handle")
     sp.add_argument("--save", default=None, help="write the payload to this path (no context cost)")
@@ -1230,6 +1318,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--runs", default="runs", help="directory of job roots to expose")
 
     return p
+
+
+def _identity_of(a: argparse.Namespace) -> Optional[Dict[str, Any]]:
+    """Best-effort (rank, job) for the identity echo. Never raises."""
+    try:
+        rank = getattr(a, "rank", None)
+        if rank is None:
+            env = os.environ.get("AMPI_RANK")
+            rank = int(env) if env not in (None, "") else None
+        if rank is None:
+            return None
+        j = open_journal(getattr(a, "job_root", None))
+        out = {"rank": int(rank), "job": j.job_id}
+        j.close()
+        return out
+    except Exception:
+        return None
 
 
 def _trace_error(a: argparse.Namespace, exc: AmpiError) -> None:
@@ -1301,6 +1406,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return exit_code(ErrClass.TIMEOUT)
     if res is None:
         res = {}
+    if isinstance(res, dict) and "_identity" not in res:
+        ident = _identity_of(a)
+        if ident:
+            res["_identity"] = ident
     print(render(res, as_json=as_json))
     return 0
 

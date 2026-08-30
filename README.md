@@ -95,6 +95,8 @@ ampi win cas  --win shared --key task/17 --expect unclaimed --value rank:4
 ampi view o:9f2a --op outline --budget 400   # read a projection, not the payload
 ampi failed ; ampi comm revoke ; ampi comm shrink
 ampi hb --extend 900                 # "I am alive and about to think for a while"
+ampi whoami --expect-rank 4          # am I who I think I am? refuses if not
+ampi view o:9f2a --op full --out f   # save a payload to disk, zero context cost
 ```
 
 Everything an agent needs is in [`bindings/AGENT_GUIDE.md`](bindings/AGENT_GUIDE.md),
@@ -218,6 +220,33 @@ agents executed the protocol.
    command, naming the missing ranks and the tag. The harness rule is the one MPI
    teaches about zero-length collectives: **send unconditionally, possibly
    empty**.
+10. **Ambient identity without an assertion is unsafe, and we had to be shown.**
+    We argued in the first draft of the spec that making rank ambient
+    "eliminates the entire class" of wrong-rank errors. It eliminated the error
+    we designed against — agents *passing* the wrong rank — and replaced it with
+    a worse one: agents silently *being* the wrong rank. The host shares shell
+    sessions between concurrent agents, so `AMPI_RANK` was rewritten between
+    calls; in four of five runs, one rank absorbed 8–9 stray `init` events, one
+    from nearly every other agent, and in one run the victim was declared failed
+    and fenced *while working*. Nineteen of twenty-two agents reported it
+    independently. The fix keeps ambient identity but makes it assertable:
+    `--expect-rank`, `--expect-job`, an identity echo on every command, a
+    launcher-issued per-rank token, and `--job-root` now overriding `AMPI_ROOT`.
+11. **Never truncate a reduction operand.** An operand is the input to a
+    function, so clipping it corrupts the result rather than shortening it — and
+    clipping JSON mid-string yields something the operator cannot parse at all.
+    Agents worked around it by prefix-matching the object store by hand. A
+    *result* may be summarised; an *operand* may not.
+12. **A canonical tree gives reproducibility, not consistency.** In a real
+    eight-rank contract reduction, two branches met the *same* conflict and
+    resolved it in *opposite* directions. Both rulings survived into the merged
+    result and no merge could have noticed, because each saw a locally consistent
+    pair. Pinning the tree shape makes the outcome reproducible; it does not make
+    it consistent. Carry unresolved conflicts forward, or verify the closed
+    result against a global invariant.
+13. **Print only commands that exist.** Our reduction directive told agents to
+    run a subcommand spelled with a space where the real one is hyphenated. Ten
+    agents reported it, several while peers were blocked behind them.
 
 That 6-of-22 launch failure, incidentally, ran to completion: all six survivors
 finalised and every collective closed — scatter, an agent-evaluated allreduce,

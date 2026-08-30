@@ -31,6 +31,7 @@ from .errors import (
     CommError,
     CtxExceededError,
     FencedError,
+    IdentityError,
     NotInitError,
     RankError,
     RevokedError,
@@ -319,6 +320,18 @@ def init_rank(
         if row is None:
             raise RankError(f"no such rank {rank}")
         epoch = int(row["epoch"])
+        # A second `init` on a rank that is demonstrably already occupied is the
+        # signature of the environment drift described in `assert_identity`. We
+        # cannot refuse it outright -- a legitimate retry looks identical -- but we
+        # can record it and return a warning the agent will see.
+        stray = (
+            row["state"] == "running"
+            and int(row["calls"] or 0) > 3
+            and not reinit
+            and agent_id is not None
+            and row["agent_id"] is not None
+            and agent_id != row["agent_id"]
+        )
         if row["state"] == "spawned":
             # The launcher (or `ampi respawn`) already allocated this epoch for
             # us, so adopt it. Bumping again here would fence the replacement
@@ -348,16 +361,28 @@ def init_rank(
                 rank,
             ),
         )
-        j.trace("init", rank=rank, epoch=epoch, phase="instant", detail={"reinit": reinit}, conn=c)
+        j.trace("init", rank=rank, epoch=epoch, phase="instant",
+                detail={"reinit": reinit, "stray_suspected": bool(stray)}, conn=c)
     row = rank_row(j, rank)
-    return {
+    out: Dict[str, Any] = {
         "rank": rank,
         "epoch": int(row["epoch"]),
+        "job": j.job_id,
         "world_size": int(j.job_row()["world_size"]),
         "role": row["role"],
         "ctx_budget": int(row["ctx_budget"]),
         "ctx_used": int(row["ctx_used"]),
+        "inits_seen": int(j.scalar(
+            "SELECT COUNT(*) FROM event WHERE job=? AND rank=? AND kind='init'",
+            (j.job_id, rank), 1)),
     }
+    if out["inits_seen"] > 1:
+        out["warning"] = (
+            f"rank {rank} has now been initialised {out['inits_seen']} times. If you did "
+            "not retry, your AMPI_RANK has drifted and you are acting as another agent: "
+            "check `ampi info` and pin AMPI_RANK inline on every command."
+        )
+    return out
 
 
 def finalize_rank(j: Journal, rank: int, epoch: int, *, status: str = "ok") -> None:
@@ -755,6 +780,73 @@ def package(
 # --------------------------------------------------------------------------
 
 
+def assert_identity(
+    j: Journal,
+    rank: int,
+    *,
+    expect_rank: Optional[int] = None,
+    expect_job: Optional[str] = None,
+) -> None:
+    """Check the caller's belief about its own identity against reality.
+
+    Ambient identity was a mistake to rely on alone, and we have the data to say
+    so. Making rank ambient did eliminate the error we designed it to eliminate
+    -- agents passing the wrong ``--rank`` -- but it introduced a strictly worse
+    one. In our multi-agent runs the agent host's shell sessions turned out to be
+    shared, so ``AMPI_RANK`` was silently rewritten between one call and the next;
+    the journals show one specific rank in each run accumulating eight or nine
+    ``init`` events, one from every other agent in the job. Every agent's first
+    ``init`` ran as somebody else, and because identity was ambient there was no
+    way for any of them to say "I intend to be rank 5, fail if the environment
+    disagrees."
+
+    So identity remains ambient -- an agent should not have to thread it through
+    every call -- but asserting it is now possible, and the launcher-issued token
+    below makes the assertion checkable without the agent having to remember a
+    number.
+    """
+    if expect_rank is not None and int(expect_rank) != int(rank):
+        raise IdentityError(
+            f"you asserted --expect-rank {expect_rank} but the ambient identity says "
+            f"rank {rank}",
+            hint=(
+                "your environment has been changed underneath you. Re-export "
+                f"AMPI_RANK={expect_rank} (and AMPI_ROOT) and prefix it inline on every "
+                "command rather than relying on the shell session to keep it."
+            ),
+            detail={"expected": int(expect_rank), "ambient": int(rank)},
+        )
+    if expect_job is not None and expect_job not in (j.job_id, ""):
+        raise IdentityError(
+            f"you asserted --expect-job {expect_job} but this journal is job {j.job_id}",
+            hint=(
+                "AMPI_ROOT points at a different job than you intended. Pass "
+                "--job-root explicitly; it takes precedence over AMPI_ROOT."
+            ),
+            detail={"expected": expect_job, "actual": j.job_id},
+        )
+    token = os.environ.get("AMPI_TOKEN")
+    if token:
+        expected = j.scalar(
+            "SELECT json_extract(meta,'$.token') FROM rank WHERE job=? AND rank=?",
+            (j.job_id, rank),
+        )
+        if expected and token != expected:
+            owner = j.scalar(
+                "SELECT rank FROM rank WHERE job=? AND json_extract(meta,'$.token')=?",
+                (j.job_id, token),
+            )
+            raise IdentityError(
+                f"your launch token belongs to rank {owner}, but the ambient identity "
+                f"says rank {rank}",
+                hint=(
+                    f"the environment has drifted. You are rank {owner}: re-export "
+                    f"AMPI_RANK={owner} and prefix it inline on every command."
+                ),
+                detail={"token_owner": owner, "ambient": int(rank)},
+            )
+
+
 def bind(
     j: Journal,
     *,
@@ -762,30 +854,35 @@ def bind(
     comm: str = "world",
     require_init: bool = True,
     beat: bool = True,
+    expect_rank: Optional[int] = None,
+    expect_job: Optional[str] = None,
 ) -> Ctx:
-    """Resolve the calling rank's identity from arguments or the environment.
+    """Resolve the calling rank's identity, and verify it if asked.
 
     ``AMPI_RANK`` is set in every rank's launch environment, so agents normally
-    never pass ``--rank``. Getting this right matters more than it sounds: the
-    single most common agent error in early testing was passing the wrong rank,
-    and making the identity ambient eliminated it.
+    never pass ``--rank``. See :func:`assert_identity` for why that is necessary
+    but not sufficient.
     """
     if rank is None:
         env = os.environ.get("AMPI_RANK")
         if env is None or env == "":
             raise NotInitError(
                 "cannot tell which rank you are",
-                hint="pass --rank R, or set AMPI_RANK in the environment",
+                hint="set AMPI_RANK in the environment (preferred), or pass --rank R",
             )
         try:
             rank = int(env)
         except ValueError as exc:
             raise ArgError(f"AMPI_RANK={env!r} is not an integer") from exc
+    assert_identity(j, rank, expect_rank=expect_rank, expect_job=expect_job)
     row = rank_row(j, rank)
     if require_init and row["state"] in ("unspawned", "spawned"):
         raise NotInitError(
-            f"rank {rank} has not called AMPI_Init",
-            hint=f"run `ampi init --rank {rank}` first",
+            f"rank {rank} has not called AMPI_Init in job {j.job_id} at {j.root}",
+            hint=(
+                "run `ampi init` first. If you did already, check that AMPI_ROOT still "
+                f"points at your own job: this journal is {j.job_id} at {j.root}."
+            ),
         )
     cfg = load_config(j)
     ctx = Ctx(j=j, rank=rank, epoch=int(row["epoch"]), comm=comm_row(j, comm)["id"], cfg=cfg)

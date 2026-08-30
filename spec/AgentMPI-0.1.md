@@ -86,16 +86,58 @@ failed — harmless rather than corrupting.
 > checked on every operation closes that window. This is the standard fencing
 > argument for distributed locks, applied to executor identity.
 
-### S1.2 Executor identity is ambient
+### S1.2 Executor identity is ambient, and MUST be assertable
 
 An implementation MUST make a rank's identity available to its executor without
 the executor having to supply it (in the reference implementation, the
-environment variables `AMPI_RANK` and `AMPI_ROOT`). An implementation SHOULD
-reject an operation that names a different rank than the caller's.
+environment variables `AMPI_RANK` and `AMPI_ROOT`).
 
-> **Rationale.** This is not ergonomics. In early testing, the most frequent
-> agent error by a wide margin was passing the wrong rank identifier. Ambient
-> identity eliminates the entire class.
+An implementation MUST also provide a way for an executor to **assert** its
+identity and have the operation fail if the assertion does not hold. In the
+reference implementation this is `--expect-rank N` and `--expect-job J`, failing
+with `AMPI_ERR_IDENTITY` *before* the operation takes effect.
+
+An implementation SHOULD additionally:
+
+* **Echo the acting identity on every operation's output.** When identity is
+  ambient, the only defence against it having changed is being told, on every
+  call, who you just were.
+* **Issue a per-rank launch token.** The launcher places a secret in the rank's
+  environment (`AMPI_TOKEN`) and records it in the journal. If the ambient rank
+  and the token disagree, the runtime MUST fail with `AMPI_ERR_IDENTITY` and
+  SHOULD name the rank the token actually belongs to.
+* **Prefer an explicit root argument over the environment variable.** An agent
+  that has noticed its environment drifting needs a way to override it.
+* **Warn when a rank is initialised more than once** without an explicit
+  reinitialisation request.
+
+> **Rationale, and a correction.** An earlier version of this document said:
+> *"This is not ergonomics. In early testing, the most frequent agent error by a
+> wide margin was passing the wrong rank identifier. Ambient identity eliminates
+> the entire class."* The first two sentences are still true. The third was
+> wrong, and the multi-agent runs proved it.
+>
+> Making identity ambient eliminated the error we designed it to eliminate --
+> agents *passing* the wrong rank -- and replaced it with a strictly worse one:
+> agents silently *being* the wrong rank. On our agent host, shell sessions
+> turned out to be shared between concurrently running agents, so `AMPI_RANK` was
+> overwritten between one call and the next. The journals record the result
+> precisely: in each of four independent runs, one specific rank accumulated
+> eight or nine `AMPI_Init` events, one from nearly every other agent in the job.
+> Every agent's first `init` ran as somebody else. In one run this escalated: the
+> victim rank's own calls were being credited elsewhere, its lease starved, it
+> was declared failed while actively working, and it was fenced.
+>
+> Ambient identity is still right, because an agent should not have to thread its
+> rank through every call and will make mistakes if forced to. But ambient
+> identity *alone* assumes the environment is trustworthy, and in a shared host
+> it is not. The fix is not to abandon it; it is to make the assertion available
+> and cheap, so an agent can say "I intend to be rank 5" and be told loudly when
+> it is not. Two properties of the reference implementation limited the damage
+> and are worth requiring: re-initialising a rank that is already *running* is
+> treated as a heartbeat rather than a new epoch (so the victim was not fenced by
+> the stray call itself), and every window write and message records its writer's
+> rank and epoch (so the damage was auditable afterwards).
 
 ### S1.3 The five asymmetries with MPI
 
@@ -545,8 +587,21 @@ caller. A reduction with an agent operator MUST therefore:
 3. checkpoint the accumulator and schedule position durably, so that a timeout,
    crash, or replacement resumes at the same point.
 
-Operand delivery MUST respect an optional operand budget by delivering views
-(S5.4) instead of bodies.
+Operand delivery MAY respect an optional operand budget for **unstructured**
+payloads, but MUST NOT clip a structured payload (one whose syntax a truncation
+would break), and MUST report the full payload's handle in every case.
+
+> **Rationale.** An operand is the *input to the operator*, so removing part of
+> it does not degrade the result, it corrupts it. For a structured payload it is
+> worse than that: clipping JSON mid-string yields a document the operator cannot
+> parse at all. We shipped the naive behaviour and it bit immediately -- agents
+> serving as internal nodes of a contract reduction received operands cut
+> mid-string with an elision marker spliced in, and independently invented
+> recovery hacks, one prefix-matching the content-addressed object store by hand
+> to recover the bytes, another reordering its output so that the decisions it
+> could not afford to lose came before the part that clipping would take. The
+> asymmetry to respect is that a *result* may be summarised, because its consumer
+> is a reader; an *operand* may not, because its consumer is a function.
 
 > **Rationale.** The alternative — having the runtime call a model itself — would
 > make AgentMPI a framework with an opinion about models, credentials and
@@ -571,6 +626,27 @@ tree shape.
 > *default* is the conservative choice; a harness that knows its operator is
 > order-insensitive can opt into the faster schedule, as in MPI, but with much
 > larger stakes.
+>
+> We now have a sharper example than floating point, observed rather than
+> predicted. In a real eight-rank reduction over interface proposals, two
+> branches of the tree independently encountered the *same* conflict -- which
+> module defines the shared exception type -- and resolved it in *opposite*
+> directions. Both resolutions were recorded, so the merged result contained two
+> contradictory rulings under the same identifier, and the tree had no way to
+> notice: each merge saw a locally consistent pair of operands. Two ranks then
+> acted on different halves of the result. Separately, the same reduction dropped
+> four of eight modules from one section of its output despite an explicit
+> instruction never to drop a module, because "never drop" is a global invariant
+> and every merge is local.
+>
+> This is a genuine limitation of agent-evaluated reductions and implementations
+> should not pretend otherwise. A canonical tree shape makes the outcome
+> *reproducible*; it does not make it *consistent*. Harnesses whose operator can
+> encounter the same conflict in two branches SHOULD either carry unresolved
+> conflicts forward explicitly rather than deciding them locally (so the root
+> decides once), or verify the result against a global invariant after the
+> reduction closes. The interface provides the tree; it cannot provide
+> agreement.
 
 ### S7.4 Fault-tolerant reduction
 
@@ -785,6 +861,7 @@ replacements per rank, then give up on that rank.
 | `AMPI_ERR_PROC_FAILED_PENDING` | someone failed; a wildcard receive may still complete | **yes** |
 | `AMPI_ERR_REVOKED` | communicator revoked | no — shrink |
 | `AMPI_ERR_FENCED` | caller's epoch is stale; it has been replaced | no — **terminal** |
+| `AMPI_ERR_IDENTITY` | asserted identity, or launch token, disagrees with the ambient identity; the operation did not run | no — fix the environment |
 | `AMPI_ERR_CTX_EXCEEDED` | delivery would exceed the context budget | no — use a view |
 | `AMPI_ERR_BUDGET_EXHAUSTED` | cost limit reached | no |
 | `AMPI_ERR_OP_FAILED` | an agent operator step was abandoned or malformed | no |
@@ -825,13 +902,22 @@ whose output lands in its context window.
 
 A conforming binding for LLM executors SHOULD:
 
-* take identity from the environment, never from an argument;
+* take identity from the environment, offer an assertion against it (S1.2), and
+  echo the acting identity on every operation;
 * emit terse structured output with sizes in tokens, and an explicit next-action
   line;
 * mark retryable errors as such, in the output;
 * be idempotent by default: labelled collectives, idempotency keys on sends,
   resumable blocking calls;
-* provide the protocol manual as a command, so an executor can re-read it.
+* provide the protocol manual as a command, so an executor can re-read it;
+* print only commands that exist. An early version's reduction directive told the
+  agent to run a subcommand spelled with a space where the real one is
+  hyphenated; roughly ten agents reported it, several while peers were blocked
+  behind them. A binding that prints a command an agent cannot copy-paste is
+  worse than one that prints nothing;
+* offer a way to move a payload to disk *without* charging context, on every
+  operation that hands back a payload. Agents that lacked it reached into the
+  object store directly rather than pay to see what was already a file.
 
 ---
 

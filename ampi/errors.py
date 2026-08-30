@@ -60,6 +60,10 @@ class ErrClass:
     #: The caller's lease expired and it was declared failed by its peers; a
     #: replacement may already be running. The caller must stop (zombie fence).
     FENCED = "AMPI_ERR_FENCED"
+    #: The caller's asserted identity does not match its ambient identity, or its
+    #: launch token belongs to a different rank. Raised before the operation runs,
+    #: so nothing has happened yet.
+    IDENTITY = "AMPI_ERR_IDENTITY"
 
     # --- AgentMPI-specific classes -------------------------------------
     #: Delivering/materialising this payload would exceed the caller's context
@@ -99,6 +103,7 @@ _EXIT_CODES: Dict[str, int] = {
     ErrClass.PROC_FAILED_PENDING: 22,
     ErrClass.REVOKED: 23,
     ErrClass.FENCED: 24,
+    ErrClass.IDENTITY: 25,
     ErrClass.CTX_EXCEEDED: 30,
     ErrClass.BUDGET_EXHAUSTED: 31,
     ErrClass.OP_FAILED: 32,
@@ -166,6 +171,7 @@ ProcFailedError = _mkerr("ProcFailedError", ErrClass.PROC_FAILED)
 ProcFailedPendingError = _mkerr("ProcFailedPendingError", ErrClass.PROC_FAILED_PENDING)
 RevokedError = _mkerr("RevokedError", ErrClass.REVOKED)
 FencedError = _mkerr("FencedError", ErrClass.FENCED)
+IdentityError = _mkerr("IdentityError", ErrClass.IDENTITY)
 CtxExceededError = _mkerr("CtxExceededError", ErrClass.CTX_EXCEEDED)
 BudgetExhaustedError = _mkerr("BudgetExhaustedError", ErrClass.BUDGET_EXHAUSTED)
 OpFailedError = _mkerr("OpFailedError", ErrClass.OP_FAILED)

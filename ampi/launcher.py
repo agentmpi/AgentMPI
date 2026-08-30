@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
@@ -91,6 +92,13 @@ def create(
     manual = _manual_path(Path(__file__).resolve().parent.parent).read_text(encoding="utf-8")
     (root / STATE_DIR / "AGENT_GUIDE.md").write_text(manual, encoding="utf-8")
 
+    # A per-rank launch token, in the environment alongside the rank number.
+    # The runtime checks it against the journal, so an agent whose AMPI_RANK has
+    # been overwritten by a peer is told which rank it actually holds credentials
+    # for instead of silently acting as that peer. This is what a scheduler does
+    # when it hands a task its credentials rather than trusting it to name itself.
+    tokens_by_rank = {s.rank: "t-" + uuid.uuid4().hex[:16] for s in specs}
+
     manifest: Dict[str, Any] = {
         "job": job_id,
         "label": label,
@@ -119,7 +127,8 @@ def create(
                 "UPDATE rank SET state='spawned', meta=?,"
                 " lease_expires_ns=?, last_hb_ns=? WHERE job=? AND rank=?",
                 (
-                    json.dumps({"prompt": str(p), "env": s.env, "task_chars": len(s.task)}),
+                    json.dumps({"prompt": str(p), "env": s.env, "task_chars": len(s.task),
+                                "token": tokens_by_rank[s.rank]}),
                     now_ns() + int(join_grace_s * 1_000_000_000),
                     now_ns(),
                     job_id,
@@ -128,7 +137,8 @@ def create(
             )
         manifest["ranks"].append(
             {"rank": s.rank, "role": s.role, "prompt": str(p),
-             "env": {"AMPI_ROOT": str(root), "AMPI_RANK": str(s.rank), **s.env}}
+             "env": {"AMPI_ROOT": str(root), "AMPI_RANK": str(s.rank),
+                     "AMPI_TOKEN": tokens_by_rank[s.rank], **s.env}}
         )
     (root / STATE_DIR / "manifest.json").write_text(
         json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"

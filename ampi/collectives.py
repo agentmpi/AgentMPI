@@ -865,6 +865,12 @@ def _present(
     return out
 
 
+def _looks_structured(body: str) -> bool:
+    """True if clipping this payload would destroy its syntax rather than shorten it."""
+    head = body.lstrip()[:1]
+    return head in ("{", "[")
+
+
 def _work_dir(ctx: Ctx, cid: str) -> Path:
     d = ctx.j.dir / "work" / cid
     d.mkdir(parents=True, exist_ok=True)
@@ -1444,14 +1450,27 @@ def _describe_step(ctx: Ctx, coll: sqlite3.Row, step: sqlite3.Row) -> Dict[str, 
     right_p = work / f"r{ctx.crank}_round{step['round']}_right.txt"
     out_p = work / f"r{ctx.crank}_round{step['round']}_merged.txt"
     charged = 0
+    clipped: List[str] = []
     for oid, path in ((str(step["left_obj"]), left_p), (str(step["right_obj"]), right_p)):
         meta = j.object_meta(oid)
-        if ob and int(meta["tokens"]) > int(ob):
+        body = j.object_text(oid)
+        # Operands are the one payload that must never be clipped blindly. A
+        # reduction operand is the *input to the operator*, so removing part of it
+        # does not degrade the result, it corrupts it -- and for a structured
+        # payload it does worse than that: clipping JSON mid-string produces a
+        # document the agent cannot parse at all. We saw exactly this: agents
+        # received operands cut mid-string with an elision marker inserted, and
+        # had to reconstruct them by prefix-matching the object store by hand.
+        #
+        # So a budget now applies only to unstructured text, and even then the
+        # full payload's handle is always reported so the agent can recover it.
+        if ob and int(meta["tokens"]) > int(ob) and not _looks_structured(body):
             view = views_mod.render_view(j, oid, {"op": "headtail", "budget": int(ob)})
             path.write_text(view["body"], encoding="utf-8")
             charged += view["tokens"]
+            clipped.append(oid)
         else:
-            path.write_text(j.object_text(oid), encoding="utf-8")
+            path.write_text(body, encoding="utf-8")
             charged += int(meta["tokens"])
     with j.tx() as c:
         ctx_charge(j, ctx.rank, ctx.epoch, charged, conn=c, force=True, what="reduction operands")
@@ -1468,17 +1487,23 @@ def _describe_step(ctx: Ctx, coll: sqlite3.Row, step: sqlite3.Row) -> Dict[str, 
         "right_file": str(right_p),
         "left_from": int(step["left_from"]) if step["left_from"] is not None else None,
         "right_from": int(step["right_from"]) if step["right_from"] is not None else None,
+        "left_handle": str(step["left_obj"]),
+        "right_handle": str(step["right_obj"]),
         "suggested_out": str(out_p),
         "context_charged": charged,
+        "clipped_operands": clipped,
         "directive": (
             f"REDUCTION STEP (round {step['round']}, operator '{op_label}'). You are an internal "
             f"node of the reduction tree. Combine the two operands into ONE result of the SAME "
             f"shape:\n  left  (yours, rank {step['left_from']}): {left_p}\n"
             f"  right (from rank {step['right_from']}): {right_p}\n"
             f"Write the combined result to {out_p}, then run:\n"
-            f"  ampi reduce commit --step {step['id']} --in @{out_p}\n"
+            f"  ampi reduce-commit --step {step['id']} --in @{out_p}\n"
             "The combined result may be handed to you again at the next round, so keep it "
             "self-contained and do not lose information that later rounds will need."
+            + (f"\nNOTE: operand(s) {clipped} were clipped to fit a budget; recover the full "
+               f"text with `ampi obj <handle> --save <path>` if you need it."
+               if clipped else "")
         ),
     }
 

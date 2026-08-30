@@ -293,11 +293,19 @@ def cart_shift(ctx: Ctx, *, direction: int, disp: int) -> Dict[str, Any]:
     src = cart_rank(topo, up)
     dst = cart_rank(topo, dn)
     size = int(row["size"])
+    src_ok = src if (src is not None and src < size) else None
+    dst_ok = dst if (dst is not None and dst < size) else None
+    # Print the absent neighbour explicitly rather than omitting the key. An
+    # omitted field and an explicit null are indistinguishable from a truncated
+    # line, and agents told us they could not tell "no upstream" from "output cut
+    # off".
     return {
         "comm": str(row["name"]),
         "your_coords": coords,
-        "source": src if (src is not None and src < size) else None,
-        "dest": dst if (dst is not None and dst < size) else None,
+        "source": src_ok,
+        "dest": dst_ok,
+        "source_str": "none (you are the first in this direction)" if src_ok is None else str(src_ok),
+        "dest_str": "none (you are the last in this direction)" if dst_ok is None else str(dst_ok),
     }
 
 

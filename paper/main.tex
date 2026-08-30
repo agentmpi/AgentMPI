@@ -102,10 +102,13 @@ spontaneously recreated the protocol's own mechanisms --- unprompted, its agents
 built a contract window and per-rank interface declarations --- and reached the
 same score for a third of the cost. A run in which \eThreeNeverStarted of
 \eThreeRequestedP requested ranks never started completed with all
-\eThreeFinalized survivors finalised and every collective closed. We also report the
-protocol defects that only real agents exposed --- among them that an agent
-instructed to retry a timed-out call twenty times gave up after two, and that a
-rank blocked in a barrier was declared dead for the crime of waiting.
+\eThreeFinalized survivors finalised and every collective closed. We also report the fourteen
+protocol and harness defects that only real agents exposed --- among them that an
+agent instructed to retry a timed-out call twenty times gave up after two, that a
+rank blocked in a barrier was declared dead for the crime of waiting, and that
+making rank identity ambient, which we had argued eliminated a class of errors,
+in fact replaced it with a worse one once the host's shell sessions turned out to
+be shared.
 \end{abstract}
 
 %======================================================================
@@ -342,10 +345,16 @@ cannot know that its lease expired mid-step, so between expiry and its next call
 two executors believe they own the rank. A lease alone makes that race unlikely;
 a token checked on every operation closes it~\cite{gray1989leases,burrows2006chubby,kleppmann2016locks}.
 
-Identity is \emph{ambient} --- taken from the environment, never from an argument.
-This is not ergonomics: in early testing the most frequent agent error by a wide
-margin was passing the wrong rank, and making identity ambient eliminated the
-class.
+Identity is \emph{ambient} --- taken from the environment rather than passed on
+every call --- because in early testing the most frequent agent error by a wide
+margin was passing the wrong rank. That is necessary and, as
+\Cref{sec:lessons} (L8) reports at length, it is not sufficient: ambient
+identity assumes the environment is trustworthy, and on a host that shares shell
+sessions between agents it is not. An implementation MUST therefore also let an
+executor \emph{assert} its identity (\op{--expect-rank}, \op{--expect-job}) and
+fail before the operation runs, echo the acting identity on every operation, and
+check a launcher-issued per-rank token. Ambient by default, assertable on
+demand.
 
 \subsection{Context-denominated flow control}
 \label{sec:context}
@@ -529,6 +538,35 @@ deterministic, and different tree shapes give materially different results.
 Inverting MPI's default is the conservative choice; a harness that knows its
 operator is order-insensitive can opt into the faster schedule, as in MPI, but
 with much larger stakes~\cite{bocchino2009deterministic}.
+
+\subsection{A canonical tree gives reproducibility, not consistency}
+\label{sec:contradiction}
+
+\Cref{sec:repro} argues that a non-commuting operator needs a pinned tree shape.
+That is necessary and it is not sufficient, and E2 showed us why in a form we had
+not anticipated.
+
+In the eight-rank contract reduction, two branches of the tree independently
+encountered the \emph{same} conflict --- which module defines the shared exception
+type --- and resolved it in \emph{opposite} directions. Both resolutions were
+carried into the merged result, which therefore contained two contradictory
+rulings under the same identifier. No merge could have detected this: each one saw
+a locally consistent pair of operands, and the contradiction existed only in the
+union. Two ranks then began acting on different halves of the result, and it was
+caught by a rank reading the published contract afterwards rather than by the
+collective. Separately, the same reduction dropped four of eight modules from one
+section of its output despite an explicit instruction never to drop a module,
+because ``never drop'' is a global invariant and every merge is local.
+
+Both failures are inherent to reducing with a non-associative operator over a
+tree, and no choice of tree shape removes them. What a harness can do is
+structural: carry unresolved conflicts \emph{forward} as unresolved rather than
+deciding them at an internal node, so the root decides each one exactly once; or
+verify the closed result against a global invariant. Both are the
+agent-operator analogue of what reproducible-reduction work does for floating
+point~\cite{bocchino2009deterministic} --- change the operator so the schedule
+cannot change the answer, rather than hoping the schedule is stable. The interface
+supplies the tree; it cannot supply agreement, and \Cref{sec:design} now says so.
 
 \subsection{A schedule with no MPI analogue}
 
@@ -1176,19 +1214,55 @@ At the time this draft was generated:
 \item \textbf{Complete}: all microbenchmarks (\Cref{sec:eval:micro}); E1 both
 arms at $P=\eOneAmpiP$; E2 both arms at $P=8$, each graded against the full
 \eTwoSuite-case held-out suite; the E3 fault-tolerance audit.
-\item \textbf{Single-run}: every application result is one run per arm. Agent
-runs are expensive and our concurrency ceiling was ten, so we have no variance
-estimates. Where an effect is small we say so and decline to claim it; where it is
-structural (context cost, schedule shape, message counts) it does not depend on
-sampling.
 \item \textbf{Not attempted}: application runs above $P=8$; a task with genuinely
 novel internal interfaces or without a shared filesystem, which
 \Cref{sec:eval:e2} argues is where the E2 comparison would discriminate.
 \end{itemize}
 
+\Cref{sec:threats} discusses the threats to validity, of which the most serious
+is identity drift in the agent host.
+
 The harnesses, the grading suite, the probe-term list and the analysis scripts are
 all in the artefact, and \texttt{scripts/reproduce.sh} regenerates everything that
 does not require an agent host and prepares the launch plans for what does.
+
+\subsection{Threats to validity}
+\label{sec:threats}
+
+\paragraph{Identity drift contaminated every run.} As \Cref{tab:drift} records,
+the host's shared shell sessions caused stray \op{AMPI\_Init} calls in four of
+five runs. We report the affected results anyway, for three reasons, and readers
+should weigh them. First, the contamination is \emph{auditable}: every window
+write and message records its writer's rank and epoch, so the artefacts we score
+are attributed from the journal rather than from what an agent claimed. Second,
+re-initialising a running rank is a heartbeat rather than a new epoch, so a stray
+\op{init} did not displace its victim; the agents detected the drift, pinned their
+identity, and completed their assigned work. Third, the E1 metrics are computed
+from window cells whose writer field matches the intended rank, and the E2
+grading runs against the source tree, which is owned per-file. The exception is
+E3, where drift and genuine launch failure are partly confounded: some ranks that
+appear failed had agents running under another rank's identity for part of the
+run. We therefore present E3 as a demonstration that the mechanisms compose, not
+as a measurement of failure rate, which is how \Cref{sec:eval:e3} already framed
+it.
+
+\paragraph{Single runs.} Every application result is one run per arm. Agent runs
+are expensive and our concurrency ceiling was ten, so we have no variance
+estimates. Where an effect is small we decline to claim it; where it is
+structural --- context cost, schedule shape, message counts --- it does not depend
+on sampling.
+
+\paragraph{Application scale.} The concurrency ceiling bounded real-agent runs at
+$P=8$, well below the microbenchmark range. The selection thresholds in
+\Cref{sec:selection} are validated with stub executors, not agents.
+
+\paragraph{Our harnesses had bugs, and they are in the results.} Three of the
+fourteen lessons in \Cref{sec:lessons} are defects in the experiment harnesses
+rather than in the protocol: a conditional send against an unconditional receive
+(L9), a round-two tag mismatch, and a prescribed schedule far heavier than the
+task needed (L10). These cost wall time and one operator intervention, all
+disclosed. We report them because a paper that presented only the runs that went
+smoothly would be describing a different protocol from the one we built.
 
 %======================================================================
 \section{What only real agents exposed}
@@ -1237,7 +1311,84 @@ command far more reliably than they infer a remedy from a description of the
 fault. This is why every \ampi error carries a hint and why retryable errors say
 so in their own output.
 
-\paragraph{L10. An interface invites a process; do not confuse the two.} Our E2
+\paragraph{L8. Ambient identity without an assertion is unsafe, and we had to be
+shown.} An earlier draft of \Cref{sec:design} argued that making rank ambient
+``eliminates the entire class'' of wrong-rank errors. It eliminated the error we
+designed against --- agents \emph{passing} the wrong rank --- and replaced it with
+a worse one: agents silently \emph{being} the wrong rank. Our agent host shares
+shell sessions between concurrently running agents, so \op{AMPI\_RANK} was
+overwritten between one call and the next. The journals record the consequence
+exactly: in each of four independent runs, one specific rank accumulated
+\emph{eight or nine} \op{AMPI\_Init} events, one from nearly every other agent in
+the job (\Cref{tab:drift}). Every agent's first \op{init} ran as somebody else.
+In one run it escalated: the victim's own calls were credited elsewhere, its
+lease starved, and it was declared failed and fenced while actively working.
+
+Nineteen of twenty-two agents reported this independently, and every one reached
+the same workaround --- prefix the identity inline on every invocation --- because
+the interface offered nothing better. It now does: \op{--expect-rank} and
+\op{--expect-job} fail with \op{AMPI\_ERR\_IDENTITY} before the operation runs, an
+explicit root argument overrides the environment variable, every command echoes
+the identity it acted as, and the launcher issues a per-rank token that the
+runtime checks --- so a drifted rank is told which rank it actually holds
+credentials for. Ambient identity remains the default, because an agent forced to
+thread its rank through every call will get \emph{that} wrong instead. What
+changed is that asserting it is now possible and cheap.
+
+Two design decisions limited the damage and are worth requiring of any
+implementation. Re-initialising a rank that is already \emph{running} is treated
+as a heartbeat rather than a new epoch, so a stray \op{init} did not fence its
+victim. And every window write and message records its writer's rank and epoch,
+so the corruption was auditable afterwards --- which is how we can quantify it at
+all rather than merely suspecting it.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{@{}llr@{}}
+\toprule
+Run & Ranks & \op{init} events on the drift target \\
+\midrule
+E1 (P=22, launch failure) & 22 & 8 on rank 2 \\
+E1b, protocol arm (P=5)   & 5  & 0 \\
+E1b, ablated arm (P=5)    & 5  & 9 on rank 4, 2 on rank 3 \\
+E2, protocol arm (P=8)    & 8  & 8 on rank 1 \\
+E2, ablated arm (P=8)     & 8  & 8 on rank 7 \\
+\bottomrule
+\end{tabular}
+\caption{Identity drift, from the journals. One rank per run absorbed a stray
+\op{AMPI\_Init} from nearly every other agent, because the host's shell sessions
+were shared and one agent's exported \op{AMPI\_RANK} leaked into the others.
+Because window writes and messages record their writer, the contamination is
+auditable rather than merely suspected.}
+\label{tab:drift}
+\end{table}
+
+\paragraph{L9. Never truncate an operand.} A reduction operand is the input to a
+function, so removing part of it does not degrade the result, it corrupts it ---
+and for structured payloads it is worse, because clipping JSON mid-string yields
+a document the operator cannot parse. We shipped the naive behaviour and it bit
+immediately: agents serving as internal nodes received operands cut mid-string
+with an elision marker spliced in, and independently invented recovery hacks, one
+prefix-matching the content-addressed object store by hand, another reordering
+its output so the decisions it could not afford to lose came before the part
+clipping would take. The asymmetry to respect is that a \emph{result} may be
+summarised, because its consumer is a reader; an \emph{operand} may not, because
+its consumer is a function.
+
+\paragraph{L10. Print only commands that exist.} Our reduction directive told the
+agent to run a subcommand spelled with a space where the real one is hyphenated.
+Roughly ten agents reported it, several while peers were blocked behind them. A
+binding that prints a command an agent cannot copy-paste is worse than one that
+prints nothing, because the agent trusts it.
+
+\paragraph{L11. Give every payload a free path to disk.} Agents that wanted to
+keep a large result without paying context for it reached into the object store
+directly, or paid. Both are our fault: every operation that hands back a payload
+needs an option to write it to disk, since nothing enters a context window that
+way.
+
+\paragraph{L12. An interface invites a process; do not confuse the two.} Our E2
 harness prescribed the heaviest schedule the interface allows --- agree a complete
 contract by agent-evaluated reduction before writing any code, then two
 synchronised integration rounds --- and it cost \eTwoWallRatio$\times$ the wall
@@ -1247,7 +1398,7 @@ mean agreement should be a phase. The mistake is ours, not the protocol's, but i
 is the mistake a protocol makes easy, and it is worth naming: prefer opportunistic
 publication, and escalate to a full reduction only when it demonstrably fails.
 
-\paragraph{L9. A conditional send plus an unconditional receive is a deadlock,
+\paragraph{L13. A conditional send plus an unconditional receive is a deadlock,
 and the protocol cannot save you from it.} Our own E2 harness contained this bug.
 The integrator was told to send a fix assignment \emph{for each failure}; the
 other ranks were told to receive one. When the test suite passed, there were no
@@ -1262,7 +1413,7 @@ is the same one MPI teaches about collectives with zero-length buffers:
 \emph{send unconditionally, possibly empty}. An empty assignment is still an
 assignment.
 
-\paragraph{L8. Schema evolution is a live concern.} Adding a column to the journal
+\paragraph{L14. Schema evolution is a live concern.} Adding a column to the journal
 mid-experiment broke a running 22-rank job. A durable protocol store must migrate
 on open; a journal written by an older runtime has to stay readable.
 

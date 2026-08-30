@@ -12,8 +12,23 @@ This manual is the contract. Read it once, then work.
 ## 0. The rules
 
 1. **`ampi init` first, `ampi fini` last.** Nothing works before init.
-2. **Your identity is ambient.** `AMPI_RANK` and `AMPI_ROOT` are already set.
-   Never pass `--rank`. Never pretend to be another rank.
+2. **Pin your identity on every single command. This is the most important
+   rule.** `AMPI_RANK` and `AMPI_ROOT` are set for you, but **do not trust the
+   shell to keep them.** On a host running several agents, one agent's `export`
+   can land in another's session; we have measured this happening to nearly every
+   rank of every job. Two habits protect you, and you need both:
+
+   ```bash
+   # (a) set them inline, in the same command, every time
+   AMPI_ROOT=/path/to/job AMPI_RANK=5 ampi recv --from 4 --tag x --expect-rank 5
+   # (b) assert who you are; the command refuses to run if the answer is wrong
+   ampi whoami --expect-rank 5
+   ```
+
+   Every command echoes `[acting as rank N of job J]`. **Read it.** If it is not
+   you, stop and fix your environment before doing anything else. A command that
+   fails with `AMPI_ERR_IDENTITY` is telling you the environment drifted, and its
+   hint names the rank you actually hold credentials for.
 3. **Before any step that takes more than a minute, run `ampi hb --extend 900`.**
    Every `ampi` call renews your *lease*; a step that makes no calls looks
    identical to death. Go silent longer than your lease and the job declares you
@@ -45,6 +60,7 @@ This manual is the contract. Read it once, then work.
 ```bash
 ampi init                 # join. Prints your rank, the world size, your role.
 ampi info                 # who am I, which communicator, how big, who has failed
+ampi whoami --expect-rank N   # am I who I think I am? refuses if not
 ampi ctx                  # my context budget: used / remaining
 ampi hb --extend 900      # "I am alive and about to think for a while"
 ampi fini                 # leave cleanly
@@ -226,6 +242,29 @@ ampi comm shrink                  # -> tells you the new comm name and your new 
 ampi barrier --comm world#g1 --label phase2-retry
 ```
 
+## 6b. Things that have actually gone wrong
+
+Read this once; every item cost a real agent real time.
+
+* **Your rank changed underneath you.** See rule 2. This was the single most
+  common failure. Symptom: `[acting as rank N]` shows a rank that is not you, or
+  `ampi init` reports a role you were not given.
+* **You are waiting for a message nobody sent.** If a peer was told to send
+  "only if there is something to report", and there was nothing, your `recv` can
+  never succeed. Retry five times, then read `ampi inbox` and `ampi status`, then
+  proceed without it and say so in your report. Do not wait forever.
+* **A collective completed without a peer's contribution.** Look for
+  `dropped=[...]`. That is a peer declared failed, not a data problem — but the
+  "agreed" result never saw its input. Report it.
+* **`--quorum` rounds up.** With 8 ranks, `--quorum 0.9` needs `ceil(7.2) = 8`,
+  every rank. A quorum relaxes nothing unless `ceil(q × live) < live`.
+* **A blocking call can run for minutes.** Each invocation retries internally, so
+  one command may block far longer than its `--timeout`. Set `block_until_ms`
+  generously (400000+); if the command is backgrounded, read its output file
+  rather than re-running blindly.
+* **Backticks inside `--in "..."` get run by your shell.** Use `--in @file` for
+  anything longer than a few words.
+
 ## 7. Context discipline
 
 Your context window is the scarcest resource in the job. The protocol helps, but
@@ -240,6 +279,7 @@ you must cooperate.
   ampi view o:9f2a --op lines:120-180
   ampi view o:9f2a --op stat                  # size only
   ampi obj  o:9f2a --save ./big.md            # to disk, zero context cost
+  ampi view o:9f2a --op full --out ./big.md   # a view, to disk, zero cost
   ```
 * Check `ampi ctx` periodically. Above 80% you will be warned.
 * Compact: write your state into a window cell or a memo, then work from that
@@ -260,7 +300,7 @@ the difference between a recoverable job and a lost one.
 ## 9. Quick reference
 
 ```
-ampi init | fini | info | ctx | hb --extend S | man | status
+ampi init | fini | info | whoami --expect-rank N | ctx | hb --extend S | man | status
 ampi send --to R --tag T --in @f | recv [--from R|any] [--tag T|any] [--timeout S]
 ampi probe | inbox | isend | irecv | wait REQ... | test REQ | cancel REQ
 ampi barrier|bcast|scatter|gather|allgather|reduce|allreduce|scan|exscan|alltoall

@@ -653,3 +653,120 @@ def test_error_classes_are_all_documented():
     ]
     missing = [n for n in names if n not in spec]
     assert not missing, f"error classes absent from the specification: {missing}"
+
+
+def test_identity_assertion_catches_a_drifted_rank(job):
+    """`--expect-rank` must fail when the ambient rank disagrees.
+
+    This is the fix for the worst thing the multi-agent runs exposed: the host's
+    shell sessions were shared, `AMPI_RANK` was rewritten between calls, and
+    every agent's first `init` ran as somebody else. Ambient identity gave them
+    no way to say "I intend to be rank 1".
+    """
+    root = job(3)
+    ok = ampi(root, 1, "info", "--expect-rank", "1")
+    assert ok["rank"] == 1
+    # The environment says 2 while the agent asserts 1: the operation must not run.
+    bad = ampi(root, 2, "info", "--expect-rank", "1", check=False)
+    assert bad["err_class"] == "AMPI_ERR_IDENTITY"
+    assert bad["detail"]["ambient"] == 2
+    bad_job = ampi(root, 1, "info", "--expect-job", "j-nonexistent", check=False)
+    assert bad_job["err_class"] == "AMPI_ERR_IDENTITY"
+
+
+def test_launch_token_names_the_real_owner(tmp_path):
+    """A drifted AMPI_RANK with an intact token must be diagnosed, not obeyed."""
+    root = tmp_path / "tok"
+    root.mkdir()
+    ampi(root, None, "run", "--np", "4", "--label", "tok", "--job-root", str(root))
+    manifest = json.loads((root / ".ampi" / "manifest.json").read_text())
+    tokens = {r["rank"]: r["env"]["AMPI_TOKEN"] for r in manifest["ranks"]}
+    assert len({*tokens.values()}) == 4, "each rank needs a distinct token"
+
+    env = dict(os.environ)
+    env["AMPI_ROOT"] = str(root)
+    env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+    # Rank 3's token, but the environment claims rank 1: the drift signature.
+    env["AMPI_RANK"] = "1"
+    env["AMPI_TOKEN"] = tokens[3]
+    proc = subprocess.run(
+        [sys.executable, "-m", "ampi.cli", "whoami", "--json"],
+        capture_output=True, text=True, env=env, cwd=str(root),
+    )
+    assert proc.returncode != 0
+    payload = json.loads(proc.stderr)
+    assert payload["err_class"] == "AMPI_ERR_IDENTITY"
+    assert payload["detail"]["token_owner"] == 3
+    assert "rank 3" in payload["hint"]
+
+
+def test_job_root_argument_beats_the_environment(job, tmp_path):
+    """An agent that notices its AMPI_ROOT has drifted needs a way to override it."""
+    a = job(2)
+    b = tmp_path / "other"
+    b.mkdir()
+    ampi(b, None, "run", "--np", "2", "--label", "other", "--job-root", str(b))
+    env = dict(os.environ)
+    env["AMPI_ROOT"] = str(a)          # drifted
+    env["AMPI_RANK"] = "0"
+    env["PYTHONPATH"] = str(REPO) + os.pathsep + env.get("PYTHONPATH", "")
+    proc = subprocess.run(
+        [sys.executable, "-m", "ampi.cli", "whoami", "--job-root", str(b), "--json"],
+        capture_output=True, text=True, env=env, cwd="/tmp",
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert json.loads(proc.stdout)["root"] == str(b.resolve())
+
+
+def test_structured_reduction_operands_are_never_clipped(job):
+    """An operand is the input to a function, so it must not be truncated.
+
+    Clipping a JSON operand mid-string produced documents the operator could not
+    parse at all, and agents worked around it by reaching into the object store.
+    """
+    root = job(2)
+    big = json.dumps({"decisions": [f"decision number {i} " + "x" * 60 for i in range(120)]})
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    directives = {}
+
+    def call(r: int):
+        res = ampi(root, r, "reduce", "--op", "agent:merge", "--label", "m",
+                   "--root", "0", "--algo", "binomial", "--in", big,
+                   "--operand-budget", "50", "--timeout", "20", check=False)
+        directives[r] = res
+        return res
+
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        list(ex.map(call, [0, 1]))
+
+    d = directives.get(0, {})
+    assert d.get("action_required") == "merge", d
+    for key in ("left_file", "right_file"):
+        text = Path(d[key]).read_text(encoding="utf-8")
+        json.loads(text)  # must still parse despite --operand-budget 50
+    assert d["clipped_operands"] == []
+    assert d["left_handle"].startswith("o:")
+
+
+def test_view_out_costs_no_context(job, tmp_path):
+    root = job(1)
+    big = "sentence " * 400
+    h = ampi(root, 0, "send", "--to", "0", "--tag", "1", "--in", big)["handle"]
+    before = ampi(root, 0, "ctx")["used"]
+    dest = tmp_path / "saved.txt"
+    out = ampi(root, 0, "view", h, "--op", "full", "--out", str(dest))
+    assert out["context_charged"] == 0
+    assert dest.read_text() == big
+    assert ampi(root, 0, "ctx")["used"] == before
+
+
+def test_cart_shift_reports_absent_neighbours_explicitly(job):
+    root = job(4)
+    ampi(root, 0, "comm", "cart", "--dims", "4")
+    first = ampi(root, 0, "comm", "shift", "--comm", "world.cart", "--direction", "0", "--disp", "1")
+    last = ampi(root, 3, "comm", "shift", "--comm", "world.cart", "--direction", "0", "--disp", "1")
+    assert "source" in first and first["source"] is None
+    assert "none" in first["source_str"]
+    assert last["dest"] is None and "none" in last["dest_str"]
