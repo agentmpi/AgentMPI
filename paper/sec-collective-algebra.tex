@@ -1,0 +1,199 @@
+% ---------------------------------------------------------------------------
+% The algebra of agent reductions, the decision function, and the context bound.
+% Included from main.tex after the collectives section.
+% ---------------------------------------------------------------------------
+
+\section{The Algebra of Agent Reductions}
+\label{sec:algebra}
+
+Naming an operation \code{allreduce} is worth something only if the runtime is
+free to choose how to perform it.  MPI bought that freedom with one sentence in
+the standard: the operator passed to a reduction must be associative, and the
+implementation may therefore evaluate it in any order consistent with
+associativity, and with commutativity when the user declares it through
+\code{MPI\_Op\_create}'s \code{commute} flag~\cite{mpi41}.  Thirty years of
+collective optimisation --- recursive doubling, Rabenseifner's
+reduce-scatter/allgather decomposition, ring algorithms, hardware offload ---
+all sit inside the licence that sentence grants~\cite{thakur2005collectives,
+rabenseifner2004reduction,chan2007}.
+
+The freedom is not free of consequence even in MPI.  Because reordering is
+permitted, a floating-point sum is not bitwise reproducible across process
+counts, and the standard declines to promise that it will be.  Practitioners
+accept this because the error is bounded and well understood.
+
+For agents the same trade appears with the bound removed.  The reductions a
+harness actually wants --- merge these partial glossaries, reconcile these two
+API designs, synthesise these eight reviews --- are evaluated by a language
+model.  Such an operator is at best approximately associative: merging $A$ into
+$B$ and then $C$ need not produce what merging $B$ into $C$ and then $A$
+produces, and the difference is not a rounding error but a different document.
+
+\ampi{} therefore makes the algebra an explicit, machine-read part of the
+operator declaration, and lets it \emph{constrain the algorithm}:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+declared & admissible schedules & depth \\
+\midrule
+assoc.\ and comm. & any tree, any order, block-decomposed & $O(\log p)$ \\
+assoc.\ only      & any tree, rank order                  & $O(\log p)$ \\
+neither           & canonical linear order                & $O(p)$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The third row is the interesting one, and it is what MPI never had to write
+down because MPI simply refused non-associative operators.  \ampi{} accepts
+them, because refusing them would exclude most of the operators a harness
+author wants, and pays for them in depth.  Declaring an operator associative
+when it is not is the agent analogue of lying to \code{MPI\_Op\_create}: the
+program still runs, and the answer silently depends on the agent count.
+
+\subsection{Structural and semantic operators}
+
+Operators come in two kinds, and the distinction is what makes the depth
+argument have teeth.
+
+A \textbf{structural} operator executes inside the library.  It costs no
+tokens, is exactly reproducible, and its algebra can be established by
+inspection.  \ampi{} predefines eleven: \code{AMPI\_CONCAT} (associative, not
+commutative), \code{AMPI\_UNION} and \code{AMPI\_BAG} (both), \code{AMPI\_MERGE\_JSON}
+(a deep merge whose scalar conflicts resolve to the lexicographically smaller
+encoding, which is an arbitrary but total, associative and commutative rule),
+the numeric and logical operators, \code{AMPI\_MAXLOC} and \code{AMPI\_MINLOC}
+with MPI's lower-rank tie-break, and \code{AMPI\_VOTE}.
+
+A \textbf{semantic} operator cannot execute inside the library, because
+evaluating it requires a model.  \ampi{} handles this with an
+\emph{upcall}: the library suspends the collective, unwinds to the binding, and
+hands the calling agent the two operands together with the operator's
+instructions.  The agent evaluates the merge in its own turn, submits the
+result with \code{ampi op-submit}, and re-issues the identical collective call,
+which resumes at exactly the step where it stopped.  This is the direct
+analogue of MPI invoking a user function registered through
+\code{MPI\_Op\_create}; the only difference is that the callback runs inside a
+model turn and is billed in tokens.
+
+Resumption is what makes the upcall practical, and it is why the collective
+layer is implemented as a persisted step machine rather than a straight-line
+procedure --- the same design LibNBC uses to make collectives
+nonblocking~\cite{hoefler2007nbc}.  Each rank's participation in a collective
+compiles to a list of send, receive and combine steps, and the program counter
+lives in the device.  One mechanism then buys three properties: collectives
+that can be nonblocking, collectives that survive an agent process restarting
+mid-operation, and collectives that can suspend for a model upcall without the
+other ranks noticing.
+
+\code{AMPI\_VOTE} deserves separate mention because it is the operator with no
+MPI counterpart at all.  Pairwise majority is not associative, so \ampi{} does
+not implement it pairwise.  Instead the reduction accumulates a commutative
+multiset and a \emph{finalize} step takes the mode, reporting the tally and the
+agreement fraction rather than only the winner.  This monoid-plus-projection
+shape is the honest way to express quorum operators without misdeclaring their
+algebra, and it is the agent analogue of algorithm-based fault
+tolerance~\cite{huang1984abft}: disagreement among redundant executors is
+surfaced, not averaged away.
+
+\subsection{A cost model in tokens, turns, and context}
+
+The Hockney model that underlies MPI collective analysis charges $\alpha$ per
+message and $\beta$ per byte, and the analyses that follow from it are about
+trading latency terms against bandwidth terms~\cite{hockney1994,chan2007}.  The
+substitution for agents is nearly mechanical and one term is new.
+
+Let $p$ be the communicator size and $n$ the payload in tokens.  Write
+$\alpha$ for the per-step dispatch latency, $\beta$ for the seconds per token
+transferred, and $\gamma$ for the seconds an operator evaluation costs when it
+requires a model turn.  Then a schedule of depth $d$, moving $v$ tokens per
+rank, with $e$ operator evaluations on the critical path, takes
+\begin{equation}
+T \;=\; d\,\alpha \;+\; v\,\beta \;+\; e\,\gamma .
+\label{eq:cost}
+\end{equation}
+The fourth quantity, $C$, is not a cost but a \emph{constraint}: the context
+window of a single rank.  A schedule whose peak residency
+$R$ --- the greatest number of tokens a rank must hold simultaneously ---
+exceeds $C$ is inadmissible at any price.
+
+Table~\ref{tab:allreduce-cost} instantiates
+Equation~\ref{eq:cost} for the allreduce algorithms \ampi{} implements.  The
+columns are the standard ones with bytes replaced by tokens, plus the two that
+matter here: $e$, because when $\gamma$ is a model turn it dominates every
+other term by three orders of magnitude, and $R$, because it decides
+feasibility rather than speed.
+
+\begin{table}[t]
+\centering
+\small
+\caption{Allreduce schedules under the agent cost model. $R$ is peak resident
+tokens; $e$ is operator evaluations on the critical path. The last column is
+what a semantic operator actually pays, since $\gamma \gg \alpha, \beta$.}
+\label{tab:allreduce-cost}
+\begin{tabular}{@{}lcccc@{}}
+\toprule
+schedule & depth $d$ & $v$ & $R$ & $e$ \\
+\midrule
+linear              & $p$        & $n$              & $2n$   & $p-1$ \\
+binomial tree       & $2\lg p$   & $n \lg p$        & $2n$   & $\lg p$ \\
+recursive doubling  & $\lg p$    & $2n \lg p$       & $2n$   & $\lg p$ \\
+ring                & $2(p{-}1)$ & $2n\frac{p-1}{p}$ & $3n/p$ & $p-1$ \\
+Rabenseifner        & $2\lg p$   & $2n\frac{p-1}{p}$ & $2n/p$ & $\lg p$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\subsection{The context bound decides feasibility}
+
+Two rows of Table~\ref{tab:allreduce-cost} differ in a way that has no
+counterpart in the HPC reading of the same table.  Recursive doubling and the
+binomial tree require every rank to materialise the whole vector at every step,
+so $R = \Theta(n)$ independently of $p$.  The reduce-scatter family --- the ring
+and Rabenseifner's algorithm --- reduces one block at a time and can discard a
+block once it has been forwarded, so $R = \Theta(n/p)$ through the reduction.
+
+In MPI this is a bandwidth argument worth a constant factor, and it is why
+Rabenseifner's algorithm wins for long messages~\cite{rabenseifner2004reduction,
+thakur2005collectives}.  Under a context bound it is a feasibility argument:
+
+\begin{quote}
+For a vector of $n$ tokens over $p$ agents each bounded by a context window of
+$C$ tokens, an allreduce whose schedule materialises the whole vector is
+admissible only when $n \lesssim C/2$, while a reduce-scatter-based schedule
+remains admissible as long as $n \lesssim pC/2$.  The reduce-scatter family is
+therefore not merely faster at scale; past $n \approx C$ it is the only family
+that can run at all.
+\end{quote}
+
+This is a claim about schedules, not about a particular implementation, and
+\ampi{} enforces it rather than merely documenting it:
+\code{analyse\_allreduce} computes $R$ in closed form and marks a schedule
+inadmissible when $R > C$, and \code{select\_algorithm} refuses to return an
+inadmissible schedule.  Section~\ref{sec:eval-residency} measures $R$ directly
+from the step machine and finds the predicted separation.
+
+\subsection{The decision function}
+
+Open MPI ships a \code{coll tuned} decision file and MPICH a set of control
+variables; both select a collective algorithm from message size and
+communicator size, tuned per machine~\cite{thakur2005collectives,gabriel2004openmpi}.
+\ampi's decision function takes two further inputs that HPC does not have --- the
+operator's declared algebra and the rank context bound --- and applies three
+admissibility rules in order:
+
+\begin{enumerate}
+\item re-association requires a declared associative operator, so a
+non-associative operator admits only the canonical linear order;
+\item block decomposition additionally requires commutativity, because
+reduce-scatter reorders operands within a block --- the same restriction MPICH
+places on Rabenseifner's algorithm, for the same reason;
+\item the peak residency of the schedule must fit the rank context bound.
+\end{enumerate}
+
+Among the survivors it minimises Equation~\ref{eq:cost}.  It also returns its
+reasoning: \code{ampi plan} and \code{--explain} report every schedule
+considered, its closed-form cost, and, for each rejected one, why.  A harness
+author who cannot see why their semantic allreduce took $p$ rounds instead of
+$\lg p$ cannot fix it, and the fix is usually a one-word change to an operator
+declaration rather than a change to the harness.
