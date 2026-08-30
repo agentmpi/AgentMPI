@@ -123,6 +123,7 @@ class Runtime:
         self.world_rank = world_rank
         self.world_size = world_size
         self.root = root
+        self.run_id = ""
         self.cvars = {**default_cvars(), **(cvars or {})}
         self.thread_level = thread_level
         self.spec = spec or RankSpec(rank=world_rank)
@@ -162,6 +163,7 @@ class Runtime:
         self._mismatch_since: dict[str, float] = {}
         self.persist_state = device.name != "inproc"
         if self.persist_state:
+            self.run_id = self._read_run_id()
             self._load_state()
 
         self.world = self._make_world()
@@ -171,6 +173,20 @@ class Runtime:
     def _state_key(self) -> str:
         return f"pstate/{self.world_rank}"
 
+    def _read_run_id(self) -> str:
+        """The identity of the run this rank is joining.
+
+        Read from the manifest rather than derived from the path, precisely
+        because the path is the thing that can be reused.
+        """
+        if not self.root:
+            return ""
+        try:
+            with open(os.path.join(self.root, RUN_MANIFEST), encoding="utf-8") as fh:
+                return str(json.load(fh).get("run_id", ""))
+        except (OSError, json.JSONDecodeError):
+            return ""
+
     def _load_state(self) -> None:
         raw = self.device.kv_get(self._state_key())
         if not raw:
@@ -178,6 +194,24 @@ class Runtime:
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
+            return
+        # Refuse state belonging to a different run.
+        #
+        # An epoch counter protects against stale messages *within* a run; it
+        # does nothing when the run directory itself is recycled. A rank that
+        # joins a freshly created run at a path an earlier run used will
+        # otherwise inherit the earlier run's collective counter, number every
+        # collective one too high, and match the wrong message -- a bcast
+        # returning a scatter's payload, which fails as a type error a long
+        # way from its cause. We saw exactly this. MPI never has to consider
+        # it because a job's transport is process-scoped and cannot outlive
+        # the job; a directory can.
+        stored = data.get("run_id")
+        if stored is not None and self.run_id and stored != self.run_id:
+            self.device.append_journal("lifecycle", {
+                "event": "discarded_stale_state", "rank": self.world_rank,
+                "stale_run": stored, "run": self.run_id, "ts": time.time(),
+            })
             return
         self.send_seq = {k: int(v) for k, v in data.get("send_seq", {}).items()}
         self.coll_counter = {k: int(v) for k, v in data.get("coll_counter", {}).items()}
@@ -214,6 +248,7 @@ class Runtime:
             if wm or extra:
                 consumed[f"{ctx}|{src}|{dst}"] = {"wm": wm, "extra": extra}
         self.device.kv_put(self._state_key(), json.dumps({
+            "run_id": self.run_id,
             "send_seq": self.send_seq,
             "coll_counter": self.coll_counter,
             "coll_log": {ctx: {str(k): v for k, v in log.items()}

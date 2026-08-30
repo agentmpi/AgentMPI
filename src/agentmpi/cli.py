@@ -83,10 +83,35 @@ def _emit(args: argparse.Namespace, value: Any, extra: dict[str, Any] | None = N
         print(text if text is not None else "")
 
 
+def _require_run(root: str) -> None:
+    """Fail with a diagnosis, not a traceback, when the run is gone.
+
+    A rank outliving its run directory is not exotic: the run may have been
+    cleaned up, moved, or recreated while this rank was blocked in a
+    collective. The rank cannot repair that and should say so plainly, since
+    the alternative is a stack trace about a missing file that tells the
+    operator nothing about what actually happened.
+    """
+    if not os.path.isdir(root):
+        raise SystemExit(json.dumps({
+            "error": "ERR_NO_RUN",
+            "message": f"the run directory {root} does not exist; it was "
+                       f"removed or moved while this rank was running",
+        }))
+    if not os.path.exists(os.path.join(root, RUN_MANIFEST)):
+        raise SystemExit(json.dumps({
+            "error": "ERR_NO_RUN",
+            "message": f"{root} has no {RUN_MANIFEST}; the run was deleted or "
+                       f"is being recreated. This rank cannot continue and "
+                       f"should stop rather than issue further collectives.",
+        }))
+
+
 def _open(args: argparse.Namespace) -> Runtime:
     root = getattr(args, "run_root", None) or os.environ.get("AMPI_ROOT")
     if not root:
         raise SystemExit("error: --root or $AMPI_ROOT is required")
+    _require_run(str(root))
     rank = args.rank if args.rank is not None else os.environ.get("AMPI_RANK")
     if rank is None:
         raise SystemExit("error: --rank or $AMPI_RANK is required")
@@ -172,6 +197,7 @@ def _coerce(value: str) -> Any:
 
 def cmd_info(args: argparse.Namespace) -> int:
     root = Path(args.run_root or os.environ.get("AMPI_ROOT", "."))
+    _require_run(str(root))
     manifest = RunManifest.load(root / RUN_MANIFEST)
     print(json.dumps({
         "run_id": manifest.run_id, "size": manifest.size, "label": manifest.label,
@@ -438,6 +464,7 @@ def cmd_peers(args: argparse.Namespace) -> int:
     root = args.run_root or os.environ.get("AMPI_ROOT")
     if not root:
         raise SystemExit("error: --root or $AMPI_ROOT is required")
+    _require_run(str(root))
     device = JournalDevice(root, owner="observer")
     manifest = RunManifest.load(Path(root) / RUN_MANIFEST)
     now = time.time()

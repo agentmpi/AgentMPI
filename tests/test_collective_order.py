@@ -148,3 +148,73 @@ def test_collective_counter_is_durable_before_the_collective(tmp_path):
         a.result()
     after = json.loads((root / "kv" / "pstate%2f0").read_text())
     assert after["coll_counter"]["world"] == 2
+
+
+def test_state_from_a_recycled_run_directory_is_discarded(tmp_path):
+    """A rank must not inherit an earlier run's counters from the same path.
+
+    Epoch numbers protect against stale messages within a run; they do
+    nothing when the run *directory* is recycled. A rank joining a freshly
+    created run at a path an earlier run used would otherwise inherit the
+    earlier run's collective counter, number every collective one too high,
+    and match the wrong message -- a broadcast returning a scatter's payload,
+    which surfaces as a type error a long way from its cause. MPI never has
+    to consider this because a job's transport is process-scoped and cannot
+    outlive the job; a directory can.
+    """
+    import json
+    import os
+    import subprocess
+    import sys
+
+    root = tmp_path / "run"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    ampi = [sys.executable, "-m", "agentmpi.cli"]
+
+    def call(rank, *args, timeout=30):
+        return subprocess.run(ampi + list(args), capture_output=True, text=True,
+                              timeout=timeout,
+                              env={**env, "AMPI_ROOT": str(root),
+                                   "AMPI_RANK": str(rank)})
+
+    # First run: rank 0 abandons a barrier, leaving a durable counter of 1.
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2",
+                           "--label", "first"],
+                   check=True, capture_output=True, env=env, timeout=60)
+    call(0, "barrier", "--timeout", "2")
+    assert json.loads((root / "kv" / "pstate%2f0").read_text())["coll_counter"]["world"] == 1
+
+    # The directory is recycled for a different run, as ours was.
+    import shutil
+
+    shutil.rmtree(root / "inbox", ignore_errors=True)
+    subprocess.run(ampi + ["init", "--root", str(root), "--ranks", "2",
+                           "--label", "second"],
+                   check=True, capture_output=True, env=env, timeout=60)
+
+    # Rank 0's first collective in the new run must be #1, not #2.
+    call(0, "barrier", "--timeout", "2")
+    state = json.loads((root / "kv" / "pstate%2f0").read_text())
+    assert state["run_id"] == "second"
+    assert state["coll_counter"]["world"] == 1, (
+        "the rank inherited a recycled run's collective counter")
+
+
+def test_cli_reports_a_deleted_run_instead_of_crashing(tmp_path):
+    """A rank that outlives its run must diagnose it, not traceback."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    env = {k: v for k, v in os.environ.items() if not k.startswith("AMPI_")}
+    missing = tmp_path / "gone"
+    missing.mkdir()
+    proc = subprocess.run(
+        [sys.executable, "-m", "agentmpi.cli", "barrier"],
+        capture_output=True, text=True, timeout=60,
+        env={**env, "AMPI_ROOT": str(missing), "AMPI_RANK": "0"})
+    assert proc.returncode != 0
+    payload = json.loads((proc.stdout + proc.stderr).strip().splitlines()[-1])
+    assert payload["error"] == "ERR_NO_RUN"
+    assert "deleted" in payload["message"] or "does not exist" in payload["message"]

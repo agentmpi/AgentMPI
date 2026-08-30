@@ -74,10 +74,10 @@ address space. The nearest available remedy is to remove the side channel:
 run ranks in sandboxes whose only view of the job is the run directory. We
 did not do this, and we think a serious deployment should.
 
-\subsection{Three bugs, and what they have in common}
+\subsection{Four bugs, and what they have in common}
 \label{sec:discussion-bugs}
 
-The experiments found three defects in our own implementation, and they
+The experiments found four defects in our own implementation, and they
 share a shape worth naming.
 
 \emph{Sub-communicator misrouting.} Envelopes carried communicator-local
@@ -95,14 +95,40 @@ consumed when it was polled rather than when it was matched, so a rank
 implemented as a sequence of short-lived commands destroyed every message it
 polled but did not match.
 
-All three are the same mistake: an assumption that holds when a rank is one
-long-lived process on the world communicator, and fails when it is a
-succession of short-lived processes on a communicator that can change. The
-generalisable lesson is that \emph{the endpoint being stateless is a load
-bearing property of an agent protocol}, not an implementation convenience,
-and every piece of protocol state has to be examined against it. A test
-suite that only exercises \op{COMM\_WORLD} with in-process ranks will not
-find any of them.
+\emph{No run identity.} We deleted a wedged run and created a new one at the
+same path while ranks of the old one were still blocked. Those ranks
+re-attached, inherited the previous run's collective counter from their own
+durable state, numbered every collective one too high, and matched the wrong
+message: a rank's broadcast returned the payload of the coordinator's
+scatter, and its scatter returned the integer a barrier had sent, which
+surfaced as a type error a long way from its cause. An epoch counter guards
+against stale messages \emph{within} a run and is silent about a recycled
+directory. Durable state now carries the run identity from the manifest and
+is discarded when it does not match, and a rank whose run directory has
+vanished reports \code{ERR\_NO\_RUN} and stops rather than issuing further
+collectives.
+
+All four are the same mistake: an assumption that holds when a rank is one
+long-lived process on the world communicator inside a job it cannot outlive,
+and fails when it is a succession of short-lived processes, on a communicator
+that can change, in a run whose transport can be deleted underneath it. MPI
+never has to consider the fourth, because a job's transport is process-scoped
+and dies with the job; a directory does not. The generalisable lesson is that
+\emph{the endpoint being stateless is a load-bearing property of an agent
+protocol}, not an implementation convenience, and every piece of protocol
+state must be examined against it --- including the question of which run the
+state belongs to. A test suite that only exercises \op{COMM\_WORLD} with
+in-process ranks in a run that outlives them will not find any of the four.
+
+It is worth recording how the fourth was diagnosed, because it bears on
+\Cref{sec:discussion-disobedience}. The affected rank worked out the cause
+itself --- that its persisted counter was one ahead, that this was why its
+broadcast had returned the wrong payload --- observed that a second process
+was concurrently acting as the same rank, and then \emph{declined to issue
+its remaining collectives} on the grounds that doing so would overwrite state
+a live peer depended on. That is the behaviour one wants and cannot rely on.
+The protocol should have made the situation impossible rather than merely
+diagnosable, which is what the run-identity check now does.
 
 The second bug also exposes a limit of our own diagnostics. Collective-order
 verification compares operation \emph{names} at a sequence number, so it
