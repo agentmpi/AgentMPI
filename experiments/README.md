@@ -112,6 +112,10 @@ The Cursor-agent workload requires an orchestrator capable of launching
 independent agents in the same workspace. The exact executor protocol is in
 `tasks/translation_agent_protocol.md`; `coordinator.py` owns rank zero.
 
+The completed 100-rank Aesop→Spanish Cursor wave is collected by
+`python3 experiments/cursor/collect_scale.py` into
+`experiments/results/cursor_scale.json` (100/100 ranks, 200 items).
+
 ## Threats to validity
 
 - One provider/model family, one machine, and pilot-scale replication do not
