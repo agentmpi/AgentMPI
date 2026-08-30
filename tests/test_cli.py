@@ -293,3 +293,34 @@ def test_campaign_deactivate_does_not_clobber_another_campaign(tmp_path):
     (shared / "active").write_text("/somewhere", encoding="utf-8")
     third.deactivate()
     assert (shared / "active").read_text().strip() == ""
+
+
+def test_campaign_recipes_contain_the_named_steps():
+    """The `--only` filter matches on step name, so the names are an interface.
+
+    A campaign invoked with `--only` that matches nothing runs zero steps and exits
+    successfully, which is indistinguishable from a completed run in the log. That
+    happened: a recipe edit silently failed to apply, the queued ablation selected two
+    steps that did not exist, and the campaign reported "0 steps -> []" and declared
+    itself complete. Pinning the names here makes the mismatch a test failure instead
+    of a missing experiment.
+    """
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "experiments"))
+    from campaign import microbench_steps, software_steps, translation_steps  # noqa: PLC0415
+
+    sw = {s.name for s in software_steps(ranks=8, prefix="x", rounds=2)}
+    assert {"p8-full", "p8-noshared", "p8-vague-shared", "p8-vague-noshared", "p1-full"} <= sw, sw
+
+    tr = {s.name for s in translation_steps(ranks=8, words=600, prefix="x")}
+    assert {"p8-full", "p8-noglossary", "p8-nohalo", "p1-full"} <= tr, tr
+
+    mb = {s.name for s in microbench_steps(ranks=8, prefix="x")}
+    assert {"fidelity", "collectives", "faults", "pingpong"} <= mb, mb
+
+    # Every step must carry a distinct output root, or one run overwrites another.
+    for steps in (software_steps(ranks=8, prefix="x", rounds=2), translation_steps(ranks=8, words=600, prefix="x")):
+        roots = [str(s.root) for s in steps]
+        assert len(roots) == len(set(roots)), [r for r in roots if roots.count(r) > 1]

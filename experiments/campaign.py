@@ -212,6 +212,13 @@ def software_steps(*, ranks: int, prefix: str, rounds: int) -> list[Step]:
 
     add(f"p{ranks}-full", [], ranks)
     add(f"p{ranks}-noshared", ["--no-shared-interfaces"], ranks)
+    # The pair that actually tests interface publication. With the precise
+    # specification the window is redundant -- the spec already pins every signature,
+    # so withholding it cost one acceptance case out of sixty. These two withhold the
+    # signatures instead, leaving six of the eight module boundaries to be negotiated
+    # through the window, which is the condition the mechanism was designed for.
+    add(f"p{ranks}-vague-shared", ["--vague-spec"], ranks)
+    add(f"p{ranks}-vague-noshared", ["--vague-spec", "--no-shared-interfaces"], ranks)
     add(f"p{ranks}-nolocks", ["--no-locks"], ranks)
     add(f"p{ranks}-noreview", ["--no-review"], ranks)
     add("p1-full", [], 1)
@@ -278,7 +285,20 @@ def main(argv: list[str] | None = None) -> int:
         steps += software_steps(ranks=cfg.ranks, prefix=f"{cfg.prefix}-sw", rounds=cfg.rounds)
     if cfg.only:
         wanted = set(cfg.only)
+        available = {s.name for s in steps}
+        unknown = wanted - available
+        if unknown:
+            # Fail loudly. A `--only` that matches nothing runs zero steps and exits
+            # successfully, which in a log is indistinguishable from a completed run --
+            # and that is exactly how a queued ablation went missing: a recipe edit
+            # silently failed to apply, the selection named two steps that did not
+            # exist, and the campaign printed "0 steps" and declared itself complete.
+            raise SystemExit(
+                f"unknown step name(s): {sorted(unknown)}\navailable for --suite {cfg.suite}: {sorted(available)}"
+            )
         steps = [s for s in steps if s.name in wanted]
+    if not steps:
+        raise SystemExit(f"no steps selected for --suite {cfg.suite}; nothing to run")
     for s in steps:
         s.timeout_s = cfg.step_timeout
 
