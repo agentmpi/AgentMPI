@@ -27,36 +27,57 @@ export function App() {
   const [zoom, setZoom] = useState(1);
   const scrollRef = useRef<HTMLDivElement>(null);
 
+  const [live, setLive] = useState<boolean | null>(null);
+
   useEffect(() => {
     let cancelled = false;
-    fetch("/api/runs")
-      .then((r) => r.json())
-      .then((data: RunListItem[]) => {
-        if (cancelled) return;
-        setRuns(data);
-        setLoading(false);
-        const best = [...data].sort((a, b) => (b.n_events ?? 0) - (a.n_events ?? 0))[0];
-        if (best) setSelected(best.name);
-      })
-      .catch((e) => {
-        if (!cancelled) {
-          setError(String(e));
+    // Prefer the live trace server, fall back to the traces committed under
+    // public/traces. A reader who has cloned the repository has no server running and
+    // has not executed any experiments, and an empty viewer is the wrong default for the
+    // one artifact whose purpose is to make a run legible.
+    const load = async () => {
+      for (const [isLive, url] of [
+        [true, "/api/runs"],
+        [false, "/traces/index.json"],
+      ] as const) {
+        try {
+          const r = await fetch(url);
+          if (!r.ok) continue;
+          const data = (await r.json()) as RunListItem[];
+          if (!Array.isArray(data) || data.length === 0) continue;
+          if (cancelled) return;
+          setLive(isLive);
+          setRuns(data);
           setLoading(false);
+          const best = [...data].sort((a, b) => (b.n_events ?? 0) - (a.n_events ?? 0))[0];
+          if (best) setSelected(best.name);
+          return;
+        } catch {
+          /* try the next source */
         }
-      });
+      }
+      if (!cancelled) {
+        setRuns([]);
+        setLoading(false);
+      }
+    };
+    void load();
     return () => {
       cancelled = true;
     };
   }, []);
 
   useEffect(() => {
-    if (!selected) return;
+    if (!selected || live === null) return;
     setDetail(null);
-    fetch(`/api/run?name=${encodeURIComponent(selected)}`)
+    const url = live
+      ? `/api/run?name=${encodeURIComponent(selected)}`
+      : `/traces/${encodeURIComponent(selected)}.json`;
+    fetch(url)
       .then((r) => r.json())
       .then((d) => (d.error ? setError(d.error) : setDetail(d)))
       .catch((e) => setError(String(e)));
-  }, [selected]);
+  }, [selected, live]);
 
   const ranks = useMemo(() => (detail ? Object.keys(detail.lanes).sort((a, b) => +a - +b) : []), [detail]);
   const width = Math.max(900, 900 * zoom);
@@ -77,10 +98,11 @@ export function App() {
     return (
       <Shell>
         <div className="empty">
-          <h2>Cannot reach the trace server</h2>
+          <h2>Could not load that trace</h2>
           <p className="mono">{error}</p>
           <p>
-            Start it with <code>python3 scripts/trace_server.py --runs runs</code> and reload.
+            For live runs, start <code>python3 scripts/trace_server.py --runs runs</code>. The
+            traces committed under <code>viz/public/traces</code> are served without it.
           </p>
         </div>
       </Shell>
@@ -91,14 +113,16 @@ export function App() {
     return (
       <Shell>
         <div className="empty">
-          <h2>No runs yet</h2>
+          <h2>No traces found</h2>
           <p>
-            Every AgentMPI job writes a durable, totally ordered event log. Produce one with
+            Every AgentMPI job writes a durable, totally ordered event log. Recorded traces
+            ship in <code>viz/public/traces</code>; to view a run of your own, produce one with
           </p>
           <pre>make microbench</pre>
-          <p>or</p>
-          <pre>python3 experiments/translation.py --ranks 4 --executor function</pre>
-          <p>then reload this page.</p>
+          <p>then either export it</p>
+          <pre>python3 scripts/export_traces.py</pre>
+          <p>or serve it live</p>
+          <pre>python3 scripts/trace_server.py --runs runs</pre>
         </div>
       </Shell>
     );
@@ -135,7 +159,7 @@ export function App() {
                 <h1>{detail.name}</h1>
                 <p className="sub">
                   {detail.experiment || "run"} · {detail.n_events.toLocaleString()} events ·{" "}
-                  {detail.t_span.toFixed(1)} s span
+                  {detail.t_span.toFixed(1)} s span · {live ? "live fabric" : "recorded trace"}
                 </p>
               </div>
               <div className="zoom">

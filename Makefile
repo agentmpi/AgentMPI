@@ -1,4 +1,4 @@
-.PHONY: help install test lint paper tables clean microbench translation software campaign-status
+.PHONY: help install test lint paper tables clean microbench translation software campaign-status traces viz
 
 PY ?= python3
 AMPI ?= $(HOME)/.local/bin/ampi
@@ -35,6 +35,19 @@ software:
 
 tables:
 	$(PY) scripts/make_tables.py
+
+# Export run traces to static JSON under viz/public/traces, so the viewer works from a
+# fresh clone with no server and no experiments run. The run directories themselves are
+# hundreds of megabytes and gitignored; this is the derived view, ~600 KiB, committed.
+traces:
+	$(PY) scripts/export_traces.py --min-events 40 \
+		--exclude smoke --exclude "__coll-" --exclude "__transport-" --exclude "__pingpong"
+
+# The viewer. Reads the live trace server if one is running, otherwise the exported
+# traces. Start the server separately for live runs:
+#   python3 scripts/trace_server.py --runs runs
+viz:
+	cd viz && npm install --silent && npm run dev
 
 # Three passes plus bibtex: the cross-references, the bibliography, and then the
 # page balancing all need a settled .aux file.

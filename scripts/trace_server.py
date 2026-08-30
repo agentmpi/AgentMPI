@@ -39,9 +39,36 @@ LANE_KINDS = (
 )
 
 
+#: Separator used in place of "/" for nested run names. A benchmark that sweeps a
+#: parameter creates one fabric per point under a parent directory, and those are the
+#: most illustrative traces -- a reduction tree's shape is exactly what a timeline shows
+#: -- so they must be reachable. Path separators are kept out of the name so a request
+#: cannot traverse.
+NEST = "__"
+
+
+def _candidate_dirs() -> list[Path]:
+    """Fabric directories, scanning one level below `runs/` as well as directly in it."""
+    if not RUNS.exists():
+        return []
+    out: list[Path] = []
+    for child in sorted(RUNS.iterdir()):
+        if not child.is_dir():
+            continue
+        if (child / "fabric.sqlite").exists():
+            out.append(child)
+            continue
+        out.extend(sorted(g for g in child.iterdir() if g.is_dir() and (g / "fabric.sqlite").exists()))
+    return out
+
+
+def _name_of(path: Path) -> str:
+    return str(path.relative_to(RUNS)).replace("/", NEST)
+
+
 def list_runs() -> list[dict[str, Any]]:
     out = []
-    for child in sorted(RUNS.iterdir() if RUNS.exists() else []):
+    for child in _candidate_dirs():
         db = child / "fabric.sqlite"
         if not db.exists():
             continue
@@ -51,7 +78,7 @@ def list_runs() -> list[dict[str, Any]]:
             ranks = fabric.query_one("SELECT COUNT(*) AS n FROM ranks")
             out.append(
                 {
-                    "name": child.name,
+                    "name": _name_of(child),
                     "path": str(child),
                     "job_id": fabric.job_id,
                     "label": fabric.get_meta("label") or "",
@@ -62,12 +89,12 @@ def list_runs() -> list[dict[str, Any]]:
                 }
             )
         except Exception as exc:  # a partially written run must not break the list
-            out.append({"name": child.name, "path": str(child), "error": repr(exc)})
+            out.append({"name": _name_of(child), "path": str(child), "error": repr(exc)})
     return out
 
 
 def run_detail(name: str) -> dict[str, Any]:
-    root = RUNS / name
+    root = RUNS / name.replace(NEST, "/")
     fabric = ampi.Fabric(root)
     events = fabric.events()
     t0 = events[0]["ts"] if events else 0.0

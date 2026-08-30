@@ -159,6 +159,23 @@ be stolen by another. The exact worker bootstrap prompt used in the experiments 
 [`experiments/worker_prompt.md`](experiments/worker_prompt.md) — note that it
 mentions neither collectives nor the experiment.
 
+### Looking at a run
+
+A message-passing bug is almost always a shape in time — a rank idle while its peers work,
+a fan-in serialising at a root, a barrier whose last arrival is minutes after its first —
+and those shapes are invisible in a log and obvious in a picture. The viewer draws one lane
+per rank, agent invocations as spans, messages as ticks, window operations as diamonds with
+stale writes in red.
+
+```bash
+make viz                                          # http://127.0.0.1:43117
+python3 scripts/trace_server.py --runs runs       # optional: serve live runs
+```
+
+32 recorded traces from the experiments in this repository ship under
+`viz/public/traces`, so the viewer works immediately after a clone with no server and
+nothing run. `make traces` re-exports from `runs/` after an experiment of your own.
+
 Diagnostics:
 
 ```bash

@@ -81,6 +81,7 @@ export interface RankHealth {
 
 export interface RunDetail {
   name: string;
+  truncated?: boolean;
   job_id: string;
   experiment: string;
   t_span: number;
