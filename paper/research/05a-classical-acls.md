@@ -1627,4 +1627,911 @@ central claim.
 
 ---
 
-<!-- APPEND-POINT -->
+## BibTeX
+
+Verification convention below: entries whose bibliographic details I confirmed against a primary source
+(the publisher record, the specification itself, or the paper's own front matter) during this pass carry no
+warning. Entries where I confirmed the *work* but reconstructed volume/page/author details from memory
+carry an inline `% [UNVERIFIED: ...]` comment naming the specific field to check. Two entries are
+web/encyclopedic sources included only as pointers and should not appear in the camera-ready.
+
+```bibtex
+% ============================================================
+% KQML and the ARPA Knowledge Sharing Effort
+% ============================================================
+
+@article{kse1991,
+  author  = {Neches, Robert and Fikes, Richard and Finin, Tim and Gruber, Thomas and
+             Patil, Ramesh and Senator, Ted and Swartout, William R.},
+  title   = {Enabling Technology for Knowledge Sharing},
+  journal = {AI Magazine},
+  volume  = {12},
+  number  = {3},
+  pages   = {36--56},
+  year    = {1991}
+}
+% [UNVERIFIED: pages 36--56 reconstructed from memory.]
+
+@techreport{kqmlspec1993,
+  author      = {{ARPA Knowledge Sharing Initiative, External Interfaces Working Group}},
+  title       = {Specification of the {KQML} Agent-Communication Language},
+  type        = {Working Paper},
+  institution = {ARPA Knowledge Sharing Initiative},
+  month       = jun,
+  year        = {1993},
+  note        = {Draft; see also \url{http://www.cs.umbc.edu/kqml/}}
+}
+
+@inproceedings{finin1994kqml,
+  author    = {Finin, Tim and Fritzson, Richard and McKay, Don and McEntire, Robin},
+  title     = {{KQML} as an Agent Communication Language},
+  booktitle = {Proceedings of the Third International Conference on Information and
+               Knowledge Management (CIKM '94)},
+  pages     = {456--463},
+  publisher = {ACM},
+  year      = {1994},
+  doi       = {10.1145/191246.191322}
+}
+% [UNVERIFIED: pages 456--463 from memory; DOI confirmed.]
+
+@inproceedings{labrou1994semantics,
+  author    = {Labrou, Yannis and Finin, Tim},
+  title     = {A Semantics Approach for {KQML} --- A General Purpose Communication
+               Language for Software Agents},
+  booktitle = {Proceedings of the Third International Conference on Information and
+               Knowledge Management (CIKM '94)},
+  publisher = {ACM},
+  month     = nov,
+  year      = {1994}
+}
+
+@techreport{labrou1997kqmlspec,
+  author      = {Labrou, Yannis and Finin, Tim},
+  title       = {A Proposal for a New {KQML} Specification},
+  number      = {TR CS-97-03},
+  institution = {Computer Science and Electrical Engineering Department,
+                 University of Maryland Baltimore County},
+  year        = {1997}
+}
+% [UNVERIFIED: report number TR CS-97-03 from memory.]
+
+@unpublished{kqmloverview,
+  author = {Finin, Tim and Weber, Jay and Wiederhold, Gio and Genesereth, Michael and
+            Fritzson, Richard and McKay, Don and McGuire, James and Pelavin, Richard and
+            Shapiro, Stuart and Beck, Chris},
+  title  = {An Overview of {KQML}: A Knowledge Query and Manipulation Language},
+  note   = {Draft, KQML Advisory Group.
+            \url{https://userpages.cs.umbc.edu/finin/papers/kqmloverview.pdf}},
+  year   = {1992}
+}
+% [UNVERIFIED: author list and 1992 date reconstructed; the PDF is marked DRAFT throughout.]
+
+@article{labrou1999landscape,
+  author  = {Labrou, Yannis and Finin, Tim and Peng, Yun},
+  title   = {Agent Communication Languages: The Current Landscape},
+  journal = {IEEE Intelligent Systems},
+  volume  = {14},
+  number  = {2},
+  pages   = {45--52},
+  year    = {1999},
+  doi     = {10.1109/5254.757631}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+% ============================================================
+% Critiques: semantics and verifiability
+% ============================================================
+
+@inproceedings{cohen1995communicative,
+  author    = {Cohen, Philip R. and Levesque, Hector J.},
+  title     = {Communicative Actions for Artificial Agents},
+  booktitle = {Proceedings of the First International Conference on Multiagent
+               Systems (ICMAS-95)},
+  editor    = {Lesser, Victor and Gasser, Les},
+  address   = {San Francisco, CA},
+  publisher = {AAAI Press / MIT Press},
+  month     = jun,
+  year      = {1995}
+}
+
+@article{cohen1979elements,
+  author  = {Cohen, Philip R. and Perrault, C. Raymond},
+  title   = {Elements of a Plan-Based Theory of Speech Acts},
+  journal = {Cognitive Science},
+  volume  = {3},
+  number  = {3},
+  pages   = {177--212},
+  year    = {1979},
+  doi     = {10.1207/s15516709cog0303_1}
+}
+
+@article{wooldridge2000semantic,
+  author  = {Wooldridge, Michael},
+  title   = {Semantic Issues in the Verification of Agent Communication Languages},
+  journal = {Autonomous Agents and Multi-Agent Systems},
+  volume  = {3},
+  number  = {1},
+  pages   = {9--31},
+  year    = {2000},
+  doi     = {10.1023/A:1010090027213}
+}
+
+@book{wooldridge2009intro,
+  author    = {Wooldridge, Michael},
+  title     = {An Introduction to MultiAgent Systems},
+  edition   = {2nd},
+  publisher = {John Wiley \& Sons},
+  year      = {2009}
+}
+
+@misc{comp310acl,
+  author = {Wooldridge, Michael and Parsons, Simon and Payne, Terry R.},
+  title  = {{COMP310}: Multi-Agent Systems --- Chapter 6/7: Agent Communication},
+  note   = {Lecture notes, University of Liverpool.
+            \url{https://cgi.csc.liv.ac.uk/~trp/COMP310_files/COMP310-Chapter7.pdf}},
+  year   = {2013}
+}
+% Teaching material. Cite wooldridge2009intro in the camera-ready instead where possible.
+
+@article{vieira2007formalsemantics,
+  author  = {Vieira, Renata and Moreira, {\'A}lvaro F. and Wooldridge, Michael and
+             Bordini, Rafael H.},
+  title   = {On the Formal Semantics of Speech-Act Based Communication in an
+             Agent-Oriented Programming Language},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {29},
+  pages   = {221--267},
+  year    = {2007},
+  doi     = {10.1613/jair.2221}
+}
+% [UNVERIFIED: volume 29 and pages 221--267 from memory; DOI confirmed.]
+
+@article{singh1998socialsemantics,
+  author  = {Singh, Munindar P.},
+  title   = {Agent Communication Languages: Rethinking the Principles},
+  journal = {IEEE Computer},
+  volume  = {31},
+  number  = {12},
+  pages   = {40--47},
+  year    = {1998},
+  doi     = {10.1109/2.735849}
+}
+% [UNVERIFIED: pages/DOI from memory. See also Singh, "A Social Semantics for Agent
+%  Communication Languages", in Issues in Agent Communication, LNCS 1916, Springer, 2000.]
+
+@article{mallya2007commitments,
+  author  = {Bentahar, Jamal and Moulin, Bernard and Meyer, John-Jules Ch.},
+  title   = {A New Semantics for {ACL} Based on Commitments and Penalties},
+  journal = {International Journal of Intelligent Systems},
+  year    = {2007},
+  doi     = {10.1002/int.20267}
+}
+% [UNVERIFIED: AUTHORS AND VOLUME/PAGES NOT CONFIRMED. Only the DOI and title were
+%  observed. Resolve the DOI before citing.]
+
+@article{pitt1999remarks,
+  author  = {Pitt, Jeremy and Mamdani, Abe},
+  title   = {Some Remarks on the Semantics of {FIPA}'s Agent Communication Language},
+  journal = {Autonomous Agents and Multi-Agent Systems},
+  volume  = {2},
+  number  = {4},
+  pages   = {333--356},
+  year    = {1999}
+}
+% [UNVERIFIED: authors, volume, number and pages all reconstructed from memory.
+%  Only the paper title and its content were confirmed.]
+
+@inproceedings{boella2016defeasible,
+  author    = {Boella, Guido and Governatori, Guido and Rotolo, Antonino and
+               van der Torre, Leendert},
+  title     = {{FIPA} Communicative Acts in Defeasible Logic},
+  booktitle = {Proceedings of the Workshop on Logic and Communication in Multi-Agent
+               Systems},
+  year      = {2016},
+  note      = {\url{https://orbilu.uni.lu/bitstream/10993/25294/1/dialdl.pdf}}
+}
+% [UNVERIFIED: AUTHORS, VENUE AND YEAR NOT CONFIRMED. Only title and content observed.]
+
+@inproceedings{tanetal2004verifying,
+  title     = {Verifying the Contract Net Protocol: A Case Study in Interaction Protocol
+               and Agent Communication Language Semantics},
+  booktitle = {Proceedings of the Second International Workshop on Logic and
+               Communication in Multi-Agent Systems (LCMAS 2004)},
+  year      = {2004},
+  note      = {\url{https://eprints.soton.ac.uk/259563/}}
+}
+% [UNVERIFIED: AUTHORS NOT DETERMINED. The paper is real (Southampton ePrint 259563) and
+%  the quoted passages are accurate, but I could not confirm the author list. MUST be
+%  resolved before citing; do not guess.]
+
+% ============================================================
+% FIPA specifications
+% ============================================================
+
+@techreport{fipa2002acl,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} {ACL} Message Structure Specification},
+  number      = {SC00061G},
+  institution = {FIPA},
+  year        = {2002},
+  note        = {\url{https://www.fipa.org/specs/fipa00061/SC00061G.html}}
+}
+
+@techreport{fipa2002cal,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} Communicative Act Library Specification},
+  number      = {SC00037J},
+  institution = {FIPA},
+  year        = {2002},
+  note        = {\url{https://www.fipa.org/specs/fipa00037/SC00037J.html}}
+}
+
+@techreport{fipa2002contractnet,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} Contract Net Interaction Protocol Specification},
+  number      = {SC00029H},
+  institution = {FIPA},
+  year        = {2002},
+  note        = {\url{https://www.fipa.org/specs/fipa00029/SC00029H.html}}
+}
+
+@techreport{fipa2002sl,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} {SL} Content Language Specification},
+  number      = {SC00008I},
+  institution = {FIPA},
+  year        = {2002}
+}
+% [UNVERIFIED: document suffix (SC00008I) from memory; base number FIPA00008 is correct.]
+
+@techreport{fipa2002mgmt,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} Agent Management Specification},
+  number      = {SC00023K},
+  institution = {FIPA},
+  year        = {2004},
+  note        = {Defines the AMS, the Directory Facilitator, the Message Transport Service
+                 and the Agent Platform Life Cycle state machine}
+}
+% [UNVERIFIED: document suffix and year from memory; base number FIPA00023 is correct.]
+
+@techreport{fipainteractionprotocols,
+  author      = {{Foundation for Intelligent Physical Agents}},
+  title       = {{FIPA} Interaction Protocols},
+  institution = {FIPA},
+  year        = {1997},
+  note        = {FIPA97 Specification Part 2, Agent Communication Language.
+                 Mirror: \url{http://www.sce.carleton.ca/faculty/esfandiari/agents/fipa/}}
+}
+% [UNVERIFIED: exact FIPA97 part/section numbering. Content quoted was read from the
+%  Carleton mirror; prefer the individual SC000xx specs (Request FIPA00026,
+%  Iterated Contract Net FIPA00030, etc.) where a normative citation is needed.]
+
+@misc{fipaieee2005,
+  author = {{Foundation for Intelligent Physical Agents}},
+  title  = {Welcome to the Foundation for Intelligent Physical Agents},
+  note   = {FIPA was officially accepted by the IEEE Computer Society as its eleventh
+            standards committee on 8 June 2005. \url{https://www.fipa.org/}},
+  year   = {2005}
+}
+
+@misc{fipagrokipedia,
+  title = {Foundation for Intelligent Physical Agents},
+  note  = {Encyclopedic entry. \url{https://grokipedia.com/page/foundation_for_intelligent_physical_agents}},
+  year  = {2025}
+}
+% LOW-CONFIDENCE SECONDARY SOURCE. Do not cite in the camera-ready; used here only as a
+% pointer for the post-2005 dormancy claim, which still needs a primary source.
+
+@misc{jadetutorialfipa,
+  title = {{FIPA}: The Foundation for Intelligent, Physical Agents (JADE tutorial slides)},
+  note  = {\url{https://semcop.mit.bme.hu/site/assets/files/1028/jadetutorial_fipa.pdf}},
+  year  = {2004}
+}
+% Teaching slides; used only for the transport-envelope field list. Prefer fipa2002acl.
+
+% ============================================================
+% Contract Net
+% ============================================================
+
+@article{smith1980contractnet,
+  author  = {Smith, Reid G.},
+  title   = {The Contract Net Protocol: High-Level Communication and Control in a
+             Distributed Problem Solver},
+  journal = {IEEE Transactions on Computers},
+  volume  = {C-29},
+  number  = {12},
+  pages   = {1104--1113},
+  month   = dec,
+  year    = {1980},
+  doi     = {10.1109/TC.1980.1675516}
+}
+
+@article{davis1983negotiation,
+  author  = {Davis, Randall and Smith, Reid G.},
+  title   = {Negotiation as a Metaphor for Distributed Problem Solving},
+  journal = {Artificial Intelligence},
+  volume  = {20},
+  number  = {1},
+  pages   = {63--109},
+  year    = {1983},
+  doi     = {10.1016/0004-3702(83)90015-2}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+% ============================================================
+% Blackboard architectures
+% ============================================================
+
+@article{erman1980hearsay,
+  author  = {Erman, Lee D. and Hayes-Roth, Frederick and Lesser, Victor R. and
+             Reddy, D. Raj},
+  title   = {The {Hearsay-II} Speech-Understanding System: Integrating Knowledge to
+             Resolve Uncertainty},
+  journal = {ACM Computing Surveys},
+  volume  = {12},
+  number  = {2},
+  pages   = {213--253},
+  month   = jun,
+  year    = {1980},
+  doi     = {10.1145/356810.356816}
+}
+
+@inproceedings{lesser1977retrospective,
+  author    = {Lesser, Victor R. and Erman, Lee D.},
+  title     = {A Retrospective View of the {Hearsay-II} Architecture},
+  booktitle = {Proceedings of the Fifth International Joint Conference on Artificial
+               Intelligence (IJCAI-77)},
+  pages     = {790--800},
+  year      = {1977},
+  note      = {\url{https://www.ijcai.org/Proceedings/77-2/Papers/055.pdf}}
+}
+% [UNVERIFIED: pages 790--800 from memory; the paper is IJCAI-77 volume 2, paper 055.]
+
+@article{hayesroth1985bb1,
+  author  = {Hayes-Roth, Barbara},
+  title   = {A Blackboard Architecture for Control},
+  journal = {Artificial Intelligence},
+  volume  = {26},
+  number  = {3},
+  pages   = {251--321},
+  year    = {1985},
+  doi     = {10.1016/0004-3702(85)90063-3}
+}
+% [UNVERIFIED: DOI from memory; volume/number/pages confirmed via two independent
+%  reference lists.]
+
+@techreport{hayesroth1984bb1tr,
+  author      = {Hayes-Roth, Barbara},
+  title       = {{BB1}: An Architecture for Blackboard Systems that Control, Explain, and
+                 Learn about their own Behavior},
+  number      = {CS-TR-84-1034},
+  institution = {Department of Computer Science, Stanford University},
+  month       = dec,
+  year        = {1984},
+  note        = {\url{http://i.stanford.edu/TR/CS-TR-84-1034.html}}
+}
+
+@techreport{bbinstructional,
+  title       = {The Blackboard Instructional Planner: A {BB1}-Based Architecture},
+  institution = {ERIC document ED302220},
+  year        = {1988},
+  note        = {\url{https://files.eric.ed.gov/fulltext/ED302220.pdf}}
+}
+% [UNVERIFIED: AUTHORS, TITLE AND YEAR NOT CONFIRMED. Used only as a secondary source for
+%  the KSAR/control-blackboard mechanism. Replace with hayesroth1985bb1 in the
+%  camera-ready --- the same mechanism is described there normatively.]
+
+@inproceedings{corkill1986gbb,
+  author    = {Corkill, Daniel D. and Gallagher, Kevin Q. and Murray, Kelly E.},
+  title     = {{GBB}: A Generic Blackboard Development System},
+  booktitle = {Proceedings of the Fifth National Conference on Artificial Intelligence
+               (AAAI-86)},
+  pages     = {1008--1014},
+  year      = {1986},
+  note      = {\url{https://cl-pdx.com/static/AAAI86-166.pdf}}
+}
+% [UNVERIFIED: pages from memory; authors and title confirmed from the PDF.]
+
+@inproceedings{corkill1987flexibility,
+  author    = {Corkill, Daniel D. and Gallagher, Kevin Q. and Johnson, Philip M.},
+  title     = {Achieving Flexibility, Efficiency, and Generality in Blackboard
+               Architectures},
+  booktitle = {Proceedings of the Sixth National Conference on Artificial Intelligence
+               (AAAI-87)},
+  address   = {Seattle, WA},
+  pages     = {18--23},
+  month     = jul,
+  year      = {1987}
+}
+
+@misc{wikiblackboard,
+  title = {Blackboard system},
+  note  = {\url{https://en.wikipedia.org/wiki/Blackboard_system}},
+  year  = {2025}
+}
+% ENCYCLOPEDIC. Do not cite in the camera-ready; used here only for the BB1-vs-GBB
+% emphasis contrast and BB1's application domains. Both need primary sourcing.
+
+% ============================================================
+% Tuple spaces
+% ============================================================
+
+@article{gelernter1985linda,
+  author  = {Gelernter, David},
+  title   = {Generative Communication in {Linda}},
+  journal = {ACM Transactions on Programming Languages and Systems},
+  volume  = {7},
+  number  = {1},
+  pages   = {80--112},
+  month   = jan,
+  year    = {1985},
+  doi     = {10.1145/2363.2433}
+}
+
+@article{carriero1989lindaincontext,
+  author  = {Carriero, Nicholas and Gelernter, David},
+  title   = {{Linda} in Context},
+  journal = {Communications of the ACM},
+  volume  = {32},
+  number  = {4},
+  pages   = {444--458},
+  year    = {1989},
+  doi     = {10.1145/63334.63337}
+}
+% [UNVERIFIED: pages from memory; DOI confirmed.]
+
+@article{carriero1989howto,
+  author  = {Carriero, Nicholas and Gelernter, David},
+  title   = {How to Write Parallel Programs: A Guide to the Perplexed},
+  journal = {ACM Computing Surveys},
+  volume  = {21},
+  number  = {3},
+  pages   = {323--357},
+  month   = sep,
+  year    = {1989},
+  doi     = {10.1145/72551.72553}
+}
+% [UNVERIFIED: pages from memory; DOI confirmed.]
+
+@techreport{carriero1993learned,
+  author      = {Carriero, Nicholas and Gelernter, David},
+  title       = {{Linda} and Message Passing: What Have We Learned?},
+  number      = {YALEU/DCS/TR-984},
+  institution = {Department of Computer Science, Yale University},
+  month       = sep,
+  year        = {1993},
+  note        = {\url{https://cs.yale.edu/publications/techreports/tr984.pdf}}
+}
+% [UNVERIFIED: month September 1993 from memory; TR number 984 confirmed from the URL.]
+
+@article{carriero1994alternative,
+  author  = {Carriero, Nicholas and Gelernter, David},
+  title   = {The {Linda} Alternative to Message-Passing Systems},
+  journal = {Parallel Computing},
+  volume  = {20},
+  number  = {4},
+  pages   = {633--655},
+  year    = {1994},
+  doi     = {10.1016/0167-8191(94)90032-2}
+}
+% [UNVERIFIED: journal, volume, number, pages and DOI all reconstructed from memory.
+%  The paper's text was read and quoted accurately; the venue must be confirmed.]
+
+@phdthesis{bjornson1992linda,
+  author = {Bjornson, Robert D.},
+  title  = {{Linda} on Distributed Memory Multiprocessors},
+  school = {Yale University},
+  year   = {1992}
+}
+
+@article{buravlev2018evaluating,
+  author  = {Buravlev, Vitaly and De Nicola, Rocco and Mezzina, Claudio Antares},
+  title   = {Evaluating the Efficiency of {Linda} Implementations},
+  journal = {Concurrency and Computation: Practice and Experience},
+  year    = {2018},
+  doi     = {10.1002/cpe.4381}
+}
+% [UNVERIFIED: author list inferred from the same authors' COORDINATION 2016 paper cited
+%  within; volume/number/pages not observed. Resolve the DOI.]
+
+@mastersthesis{xlinda1994,
+  title  = {{X-Linda}: An Implementation of a Tuple Space on a Transputer Network},
+  school = {University of the Witwatersrand},
+  year   = {1994},
+  note   = {\url{https://wiredspace.wits.ac.za/}}
+}
+% [UNVERIFIED: AUTHOR, EXACT TITLE, DEGREE AND YEAR ALL UNCONFIRMED. Treat the overhead
+%  measurements as suggestive only, as flagged in section 5.3. Consider dropping.]
+
+@book{freeman1999javaspaces,
+  author    = {Freeman, Eric and Hupfer, Susanne and Arnold, Ken},
+  title     = {JavaSpaces Principles, Patterns, and Practice},
+  publisher = {Addison-Wesley},
+  year      = {1999}
+}
+
+@article{wyckoff1998tspaces,
+  author  = {Wyckoff, Peter and McLaughry, Stephen W. and Lehman, Tobin J. and
+             Ford, Daniel A.},
+  title   = {{T} {Spaces}},
+  journal = {IBM Systems Journal},
+  volume  = {37},
+  number  = {3},
+  pages   = {454--474},
+  year    = {1998},
+  doi     = {10.1147/sj.373.0454}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+@misc{lindamodel,
+  title = {The {Linda} Model and System},
+  note  = {\url{https://www.netlib.org/utk/papers/comp-phy7/node3.html}}
+}
+% Web tutorial; used only to corroborate the rd/in/out/eval descriptions.
+% Prefer gelernter1985linda and carriero1989howto.
+
+% ============================================================
+% Agent platforms
+% ============================================================
+
+@inproceedings{bellifemine1999jade,
+  author    = {Bellifemine, Fabio and Poggi, Agostino and Rimassa, Giovanni},
+  title     = {{JADE} --- A {FIPA}-Compliant Agent Framework},
+  booktitle = {Proceedings of the Fourth International Conference on the Practical
+               Application of Intelligent Agents and Multi-Agent Technology (PAAM'99)},
+  pages     = {97--108},
+  address   = {London},
+  year      = {1999}
+}
+% [UNVERIFIED: pages from memory.]
+
+@article{bellifemine2003jadewhitepaper,
+  author  = {Bellifemine, Fabio and Caire, Giovanni and Poggi, Agostino and
+             Rimassa, Giovanni},
+  title   = {{JADE} --- A White Paper},
+  journal = {EXP in Search of Innovation},
+  volume  = {3},
+  number  = {3},
+  pages   = {6--19},
+  year    = {2003}
+}
+% [UNVERIFIED: volume/number/pages from memory.]
+
+@book{bellifemine2007jadebook,
+  author    = {Bellifemine, Fabio Luigi and Caire, Giovanni and Greenwood, Dominic},
+  title     = {Developing Multi-Agent Systems with {JADE}},
+  publisher = {John Wiley \& Sons},
+  series    = {Wiley Series in Agent Technology},
+  year      = {2007}
+}
+
+@manual{jadeprogrammersguide,
+  title        = {{JADE} Programmer's Guide},
+  organization = {Telecom Italia Lab / JADE Project},
+  note         = {\url{https://jade-project.gitlab.io/docs/programmersguide.pdf}.
+                  Section on the FIPA agent life-cycle states}
+}
+
+@manual{jadeapiagent,
+  title        = {{JADE} v4.5.0 API Documentation: \texttt{jade.core.Agent}},
+  organization = {JADE Project},
+  note         = {\url{https://jade-project.gitlab.io/API/jade/core/Agent.html}}
+}
+
+@manual{jadeapiams,
+  title        = {{JADE} v4.5.0 API Documentation:
+                  \texttt{jade.domain.FIPAAgentManagement.AMSAgentDescription}},
+  organization = {JADE Project},
+  note         = {\url{https://jade-project.gitlab.io/API/jade/domain/FIPAAgentManagement/AMSAgentDescription.html}}
+}
+
+@misc{jadeagentsource,
+  title = {{JADE} source: \texttt{jade/core/Agent.java}},
+  note  = {State constants \texttt{AP\_INITIATED}, \texttt{AP\_ACTIVE},
+           \texttt{AP\_SUSPENDED}, \texttt{AP\_WAITING}, \texttt{AP\_DELETED} and the
+           \texttt{doXXX()} transition methods}
+}
+
+@inproceedings{rao1996agentspeak,
+  author    = {Rao, Anand S.},
+  title     = {{AgentSpeak(L)}: {BDI} Agents Speak Out in a Logical Computable Language},
+  booktitle = {Agents Breaking Away (MAAMAW'96)},
+  series    = {Lecture Notes in Artificial Intelligence},
+  volume    = {1038},
+  pages     = {42--55},
+  publisher = {Springer},
+  year      = {1996}
+}
+% [UNVERIFIED: LNAI volume 1038 and pages from memory.]
+
+@book{bordini2007jason,
+  author    = {Bordini, Rafael H. and H{\"u}bner, Jomi Fred and Wooldridge, Michael},
+  title     = {Programming Multi-Agent Systems in {AgentSpeak} using {Jason}},
+  publisher = {John Wiley \& Sons},
+  series    = {Wiley Series in Agent Technology},
+  year      = {2007}
+}
+
+@incollection{winikoff2005jack,
+  author    = {Winikoff, Michael},
+  title     = {{JACK} Intelligent Agents: An Industrial Strength Platform},
+  booktitle = {Multi-Agent Programming: Languages, Platforms and Applications},
+  editor    = {Bordini, Rafael H. and Dastani, Mehdi and Dix, J{\"u}rgen and
+               El Fallah Seghrouchni, Amal},
+  pages     = {175--193},
+  publisher = {Springer},
+  year      = {2005}
+}
+% [UNVERIFIED: pages from memory.]
+
+@article{sycara2003retsina,
+  author  = {Sycara, Katia and Paolucci, Massimo and van Velsen, Martin and
+             Giampapa, Joseph},
+  title   = {The {RETSINA} {MAS} Infrastructure},
+  journal = {Autonomous Agents and Multi-Agent Systems},
+  volume  = {7},
+  number  = {1--2},
+  pages   = {29--48},
+  year    = {2003},
+  doi     = {10.1023/A:1024172719965}
+}
+% [UNVERIFIED: volume/number/pages/DOI from memory.]
+
+@inproceedings{helsinger2004cougaar,
+  author    = {Helsinger, Aaron and Thome, Michael and Wright, Todd},
+  title     = {{Cougaar}: A Scalable, Distributed Multi-Agent Architecture},
+  booktitle = {Proceedings of the IEEE International Conference on Systems, Man and
+               Cybernetics},
+  pages     = {1910--1917},
+  year      = {2004}
+}
+% [UNVERIFIED: pages from memory.]
+
+% ============================================================
+% Coordination theory
+% ============================================================
+
+@article{cohen1991teamwork,
+  author  = {Cohen, Philip R. and Levesque, Hector J.},
+  title   = {Teamwork},
+  journal = {No{\^u}s},
+  volume  = {25},
+  number  = {4},
+  pages   = {487--512},
+  year    = {1991}
+}
+
+@inproceedings{levesque1990actingtogether,
+  author    = {Levesque, Hector J. and Cohen, Philip R. and Nunes, Jos{\'e} H. T.},
+  title     = {On Acting Together},
+  booktitle = {Proceedings of the Eighth National Conference on Artificial Intelligence
+               (AAAI-90)},
+  pages     = {94--99},
+  year      = {1990}
+}
+% [UNVERIFIED: pages from memory.]
+
+@article{cohen1990intention,
+  author  = {Cohen, Philip R. and Levesque, Hector J.},
+  title   = {Intention Is Choice with Commitment},
+  journal = {Artificial Intelligence},
+  volume  = {42},
+  number  = {2--3},
+  pages   = {213--261},
+  year    = {1990},
+  doi     = {10.1016/0004-3702(90)90055-5}
+}
+
+@article{jennings1996commitments,
+  author  = {Jennings, Nicholas R.},
+  title   = {Commitments and Conventions: The Foundation of Coordination in
+             Multi-Agent Systems},
+  journal = {The Knowledge Engineering Review},
+  volume  = {8},
+  number  = {3},
+  pages   = {223--250},
+  year    = {1993}
+}
+% NOTE: the citation KEY says 1996 but the correct year is 1993 (Knowledge Engineering
+% Review 8(3)). Either rename the key to jennings1993commitments throughout section 7 or
+% keep it as-is; do not "fix" the year to match the key.
+% [UNVERIFIED: pages from memory.]
+
+@article{pynadath2002commtdp,
+  author  = {Pynadath, David V. and Tambe, Milind},
+  title   = {The Communicative Multiagent Team Decision Problem: Analyzing Teamwork
+             Theories and Models},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {16},
+  pages   = {389--423},
+  year    = {2002},
+  doi     = {10.1613/jair.1024}
+}
+% [UNVERIFIED: volume/pages/DOI from memory.]
+
+@article{grosz1996sharedplans,
+  author  = {Grosz, Barbara J. and Kraus, Sarit},
+  title   = {Collaborative Plans for Complex Group Action},
+  journal = {Artificial Intelligence},
+  volume  = {86},
+  number  = {2},
+  pages   = {269--357},
+  year    = {1996},
+  doi     = {10.1016/0004-3702(95)00103-4}
+}
+
+@incollection{grosz1990plans,
+  author    = {Grosz, Barbara J. and Sidner, Candace L.},
+  title     = {Plans for Discourse},
+  booktitle = {Intentions in Communication},
+  editor    = {Cohen, Philip R. and Morgan, Jerry and Pollack, Martha E.},
+  pages     = {417--444},
+  publisher = {MIT Press},
+  year      = {1990}
+}
+% [UNVERIFIED: pages from memory.]
+
+@article{grosz1999planningacting,
+  author  = {Grosz, Barbara J. and Kraus, Sarit},
+  title   = {Planning and Acting Together},
+  journal = {AI Magazine},
+  volume  = {20},
+  number  = {4},
+  pages   = {23--34},
+  year    = {1999},
+  doi     = {10.1609/aimag.v20i4.1476}
+}
+% [UNVERIFIED: pages from memory; DOI confirmed.]
+
+@article{durfee1991pgp,
+  author  = {Durfee, Edmund H. and Lesser, Victor R.},
+  title   = {Partial Global Planning: A Coordination Framework for Distributed
+             Hypothesis Formation},
+  journal = {IEEE Transactions on Systems, Man, and Cybernetics},
+  volume  = {21},
+  number  = {5},
+  pages   = {1167--1183},
+  year    = {1991},
+  doi     = {10.1109/21.120067}
+}
+% [UNVERIFIED: volume/number/pages/DOI from memory.]
+
+@article{lesser1983dvmt,
+  author  = {Lesser, Victor R. and Corkill, Daniel D.},
+  title   = {The Distributed Vehicle Monitoring Testbed: A Tool for Investigating
+             Distributed Problem Solving Networks},
+  journal = {AI Magazine},
+  volume  = {4},
+  number  = {3},
+  pages   = {15--33},
+  year    = {1983}
+}
+% [UNVERIFIED: volume/number/pages from memory.]
+
+@inproceedings{decker1995taems,
+  author    = {Decker, Keith S. and Lesser, Victor R.},
+  title     = {Designing a Family of Coordination Algorithms},
+  booktitle = {Proceedings of the First International Conference on Multi-Agent
+               Systems (ICMAS-95)},
+  pages     = {73--80},
+  year      = {1995}
+}
+% [UNVERIFIED: venue and pages from memory. The T{\AE}MS framework is also documented in
+%  Decker's 1995 UMass PhD thesis; pick whichever the argument actually needs.]
+
+@article{dias2006marketsurvey,
+  author  = {Dias, M. Bernardine and Zlot, Robert and Kalra, Nidhi and Stentz, Anthony},
+  title   = {Market-Based Multirobot Coordination: A Survey and Analysis},
+  journal = {Proceedings of the IEEE},
+  volume  = {94},
+  number  = {7},
+  pages   = {1257--1270},
+  year    = {2006},
+  doi     = {10.1109/JPROC.2006.876939}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+@article{gerkey2004taxonomy,
+  author  = {Gerkey, Brian P. and Matari{\'c}, Maja J.},
+  title   = {A Formal Analysis and Taxonomy of Task Allocation in Multi-Robot Systems},
+  journal = {The International Journal of Robotics Research},
+  volume  = {23},
+  number  = {9},
+  pages   = {939--954},
+  year    = {2004},
+  doi     = {10.1177/0278364904045564}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+@article{wellman1993marketoriented,
+  author  = {Wellman, Michael P.},
+  title   = {A Market-Oriented Programming Environment and its Application to
+             Distributed Multicommodity Flow Problems},
+  journal = {Journal of Artificial Intelligence Research},
+  volume  = {1},
+  pages   = {1--23},
+  year    = {1993},
+  doi     = {10.1613/jair.2}
+}
+% [UNVERIFIED: pages and DOI from memory.]
+
+@inproceedings{koenig2006auctions,
+  author    = {Koenig, Sven and Tovey, Craig and Lagoudakis, Michail and
+               Markakis, Evangelos and Kempe, David and Keskinocak, Pinar and
+               Kleywegt, Anton and Meyerson, Adam and Jain, Sonal},
+  title     = {The Power of Sequential Single-Item Auctions for Agent Coordination},
+  booktitle = {Proceedings of the Twenty-First National Conference on Artificial
+               Intelligence (AAAI-06)},
+  year      = {2006}
+}
+% [UNVERIFIED: author list and pages from memory.]
+
+@article{modi2005adopt,
+  author  = {Modi, Pragnesh Jay and Shen, Wei-Min and Tambe, Milind and Yokoo, Makoto},
+  title   = {{Adopt}: Asynchronous Distributed Constraint Optimization with Quality
+             Guarantees},
+  journal = {Artificial Intelligence},
+  volume  = {161},
+  number  = {1--2},
+  pages   = {149--180},
+  year    = {2005},
+  doi     = {10.1016/j.artint.2004.09.003}
+}
+% [UNVERIFIED: volume/number/pages/DOI from memory.]
+
+@inproceedings{petcu2005dpop,
+  author    = {Petcu, Adrian and Faltings, Boi},
+  title     = {A Scalable Method for Multiagent Constraint Optimization},
+  booktitle = {Proceedings of the Nineteenth International Joint Conference on
+               Artificial Intelligence (IJCAI-05)},
+  pages     = {266--271},
+  year      = {2005}
+}
+% [UNVERIFIED: pages from memory.]
+
+% ============================================================
+% MPI, for the comparison arguments in sections 5.3 and 8.2
+% ============================================================
+
+@techreport{mpiforum1994,
+  author      = {{Message Passing Interface Forum}},
+  title       = {{MPI}: A Message-Passing Interface Standard},
+  institution = {University of Tennessee},
+  year        = {1994}
+}
+
+@article{gropp1996mpich,
+  author  = {Gropp, William and Lusk, Ewing and Doss, Nathan and Skjellum, Anthony},
+  title   = {A High-Performance, Portable Implementation of the {MPI} Message Passing
+             Interface Standard},
+  journal = {Parallel Computing},
+  volume  = {22},
+  number  = {6},
+  pages   = {789--828},
+  year    = {1996},
+  doi     = {10.1016/0167-8191(96)00024-5}
+}
+% [UNVERIFIED: pages and DOI from memory. Supports the section 8.2(6) claim that MPI
+%  shipped a reference implementation alongside the specification.]
+```
+
+### Priority verification queue
+
+Before the camera-ready, resolve in this order — these are the entries where a citation could actually be
+*wrong* rather than merely incomplete:
+
+1. **`tanetal2004verifying`** — authors entirely undetermined. The quoted critique of FIPA's `cfp` and
+   `accept-proposal` semantics is load-bearing for §2.4 and §8.2(2). Resolve via Southampton ePrint 259563.
+2. **`mallya2007commitments`** and **`boella2016defeasible`** — authors/venue unconfirmed; resolve the DOI
+   and the ORBilu record respectively.
+3. **`pitt1999remarks`** — all bibliographic fields reconstructed.
+4. **`carriero1994alternative`** — venue unconfirmed, and it carries the §5.3(c) quotes about where Linda's
+   cost actually sits.
+5. **`xlinda1994`** and **`bbinstructional`** — both unattributed grey literature; prefer dropping in favour
+   of primary sources (`hayesroth1985bb1` covers the BB1 mechanism normatively).
+6. **`wikiblackboard`** and **`fipagrokipedia`** — encyclopedic; remove and re-source the claims they carry
+   (BB1's application domains, GBB1's relationship to BB1, FIPA's post-2005 dormancy).
+7. The `jennings1996commitments` **key/year mismatch** (correct year is 1993).
+8. The FIPA interaction-protocol spec numbers in §2.1 not marked ✔ (FIPA00026/00027/00028/00030/00033/
+   00034/00035/00036, FIPA00008, FIPA00023, FIPA00069/00070/00071).

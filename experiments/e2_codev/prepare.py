@@ -11,7 +11,7 @@ given in advance, and a disagreement about a shared representation does not
 degrade the result gracefully -- it produces an artefact that does not run at
 all.
 
-Ten agents implement **MiniScheme**, a Scheme interpreter, in Python. The public
+Eight agents implement **MiniScheme**, a Scheme interpreter, in Python. The public
 behaviour is fixed by `spec.md` and graded by a held-out suite the agents never
 see. The *internal* interfaces -- how a pair is represented, what an environment
 lookup returns for an unbound name, which exception primitives raise, how the
@@ -23,7 +23,7 @@ Protocol mechanisms exercised
 -----------------------------
 * ``AMPI_Bcast`` of the specification and, later, of test failures;
 * ``AMPI_Allreduce`` with an **agent-evaluated operator** to reduce ten
-  independently-written interface proposals into one contract;
+  independently-writeach rank's interface proposal into one contract;
 * a **window** as the shared blackboard: the contract, an append-only decisions
   log written with lock-free ``accumulate``, and a fix log;
 * ``AMPI_Win_lock`` around the one genuinely shared source file;
@@ -96,15 +96,15 @@ type.""",
         "files": ["interp/datum.py"],
         "owns": "the value representation, the printer, and the shared error type",
         "detail": """\
-You own `interp/datum.py`, which is the most depended-upon module in the system:
-it defines how every Scheme value is represented in Python, the `Pair`, `Symbol`,
-`Char`, `Vector`, unspecified and empty-list representations, the `SchemeError`
+You own `interp/datum.py`, the most depended-upon module in the system: it
+defines how every Scheme value is represented in Python (`Pair`, `Symbol`,
+`Char`, `Vector`, the unspecified value, the empty list), the `SchemeError`
 exception that everyone raises, and the `write`/`display` printers. Every other
 rank imports from you.
 
 Because everyone depends on you, publish your decisions early and do not change
 them silently. If you must change a representation after the contract is agreed,
-announce it: write to the decisions log and message the affected ranks.""",
+announce it in the decisions log and message the affected ranks.""",
     },
     {
         "rank": 3,
@@ -115,32 +115,38 @@ announce it: write to the decisions log and message the affected ranks.""",
 You own `interp/env.py`: environment frames with parent links, define / lookup /
 set!, and the closure object that `lambda` produces (parameter list including
 rest arguments, body, captured environment, optional name). Binding arguments to
-parameters -- including the `(a b . rest)` and `args` forms -- and raising on
+parameters -- including the `(a b . rest)` and bare-`args` forms -- and raising on
 arity mismatch belongs to you.""",
     },
     {
         "rank": 4,
-        "role": "special forms A",
-        "files": ["interp/special_a.py"],
-        "owns": "quote, if, define, set!, lambda, begin, let, let*, letrec, named let",
+        "role": "special forms",
+        "files": ["interp/special.py"],
+        "owns": "every special form",
         "detail": """\
-You own `interp/special_a.py`. Export a table mapping form names to handlers.
-Coordinate with rank 5, who owns the other half of the special forms and must
-export a table of the same shape, and with rank 6, whose evaluator consumes both
-tables. Tail position matters: a handler for a form whose last expression is in
-tail position must cooperate with the evaluator's tail-call mechanism rather than
-recursing into it.""",
+You own `interp/special.py`. Export a table mapping form names to handlers for
+*all* the special forms in the specification: quote, if, define, set!, lambda,
+begin, let, let*, letrec, named let, cond (with `else` and `=>`), case, and, or,
+when, unless, do, quasiquote.
+
+Tail position is the hard part and it is a shared interface: a handler for a form
+whose last expression is in tail position must hand that expression back to rank
+6's evaluator rather than recursing into it. Agree that mechanism with rank 6
+explicitly -- it is the single most important internal interface in this
+project.""",
     },
     {
         "rank": 5,
-        "role": "special forms B",
-        "files": ["interp/special_b.py"],
-        "owns": "cond, case, and, or, when, unless, do, quasiquote",
+        "role": "numeric and list primitives",
+        "files": ["interp/prim_num.py", "interp/prim_list.py"],
+        "owns": "numeric primitives, pair/list primitives, equality and type predicates",
         "detail": """\
-You own `interp/special_b.py`. Export a table of the same shape as rank 4's, for
-the derived forms. `cond` must support `else` and the `=>` form; `case` must
-support `else`; `quasiquote` must handle `unquote` and `unquote-splicing`. Tail
-position matters here too -- `cond` and `when` bodies are in tail position.""",
+You own `interp/prim_num.py` and `interp/prim_list.py`: every numeric primitive,
+every pair and list primitive, plus `eq?`, `eqv?`, `equal?`, `not` and the type
+predicates. `map`, `for-each`, `apply`, `filter` and `reduce` must call back into
+the evaluator to apply a procedure -- agree with rank 6 on how a primitive obtains
+that capability. Agree the primitive-table shape and calling convention with rank
+7, because rank 0 merges both tables into one global environment.""",
     },
     {
         "rank": 6,
@@ -149,40 +155,15 @@ position matters here too -- `cond` and `when` bodies are in tail position.""",
         "owns": "the evaluation driver and proper tail calls",
         "detail": """\
 You own `interp/evaluator.py`: the driver that evaluates one datum in one
-environment, dispatching to the special-form tables from ranks 4 and 5 and
-applying procedures. **Tail calls must not consume Python stack** -- use an
-explicit loop (a trampoline), not Python recursion, for tail position. A
-tail-recursive Scheme loop of 100000 iterations must complete. You must define
-and publish the protocol by which a special-form handler hands a tail expression
-back to you; that is the single most important interface in this project.""",
+environment, dispatching to rank 4's special-form table and applying procedures.
+**Tail calls must not consume Python stack** -- use an explicit loop (a
+trampoline), not Python recursion, for tail position. A tail-recursive Scheme
+loop of 100000 iterations must complete. You must define and publish the
+protocol by which a special-form handler hands a tail expression back to you, and
+the way a primitive obtains the ability to apply a procedure.""",
     },
     {
         "rank": 7,
-        "role": "numeric primitives",
-        "files": ["interp/prim_num.py"],
-        "owns": "all numeric primitives",
-        "detail": """\
-You own `interp/prim_num.py`. Export a table mapping primitive names to Python
-callables for every numeric primitive in the specification. Agree with the other
-primitive owners (ranks 8 and 9) on the *shape* of that table and on the calling
-convention (how arguments arrive, how errors are raised, how variadic primitives
-are handled), because rank 0 merges all three tables into one global
-environment.""",
-    },
-    {
-        "rank": 8,
-        "role": "list primitives",
-        "files": ["interp/prim_list.py"],
-        "owns": "pair/list primitives and equality",
-        "detail": """\
-You own `interp/prim_list.py`: every pair and list primitive plus `eq?`, `eqv?`,
-`equal?`, `not` and the type predicates. `map`, `for-each`, `apply`, `filter` and
-`reduce` need to call back into the evaluator to apply a procedure -- agree with
-rank 6 on how a primitive obtains that capability, and use the same table shape
-and calling convention as ranks 7 and 9.""",
-    },
-    {
-        "rank": 9,
         "role": "string/vector primitives",
         "files": ["interp/prim_str.py", "interp/prim_vec.py"],
         "owns": "string, char, symbol and vector primitives, plus error/display/write",
@@ -190,7 +171,7 @@ and calling convention as ranks 7 and 9.""",
 You own `interp/prim_str.py` and `interp/prim_vec.py`: every string, character,
 symbol and vector primitive, plus `error`, `display`, `newline` and `write`.
 `display`/`write` append to an output buffer rather than printing. Use the same
-table shape and calling convention as ranks 7 and 8.""",
+table shape and calling convention as rank 5.""",
     },
 ]
 
@@ -316,7 +297,7 @@ ampi info
 
 **PHASE 1 — receive the specification (AMPI_Bcast)**
 ```
-{f'ampi bcast --root 0 --label spec --in @{spec} --timeout 30' if integrator else 'ampi bcast --root 0 --label spec --timeout 30 --budget 1200'}
+{f'ampi bcast --root 0 --label spec --in @{spec} --timeout 120' if integrator else 'ampi bcast --root 0 --label spec --timeout 120 --budget 1200'}
 ```
 {"You are the root: you broadcast the spec." if integrator else "You will get a handle plus a clipped view. Read the spec from the file path above rather than spending context on the broadcast payload — that is what handles are for."}
 
@@ -347,12 +328,12 @@ Be concrete. Name the functions and classes, give signatures, and state the
 representation decisions you are assuming. Vagueness here is what breaks
 integration later.
 
-**PHASE 3 — reduce ten proposals into ONE contract (AMPI_Allreduce, agent operator)**
+**PHASE 3 — reduce all proposals into ONE contract (AMPI_Allreduce, agent operator)**
 ```
 ampi allreduce --op agent:merge_contract --label contract \\
-    --in @{work}/proposal.json --algo reduce_bcast --timeout 35 --materialize --operand-budget 3000
+    --in @{work}/proposal.json --algo reduce_bcast --timeout 150 --materialize --operand-budget 3000
 ```
-When the output says `action_required=merge`, read the two operand files and
+When the output says `action_required=merge`, run `ampi hb --extend 900`, read the two operand files and
 produce **one** merged JSON object of the same shape, with these keys instead of
 the per-rank ones:
 
@@ -376,6 +357,13 @@ ampi memo put phase "contract agreed"
 
 **PHASE 4 — implement**
 
+This is your longest step. First:
+```
+ampi hb --extend 1800
+```
+and run it again every few minutes while you work — if you go silent longer than
+your lease, the job declares you dead and discards your work.
+
 Write your files, honouring the contract. Two shared-state rules:
 
 1. **Record every decision you make that others could trip over**, lock-free:
@@ -390,7 +378,7 @@ ampi win get --win build --key decisions --budget 1500
 2. There is exactly one genuinely shared file, `interp/contract.py`, holding the
 agreed constants and tiny helpers everyone needs. To touch it, take the lock:
 ```
-ampi win lock --win build --key contract-file --timeout 30
+ampi win lock --win build --key contract-file --timeout 120
 # ... edit interp/contract.py ...
 ampi win unlock --win build --key contract-file
 ```
@@ -404,12 +392,12 @@ ampi memo put phase "implemented"
 
 **PHASE 5 — integration round 1 (AMPI_Win_fence, then AMPI_Bcast of failures)**
 ```
-ampi win fence --win build --label impl-done --quorum 0.9 --timeout 35
+ampi win fence --win build --label impl-done --quorum 0.9 --timeout 150
 ```
 {f'''Then run the visible tests and broadcast the result:
 ```
 cd {project} && python3 tests_visible.py > {work}/failures_r1.txt 2>&1; echo "exit=$?" >> {work}/failures_r1.txt
-ampi bcast --root 0 --label failures-r1 --in @{work}/failures_r1.txt --timeout 35
+ampi bcast --root 0 --label failures-r1 --in @{work}/failures_r1.txt --timeout 150
 ```
 Then assign the fixes: for each failure, work out which rank's file is responsible
 and tell them:
@@ -417,8 +405,8 @@ and tell them:
 ampi send --to <rank> --tag fix --in "round 1: <what is broken and the failing case>"
 ```''' if integrator else f'''Then receive the failures and check for a fix assignment:
 ```
-ampi bcast --root 0 --label failures-r1 --timeout 35 --materialize
-ampi recv --from 0 --tag fix --timeout 25 --materialize
+ampi bcast --root 0 --label failures-r1 --timeout 150 --materialize
+ampi recv --from 0 --tag fix --timeout 120 --materialize
 ```
 If the `recv` times out repeatedly (5 attempts), you have no assigned fix; read the
 broadcast failures yourself and fix anything that is clearly in *your* files.'''}
@@ -426,7 +414,7 @@ broadcast failures yourself and fix anything that is clearly in *your* files.'''
 Fix what is yours. Log what you changed:
 ```
 ampi win acc --win build --key fixlog --op union --in '["rank {r} r1: <what you fixed>"]'
-ampi barrier --label fix-r1 --quorum 0.9 --timeout 35
+ampi barrier --label fix-r1 --quorum 0.9 --timeout 150
 ```
 
 **PHASE 6 — integration round 2**
@@ -434,13 +422,13 @@ ampi barrier --label fix-r1 --quorum 0.9 --timeout 35
 Repeat Phase 5 with the labels `failures-r2` and `fix-r2`.
 {f'''```
 cd {project} && python3 tests_visible.py > {work}/failures_r2.txt 2>&1; echo "exit=$?" >> {work}/failures_r2.txt
-ampi bcast --root 0 --label failures-r2 --in @{work}/failures_r2.txt --timeout 35
+ampi bcast --root 0 --label failures-r2 --in @{work}/failures_r2.txt --timeout 150
 ```''' if integrator else '''```
-ampi bcast --root 0 --label failures-r2 --timeout 35 --materialize
-ampi recv --from 0 --tag fix2 --timeout 25 --materialize
+ampi bcast --root 0 --label failures-r2 --timeout 150 --materialize
+ampi recv --from 0 --tag fix2 --timeout 120 --materialize
 ```'''}
 ```
-ampi barrier --label fix-r2 --quorum 0.9 --timeout 35
+ampi barrier --label fix-r2 --quorum 0.9 --timeout 150
 ```
 
 **PHASE 7 — report and decide**
@@ -451,8 +439,8 @@ Write `{work}/report.json`:
   "lock_acquisitions": 0, "notes": "one or two sentences"}}
 ```
 ```
-ampi gather --root 0 --label reports --in @{work}/report.json --timeout 35
-ampi agree --label ship --flag true --timeout 35 --quorum 0.9
+ampi gather --root 0 --label reports --in @{work}/report.json --timeout 150
+ampi agree --label ship --flag true --timeout 150 --quorum 0.9
 ampi fini
 ```
 
@@ -492,6 +480,12 @@ ampi info
 
 **PHASE 1 — implement**
 
+This is your longest step. First:
+```
+ampi hb --extend 1800
+```
+and run it again every few minutes while you work.
+
 Read the specification and write your files. Decide any interface details you
 need yourself, using your best judgement about what your teammates will expect.
 
@@ -521,7 +515,7 @@ Write `{work}/report.json`:
   "lock_acquisitions": 0, "notes": "one or two sentences"}}
 ```
 ```
-ampi gather --root 0 --label reports --in @{work}/report.json --timeout 40
+ampi gather --root 0 --label reports --in @{work}/report.json --timeout 150
 ampi fini
 ```
 
@@ -534,7 +528,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--arm", choices=["ampi", "naive"], required=True)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--np", type=int, default=10)
+    ap.add_argument("--np", type=int, default=8)
     args = ap.parse_args()
     if args.np != len(MODULES):
         raise SystemExit(f"this experiment defines {len(MODULES)} module owners; use --np {len(MODULES)}")
@@ -578,13 +572,13 @@ pair is represented, or about how a special form hands a tail expression back to
 evaluator, does not degrade the result — it produces something that does not run.
 
 **Arm**: `{args.arm}`.
-{"This arm uses the full protocol: an agent-evaluated Allreduce to reduce ten interface proposals into one contract, a window as the shared decisions log, a lock around the single shared file, and synchronised integration rounds." if args.arm == "ampi" else "This arm has the same agents, the same specification, the same module assignment and a shared filesystem, but no negotiated contract, no shared decisions log and no synchronised integration rounds."}
+{"This arm uses the full protocol: an agent-evaluated Allreduce to reduce each rank's interface proposal into one contract, a window as the shared decisions log, a lock around the single shared file, and synchronised integration rounds." if args.arm == "ampi" else "This arm has the same agents, the same specification, the same module assignment and a shared filesystem, but no negotiated contract, no shared decisions log and no synchronised integration rounds."}
 
 {PROTOCOL_DISCIPLINE}
 """
     spec_path = write_spec(
         out, label=f"e2-codev-{args.arm}", preamble=preamble, ranks=ranks,
-        config={"eager_tokens": 700, "ctx_budget": 140_000, "lease_ns": 2400 * 10 ** 9,
+        config={"eager_tokens": 700, "ctx_budget": 140_000, "lease_ns": 420 * 10 ** 9,
                 "timeout_ns": 45 * 10 ** 9, "lock_lease_ns": 900 * 10 ** 9},
     )
     manifest = create_job(spec_path)

@@ -143,9 +143,9 @@ def ampi_task(
     dest = r + 1 if r + 1 < np else None
     src = r - 1 if r > 0 else None
     scatter_line = (
-        f"ampi scatter --root 0 --label assign --parts @{parts_json} --timeout 30 --materialize"
+        f"ampi scatter --root 0 --label assign --parts @{parts_json} --timeout 120 --materialize"
         if r == 0
-        else "ampi scatter --root 0 --label assign --timeout 30 --materialize"
+        else "ampi scatter --root 0 --label assign --timeout 120 --materialize"
     )
     probe_json = json.dumps(probes, ensure_ascii=False, indent=None)
     return f"""\
@@ -199,18 +199,19 @@ ampi memo put phase "terms proposed"
 
 ```
 ampi allreduce --op agent:reconcile_glossary --label glossary \\
-    --in @{work}/rank{r}_terms.json --algo reduce_bcast --timeout 30 --materialize
+    --in @{work}/rank{r}_terms.json --algo reduce_bcast --timeout 120 --materialize
 ```
 
 This is a reduction whose operator is *you*. The runtime will sometimes answer with
 `action_required=merge` and name two operand files. When it does:
 
+0. Run `ampi hb --extend 900` — merging takes you a while and the job must know you are alive.
 1. Read both operand files (they are JSON objects of the same shape).
 2. Produce **one** merged JSON object of the same shape. Where the two disagree about a term,
    pick the single best rendering and use it — do not keep both, do not invent a nested
    structure, do not drop terms.
 3. Write the merged object to the `suggested_out` path it gave you.
-4. Run: `ampi reduce-commit --step <STEP> --in @<suggested_out> --timeout 30 --materialize`
+4. Run: `ampi reduce-commit --step <STEP> --in @<suggested_out> --timeout 120 --materialize`
 5. You may immediately be handed another merge step. Keep going.
 
 Stop when the output says `complete=true`. Its payload is the **AGREED GLOSSARY**. Save it to
@@ -223,7 +224,11 @@ ampi memo put phase "glossary agreed"
 
 **PHASE 4 — translate**
 
-Translate the whole of `{secfile}` into {LANG}. **Use the agreed glossary from Phase 3 for every
+This is your longest step, so first tell the job you are alive and thinking:
+```
+ampi hb --extend 1200
+```
+Then translate the whole of `{secfile}` into {LANG}. **Use the agreed glossary from Phase 3 for every
 probe term** — that agreement is the entire purpose of Phase 3, and the experiment measures
 whether you honoured it. Write your translation to `{work}/draft_{sec.number:02d}.md`, then publish:
 
@@ -250,7 +255,7 @@ ampi send --to {dest} --tag halo --in "<the last two sentences of your translati
 ```
 '''}{"You are the first section, so you have no upstream neighbour and nothing to receive." if src is None else f'''Receive your upstream neighbour's ending:
 ```
-ampi recv --from {src} --tag halo --timeout 25 --materialize
+ampi recv --from {src} --tag halo --timeout 120 --materialize
 ```
 Then **revise the opening** of your translation so that it reads continuously after that
 ending: fix pronoun antecedents, connectives, and any terminology mismatch. Rewrite
@@ -282,14 +287,14 @@ many `reduce-commit` calls you made in Phase 3. Then:
 
 ```
 ampi win put --win book --key report/{sec.number:02d} --in @{work}/rank{r}_report.json
-ampi gather --root 0 --label results --in @{work}/rank{r}_report.json --timeout 30
+ampi gather --root 0 --label results --in @{work}/rank{r}_report.json --timeout 120
 ```
 
 **PHASE 7 — finish**
 
 ```
-ampi allreduce --op sum --label total-chars --in "<your chinese_chars as a bare number>" --timeout 30 --materialize
-ampi barrier --label done --quorum 0.85 --timeout 25
+ampi allreduce --op sum --label total-chars --in "<your chinese_chars as a bare number>" --timeout 120 --materialize
+ampi barrier --label done --quorum 0.85 --timeout 120
 ampi fini
 ```
 
@@ -326,7 +331,11 @@ ampi info
 
 **PHASE 1 — translate**
 
-Translate the whole of `{secfile}` into {LANG}. Choose the {LANG} rendering for each probe term
+This is your longest step, so first tell the job you are alive and thinking:
+```
+ampi hb --extend 1200
+```
+Then translate the whole of `{secfile}` into {LANG}. Choose the {LANG} rendering for each probe term
 yourself, using your own judgement. Write your translation to `{work}/draft_{sec.number:02d}.md`.
 
 **PHASE 2 — report**
@@ -345,8 +354,8 @@ Write `{work}/rank{r}_report.json` with exactly these keys:
 **PHASE 3 — submit your work to the coordinator**
 
 ```
-ampi gather --root 0 --label collect --in @{work}/draft_{sec.number:02d}.md --timeout 40 --materialize
-ampi gather --root 0 --label reports --in @{work}/rank{r}_report.json --timeout 40
+ampi gather --root 0 --label collect --in @{work}/draft_{sec.number:02d}.md --timeout 150 --materialize
+ampi gather --root 0 --label reports --in @{work}/rank{r}_report.json --timeout 150
 ampi fini
 ```
 
@@ -456,7 +465,7 @@ section 8 calls it another is not usable, however fast it was produced.
         config={
             "eager_tokens": 700,
             "ctx_budget": 120_000,
-            "lease_ns": 2400 * 10 ** 9,
+            "lease_ns": 420 * 10 ** 9,
             "timeout_ns": 40 * 10 ** 9,
             "summary_tokens": 60,
         },

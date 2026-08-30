@@ -71,8 +71,15 @@ def create(
     cfg: Optional[Config] = None,
     preamble: str = "",
     fresh: bool = True,
+    join_grace_s: float = 900.0,
 ) -> Dict[str, Any]:
-    """Create a job directory, journal, world communicator and rank prompts."""
+    """Create a job directory, journal, world communicator and rank prompts.
+
+    ``join_grace_s`` is how long a requested rank has to call ``AMPI_Init``
+    before the failure detector may declare it failed. It is a lease granted at
+    request time rather than at arrival time, which is what makes "the launcher
+    could not start this rank" a detectable failure rather than an eternal wait.
+    """
     root = Path(root).resolve()
     if fresh and (root / STATE_DIR).exists():
         shutil.rmtree(root / STATE_DIR)
@@ -105,9 +112,24 @@ def create(
         p = prompts_dir / f"rank{s.rank:04d}.md"
         p.write_text(text, encoding="utf-8")
         with j.tx() as c:
+            # A **join deadline**. Without one, a rank that never starts at all is
+            # invisible to the failure detector: it has no lease to expire, so it
+            # is neither alive nor failed, and every peer waits for it forever.
+            # We found this the hard way -- a launcher that could only start 10 of
+            # 22 requested ranks produced a job in which the 12 no-shows were
+            # permanently pending. Giving every rank a lease from the moment it is
+            # *requested* rather than from the moment it first calls in makes
+            # launch failure a detectable failure like any other.
             c.execute(
-                "UPDATE rank SET state='spawned', meta=? WHERE job=? AND rank=?",
-                (json.dumps({"prompt": str(p), "env": s.env, "task_chars": len(s.task)}), job_id, s.rank),
+                "UPDATE rank SET state='spawned', meta=?,"
+                " lease_expires_ns=?, last_hb_ns=? WHERE job=? AND rank=?",
+                (
+                    json.dumps({"prompt": str(p), "env": s.env, "task_chars": len(s.task)}),
+                    now_ns() + int(join_grace_s * 1_000_000_000),
+                    now_ns(),
+                    job_id,
+                    s.rank,
+                ),
             )
         manifest["ranks"].append(
             {"rank": s.rank, "role": s.role, "prompt": str(p),

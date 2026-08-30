@@ -115,6 +115,28 @@ def resolve_algo(op: str, algo: Optional[str]) -> str:
     return algo
 
 
+#: Rank count above which a journal-mediated barrier loses to a dissemination
+#: tree. Measured, not guessed: on the reference runtime the crossover sits
+#: between P=16 and P=32 (at P=128, central took 18.0s against dissemination's
+#: 7.4s before the liveness cache was added). The shared medium behaves like a
+#: switch with in-network aggregation up to a point, and like a contended
+#: resource past it -- the same reason MPI implementations abandon linear
+#: collectives at scale.
+BARRIER_CENTRAL_MAX_P = 32
+
+
+def select_barrier_algo(algo: Optional[str], size: int) -> str:
+    """Pick a barrier algorithm from the communicator size.
+
+    This is the AgentMPI analogue of MPICH selecting a collective algorithm from
+    the message size: a threshold fitted to measurement, overridable by the
+    caller, and documented so that a harness author can reason about it.
+    """
+    if algo and algo != "auto":
+        return resolve_algo("barrier", algo)
+    return "central" if size <= BARRIER_CENTRAL_MAX_P else "dissemination"
+
+
 def select_reduce_algo(kind: str, algo: Optional[str], op: "ops_mod.Op") -> str:
     """Automatic algorithm selection for reductions.
 
@@ -347,6 +369,36 @@ def _live_members(ctx: Ctx) -> List[int]:
     return [i for i, w in enumerate(comm_members(ctx.j, ctx.comm)) if w not in dead]
 
 
+class LiveCache:
+    """Cache the liveness view inside a polling loop.
+
+    Recomputing "who is alive" costs a scan of the rank table plus a scan of the
+    communicator membership. Doing that on every poll iteration, from every rank,
+    turns an O(1)-round barrier into O(P^2) journal work per round -- which is
+    exactly why the first measurements showed the journal-mediated barrier losing
+    to a dissemination tree above P=32. Liveness changes on the timescale of a
+    lease (minutes), so a one-second cache is both safe and sufficient.
+    """
+
+    TTL_S = 1.0
+
+    def __init__(self, ctx: Ctx) -> None:
+        self.ctx = ctx
+        self._at = -1e9
+        self._live: List[int] = []
+        self._members: Optional[List[int]] = None
+
+    def __call__(self) -> List[int]:
+        now = time.monotonic()
+        if now - self._at > self.TTL_S:
+            if self._members is None:
+                self._members = comm_members(self.ctx.j, self.ctx.comm)
+            dead = set(failed_ranks(self.ctx.j, self.ctx.comm))
+            self._live = [i for i, w in enumerate(self._members) if w not in dead]
+            self._at = now
+        return self._live
+
+
 def _child_alive(ctx: Ctx, crank: int) -> bool:
     w = comm_to_world(ctx.j, ctx.comm, crank)
     return w not in set(failed_ranks(ctx.j, ctx.comm))
@@ -382,7 +434,8 @@ def barrier(
     bounded-staleness throughput -- the same trade stale-synchronous parameter
     servers make, expressed as a collective.
     """
-    coll, part = join(ctx, "barrier", label=label, algo=algo, quorum=quorum)
+    coll, part = join(ctx, "barrier", label=label,
+                      algo=select_barrier_algo(algo, ctx.size), quorum=quorum)
     algo = str(coll["algo"])
     cid = str(coll["id"])
     t0 = now_ns()
@@ -424,9 +477,10 @@ def _barrier_central(ctx: Ctx, coll: sqlite3.Row, deadline: int) -> Dict[str, An
     q = float(coll["quorum"])
     start = time.time()
     prog = p2p.Progress(ctx)
+    livec = LiveCache(ctx)
     while True:
         prog()
-        live = _live_members(ctx)
+        live = livec()
         need = max(1, math.ceil(q * len(live)))
         arrived = [
             int(r["crank"])
@@ -930,9 +984,10 @@ def _reduce_flat(
             hint="use --algo binomial (or chain) for agent:<label> operators",
         )
     prog = p2p.Progress(ctx)
+    livec = LiveCache(ctx)
     while True:
         prog()
-        live = _live_members(ctx)
+        live = livec()
         need = max(1, math.ceil(q * len(live)))
         rows = j.q(
             "SELECT crank,in_obj FROM coll_part WHERE coll=? AND in_obj IS NOT NULL ORDER BY crank",
@@ -1048,30 +1103,19 @@ def _reduce_tree(
             materialize=materialize, budget=budget, operand_budget=operand_budget,
         )
 
-    while mask < P:
-        if algo == "chain":
-            # Sequential pipeline: P-1 merges on the critical path. Included as
-            # the pessimal baseline, and because it is what a naive
-            # "orchestrator merges everything" harness actually does.
-            if vr == P - 1:
-                partner = None
-            else:
-                partner = (vr + 1 + root) % P
-            if vr == 0:
-                src = (vr + 1 + root) % P if P > 1 else None
-                if src is not None and mask == 1:
-                    got = _recv_operand(ctx, coll, src, tg_base, deadline)
-                    if got is None:
-                        return _await_more(ctx, cid, [src])
-                    return _do_merge(ctx, coll, o, meta, right_obj=got, right_from=src, round_=0,
-                                     operand_budget=operand_budget, next_mask=P)
-                mask = P
-                break
-            # Non-root chain members forward upward once they hold their result.
-            _send_acc(ctx, coll, dest=(vr - 1 + root) % P, tag=tg_base, meta=meta)
-            _set_part(j, cid, rr, state="done", meta=meta, done=True)
-            return {"coll": cid, "role": "contributor", "complete": True, "algo": algo, "merges": merges}
+    if algo == "chain":
+        # Sequential pipeline: rank i receives the running accumulator from i+1,
+        # applies the operator, and passes it to i-1. Every one of the P-1
+        # operator applications is therefore on the critical path. This is the
+        # pessimal schedule, and it is included precisely because it is what a
+        # naive "the orchestrator merges everything" harness actually does -- so
+        # the paper can quantify what the tree buys over it.
+        return _reduce_chain(
+            ctx, coll, o, meta=meta, deadline=deadline, all_=all_, root=root,
+            materialize=materialize, budget=budget, operand_budget=operand_budget,
+        )
 
+    while mask < P:
         if vr & mask:
             dest = ((vr - mask) + root) % P
             _send_acc(ctx, coll, dest=dest, tag=tg_base + int(math.log2(mask)), meta=meta)
@@ -1141,6 +1185,76 @@ def _reduce_tree(
         "merges": merges,
         "note": f"your accumulator was folded upward; the result lands at root rank {root}",
     }
+
+
+def _reduce_chain(
+    ctx: Ctx,
+    coll: sqlite3.Row,
+    o: ops_mod.Op,
+    *,
+    meta: Dict[str, Any],
+    deadline: int,
+    all_: bool,
+    root: int,
+    materialize: Optional[bool],
+    budget: Optional[int],
+    operand_budget: Optional[int],
+) -> Dict[str, Any]:
+    """Linear-chain reduction: P-1 operator applications, all serialised.
+
+    State is a single flag in ``meta`` -- whether we have already folded our
+    successor's accumulator into our own -- which keeps the schedule resumable
+    across an agent-evaluated merge that spans several CLI invocations.
+    """
+    j = ctx.j
+    cid = str(coll["id"])
+    P = ctx.size
+    rr = ctx.crank
+    vr = (rr - root) % P
+    tg = internal_tag("reduce", 200)
+
+    if vr + 1 < P and not meta.get("chain_folded"):
+        succ = (vr + 1 + root) % P
+        if _child_alive(ctx, succ):
+            got = _recv_operand(ctx, coll, succ, tg, deadline)
+            if got is None:
+                return _await_more(ctx, cid, [succ])
+            step_meta = dict(meta)
+            # Persist the "already folded my successor" flag with the merge, so a
+            # resumed invocation does not try to receive from the successor twice.
+            step_meta["chain_folded"] = True
+            res = _do_merge(
+                ctx, coll, o, step_meta, right_obj=got, right_from=succ, round_=vr,
+                operand_budget=operand_budget, next_mask=1,
+            )
+            if res.get("action_required") == "merge":
+                return res
+            return res
+        with j.tx() as c:
+            j.trace("coll_drop_subtree", rank=ctx.rank, epoch=ctx.epoch, comm=ctx.comm,
+                    coll=cid, peer=succ, status="successor_failed", conn=c)
+        meta.setdefault("dropped", []).append(succ)
+
+    meta["chain_folded"] = True
+    if vr > 0:
+        _send_acc(ctx, coll, dest=(vr - 1 + root) % P, tag=tg, meta=meta)
+        _set_part(j, cid, rr, state="done", meta=meta, done=True)
+        if all_:
+            obj = _await_result_obj(ctx, cid, deadline, who=f"root rank {root}")
+            env = _present(ctx, obj, materialize=materialize, budget=budget, what="allreduce result")
+            env.update({"coll": cid, "complete": True, "algo": "chain", "op": o.name,
+                        "merges": int(meta.get("merges", 0))})
+            return env
+        return {"coll": cid, "role": "contributor", "complete": True, "algo": "chain",
+                "merges": int(meta.get("merges", 0)),
+                "note": f"your accumulator was folded and passed toward root rank {root}"}
+    _close(j, cid, result_obj=str(meta["acc"]))
+    env = _present(ctx, str(meta["acc"]), materialize=materialize, budget=budget,
+                   what="reduce result")
+    _set_part(j, cid, rr, state="done", out_obj=str(meta["acc"]), meta=meta, done=True)
+    env.update({"coll": cid, "complete": True, "algo": "chain", "op": o.name,
+                "merges": int(meta.get("merges", 0)), "dropped": meta.get("dropped", [])})
+    return env
 
 
 def _reduce_recursive_doubling(
@@ -1487,9 +1601,10 @@ def gather(
     q = float(coll["quorum"])
     start = time.time()
     prog = p2p.Progress(ctx)
+    livec = LiveCache(ctx)
     while True:
         prog()
-        live = _live_members(ctx)
+        live = livec()
         need = max(1, math.ceil(q * len(live)))
         rows = ctx.j.q(
             "SELECT crank,in_obj FROM coll_part WHERE coll=? AND in_obj IS NOT NULL ORDER BY crank",
