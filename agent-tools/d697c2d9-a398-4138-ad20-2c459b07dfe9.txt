@@ -1,0 +1,500 @@
+Point to point communication - INFO 0939 - High Performance Scientific Computing - Fall 2025
+
+Skip to content
+
+# Blocking point-to-point communication
+
+To introduce the basic principles of work distribution and blocking communication in MPI, we begin with a simple example: computing the value of $$ numerically using the trapezoidal rule. The mathematical foundation of this example is the definite integral
+
+$$ \int_0^1 \frac{1}{x^2 + 1}\,dx = \frac{\pi}{4} $$
+
+If we can approximate this integral numerically, multiplying the result by four will yield an estimate of $\pi$.
+
+In the serial implementation, the integration interval $[0,1]$ is divided into a large number of subintervals. For each subinterval, the midpoint $x_i = (i + 0.5) \cdot step$ is evaluated, and the function value $f(x_i) = 4 / (1 + x_i^2)$ is accumulated into a running sum. Finally, the result is multiplied by the step size to obtain the approximation of $\pi$.
+
+```
+#include <stdio.h>
+#include <stdint.h>
+#include <inttypes.h>
+#include <sys/time.h>
+
+static const uint64_t NUM_STEPS = 1000000000;
+
+int main(int argc, const char *argv[])
+{
+    struct timeval start_time, end_time;
+
+    const double step = 1.0 / ((double)NUM_STEPS);
+
+    gettimeofday(&start_time, NULL);
+
+    double sum = 0.0;
+    for (uint64_t istep = 0; istep < NUM_STEPS; istep++)
+    {
+        const double x = ((double)istep + 0.5) * step; 
+        sum += 4.0 / (1.0 + x * x); 
+    }
+
+    gettimeofday(&end_time, NULL);
+
+    const double pi = step * sum; 
+    const double elapsed = (end_time.tv_sec - start_time.tv_sec) 
+        + (end_time.tv_usec - start_time.tv_usec) / 1e6;
+
+    printf(" Computed value of pi with %" PRIu64 
+           " steps is %.12lf\n", NUM_STEPS, pi);
+    printf(" Computation took %lf seconds\n", elapsed);
+
+    return 0;
+}
+
+```
+
+## Distributing the work among MPI processes
+
+To parallelize the computation of $\pi$, we must divide the loop iterations among the different MPI processes so that each one performs part of the integration independently.
+
+One straightforward approach is to let each process execute every num_ranks-th iteration, starting from its own rank:
+
+```
+for (uint64_t i = rank; i < NUM_STEPS; i += num_ranks)
+
+```
+
+This so-called cyclic distribution is simple and works well for balanced workloads. However, a more general and efficient approach, applicable to a wider range of problems, is to divide the loop into contiguous chunks. Each process computes its own starting and ending indices based on its rank and the total number of ranks:
+
+$$ \text{start} = \frac{N_{\text{steps}} \cdot \text{rank}}{N_{\text{ranks}}} $$
+
+$$ \text{end} = \frac{N_{\text{steps}} \cdot (\text{rank} + 1)}{N_{\text{ranks}}} - 1 $$
+
+This method ensures that every iteration is executed exactly once and that the total work is evenly distributed, even when the number of steps is not perfectly divisible by the number of processes.
+
+### Implementations of work distribution
+
+In the parallel implementation, each process begins by determining its rank and the total number of ranks in the communicator using the functions`MPI_Comm_rank` and`MPI_Comm_size`. Using these values, the process computes its start and end indices as described above. It then performs its local portion of the numerical integration:
+
+```
+int rank, num_ranks;
+MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+MPI_Comm_size(MPI_COMM_WORLD, &num_ranks);
+
+const uint64_t start = (NUM_STEPS * rank) / num_ranks;
+const uint64_t end = (NUM_STEPS * (rank + 1UL)) / num_ranks;
+
+double sum = 0.0;
+for (uint64_t istep = start; istep < end; istep++)
+{
+    const double x = ((double)istep + 0.5) * step
+    sum += 4.0 / (1.0 + x * x); 
+} 
+
+```
+
+## Communicating the results
+
+Once each process has computed its local partial sum, these results must be combined to obtain the final value of $\pi$. Since the distributed-memory model does not provide a shared variable where all processes can directly write their contributions, the partial sums must be explicitly sent from each process to a designated root process, usually the one with rank 0. The root process then receives these values and adds them together to produce the global result.
+
+To perform this communication, we use MPI’s message-passing interface, specifically the routines`MPI_Send` and`MPI_Recv`. These routines form the foundation of all point-to-point communication in MPI.
+
+In order to send and receive data correctly, MPI needs three pieces of information:
+
+- A description of the data such as where in memory the data begins, how many elements are being transferred, and of what datatype (e.g.,`MPI_INT`,`MPI_DOUBLE`, etc.).
+- The identity of the communication partners, specifically, the rank of the sender and the rank of the receiver.
+- A message tag, an integer that uniquely identifies the type of message, allowing different kinds of communication to occur simultaneously without confusion.
+
+These parameters ensure that every message sent through MPI can be unambiguously matched to the correct receive operation.
+
+### Sending a message
+
+The basic function for sending a message is:
+
+```
+int MPI_Send(const void *buf, int count, MPI_Datatype datatype, int dest,
+             int tag, MPI_Comm comm)
+
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `buf` | (in) Initial address of send buffer |
+| `count` | (in) Maximum number of elements to send |
+| `datatype` | (in) Datatype of each send buffer entry |
+| `source` | (in) Rank of destination |
+| `tag` | (in) Message tag |
+| `comm` | (in) Communicator |
+
+### Receiving a message
+
+Receiving data is done with`MPI_Recv`, which has the form:
+
+```
+int MPI_Recv(void *buf, int count, MPI_Datatype datatype,
+             int source, int tag, MPI_Comm comm, MPI_Status *status)
+
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `buf` | (out) Initial address of receive buffer |
+| `count` | (in) Maximum number of elements to receive |
+| `datatype` | (in) Datatype of each receive buffer entry |
+| `source` | (in) Rank of source |
+| `tag` | (in) Message tag |
+| `comm` | (in) Communicator |
+| `status` | (out) Status object |
+
+The arguments mirror those of`MPI_Send`, but the additional parameter status provides information about the message that was received, such as who sent it, what tag it used, and whether any error occurred.
+
+The`MPI_Status` object returned by`MPI_Recv` holds metadata about the message. It is a structure with three main fields:
+
+- `MPI_SOURCE`: the rank of the sender
+- `MPI_TAG`: the tag of the message
+- `MPI_ERROR`: any error code associated with the communication
+
+If this information is not needed, the constant`MPI_STATUS_IGNORE` can be used instead of a valid status pointer.
+
+When calling`MPI_Recv`, the count argument specifies the maximum number of elements that can be received, not necessarily the exact number that will be transferred. If fewer elements are sent than the receiver expects, the remaining space in the buffer is left untouched.
+
+To determine how many elements were actually received, one can call the function`MPI_Get_count`. This routine examines the status returned by`MPI_Recv` and reports the exact number of items that arrived for the specified datatype.
+
+```
+int MPI_Get_count(const MPI_Status *status, MPI_Datatype datatype,
+                  int *count)
+
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `status` | (in) Initial address of receive buffer |
+| `datatype` | (in) Datatype of the receive buffer entry |
+| `count` | (out) Number of received elements |
+
+### MPI datatypes and native types
+
+MPI must know how to interpret the memory layout of the data being sent or received. This is achieved through MPI datatypes, which describe the format and size of elements. The table below provide the mapping between the MPI datatypes and the native C datatypes.
+
+| MPI datatype | C datatype |
+| --- | --- |
+| `MPI_CHAR` | `char` |
+| `MPI_UNSIGNED_CHAR` | `unsigned char` |
+| `MPI_INT` | `int` |
+| `MPI_UNSIGNED` | `unsigned int` |
+| `MPI_LONG` | `long int` |
+| `MPI_UNSIGNED_LONG` | `unsigned long int` |
+| `MPI_FLOAT` | `float` |
+| `MPI_DOUBLE` | `double` |
+| `MPI_BYTE` | `unsigned char` |
+
+### Message matching rules
+
+For communication to succeed, MPI uses a set of message matching rules to pair sends and receives correctly:
+
+- The send and receive must use the same communicator.
+- The tag used by both must match, unless the receiver specifies the wildcard`MPI_ANY_TAG`.
+- The receiver must specify either a specific source rank or the wildcard`MPI_ANY_SOURCE`.
+- The sender must specify the destination rank explicitly.
+
+MPI guarantees ordering: if multiple messages are sent from the same sender to the same receiver with the same tag and communicator, they will be received in the order they were sent.
+
+These rules ensure deterministic and reliable communication between processes.
+
+### Computing the final result of $\pi$
+
+Now that we can send and receive messages, we can complete the parallel computation of $\pi$. Each process computes its partial sum independently. Once finished, all processes except rank 0 send their results to the root process. Rank 0 receives these partial sums, adds them together, and prints the final estimate of $\pi$.
+
+This can be implemented as follows:
+
+```
+if (rank == 0) 
+{
+    double pi = step * sum;
+    for (int srank = 1; srank < num_ranks; srank++) 
+    {
+        double remote_sum;
+        MPI_Recv(&remote_sum, 1, MPI_DOUBLE, srank, 1,
+                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+        pi += step * remote_sum;
+    }
+
+    printf("Computed value of pi with %" PRIu64 
+           " steps is %.12lf\n", NUM_STEPS, pi);
+} 
+else 
+{
+    MPI_Send(&sum, 1, MPI_DOUBLE, 0, 1, MPI_COMM_WORLD);
+}
+
+```
+
+This approach illustrates the basic use of explicit point-to-point communication for gathering distributed results. However, it is not the most efficient method: the root process performs all the receiving and summing, creating a potential bottleneck. Later, we will explore collective communication operations, such as`MPI_Reduce`, which perform this combination more efficiently and automatically.
+
+## Communication protocols in MPI
+
+MPI defines several protocols for sending messages between processes. The two main ones are the Eager and Rendezvous protocols, each optimized for different message sizes and performance trade-offs.
+
+### The Eager protocol
+
+The Eager protocol is typically used for small messages, where minimizing latency is more important than minimizing memory usage. In this protocol, the sender immediately transmits the entire message to the receiver without waiting to confirm that the receiver is ready.
+
+When an eager send occurs, the message is placed into a pre-allocated buffer on the receiver’s side, managed internally by the MPI implementation. This allows the sender to proceed without blocking, as long as sufficient buffer space is available. The receiver, when it later posts a matching`MPI_Recv` call, retrieves the data directly from the buffer into its own memory space.
+
+This strategy allows communication to overlap with computation and avoids synchronization delays, but it relies on the existence of pre-allocated buffers. If too many eager sends are performed simultaneously, available buffer space can become exhausted, leading to performance degradation or, in some rare cases, forced fallback to a slower protocol.
+
+### The Rendezvous protocol
+
+For large messages, MPI uses the Rendezvous protocol, which avoids excessive buffering. In this case, the sender does not immediately transmit the full message. Instead, it begins by sending a small control message called a Request to Send (RTS) to the receiver.
+
+When the receiver is ready and has posted a matching`MPI_Recv`, it responds with a Clear to Send (CTS) acknowledgment. Only then does the sender transfer the actual data directly into the receiver’s memory.
+
+This handshake ensures that large amounts of data are only sent when the receiver has explicitly prepared to receive them, avoiding unnecessary buffering and memory usage. While this approach minimizes memory overhead, it introduces additional synchronization, which can slightly increase latency compared to the eager protocol.
+
+### When does MPI_Send return?
+
+The exact point at which a call to`MPI_Send` returns depends on both the send mode and the communication protocol being used.
+
+In all cases,`MPI_Send` is a blocking operation, meaning that it will not return until the send buffer can be safely reused by the program. However, “safe to reuse” does not always mean that the message has been received by the destination process.
+
+Under the Eager protocol,`MPI_Send` may return as soon as the message has been copied into an internal system buffer. The sending process can then proceed, even though the receiver may not yet have called`MPI_Recv`.
+
+Under the Rendezvous protocol,`MPI_Send` does not return until the receiver has posted a matching receive and the data transfer has completed.
+
+This difference means that the same MPI program might behave differently depending on message size and underlying implementation details, which can have important consequences for program correctness.
+
+### When Does MPI_Recv Return?
+
+Unlike`MPI_Send`, the semantics of`MPI_Recv` are always the same. The call is blocking, meaning it will not return until the receive buffer has been completely filled with the incoming message. Once the function returns, it is guaranteed that the data in the receive buffer is valid and ready for use.
+
+### A Common Pitfall: Deadlocks Caused by Protocol Differences
+
+The differences between the eager and rendezvous protocols can sometimes cause subtle bugs. A common issue occurs when two processes both attempt to send data to each other before posting any receives.
+
+If the message size is small and the MPI implementation uses the Eager protocol, both sends can succeed because each message is buffered on the receiver’s side. The program runs successfully.
+
+However, if the message size increases beyond the eager threshold, the MPI library switches to the Rendezvous protocol. In this case, both processes send an RTS message and then wait for a CTS from the other side. Since neither process posts a receive, the CTS messages are never sent, and both processes remain blocked indefinitely — a deadlock.
+
+This illustrates why relying on implicit buffering behavior is dangerous and why send/receive ordering must be designed carefully, especially when scaling applications to larger data sizes or process counts.
+
+### Tag Mismatch Pitfalls
+
+Another common cause of deadlock or incorrect behavior arises from mismatched message tags. MPI uses tags to distinguish between different types of messages. When two processes exchange multiple messages, the order and tag values of sends and receives must align perfectly.
+
+If one process expects messages in a different order or with different tags, a send operation may block indefinitely waiting for a receive that never matches. This is particularly problematic when the Rendezvous protocol is used because it requires both sides to explicitly coordinate before data transfer begins.
+
+### Forcing Synchronous Communication
+
+MPI provides an explicit way to force synchronous (Rendezvous-style) behavior, regardless of message size, using the`MPI_Ssend` function. This blocking send routine guarantees that the send will not complete until a matching receive has been initiated by the destination process.
+
+This ensures deterministic synchronization between sender and receiver, making potential race conditions or protocol-dependent behavior easier to reason about. The syntax of`MPI_Ssend` is identical to that of`MPI_Send`, differing only in its stronger synchronization semantics.
+
+## A second application: 1D diffusion equation
+
+In parallel computing, tasks differ greatly in how much communication and synchronization they require between processes. The simplest category is that of embarrassingly parallel problems. In such cases, each process can perform its computation completely independently, without the need to exchange data or coordinate with others. An example of this is the numerical integration of $\pi$.
+
+In contrast, many scientific and engineering simulations fall into the category of tightly coupled problems. In these cases, the result of each computation depends on data produced by other processes, often at every iteration or time step. Examples include the simulation of physical systems governed by partial differential equations (PDEs), where neighboring spatial points influence one another. Solving such problems efficiently in parallel requires careful design of communication patterns to exchange boundary or intermediate data between processes.
+
+A classical example of a tightly coupled problem is the one-dimensional diffusion equation, also known as the heat equation:
+
+$$ \frac{\partial u}{\partial t} = \alpha \frac{\partial^2 u}{\partial x^2}, \quad x \in (0, L), \; t \in (0, T] $$
+
+Here, $u(x,t)$ represents the temperature distribution along a one-dimensional rod over time, and $\alpha$ is the diffusion coefficient controlling the rate of heat transfer.
+
+To solve this equation numerically, we discretize both time and space. Using a forward difference in time and a central difference in space yields the finite-difference approximation:
+
+$$ \frac{u_i^{n+1} - u_i^n}{\Delta t} = \alpha \, \frac{u_{i+1}^n - 2u_i^n + u_{i-1}^n}{\Delta x^2} $$
+
+Rearranging for $u_i^{n+1}$ gives the explicit time-stepping formula:
+
+$$ u_i^{n+1} = u_i^n + \frac{\alpha \, \Delta t}{\Delta x^2} \left( u_{i+1}^n - 2u_i^n + u_{i-1}^n \right) $$
+
+At each time step, the update at grid point $i$
+
+depends on its immediate neighbors $i-1$ and $i+1$. This local dependency structure is what makes the diffusion equation tightly coupled: processes responsible for adjacent portions of the domain must exchange boundary values at each iteration.
+
+The serial implementation of the 1D diffusion equation would look like this:
+
+```
+#include <stdlib.h>
+#include <stdio.h>
+#include <math.h>
+
+static const size_t GRID_SIZE  = 512;
+static const int    NUM_TSTEPS = 100000;
+static const int    NOUT       = 1000;
+static const double XLEN       = 2.0;
+static const double DIFF_COEF  = 1.0;
+
+int main(int argc, char *argv[]) 
+{  
+  const double dx = XLEN / GRID_SIZE;
+  const double dt = 0.5 * dx * dx / DIFF_COEF;
+  const double alphadt_dx2 = DIFF_COEF * dt / (dx * dx);      
+
+  double* uold = (double*)malloc(sizeof(double)*(GRID_SIZE+2));
+  double* unew = (double*)malloc(sizeof(double)*(GRID_SIZE+2));
+
+  // Initial conditions
+  for(int i = 1; i <= GRID_SIZE; i++)
+  {
+    const double x = dx * ((double)(i - 0.5) - 0.5 * XLEN;
+    uold[i] = 0.5 * cos(2.0 * M_PI * x / XLEN) + 0.5;
+  }
+
+  // Left boundary condition
+  if (rank == 0) {
+    uold[0] = 0.0;
+    unew[0] = 0.0;
+  }
+
+  // Right boundary condition
+  if (rank == num_ranks-1) {
+    uold[subdom_size+1] = 0.0;
+    unew[subdom_size+1] = 0.0;
+  }
+
+  double t = 0.0;
+  for (int tstep = 1; tstep <= NUM_TSTEPS; tstep++)
+  {
+    for (int i = 1; i <= GRID_SIZE; i++)
+    {
+      unew[i] = uold[i] + alphadt_dx2 * (uold[i+1] - 2.0 * uold[i] + uold[i-1]);
+    }
+
+    t += dt;
+
+    double *tmpptr = uold;
+    uold = unew;
+    unew = tmpptr;
+  }
+
+  free(uold);
+  free(unew);
+
+  return 0;
+}
+
+```
+
+### Domain decomposition
+
+To parallelize the computation, the spatial domain is decomposed into subdomains, each assigned to a different process. Every process updates the grid points within its subdomain, but since each update depends on neighboring values, communication between adjacent processes is required.
+
+To handle this efficiently, ghost cells (or halo cells) are introduced. These are extra grid points at the edges of each subdomain that store copies of the neighboring process’s boundary data. At every time step, each process exchanges its boundary values with its left and right neighbors using message passing.
+
+This exchange ensures that when each process performs the local update for its interior points, the required neighboring values are up to date.
+
+A straightforward MPI implementation of the 1D diffusion solver uses blocking communication (`MPI_Send` and`MPI_Recv`) to exchange boundary data:
+
+```
+const size_t subdom_start = GRID_SIZE * rank / num_ranks;
+const size_t subdom_end   = GRID_SIZE * (rank + 1) / num_ranks;
+const size_t subdom_size  = subdom_end - subdom_start;
+
+const int left_rank  = rank > 0         ? rank - 1 : MPI_PROC_NULL;
+const int right_rank = rank < num_ranks ? rank + 1 : MPI_PROC_NULL;
+
+for (int tstep = 0; tstep < num_tsteps; tstep++) {
+  MPI_Send(&uold[subdom_size], 1, MPI_DOUBLE, right_rank, 0, MPI_COMM_WORLD);
+  MPI_Recv(&uold[0],           1, MPI_DOUBLE, left_rank,  0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Send(&uold[1],             1, MPI_DOUBLE, left_rank,  1, MPI_COMM_WORLD);
+  MPI_Recv(&uold[subdom_size+1], 1, MPI_DOUBLE, right_rank, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  for (int i = 1; i <= subdom_size; i++) {
+    unew[i] = uold[i] + alpha_dt_dx2 * (uold[i+1] - 2.0 * uold[i] + uold[i-1]);
+  }
+}
+
+```
+
+Here, each process sends its rightmost interior value to its right neighbor and receives from its left neighbor, then reverses direction. This ensures that both ghost cells are updated before proceeding to the computation loop that updates the interior points.
+
+Boundary processes (those at the ends of the domain) do not have both neighbors. To simplify the code and avoid special cases, MPI defines a special constant,`MPI_PROC_NULL`, that represents a "nonexistent" process.
+
+When a communication call is made with`MPI_PROC_NULL` as the source or destination:
+
+- A send to`MPI_PROC_NULL` completes immediately and does nothing.
+- A receive from`MPI_PROC_NULL` also completes immediately and leaves the receive buffer unchanged.
+
+This allows the same communication pattern to be used for all processes, including those at the edges of the domain, without requiring conditional statements to skip boundary communications.
+
+### Communication performance
+
+When using blocking`MPI_Send` and`MPI_Recv` calls, performance can degrade significantly if the underlying MPI implementation uses the Rendezvous protocol for message transfer. In this case, each send operation waits until the matching receive has been posted before proceeding.
+
+As a result, communication between neighboring processes can become serialized: each process must wait for its neighbor to reach the corresponding communication point. On large numbers of processes, this effect can lead to severe slowdowns because it introduces unnecessary dependencies.
+
+### Periodic boundaries and deadlocks
+
+If the domain uses periodic boundary conditions, the leftmost and rightmost processes are also neighbors. A naive implementation where all processes issue their sends first can lead to deadlocks, because each process waits for the other to post a receive.
+
+To avoid this, the communication pattern must be modified so that not all processes are blocked simultaneously. Two common solutions are:
+
+- Odd–even ordering, where even-ranked processes send first and odd-ranked ones receive first.
+- Using the combined send–receive routine, MPI_Sendrecv, which performs both operations safely in a single call.
+
+#### The Odd–Even Communication Pattern
+
+In the odd–even pattern, processes with even ranks perform their sends before receives, while processes with odd ranks do the reverse. This ensures that for every pair of neighbors, one is sending while the other is receiving, avoiding deadlock.
+
+```
+if(rank % 2 == 0) {
+  MPI_Send(&uold[subdom_size], 1, MPI_DOUBLE, right_rank, 0, MPI_COMM_WORLD);
+  MPI_Recv(&uold[0],           1, MPI_DOUBLE, left_rank,  0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Send(&uold[1],             1, MPI_DOUBLE, left_rank,  1, MPI_COMM_WORLD);
+  MPI_Recv(&uold[subdom_size+1], 1, MPI_DOUBLE, right_rank, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+} else {
+  MPI_Recv(&uold[0],           1, MPI_DOUBLE, left_rank,  0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  MPI_Send(&uold[subdom_size], 1, MPI_DOUBLE, right_rank, 0, MPI_COMM_WORLD);
+
+  MPI_Recv(&uold[subdom_size+1], 1, MPI_DOUBLE, right_rank, 1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+  MPI_Send(&uold[1],             1, MPI_DOUBLE, left_rank,  1, MPI_COMM_WORLD);
+}
+
+```
+
+This pattern is simple to implement and works reliably even with blocking communications. However, it requires additional logic and branching, which may slightly complicate the code.
+
+#### The combined send–receive operation
+
+MPI provides a built-in function,`MPI_Sendrecv`, that eliminates the need for manual ordering. This function combines a send and a receive into one call:
+
+```
+int MPI_Sendrecv(const void *sendbuf, int sendcount, MPI_Datatype sendtype,
+                 int dest, int sendtag, void *recvbuf, int recvcount,
+                 MPI_Datatype recvtype, int source, int recvtag,
+                 MPI_Comm comm, MPI_Status *status)
+
+```
+
+| Argument | Meaning |
+| --- | --- |
+| `sendbuf` | (in) Initial address of send buffer |
+| `sendcount` | (in) Number of elements to send |
+| `sendtype` | (in) Type of elements in send buffer |
+| `dest` | (in) Rank of destination |
+| `sendtag` | (in) Send tag |
+| `recvbuf` | (out) Initial address of receive buffer |
+| `recvcount` | (in) Maximum number of elements to receive |
+| `recvtype` | (in) Type of elements in receive buffer |
+| `source` | (in) Rank of source |
+| `recvtag` | (in) Receive tag |
+| `comm` | (in) Communicator |
+| `status` | (out) Status object |
+
+Using`MPI_Sendrecv`, MPI ensures that the communication subsystem handles potential cyclic dependencies internally, guaranteeing progress and preventing deadlocks.
+
+In the 1D diffusion solver, ghost cell exchanges can be implemented in two simple calls:
+
+```
+// Send to the left and receive from the right
+MPI_Sendrecv(&uold[            1], 1, MPI_DOUBLE, left_rank,  0,
+             &uold[subdom_size+1], 1, MPI_DOUBLE, right_rank, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+// Send to the right and receive from the left
+MPI_Sendrecv(&uold[subdom_size], 1, MPI_DOUBLE, right_rank, 1,
+             &uold[          0], 1, MPI_DOUBLE, left_rank,  1, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+```
+
+This pattern is compact, and efficient, making it the preferred approach.

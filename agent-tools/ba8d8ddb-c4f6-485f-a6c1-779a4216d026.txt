@@ -1,0 +1,408 @@
+Hierarchical Server Architecture for Agentic Science
+
+# Hierarchical Server Architecture for Agentic Science
+
+ Vanessa Sochat sochat1@llnl.gov 0000-0002-4387-3819 Lawrence Livermore National Laboratory Livermore California USA and Daniel Milroy milroy1@llnl.gov 0000-0001-6500-3227 Lawrence Livermore National Laboratory Livermore California USA 
+
+###### Abstract.
+
+Agentic science is transforming the landscape of computational work, extending to scientific pipelines and workload managers. The workloads require specialized hardware within and across institutions. If assessing workload needs against environments is required for scheduling, automated discovery of resources is an essential step. In this paper, we present a hierarchical, dynamic architecture and software to discover resources across diverse cloud, edge, and HPC systems. The design enables concurrent, asynchronous negotiation, selection, and dispatch of requests for work using secretary agents. The agents probe and discover 51 real and simulated providers across 7 categories. We perform 19,973 negotiation and 6,952 selection simulations to assess reliability of decisions, demonstrating high (87.71%) negotiation accuracy and selection costs comparable to more traditional strategies. Designed for extensibility and currently supporting the Genesis Mission, this architecture exemplifies the importance of careful coordination between agents, discovery tools, and infrastructure for agentic science.
+
+## 1. Introduction
+
+The high performance computing (HPC) center of the future is not just a facility for running jobs. It is a proactive, autonomous platform that accelerates science. The underlying brain of the operation are Large Language Models (LLMs) that can receive and intelligently respond to requests. In this possible future, a user no longer submits a job as a structured script with directives for a specific workload manager. It is provided as a textual request for resource quantity and type, and a preference for priority in time to completion, cost, and performance. Arguably, work in converged computing (Sochat et al., 2024) provides a foundational space of thinking for how traditional HPC technologies can be integrated with and extended to cloud-like environments (Sochat et al., 2025a). The movement serves as a means to transition from what has been understood for decades as default practices to a remarkably different set that we aspire to.
+
+The converged computing movement encompasses work related to scheduling (Misale et al., 2021; Wu et al., 2024; Hazlewood, 2025), workload orchestration (Sochat et al., 2025b), storage technologies (Badia Sala et al., 2017), and network (Jolicoeur et al., 2025; Link et al., 2019). While thinking was initially scoped to individual projects and features, the movement has transitioned to a larger goal to imagine an entire HPC center, including not just automation, modularity, and declarative management in center design, but also integration of LLMs and agents to accomplish scientific tasks. These models stem from artificial intelligence and machine learning (AI/ML) research that has reached an inflection point. It is clear the world has and will continue to change. While early work that brought LLMs into science focused on hypothesis generation and literature review, it has now expanded to encompass experimental design, application optimization (Hartung, 2025), and domain-specific analysis (Xin et al., 2025). An equally important task is oriented to the computational resource provisioning and management itself. Such work is reflected in national incentives via projects like the Future Generation HPC Center (FG-HPCC) (Lawrence Livermore National Security, LLC, 2025) and Genesis Mission (Gil and Moler, 2025), initiatives that explicitly fund what is deemed important.
+
+There is ample multi-cluster work to enable distributed workflows in cloud environments (Wang et al., 2025; Bahreini et al., 2024; El Kafhali, 2026). A common strategy is to dispatch a submitted job to all or multiple clusters in a set, and the first cluster to run is given ownership (SchedMD, 2024; Developers, 2024b). This approach carries a bias that running sooner is the preferred method of cluster selection. However, a resource available sooner may not be “best” for the work. The duration may be longer than another choice depending on execution time, more expensive, or not ideal for the application needs. There is also time and compute required to orchestrate the dispatches and cancel, putting load on not just one cluster, but all clusters in a fleet. An improvement to this approach would not blindly submit to all clusters, but rather select intelligently.
+
+Within development that falls under the umbrella of agentic science, a distinction must be made between resource provisioning and workflow management. While both account for application-specific needs, the first falls under the domain of administration, hardware, and dispatch, while the second is focused on application parameter selection, step coordination, and decision making. A high performance computing (HPC) center is no longer a well-understood environment that can be expected to have a specific workload manager or software suite. It could be a dynamic Kubernetes cluster running on cloud resources, a set of virtual machines with Slurm, a single server providing access to an edge device, or a traditional on-premises resource. Equally, a strategy to dispatch work cannot assume a specific manager, software distribution strategy, or network. The span of resources that are present must be probed, discovered, and made accessible not just to a local resource manager, but potentially to a fleet of computational resources that serves a broad set of users, use cases, and workload types.
+
+In this work, we present a novel architecture and supporting software to enable the probe, discovery, proposal generation, and selection of workloads. We make the following contributions:
+
+- •
+- Implementation of agentic hierarchical server architecture
+- •
+- 19,973 experiments to assess reliability of job negotiation
+- •
+- 6,952 simulations for testing of job selection
+- •
+- 51 simulated and real resource provider interfaces
+- •
+- Resource secretary software/agents for provider discovery
+- •
+- Algorithms for prompt and worker archetype generation
+- •
+- Over 20K open source datasets with detailed interactions
+
+In Section 2.1 we describe the server and software components. The server is multi-faceted, serving as a unit in any level of a hierarchy of servers – a hub, worker, both, or neither – to be deployed under a job, at the top of a cluster, or a fleet. The server as a standalone unit can provision tools, event streams, and standard prompts and resources for agents. In a hierarchy, communication can asynchronously and concurrently propagate between child and parent levels, allowing for intelligent and agentic job submission and dispatch. An agentic secretary and discovery software expose real and simulated resource providers, allowing a worker to provide on-demand information or status about its state. The architecture supports registration with credentials to join to a parent and respond to work requests. In Section 3.1 we describe the agentic secretary that handles job negotiation, selection, and dispatch. We perform 19,973 and 6,952 simulations for each of negotiation and selection (Section 3.2) with 200 worker archetypes for HPC, cloud, and edge devices to assess prompts generated from a gradient of specificity. Our negotiation agents are able to discover simulated providers and give an accurate satisfiability assessment with high accuracy (87.71%), and our selection agents show cost efficiency comparable to more traditional strategies. Importantly, we demonstrate the capabilities of the architecture to orchestrate job negotiation experiments at several levels. We present practical advice for design of descriptive, agentic dispatch systems and finish with discussion (Section 5) about lessons learned and future work.
+
+## 2. Methods
+
+### 2.1. Model Context Protocol Server
+
+The Model Context Protocol (MCP) is a standard that was developed by Anthropic with the goal of standardizing LLM interactions with a server. It was donated to the Agentic AI Foundation in 2025, and is now an industry standard (Developers, 2024c) that provides a defined set of json-rpc calls expected between a client and server. A primary contribution of MCP to the scientific community is one of sociotechnical significance: agreeing to use the same protocol.
+
+The model context protocol server (mcp-server) project (Sochat, 2026c, b) aims to provide a base server for the dynamic addition of resources to jobs, cluster services, and orchestrations that need to serve LLM agents. By way of a YAML configuration file, a user can dynamically add tools, prompts, resources, and events at the level of a single node, a job, a shared cluster resource, or a center (Figure 1). A parent worker that distributes requests to child workers is considered a hub. A group of workers is called a fleet. The requests can be batched, serial, or done in parallel. Any computational resource can start a server with an address and credentials for a parent to register to a larger network. For the purposes of this work we consider workers as cloud, edge, and on-premises clusters, either real or simulated.
+
+Figure 1. The mcp-server hierarchy at multiple levels. When deployed under the context of a Job, the server exists for the lifecycle of the job and is user owned and provisions functions for an application or workflow orchestration. At the level of the Cluster it requires multi-tenancy authentication and authorization and runs as a persistent service. On the level of a Center, the server requires the highest level of security.
+
+Hierarchical Design An mcp-server can be deployed at several levels that map to use cases for an application, cluster, or center (Figure 1). The hub is designed to minimize computational work, and distribute requests efficiently using asynchronous, concurrent calls. Its primary role is to receive and transmit requests. Computational work such as serving models for LLMs or executing decision algorithms are placed on leaf workers or the calling client. While a hub can be included in a fleet and dually act as a worker, we recommend a standalone hub for production use cases.
+
+Authentication and Authorization An mcp-server hub can be deployed with or without SSL or authentication, the process of identifying the user, and authorization, determining if the user has permission to access a resource (authN and authZ). We provide token-based authentication. These interfaces are provided as middleware, and can be extended to include institution-specific needs. While detailed design on this aspect of the architecture is out of scope for this work, national initiatives have authZ and authN as a primary focus (Gil and Moler, 2025; Lawrence Livermore National Security, LLC, 2025). Logically, most production cases would require both, however testing and development does not. For our local testing and simulations we did not enable it.
+
+Capabilities The MCP standard defines capabilities as tools (executable functions), resources (read-only data), and prompts (templates for agents). While it is common practice to see libraries for agentic science implement servers and tools alongside one another with hard-coded decorators for discovery (Menon et al., 2026; Laboratory, 2024), the mcp-server takes a more flexible approach to load capabilities dynamically from a configuration file along with custom capabilities that a specific application might need at execution time.
+
+The mcp-server adds event subscriptions to extend traditional MCP. Using the synchronous request model afforded by HTTP, a requester must wait for a server response. By way of streamable HTTP notifications (Developers, 2024a), we provision a Subscription Manager that can register, validate, and deliver events from a local provider. A user server can register an event streaming class (e.g., events from workload managers Kubernetes and Flux (Ahn et al., 2014)) on the fly, and events are collected in the background that can be delivered as they come, or in batches between looped requests.
+
+Job Negotiation When running as a hierarchy, the hub and workers handle job negotiation, which is the receipt of a textual request for work that leads to dispatch to a specific computational resource in the fleet (Figure 2). The steps for job negotiation include:
+
+- •
+- Submit a textual request for work (application and resources).
+- •
+- Query the fleet to evaluate if the request can be satisfied.
+- •
+- Receive proposals from distributed secretary agents.
+- •
+- Select a proposal based on algorithm and user policy.
+- •
+- Dispatch work to the target cluster.
+
+We provide software, the “Resource Secretary,” that provides a client to easily perform the interactions above and a Secretary Agent (Section 3.1) that evaluates the computational resource for satisfiability. The software enables resource provider discovery for the worker (Section 3.2). Job negotiation is discussed next.
+
+## 3. Agentic Negotiation
+
+Workload Submission Negotiation is the process to query a set of resources to determine satisfiability of work. A user submits a textual request for work to a hub to the negotiate_job endpoint. The prompt can take on any level of detail that is desired, for example, including a workload and scale to run, policy or priority for the job, and needs for time and cost. The request can range from an exact command to a generic description that the agent must parse. If an agent does not have enough information to complete a request during negotiation, it is returned with feedback to the user to update the request. The flow of a request is shown in Figure 2. The request is received by the hub, and is parsed into a prompt and sent out to workers asynchronously and concurrently using a gather function (4). A worker receives the request via the ask_secretary function, where a Secretary Agent (Section 3.1) is instantiated to serve as a representative for the computational resource. By way of a discoverable provider interface, the agent is able to see and query the current state of the resources it owns. Importantly, each SecretaryAgent instance is scoped to one job request for security – information cannot be shared across jobs. Computational resources can use private or on-premises models. The model name, type, and credentials are discovered in the environment, and the model connection is created by a generic interface that handles the OpenAI application programming interface (API) standard and Google Gemini. This interface can be extended to other API s.
+
+Selection Secretary Agents respond to the calling server with a proposal for work. The proposals return from workers and are received by the parent hub. They are immediately sent back to the calling client to perform selection. Selection is the process of choosing a cluster from the set of proposals. Importantly, the selection algorithm is run by the calling client, removing any computational burden from the fleet or a hub, and allowing for use of private models or custom algorithms and interfaces written by developer users. The client uses the resource secretary software selection algorithm interface to call one or more selection algorithms (Table 1) to choose a cluster. These algorithms currently are a combination of more traditional heuristics (N=6) and one agentic. For experimental use, the secretary agent command line tool can also receive proposals that have been saved as JSON to perform the same selection.
+
+A single proposal carries a verdict of READY (the cluster can satisfy and receive the work immediately), BUSY (the cluster can satisfy and receive the work later), or INCOMPATIBLE (the cluster cannot satisfy the needs of the job). During negotiation, the agent must provide reasoning along with metrics and constraints in a JSON formatted response. These statuses are primarily provided to assist the selection algorithms described in Table 1. If no proposals can accept work, the user receives feedback, and can update and resubmit the request.
+
+Workload Dispatch A selected proposal is sent as a dispatch request to the hub via the dispatch_job endpoint, and the work is sent to the Secretary Agent representing the chosen cluster, again as a prompt. The agent takes ownership of the job, using a prompt informed by its local resources along with dispatch tools provisioned by the providers to submit the work. Ownership is not just preparation of the submission, but also monitoring state update. Toward this aim, while not required for a worker, it is suggested to use streaming events (Section 2.1) for this purpose.
+
+Figure 2. Job Negotiation. The client makes a request for an application, resources, and constraints (1) received by the hub that makes a concurrent request to workers via ask_secretary (2). The secretary agent of each cluster receives the request. Resource providers allow for dynamic query (3). The agent explores until it has sufficient information to return a proposal (4). A selection algorithm is used (5) to choose a cluster. The client calls dispatch_job to dispatch the work to hub (6), and the hub submits (7) to the selected cluster. The secretary agent transforms the request into a job for the workload manager (8) and the work is executed (9). 
+
+### 3.1. The Resource Secretary
+
+The resource secretary software (Sochat, 2026d, e) is a generic interface library that defines 51 real and simulated resource providers (Table 3) for use by an LLM-driven Secretary Agent to determine the appropriateness of a work request for a computational resource. The library has a command line interface, resource-ask, to expose job negotiation or component steps (Listing 1).
+
+ ⬇ 1# Includes request, query, selection, and dispatch 2 resource- ask negotiate "I need <resources, constraints>" 3 4# Includes request and query 5 resource- ask satisfy "I need <resources, constraints>" 6 7# Includes request, query, and select 8 resource- ask select "I need <resources, constraints>" 9 10# List selection algorithms 11 resource- ask list select 12 13# Dispatch directly to a named cluster 14 resource- ask dispatch < cluster> "I need " List of Listings 1 The resource-ask command enables job negotiation or execution of component steps. 
+
+Provider Interface Providers use a common underlying interface to call probe against a system, and provision a metadata property with the provider name, description, and function argument signature for an agent to use. Decorators secretary_tool and dispatch_tool identify class functions for negotiation and dispatch agents, respectively. Each decorated function exposes itself to the agent via parsing of inputs, outputs, and docstrings. At the time of negotiation or dispatch, a function manifest is provided to the Secretary Agent along with instructions for call formatting. As an example, a request that requires LAMMPS might proceed as follows. The Secretary Agent is instantiated, and the SpackProvider probe detects spack via the SPACK_ROOT. The agent sees that Spack is a package manager with a tool find_package that is documented to search for software of interest. The agent calls the function, learns that LAMMPS is installed as a package, and continues with other tool calls until a decision can be made.
+
+A provider is any resource that might be discovered by a worker, including and not limited to workload managers, hardware (e.g., CPU, GPU, memory), storage, parallel interfaces like the Message Passing Interface (MPI), container technologies, software package managers, and network. The worker automatically probes for all provider types, and cluster administrators can choose to selectively disable a provider, or better expose a provider (e.g., spack can also be discovered if the spack executable is on the path). Joining a hierarchy does not require a cluster to expose any or all resources. Providers are designed to be read-only, and expose state data about density, quantity, and type. The provider interface is simple for developers to easily add or request custom resource providers. Simulated provider interfaces are also available to run experiments to understand each step in the negotiation process, and agent design (Section 2).
+
+The Negotiation Agent The SecretaryAgent negotiate function prepares a prompt to instruct the agent how to respond to a negotiation request with a proposal. First, the agent must analyze the user’s request against provider manifests to determine if the cluster can meet the needs of the job. A provider manifest (Section 3.1) informs the agent of provider tools available, each of which is a controlled call to an instantiated class that runs in the same process. The agent can format one or more calls with needed arguments to learn more about the environment within one interaction using the LLM. Negotiation requires the agent to make at least one observation of the system. The agent is instructed to never provide generic chat, explain how to use software, or misrepresent the resource. The agent must also determine if the cluster is compatible based on state, and verify that software is installed and resources are sufficient. We require the agent to make at least one observation of the system, and return a response with a verdict that can be received and parsed by the calling client, as described previously (Section 1).
+
+The Dispatch Agent Upon receiving a dispatch request from the hub the SecretaryAgent of the selected computational resource receives a submit request to finalize dispatch of the work. The agent is first tasked with transforming the textual request into a job for the workload manager on the computational resource it serves. The SecretaryAgent transforms the textual request into a job specification, and further queries the system via providers to fine tune it. Functions decorated with dispatch_tool are provided as a manifest to this agent for use to submit jobs and further query. In practice, the generation of the job specification means that the agent will discover exact software or library paths, and generate a command that includes application flags, environment, and workload manager parameters. When the job specification is ready, the agent executes provider tools to submit and query status. It can return updated state to the hub via event streams.
+
+Table 1. Resource Secretary Selection Algorithms
+
+| Strategy | Logic Type | Status | Primary Use Case |
+| --- | --- | --- | --- |
+| agentic | LLM Reasoning | Varies | Handles complex requests |
+| first-ready | Greedy | READY | First available compatible |
+| random | Stochastic | READY | Random selection |
+| soonest | Quantitative | R/B a | Shortest ETS b |
+| run-anytime | Stochastic | R/B | All compatible clusters |
+| min-cost | Economic | R/B | Budget optimized |
+| queue-depth | Quantitative | R/B | Fleet-wide load balancing |
+
+- •
+- a) READY or BUSY status, with preference to READY b) Estimated time to start
+
+### 3.2. Experimental Simulations
+
+To assess the reliability and functionality of the server architecture, we performed simulations to test negotiation and selection components. The simulations are based on the logic that we can generate simulated workers according to computational resource archetypes, control random generation of the state of the resources they provision, and then assess the reliability of the agents to report it accurately. The simulations can easily be run on a single machine, giving insights into agent behavior and ability. We will perform simulation experiments to test each of negotiation and selection. For negotiation experiments, we will deploy a standard mcp-server and generate a fleet of 200 simulated workers as background processes in a different terminal (Section 3.2). A subset of responses and metadata for 100 workers will be carried forward from negotiation simulations for selection experiments.
+
+Simulated Workers The simulation experiments start with negotiation. The hub and fleet of 200 simulated workers is deployed using the –mock flag to start each worker. Each worker conforms to and creates simulated providers based on a computational resource archetype (Section 3.2) at a breakdown of 40/40/20 for each of HPC, cloud, and standalone, respectively. To drive generation of the provider state, scale, and density, a lower level configuration is provided upon generation that is oriented to an archetype of interest. A prompt generation strategy that handles different levels of complexity and style across 10 different resource dimensions will allow us to study the impact of increasing levels of complexity on agent accuracy. We use an archetype-based approach to account for the Venn Diagram-like nature of providers. While some providers are shared between spaces, others tend to be unique to the space. If we create a randomized, simulated worker, we want it to be representative of a likely archetype.
+
+Worker Generation via Archetype A new worker comes up and selects an archetype based on the distribution stated in the previous paragraph. We use a procedural generation to create 100 deterministic and auditable prompts to give to each of 200 of our simulated workers, for a total of 20,000 potential tests. We chose to run the simulations in serial to guarantee no violation of request limits, and to allow for execution on a single machine and careful observation. Each prompt is generated by a simulation module provided by the Resource Secretary library that can receive an archetype that drives the density and scale of generation.
+
+Worker identity is used to start the process. The worker identifier (e.g., “10”) is hashed into an integer to better reproduce the state. Using the seed, the generator performs a weighted random roll to assign one of three archetypes: cloud, HPC, and standalone, at the breakdown of 40/40/20, respectively. Cloud generally represents the most heterogeneous of the setups, testing a secretary agent’s ability to handle variety and non-standard naming conventions. The HPC archetype brings in traditional and specialized providers that are often strictly managed, and standalone is a long tail that encompasses the gamut from virtual machines to serverless and edge-computing. Archetype generation logic is shown in Table 2.
+
+Table 2. Simulated Worker Archetypes
+
+ Arch. 
+
+ Distr. ($μ,σ\mu,\sigma$) 
+
+ Cat. [choose] 
+
+ Provider Slots 
+
+ HPC 
+
+$Ts:(0.7,0.2)T_{s}:(0.7,0.2)$
+
+Workload [1]
+
+ Flux, Slurm 
+
+ (40%) 
+
+$Td:(0.8,0.2)T_{d}:(0.8,0.2)$
+
+Software [1-3]
+
+ Spack, Modules, Conda, Pip 
+
+Storage [1-2]
+
+ Lustre, NFS 
+
+Network [1]
+
+ InfiniBand, OmniPath 
+
+Parallel [1-2]
+
+ OpenMPI, MPICH 
+
+Hardware [1]
+
+ Hardware 
+
+Container [1]
+
+ Singularity, Podman 
+
+ Cloud 
+
+$Ts:(0.3,0.2)T_{s}:(0.3,0.2)$
+
+Workload [1]
+
+ Kubernetes 
+
+ (40%) 
+
+$Td:(0.4,0.2)T_{d}:(0.4,0.2)$
+
+Software [1,2]
+
+ Conda, Pip 
+
+Storage [1-2]
+
+ S3, NFS 
+
+Network [1]
+
+ Ethernet 
+
+Hardware [1]
+
+ Hardware 
+
+Container [1]
+
+ Docker 
+
+ Standalone 
+
+$Ts:(0.3,0.2)T_{s}:(0.3,0.2)$
+
+Workload [1]
+
+ Machine 
+
+ (20%) 
+
+$Td:(0.4,0.2)T_{d}:(0.4,0.2)$
+
+Software [1-2]
+
+ Conda, Spack, Pip 
+
+Storage [1]
+
+ Local-scratch 
+
+Network [1]
+
+ Ethernet 
+
+Hardware [1]
+
+ Hardware 
+
+Container [0-2]
+
+ Docker, Singularity 
+
+$Ts,TdT_{s},T_{d}$ represent latent Scale and Density targets sampled from $𝒩​(μ,σ)\mathcal{N}(\mu,\sigma)$ and clipped to $[0.01,1.0][0.01,1.0]$. Bracketed numbers indicate slot cardinality (min-max). The hardware provider provisions each of CPU, GPU, and memory, with the potential for generating clusters without any GPU. Hardware always includes CPU and memory.
+
+Each archetype defines a scale $TsT_{s}$ and a density $TdT_{d}$ target, which provide instruction for generation of a resource based on size (scale) or complexity and variety (density). For each, we specify the character of a worker by sampling two latent variables from a broad Gaussian distribution $𝒩​(0.5,0.2)\mathcal{N}(0.5,0.2)$, clipped to $[0.01,1.0][0.01,1.0]$, where both the mean and standard deviations can be customized by archetype or simulated provider. While each provider defines detailed metadata, the archetype gives ranges for prominent features of interest. Ranges for HPC (100-10K nodes with 32–128 CPUs per node, 128-1024 GB RAM per node, 0-8 GPUs, and 10TB-10PB storage, 3-10 partitions, 50-500 applications), Cloud (1-500 nodes with 2–64 CPUs per node, 4-256 GB RAM, 0-8 GPUs, and 10GB-5TB, 1-2 partitions, 10-50 applications), and standalone systems (1 node, 4-32 CPUs, 8-128 GB RAM, 0-1 GPU, 100GB-2TB local storage, 20-100 packages) reflect these preferences.
+
+In the context of scale, a large value (e.g., 0.9) would mean a specific provider resource is large (e.g., thousands of nodes, or many GPUs). A high density would indicate a large level of variety, such as a large number of types of Conda packages, or workload manager partitions. It is up to each provider to receive the archetype and use the provided functions to generate counts for resources of interest. For example, an HPCArchetype might be created that holds targets ($Ts,TdT_{s},T_{d}$) that define mean ($μ\mu$) values for future generation. Two different instances of the same archetype can hold slightly different means, however they are sampled from the same range for the archetype. A MockSlurmProvider might then receive the archetype, and need to generate a state relevant to scale like node_count. It will sample from a second Gaussian, $𝒩​(Ts,0.05)\mathcal{N}(T_{s},0.05)$, that accounts for the archetype scale to determine an actual node count. The value of 0.05 is a parameter that a specific provider can provide to define how tight the sampling is. As an example, a worker with a scale target of 0.8 might use the target to generate 8,100 nodes and 7,900 TB of storage. An example is shown in Listing 2.
+
+For provider selection, each archetype defines a slot for a subset of relevant resource types (e.g., compute or storage), and a cardinality for each. For example, a HPCArchetype might allow 1-3 software package managers, and select from a set of 3. The archetype is a blueprint to define rules for generation of the worker and providers. The final simulated worker is a realistic representation of a kind of computational resource that was procedurally generated using stated statistical distributions.
+
+Simulated Providers A simulated provider is a mock of a real provider that is populated by an archetype, and is configured to determine scale and density of a resource. Real providers with paired classes that afford simulation are shown in Table 3. The selection of a subset of real providers reflects the needs of the simulation experiments. For example, a simulated prompt from a user might ask for a cluster with a low latency network, a rootless container technology, or GPU count without needing to disambiguate vendor.
+
+ ⬇ 1 class MockProvider: 2 def probe(self): 3 # Allow drift of v1, tight selection of v2 4 self. generate("v1", mode="scale", volatility=0.4) 5 self. generate("v2", mode="density", volatility=0.05) List of Listings 2 Example generation that happens during probe. 
+
+Large Language Model We chose to use Google Gemini and the Python SDK, and specifically Gemini 2.0 Flash (Pichai, 2024) to optimize efficiency, speed, and cost-effectiveness (10 cents/1 million tokens). The context window is well-sized (1 million tokens) and allows us to run scaled experiments with reasonable cost for large numbers of requests. To not exceed rate limits and to allow observation of the experiments, we use the –serial flag provided by the hub start command to ensure that each worker request is done in serial.
+
+Prompt Generation To evaluate the agentic reliability, we used dimensional sampling of three different styles of prompt across 7 different specificity indices (SI), where each index incrementally increases in complexity of the request. The SI represents a logical AND/OR gate that the agent must pass to reach a correct verdict. We randomly select each SI with weights of 5, 20, 30, 20, 10, 10, and 5, for 1-7, respectively, to get a distribution with fewer overly sparse or detailed prompts. Attributes include resource names, counts, and versions, along with specific environment features and temporal needs. An application is always requested, and for SI 2 or greater, we request a version with a randomly selected operator in <=, >=, or ==. The values for each possible attribute are selected from a global catalog of features that are extracted as the unique values and ranges across all simulated workers. Knowing the ground truth of each prompt allows us to programmatically assess agent accuracy and discovery, and determine the degree to which an answer was thoroughly investigated versus a hallucination or guess.
+
+Table 3. Resource Providers Provided by the Resource Secretary Library
+
+| Category | Name | Simulated Available | Description |
+| --- | --- | --- | --- |
+| Workload | Cobalt | No | Discovers resource management state and job parameters for ALCF-style systems |
+| Workload | Flux | \cellcolor LimeGreen!70 Yes | Interfaces with the Flux Framework state using native Python bindings |
+| Workload | Kubernetes | \cellcolor LimeGreen!70 Yes | Inspects cluster resources, namespaces, and health |
+| Workload | Machine | \cellcolor LimeGreen!70 Yes | Local Machine (Direct Execution) |
+| Workload | Moab | No | Identifies scheduling parameters and node availability for Moab-managed clusters |
+| Workload | Oar | No | Queries resource management state and availability for OAR environments |
+| Workload | Pbs | No | Extracts status and configuration for OpenPBS and PBS Pro environments |
+| Workload | Slurm | \cellcolor LimeGreen!70 Yes | Interacts with partitions, nodes, and job queues in Slurm environments |
+| Workload | Torque | No | Detects active resource manager settings and queue data |
+| Software | Conda | \cellcolor LimeGreen!70 Yes | Looks for Conda/Mamba installs |
+| Software | Pip | \cellcolor LimeGreen!70 Yes | Looks for Pip installs |
+| Software | Modules | \cellcolor LimeGreen!70 Yes | Detects available environment modules via Lmod or TCL |
+| Software | Spack | \cellcolor LimeGreen!70 Yes | Identifies software environment state and installed package instances |
+| Container | Charliecloud | No | Enables unprivileged, user-namespace based container discovery |
+| Container | Docker | \cellcolor LimeGreen!70 Yes | Queries standard container engine state and runtime metadata |
+| Container | Podman | \cellcolor LimeGreen!70 Yes | Inspects rootless container environments and image repositories |
+| Container | Shifter | No | Interfaces with workload-integrated container runtimes for HPC |
+| Container | Singularity | \cellcolor LimeGreen!70 Yes | Detects SIF-based image runtimes and unprivileged execution settings |
+| Storage | Beegfs | No | Monitors status and mount points for BeeGFS parallel filesystems |
+| Storage | Local-scratch | \cellcolor LimeGreen!70 Yes | Detects high-speed local filesystems including XFS, ZFS, and BTRFS |
+| Storage | Lustre | \cellcolor LimeGreen!70 Yes | Queries Lustre parallel filesystem health and OST availability |
+| Storage | Network-fs | \cellcolor LimeGreen!70 Yes | Identifies standard NFS and CIFS network mounts |
+| Network | Ethernet | \cellcolor LimeGreen!70 Yes | Detects standard interface speeds and IP configurations |
+| Network | Infiniband | \cellcolor LimeGreen!70 Yes | Extracts data for InfiniBand fabrics and RDMA-capable devices |
+| Network | Omni-path | \cellcolor LimeGreen!70 Yes | Interacts with Intel Omni-Path Architecture (OPA) fabrics |
+| Hardware | AMD GPU | \cellcolor LimeGreen!70 Yes | Monitors ROCm-capable accelerators and GPU topology |
+| Hardware | CPU | \cellcolor LimeGreen!70 Yes | Identifies architecture details, core counts, and instruction set extensions |
+| Hardware | Memory | \cellcolor LimeGreen!70 Yes | Inspects system RAM capacity and memory hierarchy |
+| Hardware | NVIDIA GPU | \cellcolor LimeGreen!70 Yes | Queries CUDA-enabled devices and accelerator performance metrics |
+| Parallel | Mpich | \cellcolor LimeGreen!70 Yes | Detects specialized MPICH-based communication libraries |
+| Parallel | Openmpi | \cellcolor LimeGreen!70 Yes | Discovers OpenMPI implementations and available transport fabrics |
+| Parallel | Spectrum-mpi | No | Identifies IBM Spectrum MPI configurations for specialized interconnects |
+
+- •
+- The resource-secretary library provides a provider interface with 51 real and simulated providers across 7 categories.
+- •
+- Addition of a new provider uses a common base class, and only requires a probe and discovery functions.
+
+Audit and Analysis The Resource Secretary comes with an Auditor that is designed to handle a worker’s truth paired with a verdict and tool calls, and perform a full trace and assessment for accuracy. The process starts with comparison of the worker’s ground truth to the needs of the prompt to determine if the simulated cluster could actually satisfy the work. We then assess the agent verdict for correctness. Importantly, we generate a list of minimum tool calls that would be required to come to the final decision, and compare to the agent’s actual calls. In the case that a request is truly INCOMPATIBLE, for example, we cannot require a complete exploration of the entire space as the agent can return as soon as it sees the missing requirement. Instead, we allow for a smaller, still definitive subset. This process allows us to disambiguate a rigorous discovery process from hallucinated success. We assess outcomes across complexity and styles of prompts. To reflect the specificity index of the prompt, where the index reflects an incremental increase in number of features requested, we calculate a more exact score for each prompt by counting the number of required features. For tracing tool calls, we calculate a final score as $(s​a​t​i​s​f​i​e​d)/(r​e​q​u​i​r​e​d)(satisfied)/(required)$ for tool categories. For example, if an agent is required to explore the software and network subsystems to respond to a prompt but only looks at software, the score would be $1/21/2$ or 0.5.
+
+Selection Simulation We are interested to assess the ability of an agentic strategy to perform selection against 6 traditional heuristic strategies (Table 1). We will run 10 full simulations for each selection algorithm (Table 1). The algorithms for first-ready, random, soonest, run-anytime are considered base cases, and min-cost and queue-depth are considered more informed approaches. For the latter, we will adjust the agent prompt to not only include a summary of cluster state, but also per-unit cost data. For example, to compare the agentic strategy to the min-cost strategy, we will include per unit price data in the prompt, and a calculated total cost to the native algorithm. For each simulation, we start with a subset of 10K results across simulated workers and filter down to those that are actually compatible, as determined by the worker truth. We will run two types of simulation. The first will start workers with simulated static state and update when requests are selected. The second will assume a consistent static state for each prompt request across workers. In both cases, we are primarily interested in the agent’s ability to improve upon resource efficiency and cost.
+
+We format the result data from our negotiation experiments into a single JSON file for each prompt that was satisfiable by at least one cluster. For algorithms that require a status, we consider a state of having 95% or greater utilization BUSY. The status will change as work is assigned to a cluster; idle nodes will decrease, and queue depth will increase. For cost algorithms, we use per node costs from real data (Network, 2026; ITS Advanced Research Computing, 2026). To mirror actual practices, we treat node allocations as exclusive. For each simulation, we will randomly shuffle jobs and all satisfiable proposals, and run selection. A status of SELECTED indicates a job assigned to a cluster. In the case of not being satisfiable across contenders, it is considered REJECTED. Any agent assessment with an API error will be recorded as UNKNOWN. The agent will always be provided with resource categories and providers discovered. After selection, the chosen computational resource would be dispatched.
+
+## 4. Results
+
+We ran simulations to test our server components and agents against 200 simulated workers (85, 75, 40 for each of hpc, cloud, and standalone archetypes) and 100 generated prompts for a total of 19,973 successful negotiation tests and 6,952 selections. Complete software, datasets, and analysis scripts are available (Sochat, 2026a, b, e, c, d).
+
+Reliability of Secretary Agent The degree to which an agent is able to correctly report the ability of a computational resource to satisfy a work request is shown in Figure 3. The majority of assessments were correct (87.71% overall accuracy), with the largest source of error resulting from an agent declaring an incompatible cluster compatible (N=1611). Of these misses, we find that the agent missed the version requirement for software (N=1089), or a network (N=156), storage (N=180), or compute (N=186) requirement. There were 417 cases of UNKNOWN, which resulted from the agent exceeding the maximum of 10 exploration loops allowed.
+
+Figure 3. Worker truth versus agent verdict confusion matrix. Normalization is done by row to account for class imbalances. Agents are skilled at detecting compatible and incompatible jobs. Accuracy is $(c​o​r​r​e​c​t/t​o​t​a​l)(correct/total)$ requests
+
+Figure 4 shows the majority of error can be attributed to the HPC archetype and specificity of 7, which explicitly modifies the request to add a container technology. From observation, we noticed that agents often confused containers (e.g., declaring that Podman was satisfactory for Singularity) or using the wrong tools to query for the installed container (e.g., calling a software tool instead of the container-specific tools) and determining the container was not found.
+
+Figure 4. Accuracy vs. Specificity. Higher specificity indices correlate with an increased number of user requirements. Agents struggled with not enough information (1) or looking for a container technology (7).
+
+To determine categories that are associated with accuracy, we performed logistical regression from the Python statsmodel package to calculate the log-odds impact, where a negative coefficient means that the category makes the task harder for the agent. Our logistic regression (Figure 5) identifies several highly significant predictors ($p<0.001p<0.001$) of agent accuracy. For HPC workers, compute requirements significantly increase the log-odds of success ($β=0.5,p<0.001\beta=0.5,p<0.001$), while container requirements exert a strong negative impact ($β=−0.96,p<0.001\beta=-0.96,p<0.001$). For the standalone archetype, compute is a positive driver ($β=1.08,p<0.001\beta=1.08,p<0.001$) and containers ($β=−0.96,p<0.001\beta=-0.96,p<0.001$) feature negatively. Finally, for the cloud archetype compute ($β=0.4,p<0.001\beta=0.4,p<0.001$), network ($β=0.63,p<0.001\beta=0.63,p<0.001$), and parallel ($β=0.31,p<0.01\beta=0.31,p<0.01$) increase the log-odds of a correct verdict.
+
+Figure 5. Log-odds impact of resource categories on agent reasoning performance across archetypes. Negatives values indicate features contributed to agent incorrect responses.
+
+Tool Calls We found no significant differences between an agent’s ability to correctly predict or a machine’s ability to satisfy a request. Figure 6 shows the percentage of agent responses correct versus the tool call score. A lower score (or score of 0) indicates that the agent failed to call tools that would be required to understand the environment. A tool call score of 0 does not indicate that the agent failed to call tools, but rather it failed to call any correct tools. Accuracy values above 80% are notably present after approximately 30% exploration of the space for all archetypes. With the exception of HPC, more exploration does not necessarily lead to a better outcome. Interestingly, the HPC archetype has a drop in overall accuracy for subsets of higher exploration.
+
+Figure 6. Accuracy of secretary agent responses versus tool call score. The HPC archetype had overall lower accuracy. More calls resulting in lower accuracy likely reflects trouble finding a needed requirement.
+
+Selection Simulations We evaluated the performance of agentic resource selection against traditional scheduling heuristics in a simulated environment consisting of a heterogeneous worker fleet (hpc, cloud, and standalone). Traditional heuristics, including queue-depth, min-cost, and soonest were compared to using a selection agent under two conditions – with and without state. We found no differences between responses for with and without state, and report on with state (updating the queue) as a better representation of a true fleet. We ran 10 iterations of each of 8 strategies across 100 prompts for a total of 8000 potential results. Of that set, 6,952 simulated jobs were candidates for selection due to at least one compatible simulated worker, and 4,761 were successfully scheduled by algorithms given changing cluster state. We are primarily interested in the functionality of the simulated selection and software framework under realistic testing conditions. Toward this aim, we first did a sanity check to observe expected queue growth over time (Figure 7) given queue depths reset to zero. These results were not used for subsequent analyses.
+
+Figure 7. Selected worker pressure as a sanity check for selection experiments. A single archetype HPC with comparable queue sizes is shown.
+
+Agentic latencies for our main selection experiments were slower than more traditional heuristic strategies, an expected result since an agent needs to call a LLMs API (agentic 2.1971 $±\pm$ 1.0863; agentic-cost 2.1624 $±\pm$ 0.9757; first-ready 0.0002 $±\pm$ 0.0001; min-cost: 0.0004 $±\pm$ 0.0002; queue-depth: 0.0003 $±\pm$ 0.0002; random: 0.0084 $±\pm$ 0.0061; run-anytime: 0.0003 $±\pm$ 0.0001; soonest: 0.0003 $±\pm$ 0.0001). While $≈\approx$ 2 seconds is subjectively not slow, it would be problematic for high throughput decision making. We find selection agreement between traditional approaches across 10 iterations, a likely reflection of the more deterministic nature of the algorithms (Figure 8).
+
+Figure 8. Agreement of selected worker between algorithms. Basic heuristics have high agreement as compared to agentic.
+
+We calculated a cost efficiency index (Figure 9) (CEI) to show cost normalized by archetype, as archetypes are designed to vary in scale and cost comparisons can be skewed. For the HPC archetype, there are no significant differences in means. Each of first-ready and random strategies always selected a standalone or cloud instance, reflecting a likely greedy bias. As an example, for one simulation we see there are a total of 97 job prompts assessed. Of the 97, 18 are selected. Of the 18 selected, all are assigned to cloud and standalone. The agentic-cost strategy outperformed its analogous manual component for the standalone environment. Observation of the agent running revealed a tiered strategy of considering other resources provisioned by the node. Interestingly, we noticed the agent considering alternative resources in the case of an OR for GPU or CPU. The agent often would select an allocation of a single node with the logic that the GPUs were more expensive, but the job would run faster. For our simulation we did not model application running time. More work is needed to add this to our model. The huge cost of choosing a node for GPU does not include the reality that it would run faster. The cloud archetype demonstrates the lack of informed choice for the first-ready and random strategies.
+
+Figure 9. Normalized cost efficiency between strategies. The hpc archetype did not get assignments for two strategies. Standalone costs were higher for traditional vs. agentic.
+
+## 5. Discussion
+
+Reliability of Secretary Agent In our work we observe that the secretary agent is skilled at determining a computational environment is not compatible for a workload. We believe this results from the task itself – it is easier to rule out an environment due to a missing dependency than verify that every detail is correct. The most dangerous of cases for job negotiation are when an agent determines that a computational resource is compatible for an environment when it is not, representing 1,611 of our test cases. Closer inspection told us that of the large portion that incorrectly identified matching software (N=1089) the agent would make a call to a manager that returned dependencies (e.g., spack find) and mix up the version of the required software with a dependency. We hypothesize this is fixable by making tool call metadata more specific and decisive. Unlike human output of the command that is verbose with dependency versions, an agent should only be provided with the exact package metadata it is looking for, and a separate tool call might be exposed to relay dependency information. This finding suggests that tool call interfaces are important, and cannot always exactly mirror the human equivalent.
+
+We found that the majority (62.5%) of cases that were false negatives (stated not compatible when they were) were of specificity levels 1 and 7, where the user requested an application name only. For a level of 1 that only provides the application without version to run, secretary agents did not have enough information. For cases of 7, the agents had trouble finding the container software. A second observed state was an agent looking for a low-latency network, and looking to package managers for MPI instead of using network tools. While the check is logical, it is an error on our part to not directly tell the agent how to assess the environment for a low-latency network. For future experiments, we will add specific use cases for each tool, and will test addition of an explicit NEEDS_INFORMATION return option. We hypothesize that this option may be a double-edged sword. Telling the agent that it can ask for more information might hinder further environment exploration.
+
+Limitations Our simulated archetypes are a best effort to generate a cohesive set of reasonable environments. They do not (and cannot) reflect every real-world environment. We want to improve upon the design of an archetype to better capture more dimensions about an environment, such as including multi-tenancy, a count of users, and security or workload manager policies. When we add a scheduling component, we plan to simulate applications and more fine-grained temporal requirements. A more realistic query might require a workload to be done within a specific number of hours, or linked in time with job dependents.
+
+Probing is limited to where the worker is running. In practice, it would run on a login node or exposed worker node of a job. In the case of a launcher node, it needs to be the case that the launcher node uses tools that give access to full cluster resources. Generally speaking, it is up to the cluster or single server resource to expose the minimum set of providers needed. The agent also needs credentials for a LLMs, and there is a tradeoff between cost paired with performance, and LLMs time to respond that needs to be better studied. Results would vary based on the model used.
+
+Our selection experiments were primarily done to test the mcp-server’s ability to orchestrate them, and more sophisticated algorithms and experiments are warranted. The benefit of using a selection agent over a hard-coded algorithm is that it is flexible to uncertainty. It is flexible to receiving different preferences and policies on the fly, or even an auction-based approach for agents to bid for work. We believe that traditional algorithms can better be combined with agents. Agents can be given algorithms as tools to call to make a choice. Our selection simulation does not account for job shape, or the idea that the same work can be satisfied by different shapes. Shape has implications for scheduling and performance and work we are actively doing integrated with the Flux Framework workload manager. This is tied to the idea that a secretary agent could return a modified suggestion for another shape of resources. We are actively working on several of these ideas.
+
+Our work is also limited in that we have not addressed the flow of user identity. Our experiments currently assume that a deployment is owned by a single user or group. We are not focusing on this aspect because it is a prime focus of other projects (Gil and Moler, 2025; Lawrence Livermore National Security, LLC, 2025) and we are interested primarily in the server and agent design.
+
+To be concise we did not return call responses and arguments to the client due to the potential size of the responses. These responses are rich with cluster state at the time of the request. If we are able to better scope tools to return more specific (smaller) responses we can do this and better inform the selection agent about the cluster.
+
+Finally, we do not consider ourselves experts in all providers that we have added to our resource secretary software, and have implemented event provisioning for a subset. We invite community experts to add this for their providers of interest.
+
+Future Work We are eager to continue working on the mcp-server hierarchy and test our hypotheses for agentic designs at different stages. Notably, the dispatch framework described is completely implemented. Dispatch experiments that test job transformation and submission did not fit within the page count of this report. For the mcp-server we plan to add support to load a pre-generated simulated worker, allowing for exact or manual definition of a server without requiring an archetype. We also anticipate testing different hierarchy designs. For example, a middle level mcp-server might serve as a hub and a worker, or a cluster might provision multiple hubs across the top level using the RAFT consensus protocol (Dautov and Husom, 2025). An mcp-server also requires different policies for when to automatically de-register or not trust a worker. Anticipating future work, we plan to expand submission customization targeting specific workers.
+
+While we did not take advantage of events in our experiments, we anticipate future work to deliver events back to a hub and calling client to update about dispatch state. Updating state would be important for a higher level scheduler to make informed decisions about work. We aim for a design that allows for receiving events from both the computational resource running the workload manager and the receiving hub. We anticipate future limitation by many tools that do not deliver event streams. While synchronous calls or polling are a good start, fully event-driven is ideal. We also plan to do follow up work to provide secretary agents with tools that give hints about previously run applications. For example, if an application was run previously and figure of merit (FOM) s were collected, the agent can easily choose a more optimal starting point. The agent might also be told an explicit pattern to follow when looking for request needs, or be allowed to suggest changes. While the mcp-server receiving function ask_secretary is currently provisioning agents that use discovered resource providers, this is not a hard requirement for the future of the project. An equivalent, more deterministic algorithm can be substituted, and even one that uses the same provider interfaces to get information about the cluster.
+
+Notably, we did not include dispatch simulations and results in this work, and we are preparing a second manuscript for the assessment of this case. While dispatch at face value seems straight forward – submit a job – in practice it requires careful translation of a job specification, and an ability of an agent to use appropriate tools to submit, verify or monitor, and return state to a higher level agent or hub.
+
+## 6. Conclusion
+
+Agentic frameworks are the future for not just the HPC community, but the entire software ecosystem. Autonomous, converged HPC infrastructure that can intelligently negotiate job workloads is becoming feasible. From autonomous task execution to failure recovery and AI-supported scheduling techniques, these powerful transitions have and will continue to change the day to day work of computational scientists and engineers. We look forward to a new era of faster, more accurate, and more accessible computing for the next generation of HPC.
+
+###### Acknowledgements.
+
+Thank you to olive oil, quiet sunsets, and feel of the crisp air on the first steps out into the cold. Thank you to our cloud collaborators for continued interesting discussion in this area. Thank you to Livermore Computing for supporting me in all respects (VS). This work was performed under the auspices of the U.S. Department of Energy by Lawrence Livermore National Laboratory under Contract DE-AC52-07NA27344 and was supported by the LLNL-LDRD Program under Projects No. 24-SI-005 (LLNL-CONF-2018020). 
+
+## References
+
+- D. H. Ahn, J. Garlick, M. Grondona, D. Lipari, B. Springmeyer, and M. Schulz (2014) Flux: a next-generation resource management framework for large hpc centers. In 2014 43rd International Conference on Parallel Processing Workshops, Vol. , pp. 9–17. External Links: Document Cited by: §2.1. 
+- R. M. Badia Sala, E. Ayguadé Parra, and J. J. Labarta Mancho (2017) Workflows for science: a challenge when facing the convergence of hpc and big data. Supercomputing frontiers and innovations 4 (1), pp. 27–47. External Links: Document Cited by: §1. 
+- T. Bahreini, A. N. Tantawi, and O. Tardieu (2024) Caspian: a carbon-aware workload scheduler in multi-cluster kubernetes environments. In 2024 32nd International Conference on Modeling, Analysis and Simulation of Computer and Telecommunication Systems (MASCOTS), pp. 1–8. External Links: Document Cited by: §1. 
+- [4] (2o25) Coroutines and tasks. (en). Note: https://docs.python.org/3/library/asyncio-task.html#id8 Accessed: 2026-3-30 Cited by: §3. 
+- R. Dautov and E. J. Husom (2025) Controlled self-recovery of the aggregator in federated learning using raft protocol. ACM Transactions on Autonomous and Adaptive Systems. External Links: Document Cited by: §5. 
+- J. Developers (2024a) JSON-RPC 2.0 specification. (en). Note: https://www.jsonrpc.org/specification#notification Accessed: 2026-4-5 Cited by: §2.1. 
+- K. Developers (2024b) Multi. kubernetes (en). Note: https://kueue.sigs.k8s.io/docs/concepts/multikueue/ Accessed: 2026-4-5 Cited by: §1. 
+- M. Developers (2024c) What is the model context protocol (MCP)?. (en). Note: https://modelcontextprotocol.io/docs/getting-started/intro Accessed: 2026-4-5 Cited by: §2.1. 
+- S. El Kafhali (2026) A survey of adaptive scheduling techniques, goals, and challenges in kubernetes. Archives of Computational Methods in Engineering, pp. 1–24. External Links: Document Cited by: §1. 
+- D. Gil and K. A. Moler (2025) Accelerating science with AI. Science 390, pp. 965. External Links: Document, Link Cited by: §1, §2.1, §5. 
+- T. Hartung (2025) AI, agentic models and lab automation for scientific discovery — the beginning of scaince. Frontiers in Artificial Intelligence Volume 8 - 2025. External Links: Link, Document, ISSN 2624-8212 Cited by: §1. 
+- V. G. Hazlewood (2025) Integration of slurm and kubernetes for university research computing workloads. External Links: Document Cited by: §1. 
+- ITS Advanced Research Computing (2026) Great lakes and lighthouse hpc cluster service rates. Note: Accessed April 2026. Standard CPU core-hour rate: $0.015; GPU unit chargeback modeled on institutional cost-recovery. External Links: Link Cited by: §3.2. 
+- L. Jolicoeur, V. Sochat, F. Diakhaté, and D. Milroy (2025) Enabling rdma and gpus in rootless kubernetes for accelerated hpc and ai applications. In VHPC, External Links: Document Cited by: §1. 
+- L. A. N. Laboratory (2024) URSA. (en). Note: https://lanl.github.io/ursa/ Accessed: 2026-4-5 Cited by: §2.1. 
+- Lawrence Livermore National Security, LLC (2025) Future generation high performance computing center (fg-hpcc) request for information (rfi) no. hpc-007. Technical report Technical Report HPC-007, Lawrence Livermore National Laboratory (LLNL), Livermore, CA. Note: Attachment (1) RFI Technical Considerations External Links: Link Cited by: §1, §2.1, §5. 
+- C. Link, J. Sarran, G. Grigoryan, M. Kwon, M. M. Rafique, and W. R. Carithers (2019) Container orchestration by kubernetes for rdma networking.. In ICNP, pp. 1–2. External Links: Document Cited by: §1. 
+- H. Menon, C. F. Jekel, K. Korner, B. Gunnarson, N. K. Brown, M. Stees, M. G. Fernandez-Godino, W. Nissen, M. H. Shachar, D. M. Sterbentz, et al. (2026) Multi-agent collaboration for automated design exploration on high performance computing systems. arXiv preprint arXiv:2603.11515. External Links: Document Cited by: §2.1. 
+- C. Misale, D. J. Milroy, C. E. A. Gutierrez, M. Drocco, S. Herbein, D. H. Ahn, Z. Kaiser, and Y. Park (2021) Towards standard kubernetes scheduling interfaces for converged computing. In Smoky Mountains Computational Sciences and Engineering Conference, pp. 310–326. External Links: Document Cited by: §1. 
+- S. Network (2026) GPU cloud pricing comparison 2026: every major provider side by side. Spheron Technical Blog. Note: Market analysis showing A100-80GB on-demand rates at $1.49/hr and L4 efficiency GPUs at $0.44/hr. External Links: Link Cited by: §3.2. 
+- S. Pichai (2024) Introducing gemini 2.0: our new AI model for the agentic era. (en). Note: https://blog.google/innovation-and-ai/models-and-research/google-deepmind/google-gemini-ai-update-december-2024/ Accessed: 2026-4-5 Cited by: §3.2. 
+- SchedMD (2024) Slurm workload manager - slurm federated scheduling guide. (en). Note: https://slurm.schedmd.com/federation.html Accessed: 2026-4-5 Cited by: §1. 
+- V. Sochat, D. Milroy, C. Misale, J. Luettgau, E. F. Bollig, and W. Magro (2024) Converged computing: a best of both worlds of high-performance computing and cloud. Computing in Science & Engineering 26 (3), pp. 4–7. Cited by: §1. 
+- V. Sochat, D. Milroy, A. Sarkar, A. Marathe, and T. Patki (2025a) Usability evaluation of cloud for HPC applications. In Proceedings of the SC’25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 135–150. External Links: Document Cited by: §1. 
+- V. Sochat, L. Pottier, and D. Milroy (2025b) State machine orchestration of an hpc workflow in cloud. In Proceedings of the SC’25 Workshops of the International Conference for High Performance Computing, Networking, Storage and Analysis, pp. 2293–2304. External Links: Document Cited by: §1. 
+- V. Sochat (2026a) Fractale experiments: agentic mcp-server orchestration (converged-computing/fractale- experiments) External Links: Document, Link Cited by: §4. 
+- V. Sochat (2026b) Mcp-server: agentic server to support MCP tools and science. Github (en). Cited by: §2.1, §4. 
+- V. Sochat (2026c) Model context protocol server software (converged- computing/mcp-server) External Links: Document, Link Cited by: §2.1, §4. 
+- V. Sochat (2026d) Resource secretary (converged-computing/resource- secretary) External Links: Document, Link Cited by: §3.1, §4. 
+- V. Sochat (2026e) Resource-secretary: discover providers for resources for agentic science. Github (en). Cited by: §3.1, §4. 
+- X. Wang, X. Li, X. Xia, and M. Yang (2025) Efficient multi-cluster scheduling for heterogeneous workloads. IEEE Access 13, pp. 186856–186871. External Links: Document Cited by: §1. 
+- B. Wu, M. Hu, S. Qin, and J. Jiang (2024) Research on fusion scheduling based on slurm and kubernetes. In International Conference on Algorithms, High Performance Computing, and Artificial Intelligence (AHPCAI 2024), Vol. 13403, pp. 476–485. External Links: Document Cited by: §1. 
+- H. Xin, J. R. Kitchin, and H. J. Kulik (2025) Towards agentic science for advancing scientific discovery. Nat. Mach. Intell. 7 (9), pp. 1373–1375 (en). External Links: Document Cited by: §1. 
+
+## Instructions for reporting errors
+
+We are continuing to improve HTML versions of papers, and your feedback helps enhance accessibility and mobile support. To report errors in the HTML that will help us improve conversion and rendering, choose any of the methods listed below:
+
+- Click the "Report Issue" () button, located in the page header.
+
+Tip: You can select the relevant text first, to include it in your report.
+
+Our team has already identified the following issues. We appreciate your time reviewing and reporting rendering errors we may not have found yet. Your efforts will help us improve the HTML versions for all readers, because disability should not be a barrier to accessing research. Thank you for your continued support in championing open access for all.
+
+Have a free development cycle? Help support accessibility at arXiv! Our collaborators at LaTeXML maintain a list of packages that need conversion, and welcome developer contributions.

@@ -1,0 +1,472 @@
+### On noise and the performance benefit of nonblocking collectives
+
+Patrick M. Widener 1, Scott Levy 2, Kurt B. Ferreira 1, and Torsten Hoefler 3
+
+1Center for Computing Research, Sandia National Laboratories ∗, Albuquerque NM 2Department of Computer Science, University of New Mexico, Albuquerque NM 3Computer Science Department, ETH Z¨urich, Switzerland
+
+Abstract Relaxed synchronization offers the potential of maintaining application scalability by allowing many processes to make independent progress when some processes suffer delays. Yet, the benefits of this ap proach in important parallel workloads have not been investigated in detail. In this paper, we use a val idated simulation approach to explore the noise mitigation effects of idealized nonblocking collectives in workloads where these collectives are a major contributor to total execution time. Although nonblocking collectives are unlikely to provide significant noise mitigation to applications in the low-OS-noise environ ments expected in next-generation HPC systems, we show that they can potentially improve application runtime with respect to other noise types.
+
+1 Introduction
+
+Nonblocking collective operations [15,19], newly introduced in MPI-3.0 [12,24], allow application program mers to overlap collective communication with the application’s computation. At scale, blocking collective operations can significantly degrade application performance because, in most cases, each application pro cess must participate in the collective before any process can make further progress. As a result, a laggard process can slow the progress of all of its peers and consequently the entire application. Nonblocking collec tives have the potential to alleviate the impact of process variability by allowing a process to make progress even if its peers are late entering a collective. Delayed participation in a collective operation can be caused by several phenomena, including load imbalance, fault tolerance activities, and operating system noise. While noise exists on most computing platforms, it has a disproportionate effect in HPC systems because the applications that run on these sys tems tend to be highly synchronized. For many important HPC applications, operating system noise has been shown to have serious consequences for overall application performance [8].
+
+∗Sandia National Laboratories is a multi-program laboratory managed and operated by Sandia Corporation, a wholly-owned subsidiary of Lockheed Martin Corporation, for the U.S. Department of Energy’s National Nuclear Security Administration under contract DE-AC04-94AL85000.
+
+The effects of operating system (OS) noise on high-performance computing (HPC) applications have been examined for insights into designing scalable hardware, system software, and applications [1, 25]. Recently, system designers have invested time and effort to reduce or eliminate sources of noise in the OS. These efforts have significantly reduced the noise introduced by system software on HPC systems; there now exist operating systems that are essentially noiseless (e.g., IBM’s CNK) [16, 30]. As a result, the need for nonblocking collectives to address the performance impact of OS noise appears to be waning 1. Although the impact of OS noise may no longer be a significant issue, there are many potential sources of noise in future extreme-scale systems. For example, fault tolerance is projected to be a significant challenge on future systems. The dominant approach to fault tolerance is checkpoint/restart. Because checkpointing activities deprive the application of CPU cycles, they can be modeled as OS noise [23]. Other trends in extreme-scale system design (e.g., adaptive runtimes, in situ analytics) also have the potential to introduce noise-like events that impact application performance. As a result, even if OS noise is itself no longer an issue, emerging sources of noise mean that nonblocking collectives may still yield a performance benefit on next-generation extreme-scale systems. In this paper, we investigate the performance benefit of nonblocking collective operations on application performance at scale, in different noise environments. We begin with a simple analytical model of applica tion performance to identify upper bounds on application speedup. We use simulation to further examine the impact of nonblocking collectives. We focus on a simulated MPI Iallreduce() (i.e., the nonblocking vari ant of MPI Allreduce()) because, as we will show, it is the dominant communication operation in many important parallel workloads. To examine the potential upside of MPI Iallreduce(), we use a validated simulator to compare the standard MPI Allreduce() with an idealized cost-free MPI Iallreduce(). We also use a set of microbenchmarks to examine the different potentials for application speedup of dissemination vs. binomial-tree collective algorithms. Specifically, we show that:
+
+• in low-noise environments that are typical of current and expected future systems, MPI Iallreduce() is unlikely to provide significant noise mitigation benefits without algorithmic changes; 
+• for other sources of noise such as resilience protocol overheads, MPI Iallreduce() may have a signifi cant beneficial effect on application performance; and 
+• the expected noise mitigation effect from nonblocking collectives can vary significantly according to their underlying implementation algorithms and the interprocess dependencies those algorithms create. 
+
+1Other uses for nonblocking collectives include overlapping computation and communication as well as complex synchro nization protocols [18].
+
+w1 c1 n1 δ w2 c2 n2 wk− 1 δ ck− 1 nk− 1 wk
+
+Figure 1: A simple, hypothetical example of a trace of the execution of a single application process with blocking collectives. We model the execution trace as a sequence of interleaved periods of communication (ci) plus noise propagation (ni), work (wi) and checkpoints (δ). Communication intervals consist of blocking communication operations, including delays introduced by remote checkpointing noise. Work intervals consist of non-blocking point-to-point communication and periods of computation. A checkpoint may occur at any point in a work interval, but we model checkpoints as an extension of the duration of the checkpoint-free work interval. As a result, identifying the precise moment at which a checkpoint occurs is unnecessary.
+
+2 Experimental Approach
+
+In this paper, we use an analytic model and a validated simulator to explore the potential benefits of non blocking collectives in the presence of different noise profiles. Our analytic model allows us to identify upper bounds on the speedup of an application if nonblocking collective operations are allowed only to overlap with computation (i.e., a nonblocking collective cannot overlap with any other communication operation). For bulk synchronous parallel (BSP) applications, this is roughly equivalent to allowing collec tives to overlap with a single application iteration. Simulation allows us to explore models of communi cation/computation overlap that are difficult to capture with an analytic model. In particular, simulation allows us to examine the performance impact of allowing nonblocking collectives to overlap with each other and with blocking point-to-point collective operations. Moreover, simulation allows us to more accurately account for noise effects and their impact on the performance of collective operations.
+
+2.1 Modeling nonblocking collectives
+
+One of the principal benefits of nonblocking collectives is that they allow applications to overlap compu tation and collective communication. As a result, they can help mitigate the impact of noise by allowing application processes to continue to advance, even if one or more communication partners are delayed by noise. For the purposes of this section, we focus on noise introduced by checkpointing activities. However, our results can be easily extended to other sources of noise. To determine the potential benefits of allowing computation and collective communication to overlap, we begin with a simple model of application exe cution. As shown in Figure 1, we model the execution trace of each application process as an interleaved sequence of blocking communication operations and computation; the application’s time-to-solution is the maximum of the execution times of its constituent processes. We refer to periods of computation (including checkpointing) and nonblocking point-to-point opera tions (e.g., MPI Isend(), MPI Irecv()) as work intervals (wi). We model periods when the application is com puting checkpoints as the expansion of individual work intervals. For this simple model, we need not
+
+distinguish between the checkpoints that are taken collectively (i.e., coordinated checkpointing) or inde pendently (i.e., uncoordinated checkpointing). Collective operations and blocking point-to-point opera tions comprise communication intervals (ci). In the presence of noise, communication events may require additional time to complete because one or more of the participants has been delayed by noise events. We capture these additional communication costs as noise effects (ni). This simple execution model allows us to express an application’s time-to-solution as:
+
+Ts = Wk +
+
+k
+
+X
+
+− 1 
+i=1 
+
+(ci + ni + Wi) (1)
+
+where:
+
+k = number of communication and work intervals that comprise the application’s execution ci = duration of the i th communication interval ni = duration of the noise effects associated with the i th communication interval Wi = wi + d(i) (duration of the i th work interval) wi = duration of computation in the i th work interval
+
+d(i)
+
+=
+
+δ if a checkpoint occurs during wi 0 otherwise
+
+We note that by changing the definition of d(i), this model can be applied to other sources of noise. In this instance, the benefit of nonblocking collectives depends on the extent to which collective communi cation (including noise effects) can overlap work intervals. Conceptually, the simplest way to model this overlap is to allow each collective operation only to overlap with the work interval that immediately pre cedes it. The idea is that nonblocking collectives will allow the application to initiate the collective at an earlier point in the execution than when blocking collectives are used. 2
+
+In this model, we do not allow nonblocking collectives to overlap with each other or with blocking point-to-point operations. We assume that: (i) allowing work and communication to overlap does not alter the time required to complete any communication operation (i.e., the duration of noise effects is dependent only on the associated communication interval); (ii) with nonblocking collectives, checkpoints occur in the same work interval as for blocking collectives (i.e., the checkpoint interval is determined by the amount of work completed); and (iii) the target application can tolerate complete overlap of work and communication
+
+2Alternatively, we could model the communication/computation overlap by allowing nonblocking collectives to overlap only with the succeeding computation interval. The result obtained in this section would be the same.
+
+intervals. Given this model of communication/computation overlap, we can then express the application’s time-to-solution as:
+
+Tˆs = Wk +
+
+k
+
+X − 1
+
+i=1 ci=collective max(ci + ni, Wi) +
+
+k
+
+X − 1
+
+i=1 ci=p2p
+
+(ci + ni + Wi)
+
+= Wk +
+
+k
+
+X − 1
+
+i=1 ci=collective (ci+ni)≥ Wi (ci + ni) +
+
+k
+
+X − 1
+
+i=1 ci=collective (ci+ni) 
+
+k
+
+X − 1 i=1
+
+(ci + ni)
+
+k
+
+X − 1 i=1 ci
+
+The maximum value of the upper bound on speedup is two. It reaches this value when the computation to-communication ratio is exactly equal to the factor by which noise propagation inflates the application’s
+
+Processes
+
+HPCCG 
+LAMMPS 
+CTH 
+miniFE 
+AMG 
+LULESH 
+
+0
+
+2
+
+4
+
+6
+
+8
+
+10
+
+12
+
+14
+
+128 256 512 1Ki 2Ki 4Ki 8Ki 16Ki 32Ki 64Ki 128Ki 256Ki
+
+Figure 7: Speedup results for asynchronous checkpointing noise (0.5 Hz, 1s)
+
+communication time. In other words, nonblocking collectives can reduce the application’s time-to-solution 
+by as much as a factor of two when the application’s computation and communication (including noise 
+propagation) exactly overlap. 
+These upper bounds show that when noise propagation is modest, the benefits of nonblocking collec 
+tives will be limited by the application’s computation-to-communication ratio (β). This is consisent with 
+what we observed in Section 3. However, as the application’s execution begins to be dominated by noise 
+propagation, the opportunities to overlap communication (and noise-induced delays) with computation 
+are eventually exhausted and the application is unable to absorb additional noise. 
+As our model shows, the performance benefit of nonblocking collectives is potentially significant. 
+However, for applications that spend a large fraction of their execution on point-to-point operations and 
+their associated work intervals, this bound is not particularly tight and the benefits will be more mod 
+est. In practice, the benefit of non-blocking collectives will depend on the target application’s computa 
+tion/communication pattern and the extent to which it can allow collective communication operations and 
+computation to overlap. 
+
+4.2 Application simulation results
+
+Figure 7 shows application speedup when we simulate applications using an idealized MPI Iallreduce() in the presence of asynchronous checkpointing noise. The noise characteristics we use here reflect an applica tion using asynchronous checkpointing where each process takes a checkpoint every 120 seconds (locally timed as the checkpoint operation is not coordinated across nodes), writes 2 GiB of data per checkpoint, and
+
+has a data path to stable storage with 2 GiB/second write bandwidth. This configuration results in a check 
+point frequency of 0.5 Hz and a checkpoint duration of 1 second. These checkpoint interval and checkpoint 
+size figures are typical of many production workloads, and the write bandwidth reflects the planned incor 
+poration of solid-state storage on a per-node basis in exascale machines currently being designed by DOE 
+and other organizations. 
+Using an idealized MPI Iallreduce() allows us to consider the case where collectives are allowed to over 
+lap with other communication operations. The results shown in Figure 7 imply that allowing more liberal 
+overlap of computation and communication can lead to significant speedup for most of the applications 
+we considered. However, exploiting this difference in behavior will likely require radical changes to the 
+computational structure of the applications. 
+Figure 7 also shows a markedly different result than we observed for the low noise environment. This 
+difference reflects an important point about the nature of noise, on which we digress briefly. Asynchronous 
+checkpointing noise introduces detours with very long durations compared to OS or daemon noise — 
+on the order of seconds, as opposed to the millisecond- and microsecond-scale durations of OS/daemon 
+noise. Prior research on OS noise [8] has shown that the duration of noise events has a larger impact on 
+application performance than the frequency of those events. In the context of checkpointing, this suggests 
+that checkpoint commit time, rather than checkpoint interval, has the larger impact; this is confirmed by 
+experimental results [9] shown in Figure 8. We vary each of checkpoint interval (Figure 8(a)) and checkpoint 
+commit time (Figure 8(b)), holding the other constant in each case to satisfy Daly’s optimality equation [5]. 
+In both cases, we measured simulated application completion time for a subset of the applications we 
+consider in this paper. These figures show that changes to the checkpoint interval have very little impact 
+on application performance, while increasing checkpoint commit time can significantly increase time-to 
+solution. 
+Returning to our discussion of the potential impact of MPI Iallreduce(), Figure 7 shows that many of 
+our applications could possibly benefit significantly from its ability to mitigate the effect of asynchronous 
+checkpoint noise. HPCCG and miniFE both show large speedup factors, as does CTH. The outlier here 
+is LAMMPS, which benefits little from this improvement because of its infrequent use of MPI Allreduce(). 
+This result suggests that other nonblocking collectives may show similar benefits in applications using 
+asynchronous checkpointing. 
+
+T im e
+
+τ = 154.4s Θ node = 25yr
+
+τ = 119.5s Θ node = 15yr
+
+τ = 68.7s Θ node = 5yr
+
+0
+
+0.2
+
+0.4
+
+0.6
+
+0.8
+
+1
+
+1.2
+
+LAMMPS CTH miniFE HPCCG (a) Frequency varies, duration fixed
+
+T im e
+
+δ = 0.603s Θ node = 25yr
+
+δ = 1.01s Θ node = 15yr
+
+δ = 3.10s Θ node = 5yr
+
+0
+
+0.5
+
+1
+
+1.5
+
+2
+
+2.5
+
+3
+
+3.5
+
+4.5
+
+LAMMPS CTH miniFE HPCCG (b) Duration varies, frequency fixed
+
+Figure 8: Effects on execution time of LAMMPS, CTH, miniFE, and HPCCG observed when varying checkpoint frequency (τ ) vs. checkpoint duration (δ), for different node MBTF (Θnode) values.
+
+4.3 Microbenchmark analysis
+
+The results of our microbenchmark simulations in a high-noise environment appear in Figure 9. In contrast to the low-noise microbenchmark result, here the completion times of our simulated dissemination-based collectives (e.g., MPI Iallreduce() and MPI Iallgather()) are sped up by a noticeable factor. The completion times of simulated binomial-tree collectives (e.g., MPI Igather() and MPI Iscatter()) are barely affected, only beginning to register a performance benefit as scale increases past 128Ki processes.
+
+One of the principal reasons for the stark performance differences in Figures 7 and 9 is the difference in the dependencies that are created for collectives based on the dissemination algorithm and the depen dencies that are that are created for collectives based on a binomial tree. Figure 10 shows an example of the dependencies that are created for each algorithm. The dependencies shown for the binomial tree cor respond to collectives that use the tree for distribution (e.g., MPI Bcast(), MPI Scatter()). The most obvious difference is in the sheer number of dependencies that are created. The binomial tree algorithm creates (n − 1) direct dependencies, whereas the dissemination algorithm creates (n log n) direct dependencies.
+
+For collectives running on extremely large systems, the difference between the number of dependencies created by these two algorithms will be stark. For example, for a collective with 32Ki participants, the dissemination algorithm will generate more than 15 times as many direct dependencies. The nature of the dependencies that are created is also important. As shown in Figure 10(a), the dissemination algorithm yields bidirectional dependencies between every pair of nodes. For example, in round 1, n1 is dependent on n0. In round 3, n0 is (indirectly) dependent on n1. As a result, the total number of (direct and indirect)
+
+dependencies created by the dissemination algorithm is O(n 2). These dependencies allow noise events to propagate in the system; if any of the participants in a collective operation is delayed by a noise event, it has the potential to delay all of the participants. In contrast, the total number of dependencies are much
+
+Processes binomial dissemination
+
+0
+
+1
+
+2
+
+3
+
+4
+
+128 256 512 1Ki 2Ki 4Ki 8Ki 16Ki 32Ki 64Ki 128Ki 256Ki
+
+Figure 9: Observed microbenchmark speedup achieved by using idealized nonblocking versions of different collectives in a high-noise regime.
+
+smaller in the binomial tree algorithm O(n log n); when the binomial tree is used for distribution, depen dencies only extend to ancestors in the tree. For example, all of the nodes are dependent on n0 but n0 has no dependencies. The significance of these dependencies emerges when we consider nonblocking collectives. The ide alized nonblocking collectives that we use in the simulator allow the application to make progress even when the collective operation is delayed by the propagation of noise events. As a result, we see that non blocking collectives yield significant speedups in Figures 7 and 9. In contrast, the limited dependencies in
+
+n0 n1
+
+n2 n3
+
+n5 n4
+
+n6 n7
+
+(a) dissemination algorithm
+
+n0
+
+n1 n4 n2 n3 n5 n6
+
+n7
+
+(b) binomial tree (distribution)
+
+Figure 10: The round-by-round communication dependencies between eight nodes participating in collec tives based on: (a) the dissemination algorithm; and (b) the binomial-tree algorithm for distribution (e.g., MPI Bcast(), MPI Scatter()). Dependencies that arise in round 1 are shown in blue; dependencies that arise in rounds 2 and 3 are shown in red and green, respectively. The arrows point in the direction of the de pendencies. For example, in round 1, n1 is dependent on n0 for both algorithms. This figure illustrates the stark difference in the nature of the dependencies that are generated by the two algorithms.
+
+Processes
+
+AMG 
+HPCCG 
+LJ 
+LULESH 
+miniFE 
+CTH 
+
+0
+
+1
+
+2
+
+3
+
+4
+
+128 256 512 1Ki 2Ki 4Ki 8Ki 16Ki 32Ki 64Ki 128Ki 256Ki
+
+(a) OS noise
+
+Processes
+
+AMG 
+HPCCG 
+LJ 
+LULESH 
+miniFE 
+CTH 
+
+0
+
+1
+
+2
+
+3
+
+4
+
+128 256 512 1Ki 2Ki 4Ki 8Ki 16Ki 32Ki 64Ki 128Ki 256Ki
+
+(b) OS Daemon
+
+Processes
+
+AMG 
+HPCCG 
+LJ 
+LULESH 
+miniFE 
+CTH 
+
+0
+
+10
+
+20
+
+30
+
+40
+
+128 256 512 1Ki 2Ki 4Ki 8Ki 16Ki 32Ki 64Ki 128Ki 256Ki
+
+(c) Checkpoint
+
+Figure 11: Comparison of our idealized non-blocking collectives to a scenario with no injected noise. For each noise type, a speedup of 10 means that an application encountering no noise events completes 10 times faster than it does using our idealized non-blocking collectives in the presence of noise.
+
+binomial-tree-based collectives are less sensitive to participant delay and therefore benefit much less from
+
+nonblocking collectives.
+
+Comparison of non-blocking MPI Allreduce() to no injected noise. Lastly, we compare the perfor mance of our idealized non-blocking allreduce to a scenario with no injected noise. We use the speedup metric described previously. In this case, speedup tells us how effective a non-blocking MPI Allreduce() is at mitigating all noise impact on our applications. Figure 11 shows the speedup results for the three injected noise types. From this figure we see that for nearly all the applications except for AMG, MPI Iallreduce()
+
+mitigates all noise impact. AMG’s behavior can be explained in light of Figure 2; a significant portion of
+
+AMG’s communication time is spent in another dissemination-based collective, MPI Allgather(), which as we have discussed is subject to significant noise impact. This result underscores the potential performance benefit of an MPI Iallreduce() in noisy environments.
+
+5 Related work
+
+Techniques for improving the overlap of communication and computation in MPI applications have been thoroughly explored over the past decade. These techniques include offload [2] and nonblocking collec tives. Based on results showing the potential performance benefit of nonblocking collectives [20], Hoefler et al. have argued for the inclusion of nonblocking collectives in the MPI standard [19]. They have also developed a library that implements nonblocking versions of all of the MPI collectives and characterized its impact on application performance [15]. Although the early work only briefly discusses system noise,
+
+Hoefler et al. subsequently made the connection between nonblocking collective operations and OS noise
+
+explicit [16].
+
+Despite this body of research, our work is the first to examine the relationship between OS noise charac teristics and nonblocking collectives. We are also the first to explore how nonblocking collectives could be
+
+used to improve the performance of emerging resilience techniques (e.g., uncoordinated checkpointing).
+
+6 Conclusion
+
+Nonblocking collective operations are of increasing interest, not only as enablers of continued application scalability but also as potential mitigators of OS noise effects. We have in this paper used a simulation ap proach to investigate how applications using an idealized nonblocking allreduce operation might respond in the presence of different noise environments, at scales likely to be encountered in future extreme scale systems. Our results indicate that, for noise caused by operating system activity, MPI Iallreduce() is un likely to provide much benefit. We suggest that, by themselves, nonblocking collective operations of other types should not be automatically assumed to be able to mitigate such noise effects. However, we have also shown that the effect of other noise types, such as that caused by checkpoint/restart activity, might be usefully reduced by the introduction of nonblocking collectives. We have also demonstrated that the algorithm used to implement a nonblocking collective may have a non-trivial effect on its performance benefit. Application designers should consider carefully the characteristics of all the noise sources on their target systems to decide whether refactoring their code to take advantage of nonblocking collectives will be worthwhile.
+
+References
+
+[1] Pete Beckman, Kamil Iskra, Kazutomo Yoshii, Susan Coghlan, and Aroon Nataraj. Benchmarking 
+the effects of operating system interference on extreme-scale parallel machines. Cluster Computing, 
+11(1):3–16, 2008. 
+[2] Ron Brightwell, Rolf Riesen, and Keith D Underwood. Analyzing the impact of overlap, offload, 
+and independent progress for message passing interface applications. Intl. Journal of High Performance 
+Computing Applications, 19(2):103–117, 2005. 
+[3] Greg Bronevetsky. Communication-sensitive static dataflow for parallel message passing applications. 
+In Proceedings of the 7th annual IEEE/ACM Intl. Symposium on Code Generation and Optimization, pages 
+1–12. IEEE Computer Society, 2009. 
+[4] David Culler, Richard Karp, David Patterson, Abhijit Sahay, Klaus Erik Schauser, Eunice Santos, 
+Ramesh Subramonian, and Thorsten von Eicken. LogP: towards a realistic model of parallel com 
+putation. SIGPLAN Not., 28(7):1–12, July 1993. 
+[5] J. T. Daly. A higher order estimate of the optimum checkpoint interval for restart dumps. Future Gener. 
+Comput. Syst., 22(3):303–312, 2006. 
+[6] Jr. E. S. Hertel, R. L. Bell, M. G. Elrick, A. V. Farnsworth, G. I. Kerley, J. M. McGlaun, S. V. PetneY, S. A. 
+Silling, P. A. Taylor, and L. Yarrington. CTH: A software family for multi-dimensional shock physics 
+analysis. In Proceedings of the 19th Intl. Symp. on Shock Waves, pages 377–382, July 1993. 
+[7] Exascale Co-Design Center for Materials in Extreme Environments (ExMatEx). http://exmatex. 
+lanl.gov/. Retrieved 16 Jan 2014. 
+[8] Kurt B Ferreira, Patrick Bridges, and Ron Brightwell. Characterizing application sensitivity to OS 
+interference using kernel-level noise injection. In Proceedings of the 2008 ACM/IEEE Conference on Su 
+percomputing, page 19. IEEE Press, 2008. 
+[9] Kurt B. Ferreira, Scott Levy, Patrick M. Widener, Dorian Arnold, and Torsten Hoefler. Understanding 
+the effects of communication and coordination on checkpointing at scale. In Proc. Inernational Confer 
+ence for High Performance Computing, Networking, Storage and Analysis (Supercomputing), New Orleans, 
+Louisiana, November 2014. IEEE/ACM. 
+[10] P Ghysels and W Vanroose. Hiding global synchronization latency in the preconditioned conjugate 
+gradient algorithm. Parallel Computing, 2013. 
+[11] M. Giampapa, T. Gooding, T. Inglett, and R.W. Wisniewski. Experiences with a lightweight super 
+computer kernel: Lessons learned from Blue Gene’s CNK. In High Performance Computing, Networking, 
+
+Storage and Analysis (SC), 2010 International Conference for, pages 1–10, Nov 2010. 
+[12] William Gropp, Torsten Hoefler, Rajeev Thakur, and Ewing Lusk. Using Advanced MPI: Modern Features 
+of the Message-Passing Interface. Scientific and Engineering Computation. MIT Press, 2014. 
+[13] Van Emden Henson and Ulrike Meier Yang. Boomeramg: A parallel algebraic multigrid solver and 
+preconditioner. Appl. Num. Math., 41:155–177, 2002. 
+[14] Michael A. Heroux, Douglas W. Doerfler, Paul S. Crozier, James M. Willenbring, H. Carter Edwards, 
+Alan Williams, Mahesh Rajan, Eric R. Keiter, Heidi K. Thornquist, and Robert W. Numrich. Improving 
+performance via mini-applications. Technical Report SAND2009-5574, Sandia National Laboratory, 
+2009. 
+[15] T. Hoefler, A. Lumsdaine, and W. Rehm. Implementation and performance analysis of non-blocking 
+collective operations for MPI. In Proc. of the 2007 Intl. Conference on High Performance Computing, Net 
+working, Storage and Analysis, SC07. IEEE Computer Society/ACM, Nov. 2007. 
+[16] T. Hoefler, T. Schneider, and A. Lumsdaine. Characterizing the influence of system noise on large 
+scale applications by simulation. In International Conference for High Performance Computing, Networking, 
+Storage and Analysis (SC’10), Nov. 2010. 
+[17] T. Hoefler, T. Schneider, and A. Lumsdaine. LogGOPSim - Simulating large-scale applications in the 
+loggops model. In Proc. of the 19th ACM International Symp. on High Performance Distributed Computing, 
+pages 597–604. ACM, Jun. 2010. 
+[18] T. Hoefler, C. Siebert, and A. Lumsdaine. Scalable communication protocols for dynamic sparse 
+data exchange. In Proc. of the 2010 ACM Symposium on Principles and Practice of Parallel Programming 
+(PPoPP’10), pages 159–168. ACM, Jan. 2010. 
+[19] T. Hoefler, J. Squyres, G. Bosilca, G. Fagg, A. Lumsdaine, and W. Rehm. Non-blocking collective 
+operations for MPI-2. Technical report, Open Systems Lab, Indiana University, Aug. 2006. 
+[20] Torsten Hoefler, Prabhanjan Kambadur, Richard L Graham, Galen Shipman, and Andrew Lumsdaine. 
+A case for standard non-blocking collective operations. In Recent Advances in Parallel Virtual Machine 
+and Message Passing Interface, pages 125–134. Springer, 2007. 
+[21] Ian Karlin, Abhinav Bhatele, Bradford L. Chamberlain, Jonathan Cohen, Zachary Devito, Maya 
+Gokhale, Riyaz Haque, Rich Hornung, Jeff Keasler, Dan Laney, Edward Luke, Scott Lloyd, Jim Mc 
+Graw, Rob Neely, David Richards, Martin Schulz, Charle H. Still, Felix Wang, and Daniel Wong. 
+LULESH programming model and performance ports overview. Technical Report LLNL-TR-608824, 
+December 2012. 
+
+[22] Leslie Lamport. Time, clocks, and the ordering of events in a distributed system. Communications of the 
+ACM, 21(7):558–565, July 1978. 
+[23] Scott Levy, Bryan Topp, Kurt B. Ferreira, Dorian Arnold, Torsten Hoefler, and Patrick Widener. Using 
+simulation to evaluate the performance of resilience strategies at scale. In High Performance Computing, 
+Networking, Storage and Analysis (SCC), 2013 SC Companion:. IEEE, 2013. 
+[24] Message Passing Interface Forum. MPI: A message-passing interface standard, version 3.0. http: 
+//www.mpi-forum.org/docs/mpi-3.0/mpi30-report.pdf, September 2012. 
+[25] Fabrizio Petrini, DK Kerbyson, and Scott Pakin. The case of the missing supercomputer performance: 
+Achieving optimal performance on the 8,192 processors of ASCI Q. In Supercomputing, 2003 ACM/IEEE 
+Conference, pages 55–55. IEEE, 2003. 
+[26] Steven J. Plimpton. Fast parallel algorithms for short-range molecular dynamics. Journal Computation 
+Physics, 117:1–19, 1995. 
+[27] Rolf Riesen, Ron Brightwell, Patrick Bridges, Trammell Hudson, Arthur Maccabe, Patrick Widener, 
+and Kurt Ferreira. Designing and implementing lightweight kernels for capability computing. Con 
+currency and Computation: Practice and Experience, 21(6):793–817, April 2009. 
+[28] R. Thakur, R. Rabenseifner, and W. Gropp. Optimization of collective communications operations in 
+MPICH. International Journal of High Performance Computing Applications, 19:49–66, 2005. 
+[29] Jeffrey Vetter and Chris Chambreau. mpiP: Lightweight, scalable MPI profiling. URL: http://www. llnl. 
+gov/CASC/mpiP, 2005. 
+[30] Kazutomo Yoshii, Kamil Iskra, Harish Naik, Pete Beckman, and P. Chris Broekema. Characterizing the 
+performance of “big memory” on Blue Gene Linux. In Parallel Processing Workshops, 2009. ICPPW’09. 
+International Conference on, pages 65–72. IEEE, 2009. 
+

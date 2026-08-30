@@ -1,0 +1,423 @@
+1,417 reads
+
+# CRDTs vs Operational Transformation: A Practical Guide to Real-Time Collaboration
+
+by
+
+Saumya Tyagi
+
+bySaumya Tyagi|@saumyatyagiStaff Software Engineer at Auger
+
+Loves cricket and distributed systems.
+
+Subscribe
+
+December 24th, 2025
+
+TLDR
+
+Your browser does not support the `audio` element.
+
+Speed1x
+
+Voice
+
+Dr. One Ms. Hacker 
+
+bySaumya Tyagi@saumyatyagi
+
+bySaumya Tyagi|@saumyatyagiStaff Software Engineer at Auger
+
+Loves cricket and distributed systems.
+
+Subscribe
+
+Story's Credibility
+
+bySaumya Tyagi|@saumyatyagiStaff Software Engineer at Auger
+
+Loves cricket and distributed systems.
+
+Subscribe
+
+Story's Credibility
+
+Ever wondered how Google Docs lets multiple people type in the same document without creating chaos? Or how Figma keeps everyone's designs in sync? Behind these seamless experiences lie two powerful techniques: Operational Transformation (OT) and Conflict-free Replicated Data Types (CRDTs).
+
+In this article, I'll break down both approaches, show you when to use each, and walk through simple implementations you can actually build.
+
+## The Problem: Concurrent Edits Are Hard
+
+Imagine Alice and Bob are editing a document containing "Hello". Simultaneously:
+
+- Alice inserts " World" at position 5
+- Bob deletes "H" at position 0
+
+If we apply these operations naively, we get conflicts. Alice expects "Hello World" while Bob expects "ello". When we try to merge, chaos ensues.
+
+This is the core challenge of collaborative editing: how do we ensure everyone ends up with the same result regardless of the order they receive updates?
+
+## Operational Transformation: The Pioneer
+
+OT was invented at Xerox PARC in 1989 and powers Google Docs, Google Wave (RIP), and many collaborative editors.
+
+### The Core Idea
+
+OT transforms operations based on what has happened concurrently. When you receive a remote operation, you don't apply it directly—you transform it against operations that have already been applied locally.
+
+### How It Works
+
+Let's revisit our example. The document starts as "Hello" (positions 0-4).
+
+Alice's operation: `Insert(" World", 5)` Bob's operation: `Delete(0, 1)` (delete 1 character at position 0)
+
+When Bob receives Alice's insert, he needs to transform it. Since Bob deleted a character before position 5, Alice's insert position needs to shift:
+
+```javascript
+Transform(Insert(" World", 5), Delete(0, 1)) = Insert(" World", 4)
+
+```
+
+Similarly, when Alice receives Bob's delete, no transformation is needed since position 0 comes before her insert at position 5.
+
+### A Simple OT Implementation
+
+Here's a minimal OT system for text editing in TypeScript:
+
+```typescript
+type Operation = 
+  | { type: 'insert'; position: number; text: string }
+  | { type: 'delete'; position: number; length: number };
+
+function transformOperation(op: Operation, against: Operation): Operation {
+  if (op.type === 'insert' && against.type === 'insert') {
+    // If the other insert comes before ours, shift our position
+    if (against.position <= op.position) {
+      return { ...op, position: op.position + against.text.length };
+    }
+    return op;
+  }
+  
+  if (op.type === 'insert' && against.type === 'delete') {
+    // If deletion is before our insert, shift left
+    if (against.position < op.position) {
+      return { 
+        ...op, 
+        position: Math.max(against.position, op.position - against.length) 
+      };
+    }
+    return op;
+  }
+  
+  if (op.type === 'delete' && against.type === 'insert') {
+    // If insert is before our delete, shift right
+    if (against.position <= op.position) {
+      return { ...op, position: op.position + against.text.length };
+    }
+    return op;
+  }
+  
+  if (op.type === 'delete' && against.type === 'delete') {
+    // Handle overlapping deletes
+    if (against.position >= op.position + op.length) {
+      return op; // No overlap, delete comes before
+    }
+    if (against.position + against.length <= op.position) {
+      // Other delete is entirely before ours
+      return { ...op, position: op.position - against.length };
+    }
+    // Overlapping deletes - complex case
+    const overlapStart = Math.max(op.position, against.position);
+    const overlapEnd = Math.min(
+      op.position + op.length, 
+      against.position + against.length
+    );
+    const overlapLength = overlapEnd - overlapStart;
+    
+    return {
+      ...op,
+      position: Math.min(op.position, against.position),
+      length: op.length - overlapLength
+    };
+  }
+  
+  return op;
+}
+
+```
+
+### The Catch: OT Is Complex
+
+That simple implementation above? It's incomplete. Real OT systems need to handle:
+
+- Transformation puzzles: The order of transformations matters, and getting it wrong leads to divergence
+- Server authority: Most OT systems require a central server to determine canonical ordering
+- Operational complexity: Each operation type needs transformation rules against every other type (O(n²) combinations)
+
+Google's OT implementation for Docs reportedly has edge cases that took years to iron out.
+
+## CRDTs: The Decentralized Alternative
+
+CRDTs emerged from distributed systems research in the 2000s. The key insight: design your data structures so that concurrent operations always converge, without requiring transformation.
+
+### The Core Idea
+
+CRDTs achieve this through mathematical properties. A CRDT is either:
+
+- State-based (CvRDT): Replicas merge states using a function that is commutative, associative, and idempotent
+- Operation-based (CmRDT): Operations are designed to be commutative—order doesn't matter
+
+### A Simple CRDT: G-Counter
+
+Let's start with the simplest CRDT—a counter that can only grow:
+
+```javascript
+class GCounter {
+  private counts: Map<string, number> = new Map();
+  
+  constructor(private nodeId: string) {}
+  
+  increment(): void {
+    const current = this.counts.get(this.nodeId) || 0;
+    this.counts.set(this.nodeId, current + 1);
+  }
+  
+  value(): number {
+    let total = 0;
+    for (const count of this.counts.values()) {
+      total += count;
+    }
+    return total;
+  }
+  
+  merge(other: GCounter): void {
+    for (const [nodeId, count] of other.counts) {
+      const current = this.counts.get(nodeId) || 0;
+      this.counts.set(nodeId, Math.max(current, count));
+    }
+  }
+  
+  getState(): Map<string, number> {
+    return new Map(this.counts);
+  }
+}
+
+```
+
+Each node tracks its own count. Merging takes the maximum per node. No matter what order you merge, you get the same result.
+
+### Text CRDTs: The Real Challenge
+
+For collaborative text editing, we need something more sophisticated. The two main approaches are:
+
+1. Sequence CRDTs (like RGA, WOOT)
+
+Assign each character a unique, ordered ID that preserves intention regardless of when operations arrive.
+
+2. Tree-based CRDTs (like YATA, used in Yjs)
+
+Model the document as a tree where position is determined by relationships, not indices.
+
+Here's a simplified sequence CRDT:
+
+```javascript
+interface Char {
+  id: { nodeId: string; seq: number };
+  value: string;
+  deleted: boolean;
+  // Position determined by ID ordering, not array index
+}
+
+class TextCRDT {
+  private chars: Char[] = [];
+  private seq = 0;
+  
+  constructor(private nodeId: string) {}
+  
+  insert(index: number, value: string): Char {
+    const id = { nodeId: this.nodeId, seq: this.seq++ };
+    const char: Char = { id, value, deleted: false };
+    
+    // Find actual position accounting for tombstones
+    let actualIndex = 0;
+    let visibleCount = 0;
+    while (visibleCount < index && actualIndex < this.chars.length) {
+      if (!this.chars[actualIndex].deleted) {
+        visibleCount++;
+      }
+      actualIndex++;
+    }
+    
+    this.chars.splice(actualIndex, 0, char);
+    return char;
+  }
+  
+  delete(index: number): void {
+    let visibleCount = 0;
+    for (const char of this.chars) {
+      if (!char.deleted) {
+        if (visibleCount === index) {
+          char.deleted = true; // Tombstone, don't remove
+          return;
+        }
+        visibleCount++;
+      }
+    }
+  }
+  
+  applyRemote(char: Char): void {
+    // Find correct position based on ID ordering
+    let insertIndex = 0;
+    for (let i = 0; i < this.chars.length; i++) {
+      if (this.compareIds(char.id, this.chars[i].id) < 0) {
+        break;
+      }
+      insertIndex = i + 1;
+    }
+    this.chars.splice(insertIndex, 0, char);
+  }
+  
+  private compareIds(a: Char['id'], b: Char['id']): number {
+    if (a.seq !== b.seq) return a.seq - b.seq;
+    return a.nodeId.localeCompare(b.nodeId);
+  }
+  
+  getText(): string {
+    return this.chars
+      .filter(c => !c.deleted)
+      .map(c => c.value)
+      .join('');
+  }
+}
+
+```
+
+### Real-World CRDT Libraries
+
+Don't implement this yourself for production. Use battle-tested libraries:
+
+- Yjs: The most popular, powers many collaborative apps
+- Automerge: Elegant API, great for JSON-like data
+- Diamond Types: Rust-based, extremely fast
+
+Here's how simple Yjs makes collaborative text:
+
+```javascript
+import * as Y from 'yjs';
+
+const doc = new Y.Doc();
+const text = doc.getText('shared');
+
+// Local edits
+text.insert(0, 'Hello');
+text.insert(5, ' World');
+
+// Sync with remote
+doc.on('update', (update) => {
+  // Send update to other peers
+  broadcastToPeers(update);
+});
+
+// Apply remote update
+function onRemoteUpdate(update: Uint8Array) {
+  Y.applyUpdate(doc, update);
+}
+
+```
+
+## When to Use What?
+
+### Choose OT When:
+
+- You have a central server anyway
+- You need fine-grained control over conflict resolution
+- You're working with established systems like Google Docs
+- Bandwidth is limited (OT operations are typically smaller)
+
+### Choose CRDTs When:
+
+- You need peer-to-peer collaboration
+- Offline support is critical
+- You want simpler reasoning about correctness
+- You need to sync across many replicas without a central coordinator
+- You're building with modern libraries like Yjs
+
+### The Hybrid Approach
+
+Many real systems combine both:
+
+- Figma: Uses CRDTs for the data model but custom algorithms for specific features
+- Apple Notes: CRDTs for sync, but server still coordinates
+- Linear: CRDTs for local-first sync with server-side ordering
+
+## Performance Considerations
+
+### OT
+
+- Transformation is O(n) where n is concurrent operations
+- Central server can become a bottleneck
+- History can be compacted aggressively
+
+### CRDTs
+
+- Tombstones accumulate (deleted items stick around)
+- Metadata overhead per character/element
+- Modern CRDTs like Yjs have excellent optimizations
+
+Yjs benchmarks show it handling millions of operations efficiently, making CRDT overhead a non-issue for most applications.
+
+## Practical Recommendations
+
+1. Starting a new project? Use Yjs or Automerge. The DX is excellent, and you get offline-first for free.
+2. Building a text editor? Look at ProseMirror + Yjs or Slate + Yjs integrations.
+3. Need real-time cursors? Both approaches support awareness/presence—Yjs has this built in.
+4. Worried about conflicts? CRDTs make conflicts mathematically impossible. OT makes them resolvable.
+
+## Conclusion
+
+OT and CRDTs solve the same fundamental problem: making concurrent edits converge. OT does it through transformation, CRDTs through mathematical properties.
+
+For most new projects, I'd recommend starting with CRDTs via Yjs. The programming model is simpler, offline-first comes naturally, and the performance is excellent. OT still shines in server-centric architectures where you need maximum control.
+
+The collaborative editing landscape has matured enormously. What once required PhD-level distributed systems knowledge now comes in npm packages. Pick your approach, grab a library, and start building.
+
+← PreviousBuilding a Distributed Timer Service at Scale: Handling 100K Timers Per Second Up Next →Why Most Database Migrations Fail Silently: 5 Hidden Failure Modes in Zero-Downtime Replatforming
+
+### About Author
+
+by Saumya Tyagi|@saumyatyagi
+
+Staff Software Engineer at Auger
+
+Loves cricket and distributed systems.
+
+Subscribe
+
+Read my stories Learn More
+
+#### TOPICS
+
+Software Engineering
+
+#distributed-systems#crdt#real-time-collaboration#collabrative-editing#software-engineering#typescript#concurrent-edits#conflict-free-replicated-data
+
+## Light-Mode
+
+### Classic
+
+### Newspaper
+
+### Proof of Usefulness
+
+## Dark-Mode
+
+### Neon Noir
+
+### Minty
+
+### Startups of the Year
+
+```json
+{"@context":"http://schema.org","@type":"Article","name":"CRDTs vs Operational Transformation: A Practical Guide to Real-Time Collaboration","headline":"CRDTs vs Operational Transformation: A Practical Guide to Real-Time Collaboration","author":{"@type":"Person","name":"Saumya Tyagi"},"datePublished":"2025-12-24","image":"https://hackernoon.imgix.net/images/2jqChkrv03exBUgkLrDzIbfM99q2-7u022cw.jpeg","articleSection":"distributed-systems","articleBody":"Ever wondered how Google Docs lets multiple people type in the same document without creating chaos? Or how Figma keeps everyone's designs in sync? Behind these seamless experiences lie two powerful techniques: Operational Transformation (OT) and Conflict-free Replicated Data Types (CRDTs). In this article, I'll break down both approaches, show you when to use each, and walk through simple implementations you can actually build. The Problem: Concurrent Edits Are Hard Imagine Alice and Bob are editing a document containing "Hello". Simultaneously: Alice inserts " World" at position 5\nBob deletes "H" at position 0 Alice inserts " World" at position 5 Bob deletes "H" at position 0 If we apply these operations naively, we get conflicts. Alice expects "Hello World" while Bob expects "ello". When we try to merge, chaos ensues. This is the core challenge of collaborative editing: how do we ensure everyone ends up with the same result regardless of the order they receive updates? Operational Transformation: The Pioneer OT was invented at Xerox PARC in 1989 and powers Google Docs, Google Wave (RIP), and many collaborative editors. The Core Idea OT transforms operations based on what has happened concurrently. When you receive a remote operation, you don't apply it directly—you transform it against operations that have already been applied locally. How It Works Let's revisit our example. The document starts as "Hello" (positions 0-4). Alice's operation: Insert(" World", 5) Bob's operation: Delete(0, 1) (delete 1 character at position 0) Insert(" World", 5) Delete(0, 1) When Bob receives Alice's insert, he needs to transform it. Since Bob deleted a character before position 5, Alice's insert position needs to shift: Transform(Insert(" World", 5), Delete(0, 1)) = Insert(" World", 4) Transform(Insert(" World", 5), Delete(0, 1)) = Insert(" World", 4) Similarly, when Alice receives Bob's delete, no transformation is needed since position 0 comes before her insert at position 5. A Simple OT Implementation Here's a minimal OT system for text editing in TypeScript: type Operation = \n  | { type: 'insert'; position: number; text: string }\n  | { type: 'delete'; position: number; length: number };\n\nfunction transformOperation(op: Operation, against: Operation): Operation {\n  if (op.type === 'insert' && against.type === 'insert') {\n    // If the other insert comes before ours, shift our position\n    if (against.position <= op.position) {\n      return { ...op, position: op.position + against.text.length };\n    }\n    return op;\n  }\n  \n  if (op.type === 'insert' && against.type === 'delete') {\n    // If deletion is before our insert, shift left\n    if (against.position < op.position) {\n      return { \n        ...op, \n        position: Math.max(against.position, op.position - against.length) \n      };\n    }\n    return op;\n  }\n  \n  if (op.type === 'delete' && against.type === 'insert') {\n    // If insert is before our delete, shift right\n    if (against.position <= op.position) {\n      return { ...op, position: op.position + against.text.length };\n    }\n    return op;\n  }\n  \n  if (op.type === 'delete' && against.type === 'delete') {\n    // Handle overlapping deletes\n    if (against.position >= op.position + op.length) {\n      return op; // No overlap, delete comes before\n    }\n    if (against.position + against.length <= op.position) {\n      // Other delete is entirely before ours\n      return { ...op, position: op.position - against.length };\n    }\n    // Overlapping deletes - complex case\n    const overlapStart = Math.max(op.position, against.position);\n    const overlapEnd = Math.min(\n      op.position + op.length, \n      against.position + against.length\n    );\n    const overlapLength = overlapEnd - overlapStart;\n    \n    return {\n      ...op,\n      position: Math.min(op.position, against.position),\n      length: op.length - overlapLength\n    };\n  }\n  \n  return op;\n} type Operation = \n  | { type: 'insert'; position: number; text: string }\n  | { type: 'delete'; position: number; length: number };\n\nfunction transformOperation(op: Operation, against: Operation): Operation {\n  if (op.type === 'insert' && against.type === 'insert') {\n    // If the other insert comes before ours, shift our position\n    if (against.position <= op.position) {\n      return { ...op, position: op.position + against.text.length };\n    }\n    return op;\n  }\n  \n  if (op.type === 'insert' && against.type === 'delete') {\n    // If deletion is before our insert, shift left\n    if (against.position < op.position) {\n      return { \n        ...op, \n        position: Math.max(against.position, op.position - against.length) \n      };\n    }\n    return op;\n  }\n  \n  if (op.type === 'delete' && against.type === 'insert') {\n    // If insert is before our delete, shift right\n    if (against.position <= op.position) {\n      return { ...op, position: op.position + against.text.length };\n    }\n    return op;\n  }\n  \n  if (op.type === 'delete' && against.type === 'delete') {\n    // Handle overlapping deletes\n    if (against.position >= op.position + op.length) {\n      return op; // No overlap, delete comes before\n    }\n    if (against.position + against.length <= op.position) {\n      // Other delete is entirely before ours\n      return { ...op, position: op.position - against.length };\n    }\n    // Overlapping deletes - complex case\n    const overlapStart = Math.max(op.position, against.position);\n    const overlapEnd = Math.min(\n      op.position + op.length, \n      against.position + against.length\n    );\n    const overlapLength = overlapEnd - overlapStart;\n    \n    return {\n      ...op,\n      position: Math.min(op.position, against.position),\n      length: op.length - overlapLength\n    };\n  }\n  \n  return op;\n} The Catch: OT Is Complex That simple implementation above? It's incomplete. Real OT systems need to handle: Transformation puzzles: The order of transformations matters, and getting it wrong leads to divergence\nServer authority: Most OT systems require a central server to determine canonical ordering\nOperational complexity: Each operation type needs transformation rules against every other type (O(n²) combinations) Transformation puzzles: The order of transformations matters, and getting it wrong leads to divergence Transformation puzzles Server authority: Most OT systems require a central server to determine canonical ordering Server authority Operational complexity: Each operation type needs transformation rules against every other type (O(n²) combinations) Operational complexity Google's OT implementation for Docs reportedly has edge cases that took years to iron out. CRDTs: The Decentralized Alternative CRDTs emerged from distributed systems research in the 2000s. The key insight: design your data structures so that concurrent operations always converge, without requiring transformation. always The Core Idea CRDTs achieve this through mathematical properties. A CRDT is either: State-based (CvRDT): Replicas merge states using a function that is commutative, associative, and idempotent\nOperation-based (CmRDT): Operations are designed to be commutative—order doesn't matter State-based (CvRDT): Replicas merge states using a function that is commutative, associative, and idempotent State-based (CvRDT) Operation-based (CmRDT): Operations are designed to be commutative—order doesn't matter Operation-based (CmRDT) A Simple CRDT: G-Counter Let's start with the simplest CRDT—a counter that can only grow: class GCounter {\n  private counts: Map<string, number> = new Map();\n  \n  constructor(private nodeId: string) {}\n  \n  increment(): void {\n    const current = this.counts.get(this.nodeId) || 0;\n    this.counts.set(this.nodeId, current + 1);\n  }\n  \n  value(): number {\n    let total = 0;\n    for (const count of this.counts.values()) {\n      total += count;\n    }\n    return total;\n  }\n  \n  merge(other: GCounter): void {\n    for (const [nodeId, count] of other.counts) {\n      const current = this.counts.get(nodeId) || 0;\n      this.counts.set(nodeId, Math.max(current, count));\n    }\n  }\n  \n  getState(): Map<string, number> {\n    return new Map(this.counts);\n  }\n} class GCounter {\n  private counts: Map<string, number> = new Map();\n  \n  constructor(private nodeId: string) {}\n  \n  increment(): void {\n    const current = this.counts.get(this.nodeId) || 0;\n    this.counts.set(this.nodeId, current + 1);\n  }\n  \n  value(): number {\n    let total = 0;\n    for (const count of this.counts.values()) {\n      total += count;\n    }\n    return total;\n  }\n  \n  merge(other: GCounter): void {\n    for (const [nodeId, count] of other.counts) {\n      const current = this.counts.get(nodeId) || 0;\n      this.counts.set(nodeId, Math.max(current, count));\n    }\n  }\n  \n  getState(): Map<string, number> {\n    return new Map(this.counts);\n  }\n} Each node tracks its own count. Merging takes the maximum per node. No matter what order you merge, you get the same result. Text CRDTs: The Real Challenge For collaborative text editing, we need something more sophisticated. The two main approaches are: 1. Sequence CRDTs (like RGA, WOOT) 1. Sequence CRDTs (like RGA, WOOT) Assign each character a unique, ordered ID that preserves intention regardless of when operations arrive. 2. Tree-based CRDTs (like YATA, used in Yjs) 2. Tree-based CRDTs (like YATA, used in Yjs) Model the document as a tree where position is determined by relationships, not indices. Here's a simplified sequence CRDT: interface Char {\n  id: { nodeId: string; seq: number };\n  value: string;\n  deleted: boolean;\n  // Position determined by ID ordering, not array index\n}\n\nclass TextCRDT {\n  private chars: Char[] = [];\n  private seq = 0;\n  \n  constructor(private nodeId: string) {}\n  \n  insert(index: number, value: string): Char {\n    const id = { nodeId: this.nodeId, seq: this.seq++ };\n    const char: Char = { id, value, deleted: false };\n    \n    // Find actual position accounting for tombstones\n    let actualIndex = 0;\n    let visibleCount = 0;\n    while (visibleCount < index && actualIndex < this.chars.length) {\n      if (!this.chars[actualIndex].deleted) {\n        visibleCount++;\n      }\n      actualIndex++;\n    }\n    \n    this.chars.splice(actualIndex, 0, char);\n    return char;\n  }\n  \n  delete(index: number): void {\n    let visibleCount = 0;\n    for (const char of this.chars) {\n      if (!char.deleted) {\n        if (visibleCount === index) {\n          char.deleted = true; // Tombstone, don't remove\n          return;\n        }\n        visibleCount++;\n      }\n    }\n  }\n  \n  applyRemote(char: Char): void {\n    // Find correct position based on ID ordering\n    let insertIndex = 0;\n    for (let i = 0; i < this.chars.length; i++) {\n      if (this.compareIds(char.id, this.chars[i].id) < 0) {\n        break;\n      }\n      insertIndex = i + 1;\n    }\n    this.chars.splice(insertIndex, 0, char);\n  }\n  \n  private compareIds(a: Char['id'], b: Char['id']): number {\n    if (a.seq !== b.seq) return a.seq - b.seq;\n    return a.nodeId.localeCompare(b.nodeId);\n  }\n  \n  getText(): string {\n    return this.chars\n      .filter(c => !c.deleted)\n      .map(c => c.value)\n      .join('');\n  }\n} interface Char {\n  id: { nodeId: string; seq: number };\n  value: string;\n  deleted: boolean;\n  // Position determined by ID ordering, not array index\n}\n\nclass TextCRDT {\n  private chars: Char[] = [];\n  private seq = 0;\n  \n  constructor(private nodeId: string) {}\n  \n  insert(index: number, value: string): Char {\n    const id = { nodeId: this.nodeId, seq: this.seq++ };\n    const char: Char = { id, value, deleted: false };\n    \n    // Find actual position accounting for tombstones\n    let actualIndex = 0;\n    let visibleCount = 0;\n    while (visibleCount < index && actualIndex < this.chars.length) {\n      if (!this.chars[actualIndex].deleted) {\n        visibleCount++;\n      }\n      actualIndex++;\n    }\n    \n    this.chars.splice(actualIndex, 0, char);\n    return char;\n  }\n  \n  delete(index: number): void {\n    let visibleCount = 0;\n    for (const char of this.chars) {\n      if (!char.deleted) {\n        if (visibleCount === index) {\n          char.deleted = true; // Tombstone, don't remove\n          return;\n        }\n        visibleCount++;\n      }\n    }\n  }\n  \n  applyRemote(char: Char): void {\n    // Find correct position based on ID ordering\n    let insertIndex = 0;\n    for (let i = 0; i < this.chars.length; i++) {\n      if (this.compareIds(char.id, this.chars[i].id) < 0) {\n        break;\n      }\n      insertIndex = i + 1;\n    }\n    this.chars.splice(insertIndex, 0, char);\n  }\n  \n  private compareIds(a: Char['id'], b: Char['id']): number {\n    if (a.seq !== b.seq) return a.seq - b.seq;\n    return a.nodeId.localeCompare(b.nodeId);\n  }\n  \n  getText(): string {\n    return this.chars\n      .filter(c => !c.deleted)\n      .map(c => c.value)\n      .join('');\n  }\n} Real-World CRDT Libraries Don't implement this yourself for production. Use battle-tested libraries: Yjs: The most popular, powers many collaborative apps\nAutomerge: Elegant API, great for JSON-like data\nDiamond Types: Rust-based, extremely fast Yjs: The most popular, powers many collaborative apps Yjs Automerge: Elegant API, great for JSON-like data Automerge Diamond Types: Rust-based, extremely fast Diamond Types Here's how simple Yjs makes collaborative text: import * as Y from 'yjs';\n\nconst doc = new Y.Doc();\nconst text = doc.getText('shared');\n\n// Local edits\ntext.insert(0, 'Hello');\ntext.insert(5, ' World');\n\n// Sync with remote\ndoc.on('update', (update) => {\n  // Send update to other peers\n  broadcastToPeers(update);\n});\n\n// Apply remote update\nfunction onRemoteUpdate(update: Uint8Array) {\n  Y.applyUpdate(doc, update);\n} import * as Y from 'yjs';\n\nconst doc = new Y.Doc();\nconst text = doc.getText('shared');\n\n// Local edits\ntext.insert(0, 'Hello');\ntext.insert(5, ' World');\n\n// Sync with remote\ndoc.on('update', (update) => {\n  // Send update to other peers\n  broadcastToPeers(update);\n});\n\n// Apply remote update\nfunction onRemoteUpdate(update: Uint8Array) {\n  Y.applyUpdate(doc, update);\n} When to Use What? Choose OT When: You have a central server anyway\nYou need fine-grained control over conflict resolution\nYou're working with established systems like Google Docs\nBandwidth is limited (OT operations are typically smaller) You have a central server anyway central server You need fine-grained control over conflict resolution fine-grained control You're working with established systems like Google Docs established systems Bandwidth is limited (OT operations are typically smaller) Bandwidth is limited Choose CRDTs When: You need peer-to-peer collaboration\nOffline support is critical\nYou want simpler reasoning about correctness\nYou need to sync across many replicas without a central coordinator\nYou're building with modern libraries like Yjs You need peer-to-peer collaboration peer-to-peer Offline support is critical Offline support You want simpler reasoning about correctness simpler reasoning You need to sync across many replicas without a central coordinator sync across many replicas You're building with modern libraries like Yjs The Hybrid Approach Many real systems combine both: Figma: Uses CRDTs for the data model but custom algorithms for specific features\nApple Notes: CRDTs for sync, but server still coordinates\nLinear: CRDTs for local-first sync with server-side ordering Figma: Uses CRDTs for the data model but custom algorithms for specific features Figma Apple Notes: CRDTs for sync, but server still coordinates Apple Notes Linear: CRDTs for local-first sync with server-side ordering Linear Performance Considerations OT Transformation is O(n) where n is concurrent operations\nCentral server can become a bottleneck\nHistory can be compacted aggressively Transformation is O(n) where n is concurrent operations Central server can become a bottleneck History can be compacted aggressively CRDTs Tombstones accumulate (deleted items stick around)\nMetadata overhead per character/element\nModern CRDTs like Yjs have excellent optimizations Tombstones accumulate (deleted items stick around) Metadata overhead per character/element Modern CRDTs like Yjs have excellent optimizations Yjs benchmarks show it handling millions of operations efficiently, making CRDT overhead a non-issue for most applications. Practical Recommendations Starting a new project? Use Yjs or Automerge. The DX is excellent, and you get offline-first for free.\nBuilding a text editor? Look at ProseMirror + Yjs or Slate + Yjs integrations.\nNeed real-time cursors? Both approaches support awareness/presence—Yjs has this built in.\nWorried about conflicts? CRDTs make conflicts mathematically impossible. OT makes them resolvable. Starting a new project? Use Yjs or Automerge. The DX is excellent, and you get offline-first for free. Starting a new project? Building a text editor? Look at ProseMirror + Yjs or Slate + Yjs integrations. Building a text editor? Need real-time cursors? Both approaches support awareness/presence—Yjs has this built in. Need real-time cursors? Worried about conflicts? CRDTs make conflicts mathematically impossible. OT makes them resolvable. Worried about conflicts? Conclusion OT and CRDTs solve the same fundamental problem: making concurrent edits converge. OT does it through transformation, CRDTs through mathematical properties. For most new projects, I'd recommend starting with CRDTs via Yjs. The programming model is simpler, offline-first comes naturally, and the performance is excellent. OT still shines in server-centric architectures where you need maximum control. The collaborative editing landscape has matured enormously. What once required PhD-level distributed systems knowledge now comes in npm packages. Pick your approach, grab a library, and start building."}
+
+```

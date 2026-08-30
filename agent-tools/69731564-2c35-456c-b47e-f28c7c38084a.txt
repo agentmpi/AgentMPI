@@ -1,0 +1,450 @@
+## Reducing MPI memory usage in Exascale Networks
+
+Brian W. Barrett and K. Scott Hemmert Sandia National Laboratories P.O. Box 5800 Albuquerque, NM 87185-1319 e-mail: bwbarre@sandia.gov, kshemme@sandia.gov
+
+Keith D. Underwood Intel Corporation Rio Rancho, NM, USA e-mail: keith.d.underwood@intel.com
+
+Abstract—Exascale systems will require an unprecedented number of cores. Such systems will also require substantial increases in network bandwidth; however, commensurate de creases in network latency are not achievable. This results in a significant increase in the “bandwidth delay product” of the network, and that increase interacts with the typical strategy of buffering “short” messages in MPI. The result is an increase in memory buffer requirements in an environment that will inevitably be memory constrained. Whereas traditional MPI implementations leverage two protocols (one threshold between an eager protocol for short messages and a rendezvous protocol for long messages), we propose adding a separate protocol for “medium” messages. By adding a third protocol, it is possible to reduce the memory requirements for MPI buffers in Exascale class systems, while preserving the desirable latency characteristics of the short message protocol. Keywords-MPI, rendezvous, exascale
+
+I. INTRODUCTION
+
+Two aspects of Exascale systems are increasingly ac cepted by the community: core count will increase dras tically and system memory will not grow as rapidly as core count. This creates an increasingly memory constrained en vironment for both applications and system libraries. While there is much debate over what the Exascale programming model will be, it is likely that many of the initial applications will have a very large number of MPI ranks on the system. This makes it important to minimize the amount of memory that MPI requires per rank. At the same time, there is an upward pressure on the buffering requirements for an MPI rank: network bandwidth is increasing much more rapidly than network latency is decreasing. This means that the bandwidth delay product of the network is increasing substantially. Typical MPI implementations leverage two protocols: an “eager short” protocol and a “rendezvous long” protocol. In the “eager” protocol for “short” messages, the entire message is sent to the receiver immediately to minimize latency. Since the receiver may not have posted receives that match the sends, the receiver posts buffers to capture unexpected messages. This ensures that the data that is sent across the network is not lost. In contrast, the rendezvous protocol for long messages simply sends a header and transfers the data when a matching receive is known to be posted. This requires a round-trip across the network to transfer a message — even if the receiver has already posted the matching receive. The trade-off is that “eager short” messages require buffers to be made available at the target and the “rendezvous long” messages incur a round-trip delay before transferring the body of the message. Eager protocols provide the lowest latency message transfers, but longer messages are band width bound and can amortize the latency of a network round-trip. Thus, most implementations include both pro tocols and switch from an eager protocol to a rendezvous protocol at some message length. The switch from an eager protocol to a rendezvous pro tocol is typically related to the bandwidth delay product of the network. This means that the total buffer space required grows with the bandwidth delay product of the network. Furthermore, the number of buffers that must be provided increases (although likely sub-linearly) with the number of MPI ranks in the application. These compounding effects will drive unacceptable growth in memory requirements for MPI. To address this issue, we propose adding a third protocol to MPI. An “eager medium” would eagerly send medium sized messages, but it would drop unexpected messages and fall back to a rendezvous protocol. The threshold between short and medium messages would be set to constrain buffer ing requirements, while an additional threshold between medium and long messages would be set to minimize the impacts on performance. This approach provides the latency benefits of the eager protocol, with the buffer reduction benefits of the rendezvous protocol The trade-off is that medium messages speculatively transmit data that will have to be retransmitted if the message is unexpected. We present simulation results demonstrating the perfor mance characteristics of the dual threshold/three protocol approach in a simple bandwidth test. The simulations il lustrate regions where the addition of a medium message protocol enables the implementation to reduce the buffering requirements of the MPI library while exceeding the per formance achievable with a simple single threshold between eager and rendezvous messages.
+
+SAND2011-3493C
+
+II. RELATED WORK
+
+MPI implementations commonly utilize a dual protocol approach for messages, with short messages sent eagerly and long messages sent using a request-to-send/clear-to send rendezvous approach [1], [2]. Networks which provide remote read semantics, such as InfiniBand, may utilize receiver-side read requests as an optimization on the ren dezvous protocol [3], although the optimization improves performance due to asynchronous progress and the larger issue of large round-trip bandwidth delay product remains. Growing bandwidth delay products have significantly increased the cross-over threshold between eager and ren dezvous protocols required to avoid a significant drop-off in performance around the cross-over between short and long protocols. MPI implementations have resorted to significant protocol complexity in order to reduce the growing memory pressure of handling eager messages [4], [5], with limited success in most cases. Early implementations of MPI over the Portals 3.0 net work level API [6], [7] leveraged an eager short protocol with buffering of unexpected messages at the receiver and an eager long protocol that dropped unexpected messages. Unfortunately, this approach can waste substantial band width for unexpected messages [8], [9]. Here, we leverage an “eager medium” protocol that is similar to the previously published “eager long” protocol. Our goal is to reduce the maximum size of a short message while preserving the the short message latency characteristics.
+
+III. MOTIVATION
+
+In a two-protocol MPI library, there is a cross-over thresh old between “short” messages that are sent eagerly across the network and “long” messages that use a rendezvous protocol. There is a tension for these implementations between the buffer requirements on the receiver and the ping-pong mes sage bandwidth, which is directly correlated to the message latency. “Long” messages incur an additional round-trip net work delay before sending every message; however, “short” messages require a buffer to receive unexpected messages. From a performance perspective, the optimal message length to cross from short to long messages is the point at which the latency of a round-trip network delay is negligible in terms of the total transfer time. The time for the transfer of an eager message (Equation 1) and a rendezvous message (Equation 2) differ by twice the network latency (2 × L).
+
+TEager = L +
+
+size BW (1)
+
+TRendezvous = 3 × L + size
+
+BW
+
+(2) 
+In order to make the difference negligible, the time to 
+transfer the message ( size 
+BW ) must be much greater than twice 
+the network latency. In other words, the message size must 
+
+be much larger than the round-trip bandwidth delay product (Equations 3 and 4).
+
+2 × L size BW
+
+(3) size BW × 2 × L (4)
+
+Many proposals for Exascale systems place the computing capability of the node at over 10 TF. Such nodes are likely to have networks with bandwidths in the hundreds of gigabytes per second. Unfortunately, the network latency that is relevant is the typical or event worst case latency. While Exascale systems will likely reach 500 ns latency to nearest neighbors in the best case, the MPI must allocate buffers for a much higher one-way latency (at least 1 to 2 µs). This would place the round trip bandwidth delay product between 200 KB (100 GB/s × 2 µs) and 1 MB (250 GB/s × 4 µs). Although some work has shown a linear relationship between the unexpected buffer depth and the number of nodes [10], even a logarithmic relationship between unexpected short message buffers and node count would drive an unacceptable amount of buffering in the MPI library as shown in Figure 1. Figure 1 shows the relationship between the buffer space required per MPI rank and node count as well as the relationship between the buffer space required per MPI rank and round-trip bandwidth delay product. Figure 1(a) was generated by a round-trip bandwidth delay product of 400 KB and varying the number of nodes as well as the way the buffer usage scaled with node count. We assume the number of unexpected buffers scales as log2(P), where P is the number of nodes, with a constant multiplier of N and vary N between 8 and 64 for each of the graphs. For Figure 1(b), we assume a fixed number of 256 thousand nodes, P, and vary the round-trip bandwidth delay product from 1 byte to 512 KB. Assuming even 10 MPI ranks each node (with a large number of cores per node), the buffer space required per node when using an optimized eager/rendezvous cross-over could easily reach gigabytes.
+
+IV. METHODOLOGY
+
+Two traditional long message protocols and our dual threshold/three-protocol implementation were examined us ing the Structural Simulation Toolkit. The simulator is used to model a NIC that provides full matching and data transfer capabilities. We also used a cycle-accurate model of a 7 port router capable of building a 3-D torus. The Portals 4 network API was used for interfacing to the simulated hardware. A. Portals 4 The Portals 4 [11] data movement interface provides a rich set of building blocks for efficient implementation of multi ple upper layer protocols. Portals 4 provides both matched and unmatched one-sided communication primitives. Unlike most one-sided interfaces, such as InfiniBand, which directly
+
+0
+
+50
+
+100
+
+150
+
+200
+
+250
+
+300
+
+350
+
+400
+
+1 10 100 1000 10000 100000
+
+Node Count
+
+8 buffers 
+16 buffers 
+32 buffers 
+64 buffers 
+
+(a) Node Scaling
+
+0
+
+100
+
+200
+
+300
+
+400
+
+500
+
+100000 200000 300000 400000 500000
+
+Round-trip Delay Product (Bytes)
+
+8 buffers 
+16 buffers 
+32 buffers 
+64 buffers 
+
+(b) Bandwidth Delay Scaling Figure 1. Buffer space scaling with (a) node count and (b) bandwidth delay product
+
+use remote virtual addresses, Portals communication calls provide robust addressing semantics that allow the user to abstract away the details of the remote virtual address. Portals addresses ultimately resolve to list entries, constructs which provide fine grained, receive side addressing. List entries can include matching logic, including a set of 64 match bits, that allows Portals 4 to directly implement the MPI point-to-point matching semantics within the Portals library. While Portals only provides direct support for ex pected messages, the building blocks are complete enough to allow upper layer protocols to build a variety of protocols for handling unexpected messages. All message transfer opera tions (including matched message delivery) is asynchronous and independent of the host application entering the Portals library. B. Simulated Architecture The Structural Simulation Toolkit v2.0 (SST) [12] pro vides a component-based simulation environment designed for simulating large-scale HPC systems. The simulator is designed to be flexible enough to simultaneously provide both cycle-accurate and event-based simulation capabilities. The simulations presented in this paper utilize a cycle accurate router network model, based on the Cray SeaStar router, combined with a high-level, event-driven network interface and host processor model. The network interface architecture that was simulated is shown in Figure 2. Portals processing is offloaded to the network interface, including message matching and long expected message delivery. The design allows for true asyn chronous communication and event delivery, as well as high speed matching capabilities [13]. The simulated network provides hardware NIC-to-NIC latencies of 1 µs and a link bandwidth of approximately 3 GB/s. Router delays, software and protocol overheads, and message encoding provides software end-to-end latency of
+
+1.4 µs and bandwidth of 2.5 GB/s. The hardware latency in the NIC is divided between transmit side and receive side with 50% going to each. C. Message Protocols Three protocols for message transfer are examined: a traditional rendezvous protocol with a single threshold be tween eager and rendezvous, the previously implemented Portals eager protocol that uses both an eager short and an eager long protocol, and our dual-threshold/three-protocol approach. In all cases, short messages are sent eagerly and unexpected short messages are buffered on the receiver. The protocols differ in how larger messages are handled, with the dual-threshold/three-protocol approach providing three classes of message: short, medium, and long. 1) Rendezvous Protocol: In the rendezvous protocol, the sender of a long message generates a request to the receiver which includes matching information and the location of the message data in the sender memory space. Upon matching (whether the message is expected or unexpected at the receiver), the receiver issues a get request to retrieve the data from the sender. The completion of the get request on the sender and receiver act as completion for the message. The rendezvous protocol is advantageous for applications which experience a mix of expected and unexpected mes sages, as the performance of the implementation is similar for both cases. However, the protocol requires a round trip from the receiver after message matching to retrieve the data for all messages, which can adversely affect performance of expected messages compared to the eager protocol. The round-trip cost drives the threshold between short and long messages higher than the eager protocol in order to avoid large drops in message transfer speed around the protocol cross-over. 2) Eager Protocol: In the eager protocol, all messages are eagerly transferred. For the eager long protocol, the sender
+
+Network
+
+From
+
+H o s t
+
+To Network
+
+200ns / 20%
+
+500ns / 50%
+
+300ns / 30%
+
+300ns / 30%
+
+300ns / 30%
+
+Portals Cmds
+
+FIFO FIFO
+
+Portals Unit
+
+FIFO
+
+FIFO
+
+FIFO
+
+Engine
+
+Tx DMA
+
+Data
+
+Offload
+
+Atomic
+
+Rx DMA Engine
+
+FPU
+
+Unit Logic
+
+Trigger
+
+Match/Event
+
+Figure 2. High level NIC architecture annotated with key Portals simulation timings. Timings are shown as a percentage of back-to-back latency along with absolute values for 1000 ns latency.
+
+includes information in the message for the receiver to retrieve the message if necessary. If the message is expected, the data is deposited directly into receiver memory and the transfer is complete. If the message is unexpected, the message payload is dropped and the receiver is notified. The receiver then issues a get request, similar to the rendezvous protocol. The eager protocol avoids unnecessary round trips be tween sender and receiver for expected messages, and as a result, allows a much smaller cross-over threshold than the rendezvous protocol while still maintaining high per formance. However, the eager transfer of long messages can adversely impact the network, as the message must be transferred twice if the message is not expected. While the impact of transferring the same data twice may be minimal for medium sized messages, the impact grows with the size of the message. 3) Dual Threshold: The rendezvous protocol requires a round-trip between sender and receiver for long messages, motivating a large short to long message cross-over point. Such a cross-over is generally impractical due to buffering constraints for eager messages. The eager protocol does not require as large of a cross-over threshold, as the round-trip dependency is removed for expected messages. However, the protocol negatively impacts the network when messages are unexpected. The dual threshold protocol combines both the eager and rendezvous protocol to limit the amount of receive side buffering required for unexpected messages while also providing good performance for all message sizes. Like the other protocols, short messages are eagerly transferred and unexpected short messages are buffered at the receiver. Medium messages are eagerly transferred and, like the eager long protocol, include information for the receiver to retrieve the message if it arrives unexpectedly. Long messages, generally much larger than the round-trip bandwidth delay product, are transferred using a rendezvous protocol. The use of an eager protocol without receiver-side buffer ing reduces pressure on receiver memory, as the cross-over from short to medium sized messages can be quite small and may be driven by memory usage requirements independent of network performance. The transition to a rendezvous protocol for larger messages reduces network impact of retransmitting unexpected messages, as large messages are only transferred once. The medium to long cross-over can be set above the bandwidth delay product, eliminating drops in performance associated with low thresholds in the strict rendezvous protocol, without adversely impacting overall memory usage.
+
+V. RESULTS
+
+In modern interconnects, the typical threshold between eager and rendezvous messages is between 4 KB and 32 KB. On some networks, the default is higher (e.g. 128 KB on the Cray Seastar interconnect [14] used in the Cray XT5 due to the particularly high bandwidth delay product), but 4 KB to 32 KB represents the current typical range. Figure 3 and Figure 4 compare the a pure eager protocol with an implementation using two protocols (labeled rendezvous) and an implementation using three protocols (dual threshold) when all of the messages are expected. It should be noted that the first hitch in the graph corresponds to the programmed I/O to DMA cross-over at 2 KB for the simulated NIC.
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+3000
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Eager 
+Rendezvous 
+Dual Threshold (128 KB) 
+Dual Threshold (512 KB) 
+
+(a) Ping-Pong Bandwidth
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+10000 100000
+
+Message Size (Bytes)
+
+Eager 
+Rendezvous 
+Dual Threshold (128 KB) 
+Dual Threshold (512 KB) 
+
+(b) Ping-Pong Latency
+
+Figure 3. Bandwidth and latency with a 4 KB eager threshold and expected messages
+
+The dangers of changing protocols too early is clearly evident in the ping-pong bandwidth with a 4 KB switch from eager to rendezvous in Figure 3(a). This network has a round-trip bandwidth delay product of 7 KB (effectively
+
+2.5 GB/s with a 2.8 µs round-trip). When the protocol switch is half of that, a dramatic drop in the ping-pong bandwidth can be seen at the protocol switch. Even when the threshold is set at over four times the round-trip bandwidth delay product (Figure 4(a)), there is still a noticeable drop in performance immediately after the protocol switch in the rendezvous line. In contrast, the dual-threshold/three protocol implementation maintains the throughput of the pure eager protocol until the second threshold that switches to the rendezvous protocol. The key here is that the second threshold can be set much later for the dual-threshold/three protocol version, since the “eager medium” protocol does not require additional buffering.
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+3000
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Eager 
+Rendezvous 
+Dual Threshold (128 KB) 
+Dual Threshold (512 KB) 
+
+(a) Ping-Pong Bandwidth
+
+0
+
+10
+
+20
+
+30
+
+40
+
+50
+
+60
+
+70
+
+80
+
+10000 100000
+
+Message Size (Bytes)
+
+Eager 
+Rendezvous 
+Dual Threshold (128 KB) 
+Dual Threshold (512 KB) 
+
+(b) Ping-Pong Latency
+
+Figure 4. Bandwidth and latency with a 32 KB eager threshold and expected messages
+
+While the dual-threshold/three-protocol implementation is clearly superior when all of the messages are expected, this is clearly not always the case [9], [10]. Further, the bandwidth sacrificed when messages are unexpected can be substantial with this style of protocol [8]. Thus, Fig ure 5 presents the performance impacts of unexpected mes sages on the dual-threshold/three-protocol implementation.
+
+As with the earlier graphs, it should be noted that the first hitch in the graph corresponds to the programmed I/O to
+
+DMA cross-over at 2 KB for the simulated NIC. Three key curves provide reference points in Figure 5. At the upper end, the 0% unexpected line tracks what a pure eager protocol would provide up until the second threshold. At the lower end, the 100% unexpected line represents discarding every message (because it was unexpected) and having to retransmit it. In the middle, the traditional two-protocol (eager short + rendezvous long only) line is shown using the same amount of buffer space as the three protocol implementation (i.e. using the first threshold). At the extreme where all messages are expected, the dual-threshold/three-protocol approach provides better per formance with less buffering than the traditional two pro tocol approach. However, at the other extreme, the need to transmit the message twice when all of the messages are unexpected creates a performance domain where the dual-threshold/three-protocol design is heavily penalized. The cross-over between the performance of a single threshold/dual-protocol implementation and that of a dual threshold/three-protocol implementation is quite interesting. When the threshold at which the implementation stops buffering eager messages is set low (4 KB) to conserve memory, 50% of the messages can be unexpected and the dual-threshold/three-protocol implementation still wins (Fig ure 5(a)). As the size of the message is increased, however, the penalty of the round-trip for the rendezvous is slowly amortized over a progressively larger message. By 32 KB messages, the baseline of only two-protocol’s is superior if only 25% of the messages are unexpected. Notably, however, even with 6.25% of the messages unexpected, the two protocols break even at just under 128 KB. Taken cumulatively, Figure 5 illustrates how the two thresholds in the dual-threshold/three-protocol implementa tion can be tuned. When buffer space is abundant, increasing the first threshold (eager short to eager medium) is advan tageous, since this guarantees achieving the performance of eager messages. As the pressure on buffer space increases, the first threshold can be decreased with minimal perfor mance impact if most (75%) of the messages are expected; however, a significant performance penalty is paid if too many unexpected messages are received. Setting the second threshold too high also leads to trade-offs. While a higher threshold increases the range of messages that achieve true independent progress, it is at high thresholds (512 KB) where a simple rendezvous achieves better results if only a small fraction of the messages are unexpected. Finally, Figure 5(e) illustrates what happens when both the first and second threshold are set low. In this configuration, the dual-threshold/three-protocol implementation is likely to generally offer higher performance than a simple rendezvous protocol; however, switching to the second protocol at such a low threshold is significantly lower performance than a pure eager protocol.
+
+VI. CONCLUSIONS
+
+Traditional rendezvous protocols for handling large mes sages place significant memory constraints on MPI imple mentations. Large performance drops at cross-over thresh olds can only be avoided when the cross-over from short eager messages to long rendezvous messages is significantly larger than the bandwidth delay product of the network. Exascale systems are likely to have networks with high bandwidth delay products and small memory per node relative to compute capability, the combination of which motivates a move away from traditional single-threshold MPI protocols. Our dual threshold protocol described divorces eager un expected buffer space requirements from network bandwidth delay product through the use of an eager medium protocol, similar to the long eager protocol previously used in MPI over Portals. The penalty for unexpected large messages is significant for the long eager protocol, particularly as message size grows. Therefore, a second protocol switch to a traditional rendezvous protocol is used for large mes sages. The rendezvous protocol drastically reduces network impact of large unexpected messages. The results presented here demonstrate that there are significant portions of the configuration space where the dual-threshold/three-protocol approach can achieve superior performance with a reduced memory footprint.
+
+ACKNOWLEDGMENT
+
+Sandia National Laboratories is a multi-program labora tory managed and operated by Sandia Corporation, a wholly owned subsidiary of Lockheed Martin Corporation, for the U.S. Department of Energy’s National Nuclear Security Administration under contract DE-AC04-94AL85000.
+
+REFERENCES [1] W. Gropp, E. Lusk, N. Doss, and A. Skjellum, “A high performance, portable implementation of the MPI message passing interface standard,” Parallel Computing, vol. 22, no. 6, pp. 789–828, September 1996. [2] T. Woodall, R. Graham, R. Castain, D. Daniel, M. Sukalski, G. Fagg, E. Gabriel, G. Bosilca, T. Angskun, J. Dongarra, J. Squyres, V. Sahay, P. Kambadur, B. Barrett, and A. Lums daine, “TEG: A high-performance, scalable, multi-network point-to-point communications methodology,” in Proceed ings, 11th European PVM/MPI Users’ Group Meeting, Bu dapest, Hungary, September 2004, pp. 303–310. [3] S. Sur, H.-W. Jin, L. Chai, and D. K. Panda, “Rdma read based rendezvous protocol for mpi over infiniband: design alternatives and benefits,” in Proceedings of the eleventh ACM SIGPLAN symposium on Principles and practice of parallel programming, ser. PPoPP ’06. New York, NY, USA: ACM, 2006, pp. 32–39. [Online]. Available: http://doi.acm.org/10.1145/1122971.1122978 [4] G. M. Shipman, T. S. Woodall, R. L. Graham, A. B. Maccabe, and P. G. Bridges, “Infiniband scalability in open mpi,” in Proceedings of IEEE Parallel and Distributed Processing Symposium, April 2006. [5] P. S. Galen M. Shipman, Stephen Poole and I. Rabinovitz, “X-srq - improving scalability and performance of multi-core infiniband clusters,” in Proceedings, Euro PVM/MPI, Dublin, Ireland, September 2008. [6] R. Brightwell, A. B. Maccabe, and R. Riesen, “Design, implementation, and performance of MPI on Portals 3.0,” International Journal of High Performance Computing Ap plications, vol. 17, no. 1, pp. 7–20, Spring 2003.
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Rendezvous 
+0% Unexpected 
+6.25% Unexpected 
+12.5% Unexpected 
+25% Unexpected 
+50% Unexpected 
+100% Unexpected 
+
+(a) Three protocol, Thresholds: 4K, 128K
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Rendezvous 
+0% Unexpected 
+6.25% Unexpected 
+12.5% Unexpected 
+25% Unexpected 
+50% Unexpected 
+100% Unexpected 
+
+(b) Three protocol, Thresholds: 4K, 512K
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+3000
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Rendezvous 
+0% Unexpected 
+6.25% Unexpected 
+12.5% Unexpected 
+25% Unexpected 
+50% Unexpected 
+100% Unexpected 
+
+(c) Three protocol, Thresholds: 32K, 128K
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+3000
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Rendezvous 
+0% Unexpected 
+6.25% Unexpected 
+12.5% Unexpected 
+25% Unexpected 
+50% Unexpected 
+100% Unexpected 
+
+(d) Three protocol, Thresholds: 32K, 512K
+
+0
+
+500
+
+1000
+
+1500
+
+2000
+
+2500
+
+3000
+
+1 10 100 1000 10000 100000 1e+06 1e+07
+
+B / s )
+
+Message Size (Bytes)
+
+Rendezvous 
+0% Unexpected 
+25% Unexpected 
+50% Unexpected 
+100% Unexpected 
+
+(e) Three protocol, Thresholds: 4K, 16K
+
+Figure 5. Ping-Pong bandwidth using three protocols [7] R. Brightwell, W. Lawry, A. B. Maccabe, and R. Riesen, “Portals 3.0: Protocol building blocks for low overhead communication,” in Proceedings of the 2002 Workshop on Communication Architecture for Clusters, April 2002.
+
+[8] R. Brightwell and K. Underwood, “Evaluation of an ea ger protocol optimization for MPI,” in Proceedings of Eu roPVM/MPI, September 2003.
+
+[9] R. Brightwell, “A comparison of three MPI implementations for Red Storm,” in Recent Advances in Parallel Virtual Machine and Message Passing Interface: 12th European PVM/MPI Users’ Group Meeting, Sorrento, Italy, September 2005 Proceedings, ser. Lecture Notes in Computer Science, B. D. Martino, D. Kranzlmuller, and J. Dongarra, Eds., vol. 3666. Springer-Verlag, 2005, pp. 425–432.
+
+[10] R. Keller and R. L. Graham, “Characteristics of the unexpected message queue of mpi applications,” in Proceedings of the 17th European MPI users’ group meeting conference on Recent advances in the message passing interface, ser. EuroMPI’10. Berlin, Heidelberg: Springer-Verlag, 2010, pp. 179–188. [Online]. Available: http://portal.acm.org/citation.cfm?id=1894122.1894146 [11] R. E. Riesen, K. T. Pedretti, R. Brightwell, B. W. Barrett, K. D. Underwood, T. B. Hudson, and A. B. Maccabe, “The Portals 4.0 message passing interface,” Sandia National Laboratories, Tech. Rep. SAND2008-2639, April 2008. [12] K. D. Underwood, M. Levenhagen, and A. Rodrigues, “Sim ulating Red Storm: Challenges and successes in building a system simulation,” in 21st International Parallel and Distributed Processing Symposium (IPDPS’07), March 2007. [13] K. D. Underwood, A. Rodrigues, and K. S. Hemmert, “Ac celerating list management for MPI,” in Proceedings of the 2005 IEEE International Conference on Cluster Computing, September 2005. [14] R. L. Graham, R. Brightwell, B. Barrett, G. Bosilca, and J. Pjesivac-Grbovic, “An evaluation of Open MPI’s matching transport layer on the Cray XT,” in Proceedings of the 14th European PVM/MPI Users’ Group Conference, September 2007.
+

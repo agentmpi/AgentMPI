@@ -1,0 +1,591 @@
+Information for
+
+Evaluating and extending user-level fault tolerance in MPI applications
+
+Available access
+
+Research article
+
+First published online August, 2016
+
+# Evaluating and extending user-level fault tolerance in MPI applications
+
+Ignacio Laguna
+
+, David F Richards, [...], and Howard Pritchard+4View all authors and affiliations
+
+Volume 30, Issue 3
+
+## Abstract
+
+The user-level failure mitigation (ULFM) interface has been proposed to provide fault-tolerant semantics in the Message Passing Interface (MPI). Previous work presented performance evaluations of ULFM; yet questions related to its programability and applicability, especially to non-trivial, bulk synchronous applications, remain unanswered. In this article, we present our experiences on using ULFM in a case study with a large, highly scalable, bulk synchronous molecular dynamics application to shed light on the advantages and difficulties of this interface to program fault-tolerant MPI applications. We found that, although ULFM is suitable for master–worker applications, it provides few benefits for more common bulk synchronous MPI applications. To address these limitations, we introduce a new, simpler fault-tolerant interface for complex, bulk synchronous MPI programs with better applicability and support than ULFM for application-level recovery mechanisms, such as global rollback.
+
+## Keywords
+
+## 1. Introduction
+
+As high-performance computing (HPC) systems grow in computational power and scale, failure rates in these systems are expected to increase (Cappello et al., 2009; Dongarra et al., 2011; Shalf et al., 2011). However, although the Message-Passing Interface (MPI) (Message Passing Interface Forum, 2012) is the prevalent programming model for large-scale HPC applications, it provides practically no support for fault tolerance (Gropp and Lusk, 2004): if a failure occurs, applications either are automatically aborted or can do little more than abort themselves. Several fault-tolerant models have been proposed for MPI (Bland et al., 2012, 2013; Fagg and Dongarra, 2000; Hursey et al., 2011;), but none has been accepted in the MPI standard—the complexity that these approaches introduce to MPI application development, and their limited applicability to the vast majority of scientific computing applications, have been the main impediments.
+
+The user-level failure mitigation (ULFM) interface (Bland et al., 2013), developed by the Fault Tolerance Working Group within the MPI Forum, is the latest proposal discussed by the MPI Forum for inclusion into the standard. ULFM focuses on fail-stop process failures and provides mechanisms for application-level failure detection (e.g. via error codes) and local failure mitigation based on removing failed processes by shrinking communicators. Although prior work shows performance evaluations of the ULFM interface, questions related to its programmability and applicability, especially to non-trival, bulk synchronous applications, remain unanswered. This is critical, because the vast majority of HPC applications are bulk synchronous. Additionally, many of these applications, in particular those developed at HPC centers in government and academic labs, are highly complex and represent decades of investment in terms of both money and application-programmer hours. The notion of simply changing the programming model of these codes to adapt to a new fault tolerance strategy for MPI is untenable.
+
+To this end, we present our experiences using ULFM and describe the advantages, difficulties, and usability of this interface to program fault-tolerant MPI applications. We focus on two types of applications—master–worker and bulk synchronous applications—and consider the most common recovery models for these applications. Our goal is to answer questions, such as “How must developers reason about using the fault-tolerant semantics in ULFM?” and “What design and runtime features are required for applications and in the MPI Standard to write effective fault-tolerant applications?.” Our observations come from a case study using ULFM to implement fault recovery in a large, scalable, bulk synchronous molecular dynamics application, ddcMD (Glosli et al., 2007; Richards et al., 2009; Streitz et al., 2006). We found that ULFM is suitable to incorporate fault tolerance in master–worker applications (i.e. it is easy to modify these applications to use ULFM); however, it is not suitable for writing fault-tolerant bulk synchronous codes.
+
+To address the complexities that we uncovered with ULFM in our study, we present a new fault-tolerance interface for MPI (which we call Reinit) that is simpler to use than ULFM for the vast majority of existing HPC applications. Our intention with the Reinit interface is to standardize and streamline the best practice of checkpoint/restart already supported by bulk synchronous applications. Thus, we expect the effort required for application developers to support the Reinit model to be relatively low. In this article, we extend our prior work (Laguna et al., 2014) by fully describing this new interface, its usage implications in terms of fault tolerance and programmability, a sample definition of the interface in C, a prototype of key features of the interface in Open MPI (a widely used MPI implementation), and an initial performance evaluation in a Cray XC30 system, which shows that Reinit greatly reduces the time for failure recovery over traditional checkpoint/restart.
+
+The rest of the article is organized as follows. In Section 2, we define recovery models and application categories. Sections 3 and 4 describe the ULFM interface, its use in our case study, and a summary of our evaluation. Section 5 discusses the benefits and limitations that we found for the ULFM interface. In Section 6, we present a description of an alternate fault-tolerant model that would improve ULFM and that would have applicability to wider variety of MPI applications. Finally, in Section 8 we present our conclusions.
+
+## 2. Recovery models
+
+Recovery techniques attempt to return the application to a correct or error-free state after a failure. It is the stated goal of the ULFM developers to provide a small set of fault detection and recovery primitives that is sufficient to implement a variety of recovery strategies. It is, therefore, useful to review the full scope of failure recovery models that are available to MPI applications.
+
+## Backward versus forward recovery
+
+After a failure, backward recovery attempts to restart the application to a previously saved state (or checkpoint). This is also called rollback recovery. In forward recovery, the application attempts to find a new state (not necessarily saved previously) from which the application can continue operation. This state may be a degraded mode of the previous failure-free state (e.g. the application may run slower or it may compute a less precise numerical solution) (Pullum, 2001). Forward recovery is also known as run-through recovery.
+
+## Local versus global recovery
+
+In local recovery, the application attempts to repair failures by restoring a small part of the application, for example, a single process, a data structure, or a code region. This form of recovery assumes that the impact of a failure can be limited to the local computation (or state). Global recovery assumes that little can be done to recover from a failure locally; thus, the application must repair global state to survive the failure. For example, checkpoint rollback in most bulk synchronous parallel simulations restores the state of all application processes to a saved state, even if only one process failed.
+
+## Shrinking versus non-shrinking recovery
+
+In shrinking recovery, resources that fail (processes or nodes) become unavailable, and the application is forced to recover from failures with a reduced set of resources. In non-shrinking recovery, failed resources are replaced (e.g. from a pool of spares) and the application recovers with the same number of resources it had initially. Non-shrinking recovery is attractive from the application perspective since work decomposition and load properties are maintained. Shrinking recovery, on the other hand, is attractive from the hardware and system perspective—if a failure occurs, the system simply discards the failed resources and continues the computation with the remaining resources. However, it may require advanced algorithmic support, such as the ability to re-decompose and load balance the scientific problem at runtime for fewer processes/nodes. Consequently, shrinking recovery may very well convert a fault tolerance problem to a load-balancing problem. The characteristics of an application’s domain decomposition strongly influence the choice of a practical model. Here, we consider two aspects of domain decomposition.
+
+Weight is the size of an application’s time-evolving state. A heavyweight application has large time-evolving state; a lightweight application’s state is small.
+
+Balancing is the ability to redistribute workload among processes. A dynamically balanced application can reallocate state, while a statically balanced application cannot.
+
+Consider a master–worker application, in which the main task (master) generates many subtasks, which are assigned to “someone else” (worker). The only interaction between the master and worker tasks is that the master starts the worker computation, and the worker computation returns a result to the master. There are no significant dependencies among the workers, and modifiable computational state is completely contained within the master. Such a lightweight, dynamically balanced application is an excellent candidate for forward, local, shrinking recovery. When a worker task fails, the remaining workers can continue unaffected, and the master has all necessary information to simply relaunch the failed workload when the next worker becomes available.
+
+Now, consider a bulk synchronous mesh- or particle-based code in which the state of the system is advanced by time steps and the mesh elements or particles are too numerous to fit in memory on any single node. Each process stores only its assigned part of the time-evolving state. The problem’s domain decomposition is static. This describes a common and very important class of HPC applications. Such heavyweight, statically balanced applications typically employ backward, global, non-shrinking recovery. Returning all processes to a checkpoint is frequently the easiest—and in many cases the only—way to recover from failure and resuming with the same number of resources eliminates the need to re-decompose and rebalance the workload.
+
+Some applications fall between these two extremes. They may have fine-grained work units that can be migrated and restarted easily, along with time-evolving state distributed among processes. Charm++ (Kalé and Krishnan, 1993) applications are an example of such heavyweight, dynamically balanced applications.
+
+## 3. Molecular dynamics with ULFM
+
+This article evaluates ULFM in the context of (a) heavyweight, statically balanced applications and (b) the recovery models most suitable for such applications. These applications are of interest, because most large scientific simulations currently fall into this category. In order to truly understand the practicalities of implementing ULFM-based recovery, we require a case study that is complex enough to be realistic as well as sufficiently general to represent a wide range of scientific simulations. To this end, we have applied ULFM to a massively scalable, molecular dynamics (MD) code.
+
+## 3.1. The ULFM interface
+
+The ULFM interface (Bland et al., 2013) has been proposed by the Fault Tolerance Working Group in the MPI Forum. 1 It provides support for process fail-stop fault tolerance in MPI through a set of function calls: MPI_COMM_REVOKE to propagate failure notification, MPI_COMM_SHRINK to create new communicators with fewer processes, and MPI_COMM_AGREE to perform global agreements to determine a consistent state. ULFM also introduces error codes, which are returned by MPI routines to notify the application of failures, including MPI_ERR_PROC_FAILED for failed processes, MPI_ERR_REVOKED for revoked communicators, and MPI_ERR_PROC_FAILED_PENDING to detect failures from non-blocking operations. The current ULFM prototype is based on Open MPI 1.7.
+
+## 3.2. Application implementation strategy
+
+We applied ULFM to ddcMD, a Gordon Bell prize winning MD code. Not only is ddcMD sufficiently complex to address problems of scientific interest at the largest possible scales (Streitz et al., 2006; Glosli et al., 2007; Richards et al., 2009) but it also has several other features that make it well suited for this study:
+
+The code base (written entirely in C) is both highly portable and small enough to be tractable.
+
+ddcMD employs a flexible domain-decomposition strategy, with each domain defined only by its center and the particles it owns. A problem can be decomposed onto any number of processes.
+
+ddcMD includes load balancing. Moving domain centers in space causes the application to redistribute the particles among processes.
+
+ddcMD has previously demonstrated successful recovery from L1 parity errors on the Blue Gene/L machine (Glosli et al., 2007).
+
+ddcMD uses a single communicator for the entire job.
+
+Next, we describe our modifications to ddcMD to implement MPI fault tolerance using ULFM.
+
+## 3.2.1. Failure detection
+
+The most obvious method to detect MPI failures in ULFM is to test the return code of all MPI calls. However, most MPI applications do not check return codes, and modifying a large code base may be impractical even in applications with only a few MPI calls; let alone applications with hundreds (or more) MPI calls. Programmers can easily introduce bugs by checking error codes incorrectly, and the application performance may decrease due to the testing overhead.
+
+The use of macros might help with code modifications to check error codes. However, a more fundamental problem is that the recovery logic (needed when a failure is detected in a complex application) must either be generic (in which case the error codes are irrelevant) or very locally custom (in which case the code modifications are intrusive and difficult).
+
+The difficulties involved in checking the return code for every MPI call can be avoided by registering an MPI error handler. We use this strategy in ddcMD. When a process failure occurs, all surviving MPI ranks will eventually call the error handler, which then coordinates recovery.
+
+## 3.2.2. Recovery model
+
+For this case study, we chose a backward, global, shrinking recovery model. As with most codes that have a large distributed state, backward recovery is the only practical option since there is no known method to create a new, valid state for the atoms assigned to the failed process. We chose global recovery over local, because it avoids the complication of determining which data structures and process (or processes) are impacted by the failure. We chose shrinking recovery because ddcMD can easily alter the domain decomposition and rebalance load at runtime.
+
+Teranishi and Heroux (2014) have shown that implementing non-shrinking recovery in ULFM is quite complicated. In particular, it requires that we first repair and shrink MPI_COMM_WORLD, along with all other application communicators. Second, we must acquire a new process either by allocating a new node using MPI_COMM_SPAWN or by having hot standbys masked out of MPI_COMM_WORLD. Finally, we must join a fresh process together with all affected, shrunken communicators. Moreover, the application can no longer use MPI_COMM_WORLD or any other communicator handle after a failure: it must unnaturally use another communicator, even though this process effectively restores all communicators, including MPI_COMM_WORLD.
+
+## 3.2.3. Checkpointing strategy
+
+In ddcMD, the data that must be saved to restart after a failure (positions, velocities, and atom type for all particles) are typically small compared to system memory. Thus, we use an in-memory checkpointing strategy, in which each MPI rank stores a checkpoint in local memory (denoted by Clocal), and an identical checkpoint in a remote rank (denoted by Cremote), using point-to-point MPI communication. In our implementation, checkpoints are replicated on adjacent ranks. Rank i stores its checkpoint on rank ( ( i + 1 ) mod P ) , for P total processes. Note that some process or set of processes takes the workload of the failed process in this shrinking recovery scheme.
+
+## 3.2.4. Non-local jumps
+
+Since a process failure can be detected by any MPI call, non-local jumps are needed to support jumping to a safe restart point from any point in the execution. Because the C language lacks exception handling, we use setjmp/longjmp semantics, similar to Fagg and Dongarra (2000). At the beginning of every iteration of the main time step loop, we save the stack context and environment using setjmp. On failure, execution flow can be restored to the iteration start point using longjmp. This requires meticulous coding to avoid repeat memory allocations, which can cause memory leaks.
+
+## 3.2.5. Error handler
+
+Figure 1 shows pseudocode for the error handler. If an error code indicates process failure, we store the failed rank to later determine which particles were lost. ddcMD uses a single MPI communicator, which we revoke and shrink. Revocation ensures that all processes are notified of the failure, as some may not detect it immediately. The shrink operation is a blocking collective: every live process completes it and returns a new communicator that has P–N processes, where N is the number of failed processes. Finally, surviving processes call the application-level recovery procedure.
+
+OPEN IN VIEWER
+
+Figure 1.
+
+Pseudocode of the MPI error handler.
+
+## 3.2.6. Application-level recovery procedure
+
+The recovery procedure (Figure 2) restarts the application from a previous checkpoint after MPI state is recovered:
+
+If a rank contains the in-memory checkpoint of the failed process (Cremote), it adds that checkpoint data to its most recent local checkpoint (Clocal) and rolls back the application to Clocal—this rank now owns the particles from the failed process. The rest of the processes simply roll back to their most recent (Clocal) checkpoint.
+
+Every process invalidates and recreates its communication tables. These tables are used in the domain decomposition to keep track of the peer ranks with which each rank communicates. Invalidating the tables triggers every process (now P−N processes) to recreate the tables.
+
+Each process adjusts its domain center such that all particles of the failed process are assigned to a domain.
+
+Execution is resumed using longjmp to transfer execution to the previously saved stack context. At this point, the simulation can continue normally.
+
+OPEN IN VIEWER
+
+Figure 2.
+
+Failure recovery procedure in ddcMD.
+
+## 4. Evaluation
+
+To evaluate our implementation, we use a cluster with Intel (Xeon E5-2670) 16-core 2.6 GHz nodes, 32 GB of memory per node, and Infiniband QDR interconnect. We had e-mail conversations with ULFM’s developers to ensure that we used the best installation and configuration of the Open MPI version (in which ULFM has been developed) on our cluster.
+
+In our experiments, we kill a randomly selected MPI process and measure the time to reconstruct the MPI state, which is the time the application spent in revoking and shrinking the communicator in the error handler (in Figure 1). We do not measure the application slowdown that is introduced by ULFM, because ddcMD does not call ULFM during regular execution time (without failures); it calls ULFM functions only from the error handler. However, although our application does not require agreement functions, such as MPI_COMM_AGREE, other applications may require these functions if they want to use ULFM. Those applications may see a slowdown even if no failures occur.
+
+Figure 3 shows the time to recover MPI state, averaged over the number of participating processes (which are all surviving processes in the job since after a failure all survivors call the error handler eventually). The measured times correspond to those spent in lines 7 and 8 of the error handler (Figure 1). We observe that this time increases linearly with the number of processes and that it is in the order of several seconds for a few hundred processes. We presented these (unexpected) high-time measurements to the ULFM developers, and they indicated to us that, since this interface is currently a prototype, it has suboptimal performance.
+
+OPEN IN VIEWER
+
+Figure 3.
+
+Time (in seconds) to revoke and shrink the application communicator using the ULFM. ULFM: user-level failure mitigation.
+
+We acknowledge that other implementations could have different, possibly better performance. For example, previous work (Buntinas, 2012) has shown that consensus protocols for MPI—one of the key protocols to implement distributed fault-tolerant semantics—can be implemented efficiently (i.e., can have logarithmic complexity and can take microseconds for thousands of processes in a BlueGene/P machine). In a fully optimized implementation, ULFM could have similar performance, but the current scalability would not be acceptable for runs of 10,000 or more processes. Since large runs are most susceptible to failures, the scalability of any recovery mechanism is of utmost importance.
+
+## 5. Discussion
+
+In the following, we discuss the experiences, challenges, and limitations of using ULFM in our case study in specific and for writing fault-tolerant MPI applications in general.
+
+## 5.1. Limitations of failure notifications
+
+The ULFM fault model provides no guarantees of when failures are detected at the application level. An MPI call may succeed even when one of the participating processes has failed before the communication call completes. Consider a message sent with MPI_Isend followed by MPI_Wait . Because a non-blocking send must return before the message is received (perhaps even before the message is sent), a normal return code from MPI_Isend does not imply the successful receipt of the message. Furthermore, the success of MPI_Wait does not imply that the message was delivered, only that it is safe to modify the send buffer. It is, therefore, possible for a receiver failure to be undetected by the sender at the completion of MPI_Wait . ULFM does promise that failures are detected eventually, possibly in a later MPI call. However, the call that detects the failure may be so far removed from the calls that did not succeed as to make it very difficult to determine how to recover from the failure.
+
+To further illustrate the complexity of the problem, consider the simple data exchange pattern presented in Figure 4. In a local recovery strategy, it would be convenient to detect failures in either the send or the receive operation (in lines 3 or 7). However, the performance demands of asynchronous MPI calls make it effectively impossible to obtain reliably meaningful return codes. Failures that occur in the for loops of the data exchange may not be detected until the wait operation (line 9) or even in the barrier operation (line 13). Error detection based on return codes is clearly not very adequate for this application.
+
+OPEN IN VIEWER
+
+Figure 4.
+
+Simple data exchange pattern.
+
+The example in Figure 4 also demonstrates why local recovery is so difficult for algorithms that use non-blocking operations. Even if we somehow manage to determine that recovery requires repeating a previously successful send or receive operation, where in the loop do we reinject control? It is not possible to repeat only a subset of the loop iterations without either refactoring the exchange code or writing special exchange recovery code. The former adds unwanted complexity, and the latter increases the burden for maintenance and testing. Even then, it is hard to see how any local recovery process could avoid deadlock without some kind of message logging and playback facility in MPI—a feature not provided in ULFM. In contrast, a global recovery strategy that involves jumping back to a known good restore point, regardless of the source and type of the error avoids these complexities and handles practically any MPI fault regardless of type or source.
+
+## 5.2. Algorithmic requirements
+
+Shrinking recovery—recovering with P−N processes, where P is the original number of processes—has a number of algorithmic requirements. The most important are problem re-decomposition for computation with fewer processes and load balancing, both of which must be performed at runtime.
+
+## 5.2.1. Re-decomposition of the scientific problem
+
+Shrinking recovery and any form of recovery that involves re-decomposition of the computation domain for an arbitrary number of processes at runtime is applicable only to a narrow set of HPC applications. In contrast, most HPC applications can restart easily with the original number of processes—the strategy that has been used for many years through checkpoint/restart approaches. Thus, the semantics provided by ULFM, such as MPI_COMM_SHRINK, have limited scope for large-scale applications.
+
+## 5.2.2. Load balancing
+
+To take advantage of shrinking recovery, applications must balance their workloads after a failure; otherwise, execution time and checkpoint-overhead time will double since a surviving process must handle the load of the failed process in addition to its own. This requirement complicates the development of applications: designing efficient load-balancing algorithms is difficult. Load balancing after every failure may also decrease performance, depending on the computational complexity of the load-balancing algorithm and the time it takes to fully balance the loads—if it takes more than the mean time between failures (MTBFs) to balance loads, shrinking recovery performs poorly when compared with non-shrinking recovery (i.e., recovering with the original number of nodes/processes).
+
+## 5.3. Categories in which ULFM is useful
+
+In Table 1, we classify ULFM’s suitability for applications according to the recovery models discussed in Section 2. A “+” in the table indicates that ULFM is well suited to a recovery model (i.e., integrating ULFM requires few code changes). A “○” indicates that this form of recovery is likely to be preferred by application developers, that is, it is likely to have good performance and low implementation complexity, given the application’s weight and balance. Ideally, we would have both attributes (i.e., “○” and “+”, which we denote by ⊕) in each recovery dimension.
+
+OPEN IN VIEWER
+
+Classification of applications and recovery models in which ULFM is a convenient interface.
+
+| Application types | | | Recovery model dimensions | | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Application | Weight | Balance | Backward | Forward | Global | Local | Shrinking | Non-shrinking |
+| Master-worker | Light | Dynamic | | ⊕ | | ⊕ | ⊕ | ○ b |
+| Bulk synchronous | Heavy | Static | ○ b | + a | ○ b | + a | + a | ○ b |
+
+ULFM: user-level failure mitigation.
+
+a
+
++: It is easy to implement with ULFM, with few code changes.
+
+b
+
+○: It is easy to modify the application to support this recovery model.
+
+Most of ULFM’s functionality is designed to support forward, shrinking recovery, which is simple to implement in master–worker applications. However, backward recovery is often the simplest solution for HPC applications. As discussed, reconstructing only part of a heavyweight, dynamically balanced application’s state is a very complex task and in many cases infeasible. Frequently, the only reasonable recovery strategy, and the one preferred by developers, is global recovery. The tight coupling of parallel processes complicates the implementation of local recovery. Backward recovery can be implemented with ULFM, but previous attempts have demonstrated that it is difficult and requires substantial resource manager support (Teranishi and Heroux, 2014).
+
+However, even without domain reconstruction, global recovery in ULFM requires the user to manually check and repair all communicators after a failure. This is tedious to implement, and it is not clear whether it is possible if a code relies on a library using MPI whose communicators it does not manage. ULFM is much better suited to local recovery, though a user must determine the failure location manually.
+
+ULFM is well suited for shrinking recovery—it provides function calls, such as MPI_COMM_SHRINK—which implements it naturally. Although shrinking recovery is convenient from the hardware perspective, it is not convenient for developers of bulk synchronous applications, as it introduces performance penalties and requires load balancing after failures. For master–worker codes, resource allocation is arbitrary, and either model is suitable.
+
+Overall, from examining Table 1, we see that ULFM is best suited to the recovery requirements of master–worker applications, not those of bulk synchronous HPC applications.
+
+## 5.4. Complexities for code development
+
+One approach for adding ULFM support to applications would be via fault-tolerance libraries that utilize the MPI Profiling Interface (PMPI). PMPI works by intercepting MPI calls, which allows for separation of concerns: the library could easily handle tedious tasks like checking return codes and shrinking communicators on failure on behalf of the application. Although this eliminates error-handling code from the application, it precludes the use of any tools that also use PMPI, because the PMPI interface only supports a single tool or user at a time. Thus, any codes made fault tolerant in this manner could not also use commonly needed tools, for example, performance analysis or MPI correctness checking tools, which employ PMPI.
+
+In some cases, applications would have no choice but to use the profiling interface to use ULFM—ddcMD is an example. It uses several instances of the same communicator in different modules of the code (this was the choice of the developers for convenience reasons). Since it was impractical to write code to replace these communicator instances (by the new communicator that is created via MPI_COMM_SHRINK), we resorted to the profiling interface to replace them transparently, again making it impossible to use tools on the code, which is not acceptable in production settings.
+
+## 6. An alternative approach to fault tolerance in MPI
+
+In this section, we describe the key features that a user-level fault-tolerance MPI interface should have and a new global-rollback recovery model for MPI that implements these features.
+
+## 6.1. Key features for a fault-tolerance interface
+
+We expect that developers of large-scale simulations will be reluctant to adopt ULFM unless it has more robust support for backward, global, non-shrinking recovery. As mentioned, the intent of ULFM is to support such a recovery strategy. However, for statically balanced, heavyweight applications, this is a complex undertaking, and we expect the trade-offs will be unacceptable to the majority of developers. In particular, we advocate for developing an interface that provides the following key features.
+
+## 6.1.1. Prompt global failure notification
+
+As shown in Section 5, failure detection based on function return codes is inherently limited. Not only is it tedious and error prone to check return values of all communication MPI calls but also writing code to respond to errors is exceptionally difficult when errors are detected far from the calls that actually failed.
+
+As an alternative to checking function returns, the user can register an MPI error handler, but the error handler is local and does not notify all processes in the MPI application that a failure has occurred. In most heavyweight, statically balanced applications, all processes will need to rollback their state to respond to a failure. Most likely, it is easier for them to discard any partial work and start over from the most recent checkpoint. Such strategies would be easier to implement, given a prompt notification mechanism that does not require polling or repeated calls to MPI_COMM_AGREE (to determine global consistent states). This change would eliminate the need for return value checking and for using the PMPI interface. Allowing the user to trigger global notification would also allow applications to self-detect faults and notify remote processes using the same mechanism that MPI does. This would allow applications to respond to a broader class of faults.
+
+## 6.1.2. Simple, non-shrinking global rollback
+
+Perhaps the most cumbersome aspect of ULFM for application developers is the need to check, shrink, and reconstruct communicators. Many applications have several communicators, and many more use libraries that may build their own communicators that are unknown to the application. Carefully reconstructing this state after a failure is more complex than simply invalidating all communicators and starting over. Most applications already have logic to build and initialize communicators, but not to repair existing, broken communicators.
+
+ULFM should provide a mode for these applications that, upon receiving failure notification, destroys existing, failed communicators, restores MPI_COMM_WORLD with the same number of processes as were available before the failure, and reinjects control at a known point in the code. This would allow the application to restart easily from saved state. This recovery mode is particularly important because it supports common practice (checkpoint restart). This would reduce implementation burden by enabling a recovery model suitable to heavyweight, statically balanced applications.
+
+## 6.2. Reinit: A global rollback interface
+
+With these features in mind, we propose a new fault-tolerance interface for MPI, Reinit, which is suitable for global, backward, non-shrinking recovery—the recovery models that most bulk synchronous codes require. In contrast to ULFM, in the Reinit model, MPI reinitializes itself upon detecting a fail-stop failure. That is, it sets MPI state exactly as it would be following the initial call to MPI_Init(). It then returns control to an application-specified restart point. MPI is responsible for restarting any failed rank(s), so the restarted application has the same number of ranks as the failed one. This is non-shrinking recovery.
+
+This model provides two important guarantees: (a) no process is reported as failed until it has actually failed and (b) all surviving elements of the MPI runtime eventually know about the failed process. The model assumes a fault detector within the MPI runtime, thus applications do not have to check for faults. However, if applications can detect faults, the interface provides a routine, MPI_Fault(), that they can use to notify MPI of a failure. Note that failure propagation within MPI is triggered as soon as a failure is detected by the MPI library in any process; thus, the model does not require waiting for message completion at receivers to propagate failures. Tables 2 and 3 detail the Reinit interface.
+
+OPEN IN VIEWER
+
+Types of the Reinit interface.
+
+| Types | Description |
+| --- | --- |
+| MPI_Start_State | The recovery state of an MPI rank. Possible values are NEW (the MPI rank corresponds to a fresh process), RESTARTED (the process that has been restarted due to a fault), and ADDED (the process is new but has been added to the existing job). |
+| MPI_Restart_point | Function handler type for the main entry point of the application. An MPI_Restart_point is called by MPI_Reinit to start or restart program execution. An MPI_Start_state is passed as a parameter so the handling process can determine how it was launched. |
+| MPI_Cleanup_code | Specifies the return value of a cleanup routine. The code can be ABORT (the cleanup routine failed), or SUCCESS (the cleanup routine succeeded, and the application can rollback.) |
+| MPI_Cleanup_handler | Function handler type for an error handler that cleans up application and library resources. |
+| MPI_Cleanup_call_id | Identifier for an MPI_Cleanup_handler and its argument. Returned by MPI_Cleanup_handler_push. |
+| MPI_Fault_mode | Specifies the delivery protocol for fault notifications: SYNCHRONOUS or ASYNCHRONOUS. |
+
+OPEN IN VIEWER
+
+Functions of the Reinit interface. a
+
+| Functions | Arguments | Description |
+| --- | --- | --- |
+| MPI_Reinit() | MPI_Restart_point | Marks the start of a resilient MPI program. The MPI_Restart_point is passed a different MPI_Start_state depending on how the fault occurred. |
+| MPI_Cleanup_handler_push() | MPI_Cleanup_handler | Pushes an error handler onto the handler stack. |
+| MPI_Cleanup_handler_delete() | MPI_Cleanup_call_id | Pops an error handler off of the handler stack. |
+| MPI_Set_fault_mode() | MPI_Fault_mode | Sets the mode for receiving fault interrupts. |
+| MPI_Get_fault_mode() | | Gets the mode for receiving fault interrupts. |
+| MPI_Fault_probe() | | Tests for faults synchronously. If a fault is detected, this triggers a fault interrupt and entry into the fault handler. |
+| MPI_Fault() | | Send fault notifications to all processes. Indicates an application-detected fault that should trigger cleanup and recovery on all processes. This has behavior as when MPI detects a fault and triggers the recovery process itself. |
+
+a
+
+All functions return an MPI-valid error value.
+
+## 6.2.1. MPI initialization
+
+The Reinit interface is organized around the concept or a well-defined restart point to which control can be returned after a failure. In the interface, the restart point is a handler function of type MPI_Restart_point, and it is assumed that the entire program (or at least the part that is to be resilient) is invoked indirectly through a handler of this type. Initialization is thus the same as for a regular MPI program, but with one level of indirection. After MPI_Init, a resilient MPI program simply calls MPI_Reinit and passes it a restart handler. Code that would normally go into MPI_Init goes into the restart handler, giving the Reinit library the ability to invoke it again in the event of a failure.
+
+## 6.2.2. Reinitialization
+
+When it is first called, MPI_Reinit handles the details of setting up the resilient environment. It then invokes the restart handler, passing it an MPI_Start_state so that it knows how it was invoked. For example, the first time it is run, MPI_Reinit simply passes MPI_START_NEW to the restart handler. If a new process is started and added to the MPI application, its handler is invoked with MPI_START_ADDED, while existing processes that did not fail are forced to return to the restart point, which is called with the start state set to MPI_START_RESTARTED.
+
+## 6.2.3. Cleanup handling
+
+An important feature for a resilience application program interface (API) is composability. That is, the API should be usable in programs that make use of many libraries, and the resilience code in one library should not interfere with code in another. To accomplish this, we propose cleanup handlers, callback functions that application and library writers can push onto a handler stack. Client code can push any number of cleanup callbacks onto the handler stack using MPI_Cleanup_handler_push. This routine takes a cleanup handler and a single argument of type void* that should be passed to it when it is invoked. In the simplest case, a developer might allocate memory using malloc, then call MPI_Cleanup_handler_push, passing it the free function and the pointer returned by malloc. More complicated cleanup handlers might close files or release other resources allocated by a library. Note that cleanup handlers do not need to cleanup MPI state in libraries; this is done by Reinit automatically.
+
+On failure, cleanup handlers are popped off the stack in first in, first out order and invoked by the Reinit runtime, ensuring that a process is returned to a clean. Applications can manually remove no-longer-needed handlers from the stack using MPI_Cleanup_handler_delete. These functions are detailed in Table 3. A cleanup handler can return any of two states: ABORT or SUCCESS, specifying whether cleanup failed (in which case the application should abort) or it succeeded (and the application should continue rollback). Pushing and deleting cleanup handlers are intended to be lightweight operations.
+
+## 6.2.4. Synchronous and asynchronous fault handling
+
+By default, our API assumes an asynchronous fault notification model. That is, application processes are interrupted when a failure occurs, and the runtime system returns control to a restart handler immediately. If there are regions of code in the application or library that must be protected from asynchronous reinitialization, the model also supports synchronous failure notification. Analogous to signal masking, an MPI rank can locally set the fault detection mode to synchronous. This prevents MPI from restarting the rank until either it explicitly probes for faults or it sets the fault detection mode back to asynchronous mode. Using the interface on Table 3, the application can set and check the fault mode dynamically. We also provide functionality to test for faults (MPI_Fault_probe) and to propagate fault information to alive processes (MPI_Fault).
+
+## 6.2.5. Sample fault-tolerant MPI program
+
+Figure 5 shows a sample fault-tolerant MPI program. Note that there is a main function and a resilient_main function in which the application computation and failure recovery code is executed. After initializing MPI, both the application and libraries push cleanup handlers into the stack, which is followed by a call to the resilient_main function. Note that, in contrast to ULFM, there is no need for the application to handle local failure information, such as revoking or shrinking communicators, or determining in what MPI routine the fault occurred (or it manifested on)—this is transparently managed by an MPI library with Reinit support.
+
+OPEN IN VIEWER
+
+Figure 5.
+
+Sample definition of the Reinit interface in C, and a fault-tolerant application.
+
+## 6.3. Prototype implementation of Reinit
+
+We develop a prototype of the global-restart phase of Reinit in Open MPI. 2 The goal of this exercise is to understand the risk involved in developing a full-featured version of Reinit in a commonly used MPI library. More specifically, our goals are: (a) to understand the level of effort required to implement MPI reinitialization in the library, (b) to get initial performance measurements by comparing the cost of traditional checkpoint/restart (in which the failed job is restarted) to that of using the Reinit approach, and (c) to asses whether it is worthwhile to implement a full-featured version on Reinit in the future.
+
+One of the major difficulties to implement the Reinit reinitialization procedure is to shutdown and to restart network-related resources, which may vary on distinct platforms and communication layers. Thus, we target three different platforms for our initial investigation: (1) a cluster with a Mellanox IB interconnect, using the Open MPI ibverbs Byte Transfer Layer (BTL); (2) a cluster with an Intel/Qlogic IB interconnect, using the Open MPI Performance Scaled Messaging (PSM) and the Matching Transport Layer (MTL); (3) a Cray XC30 system, using the Open MPI uGNI BTL.
+
+Our prototype implements only the MPI_Reinit function (see Table 3), one of the key components of the interface. We reuse the internal code of the Open MPI’s MPI_Init and MPI_Finalize procedures, which are required to cleanup resources associated with MPI objects (e.g., constructors and partially delivered messages). In this exercise, we identified and fixed a number of procedures in the MPI_Finalize, where resources were not being completely released and adopted these for our prototype. We also added routines to cancel interrupted messages and to free resources associated with them.
+
+We found that the Open MPI BTL network interface is well suited for the MPI reinitialization procedure—it did not present significant difficulties to implement our model. Note that, in this prototype, all resources associated with the BTL layer are torn down and restarted during MPI reinitialization. A more refined approach would likely do selective cleanup to avoid reconnection costs as a job continued across a reinitialization boundary. We found that using the PSM MTL layer was much more complex, thus we discontinued the work on this layer and left it for future work.
+
+We enhance the group communication layer of the Open MPI’s runtime layer (ORTE)—used for out-of-band data exchange and synchronization—to support more general data exchange and synchronization. Before these modifications, the communication pattern for an MPI job startup/shutdown was hardwired into the ORTE layer.
+
+## 6.3.1. Testbed applications and initial results
+
+We modify ddcMD and a Lattice Bolzmann transport code (LBMv3) (He and Luo, 1997) to test our prototype. To approximate the asynchronous mode of the proposed method, we modify the main time step loops of the applications to explicitly execute the MPI_Reinit procedure after receiving a failure notification. We mimic failures by sending a user signal at a random point in time during the application execution.
+
+In our experiments, we measure the time to recover from a failure using two methods: Reinit and a standard job restart. In both cases, the application restarts from a previously saved checkpoint (which is saved in a parallel filesystem) when a failure notification is received. Our experimental results show that the time difference between Reinit versus a standard job restart was significant for the LBMv3 code. For ddcMD, we did not observe a significant difference because the checkpoint files of this application are small. Figure 6 shows a comparison of these times for the LBMv3 application on a Cray XC30 system using a strong scaling problem.
+
+OPEN IN VIEWER
+
+Figure 6.
+
+Recovery time (seconds) of LBMv3 using MPI Reinit versus a full job restart on a Cray XC30 system.
+
+We believe that Reinit benefits partially from the fact that at least some portion of the checkpoint data from the last write to the parallel file system is likely still cached in the kernel’s buffer cache, since in Reinit the job is not killed, and the ranks maintain their node locality across the reinitialization boundary. We also note that the benefit of Reinit tends to increase with the increasing processor count for this application. Although further experimentation and analysis is needed, we believe this is due to reduced initialization time because the problem size is decomposed over a larger number of processes.
+
+We simulate the availability of nonvolatile memory or local solid-state drive solid-state drives (SSD)—a feature that is increasingly common in high-end clusters. We modify LBMv3 to allow for optional writing of checkpoint files to a local ramfs file system on the compute nodes. We also observe some reduction in recovery time for Reinit versus a full job restart using this approach for storage of checkpoint files.
+
+The initial results of the Reinit prototype are encouraging and the difference in recovery time (of Reinit and traditional job restarts) are significant enough to continue pursuing an implementation of the Reinit model in Open MPI. In future work, we also plan to implement this model in MPICH and MVAPICH, other commonly used MPI implementations.
+
+## 6.4. Comparison of ULFM and Reinit
+
+Table 4 shows the problems that we identify in ULFM and how they are solved in Reinit. Note that this table only shows solutions for programmability and applicability of the interface—we do not show a performance comparison since the implementations of the interfaces are still in early stages. We also provide Table 5, which classifies Reinit in terms of the applications and recovery models for which it is most suitable.
+
+OPEN IN VIEWER
+
+Comparison of ULFM and Reinit.
+
+| Subject | Problem in ULFM | Solution in Reinit |
+| --- | --- | --- |
+| Applicability to codes | ULFM is suitable for shrinking recovery, a model that is applicable only to a subset of applications, such as to master–worker codes, which can re-decompose scientific problems into fewer processes at runtime. | Reinit supports non-shrinking recovery, which is applicable to all applications (bulk synchronous or master–worker). |
+| Programmability of the interfaces | Applications must deal with most of the steps that are involved in failure detection and recovery, such as checking for errors in MPI calls, propagating failure information, fixing broken communicators and eliminating failed MPI ranks. This makes very hard programming a fault-tolerant application. | The MPI layer deals with most of the steps that are involved in failure recovery: MPI deals with failure notifications and cleanup of MPI state. This greatly simplifies programming fault-tolerant applications. |
+| Error notification guaranties | ULFM does not provide guaranties about when an error is notified to the application. This complicates failure local recovery since it is unknown what MPI call can be attributed with an error and where the application must restart from. | In Reinit, when an error is detected, MPI automatically propagates error notifications to all process. Since eventually all MPI processes roll back to an initial safe state (which all agreed on before a failure) there is no need for guaranteed error notifications for MPI calls. |
+| Use of libraries | To reduce the burden of writing fault-tolerant applications, ULFM can be used to build fault-tolerant libraries, which applications can then rely on to survive failures. This approach is problematic since libraries would likely make use of PMPI for portability, which prohibits the use of performance tools. | Reinit does not require a library implementation since it is a much simpler interface. If incorporated in the MPI standard, the interface is sufficiently small to allow direct use from applications. |
+
+MPI: message-passing interface;PMPI: MPI Profiling Interface; ULFM: user-level failure mitigation.
+
+OPEN IN VIEWER
+
+Classification of applications and recovery models in which Reinit is a convenient interface.
+
+| Application types | | | Recovery model dimensions | | | | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Application | Weight | Balance | Backward | Forward | Global | Local | Shrinking | Nonshrinking |
+| Master-worker | Light | Dynamic | + a | ○ b | + a | ○ b | ○ b | ⊕ |
+| Bulk synchronous | Heavy | Static | ⊕ | | ⊕ | | | ⊕ |
+
+a
+
++: It is easy to implement with Reinit, with few code changes.
+
+b
+
+○ It is easy to modify the application to support this recovery model.
+
+## 6.5. Reinit versus job restarts
+
+The functionality of automatically flushing MPI state and allowing the application to restart from a checkpoint can also be achieved by simply restarting a failed MPI job in the preallocated set of nodes, for example, using scripts (which may be part of the application workflow) or by a fault tolerance library such as Scalable Checkpoint/Restart (Moody et al., 2010). The goal of Reinit is to make this functionality more efficient and portable than current methods. Some of the advantages of Reinit in this regard are:
+
+Applications that have long launch times (e.g., with large images or that must load many shared libraries) experience shorter failure recovery time with Reinit than with a simple job restart because only the failed resources must be restarted. Previous work has shown that these applications can have a long startup times at scale (Frings et al. 2013) (e.g. 10 h at 16,384 process job) and that the startup times can be linear with respect to job scale (i.e., number of nodes).
+
+Most of the functionality for handling failed resources—preallocating and replacing nodes in a job, for example—can be provided today at the level of resource managers. If Reinit is accepted in the MPI standard, this functionality becomes portable and would become accessible to users directly by the MPI interface.
+
+As future work, we plan to compare the efficiency of Reinit to that of traditional job restarts and to identify application characteristics that would indicate substantial reduction in post-recovery time if Reinit is employed.
+
+## 7. Related work
+
+The traditional method to deal with failures in HPC systems has been checkpoint/restart (Hargrove and Duell, 2006; Roman, 2002Sankaran et al., 2005). Although fundamentally these approaches do not require much support of MPI at the application level to recover from failures—when a failure occurs, jobs are restarted and MPI state is reinitialized—there has been previous work to identify what is required in an MPI implementation to provide better support of distributed checkpoint/restart (Hursey et al., 2007). As HPC systems increase in size and complexity, checkpoint/restart techniques may suffer from higher overheads, thus support from MPI at user level may be beneficial to improve the performance of this approach.
+
+The idea of surviving failures in MPI clusters via shrinking recovery dates back to the Starfish system (Agbaria and Friedman, 1999). This system uses distributed demons to detect failures and to propagate failure information. Once surviving processes know about a failure, they repartition the data sets on which each process computes and continue to run without interruption.
+
+Various models for fault tolerance have been proposed for MPI (Fagg and Dongarra, 2000; Hursey et al., 2011) to handle process failures at the application level. These proposals introduce new abstractions for MPI to allow applications validate communicators when failures occur and to allow using these validated communicators. Although these proposals provide useful abstractions to deal with process failures, because of the complexity of the interfaces and their usage, they have not been adopted in the MPI standard.
+
+The ULFM interface (Bland et al., 2013) is the recent proposal to add fault tolerance to the MPI standard and has been proposed by the Fault Tolerance Working Group in the MPI Forum. It provides support for process fail-stop fault tolerance in MPI through a set of function calls and reduces the complexities of previous proposals. Previous work has demonstrated the use of ULFM in scientific codes. Teranishi and Heroux (Teranishi and Heroux, 2014) propose the Local Failure Local Recovery (LFLR) model, which makes use of ULFM to implement non-shrinking recovery for a given application. Gamell et al. (2014) propose the Fenix system, which makes use of ULFM to implement non-shrinking recovery and to repair communicators transparently. Sato et al. (2014) propose fault-tolerant messaging interface (FMI), a programming model for fault tolerance that provides message-passing semantics similar to MPI via fast, transparent checkpoint/restart.
+
+## 8. Conclusions
+
+User-level fault-tolerant semantics, such as those proposed in ULFM, can be of practical use in a subset of applications (e.g., lightweight and dynamically balanced applications), in which recovering from process failures involves few steps. For the vast majority of bulk synchronous scientific computing applications, these semantics have little practical use unless applications are refactored to meet a list of complex requirements and algorithmic changes.
+
+A more natural direction for MPI fault tolerance infrastructure would be to first provide support for statically balanced, heavyweight scientific applications by improving the efficiency of checkpoint/restart. It is expected that most future HPC systems will have a large, fast checkpoint store (or “burst buffer”) close to the compute nodes, and this allows efficient, frequent checkpoints and fast restarts. With a burst buffer, the effort to harden an MPI application with ULFM, or another complex user-level interface, becomes difficult to justify.
+
+The MPI community should weigh pros and cons of any proposed fault-tolerant interface with careful attention to a broad range of application case studies like the one presented in this article. Implementation difficulties for bulk synchronous HPC applications should be weighted seriously since most vendors will hesitate to implement features with only limited applicability in the HPC community.
+
+To address the concerns that we found in ULFM, we propose a new fault-tolerance interface for MPI, Reinit, which supports global, backward, non-shrinking recovery. We believe this interface has wider applicability (provides support for statically balanced, heavyweight scientific applications), and it is easier to use than ULFM (eliminates the need for detecting and repairing failures locally). We present a prototype of key features of Reinit in Open MPI, a widely used MPI implementation. We show that the failure recovery time of an MPI job is reduced when using this interface versus the traditional recovery approach of restarting a job.
+
+## Footnotes
+
+### Declaration of Conflicting Interests
+
+The author(s) declared no potential conflicts of interest with respect to the research, authorship, and/or publication of this article.
+
+### Funding
+
+The author(s) disclosed receipt of the following financial support for the research, authorship, and/or publication of this article: This work was performed under the auspices of the U.S. Department of Energy by Lawrence Livermore National Laboratory under contract DEAC52-07NA27344 and supported by Office of Science, Office of Advanced Scientific Computing Research (LLNL-JRNL-663434).
+
+### Notes
+
+### Author biographies
+
+Ignacio Laguna (ilaguna@llnl.gov) is a computer scientist at the Center for Applied Scientific Computing (CASC) at the Lawrence Livermore National Laboratory. He received the MS and PhD degrees in the School of Electrical and Computer Engineering from Purdue University, West Lafayette, Indiana, in 2008, and 2012, respectively. Previously, he received the BS in electronics and communications engineering from Universidad de Panamá, Panama, in 2002. He received the ACM and IEEE-CS George Michael Memorial Fellowship in 2011 for his work on large-scale failure diagnosis techniques. His research interests include fault tolerance, software reliability, and debugging in high-performance computing.
+
+David F Richards (richards12@llnl.gov) is a computational physicist in the Physical and Life Sciences Directorate at Lawrence Livermore National Laboratory. He received a BS in physics from Harvey Mudd College in 1992 and a PhD in physics from the University of Illinois at Urbana-Champaign in 1999. He has over 15 years of experience in scientific computing as both a user and an application developer in academic, industrial, and national lab settings. He is the proxy app lead for the ExMatEx Co-Design center and also leads a team that is working with scientists at IBM to develop advanced cardiac modeling techniques. He was a recipient of the IEEE/ACM Gordon Bell Award in 2007 and an R & D 100 award in 2013. His research interests include large-scale parallel scientific computing and atomic scale simulation of materials.
+
+Todd Gamblin (tgamblin@llnl.gov) is a computer scientist in the Center for Applied Scientific Computing at Lawrence Livermore National Laboratory. His research focuses on scalable tools for measuring, analyzing, and visualizing performance data from massively parallel applications. He is also involved with many production projects at LLNL. He works with Livermore Computing Development Environment Group (DEG) to build tools that allow users to deploy, run, debug, and optimize their software for machines with million-way concurrency. He received his PhD in computer science from the University of North Carolina at Chapel Hill in 2009. His dissertation investigated parallel methods for compressing and sampling performance measurements from hundreds of thousands of concurrent processors. He received his BA in Computer Science and Japanese from Williams College in 2002. He has also worked as a software developer in Tokyo and held research internships at the University of Tokyo and IBM Research.
+
+Martin Schulz (schulzm@llnl.gov) is a computer scientist at the CASC at Lawrence Livermore National Laboratory (LLNL). He earned his doctorate in computer science in 2001 from the Technische Universität München (Munich, Germany) and also holds a master of science in Computer Science from the University of Illinois at Urbana Champaign. He has published over 175 peer-reviewed papers and currently serves as the chair person of the MPI Forum, the standardization body for the message-passing interface. He is the principal investigator for the Office of Science X-Stack project “Performance Insights for Programmers and Exascale Runtimes” as well as for the ASC/CCE project on Open|SpeedShop and is involved in the DOE/Office of Science exascale projects CESAR, ExMatEx, and ARGO. His research interests include parallel and distributed architectures and applications; performance monitoring, modeling and analysis; memory system optimization; parallel programming paradigms; tool support for parallel programming; power-aware parallel computing; and fault tolerance at the application and system level. He was a recipient of the IEEE/ACM Gordon Bell Award in 2006 and an R & D 100 award in 2011.
+
+Bronis R de Supinski (bronis@llnl.gov) is the chief technology officer (CTO) for Livermore Computing (LC) at Lawrence Livermore National Laboratory (LLNL). In this role, he is responsible for formulating LLNL’s large-scale computing strategy and overseeing its implementation. His position requires frequent interaction with high-performance computing (HPC) leaders and he oversees several collaborations with the HPC industry as well as academia. Prior to becoming CTO for LC, he led several research projects in LLNL’s Center for Applied Scientific Computing. Most recently, he led the Exascale Computing Technologies (ExaCT) project and coled the Advanced Scientific Computing (ASC) program’s Application Development Environment and Performance Team (ADEPT). ADEPT is responsible for the development environment, including compilers, tools, and runtime systems, on LLNL’s large-scale systems. ExaCT explored several critical directions related to programming models, algorithms, performance, code correctness, and resilience for future large-scale systems. He currently continues his interests in these topics, particularly programming models, and serves as the Chair of the OpenMP Language Committee. He earned his PhD in computer science from the University of Virginia in 1998 and he joined CASC in July 1998. In addition to his work with LLNL, he is also a Professor of Exascale Computing at Queen’s University of Belfast and an Adjunct Associate Professor in the Department of Computer Science and Engineering at Texas A&M University. Throughout his career, he has won several awards, including the prestigious Gordon Bell Prize in 2005 and 2006, as well as an R & D 100 for his leadership of a team that developed a novel scalable debugging tool. He is a member of the ACM and the IEEE Computer Society.
+
+Kathryn Mohror (kathryn@llnl.gov) is a computer scientist on the Scalability Team at the Center for Applied Scientific Computing at Lawrence Livermore National Laboratory (LLNL). Her research on high-end computing systems is currently focused on scalable fault-tolerant computing and I/O for extreme scale systems. Her other research interests include scalable performance analysis and tuning and parallel programming paradigms. She has been working at LLNL since 2010. Her current research focuses primarily on the Scalable Checkpoint/Restart Library (SCR), a multilevel checkpointing library that has been shown to significantly reduce checkpointing overhead. She also leads the Tools Working Group for the MPI Forum. Her received her PhD in Computer Science in 2010, an MS in Computer Science in 2004, and a BS in Chemistry in 1999 from the Portland State University in Portland, OR.
+
+Howard Pritchard (howardp@lanl.gov) is a research scientist at Los Alamos National Laboratory (LANL). Before joining LANL, he spent 10 years at Cray Inc. as a principal engineer. He received his PhD degree in chemistry from the California Institute of Technology in 1994 and his BA in chemistry from Rice University in 1985.
+
+## References
+
+1.
+
+Agbaria AM Friedman R (1999) Starfish: fault-tolerant dynamic MPI programs on clusters of workstations. In: Proceedings of the Eighth International Symposium on High Performance Distributed Computing. Redondo Beach, CA, 3–6 August 1999, pp. 167–176. Los Alamitos, CA: IEEE.
+
+Go to Reference
+
+2.
+
+Bland W Du P Bouteiller A . (2012) A checkpoint-on-failure protocol for algorithm-based recovery in standard MPI. In: Kaklamanis C Papatheodorou T Spirakis PG (eds) Euro-Par 2012 Parallel Processing, pp. 477–488. Heidelberg: Springer.
+
+Go to Reference
+
+3.
+
+Bland W Bouteiller A Herault T . (2013) An evaluation of user-level failure mitigation support in MPI. Computing95(12): 1171–1184.
+
++ Show References
+
+4.
+
+Buntinas D (2012) Scalable distributed consensus to support MPI fault tolerance. In: 2012 IEEE 26th International Parallel & Distributed Processing Symposium (IPDPS), Shanghai, China, 21–25 May 2012, pp. 1240–1249. Los Alamitos, CA: IEEE.
+
+Go to Reference
+
+5.
+
+Cappello F Geist A Gropp B . (2009) Toward exascale resilience. International Journal of High Performance Computing Applications23: 374–388.
+
+Go to Reference
+
+6.
+
+Dongarra J Beckman P Moore T . (2011) The international exascale software project roadmap. International Journal of High Performance Computing Applications25: 3–60.
+
+Go to Reference
+
+7.
+
+Fagg GE Dongarra JJ (2000) FT-MPI: FAULT tolerant MPI, supporting dynamic applications in a dynamic world. In: Dongarra J Kacsuk P Podhorszki N (eds) Recent Advances in Parallel Virtual Machine and Message Passing Interface. Heidelberg: Springer, pp. 346–353.
+
++ Show References
+
+8.
+
+Frings W Ahn DH LeGendre M . (2013) Massively parallel loading. In: Proceedings of the 27th International ACM Conference on International Conference on Supercomputing (ICS), Eugene, OR, 10–14 June 2013, pp. 389–398. New York: ACM.
+
+Go to Reference
+
+9.
+
+Gamell M Katz DS Kolla H . (2014) Exploring automatic, online failure recovery for scientific applications at extreme scales. In: International Conference for High Performance Computing, Networking, Storage and Analysis (SC14), New Orleans, LA, 16–21 November 2014, New Orleans, USA, pp. 895–906. Piscataway, NJ: IEEE.
+
+Go to Reference
+
+10.
+
+Glosli JN Richards DF Caspersen K . (2007) Extending stability beyond CPU millennium: a micron-scale atomistic simulation of Kelvin-Helmholtz instability. In: Proceedings of the 2007 ACM/IEEE Conference on Supercomputing (SC), p. 58. New York: ACM.
+
++ Show References
+
+11.
+
+Gropp W Lusk E (2004) Fault tolerance in message passing interface programs. International Journal of High Performance Computing Applications18(3): 363–372.
+
+Go to Reference
+
+12.
+
+Hargrove PH Duell JC (2006) Berkeley lab checkpoint/restart (BLCR) for Linux clusters. Journal of Physics: Conference Series46(1): 494.
+
+Go to Reference
+
+13.
+
+He X Luo L-S (1997) Theory of the lattice boltzmann method: from the boltzmann equation to the lattice Boltzmann equation. Physical Review E56(6): 6811–6817.
+
+Go to Reference
+
+14.
+
+Hursey J Squyres JM Mattox TI . (2007) The design and implementation of checkpoint/restart process fault tolerance for Open MPI. In: IEEE International Parallel and Distributed Processing Symposium (IPDPS), Long Beach, CA, 26–30 March 2007, pp. 1–8. Washington, DC: IEEE.
+
+Go to Reference
+
+15.
+
+Hursey J Graham RL Bronevetsky G . (2011) Run-through stabilization: an MPI proposal for process fault tolerance. In: Recent Advances in the Message Passing Interface. Heidelberg: Springer, pp. 329–332.
+
++ Show References
+
+16.
+
+Kalé L Krishnan S (1993) CHARM++: a portable concurrent object oriented system based on C++. In: Paepcke A (ed) Proceedings of the Eighth Annual Conference on Object-oriented Programming Systems, Languages, and Applications (OOPSLA ’93), September, pp. 91–108. New York: ACM Press.
+
+Go to Reference
+
+17.
+
+Laguna I Richards DF Gamblin T . (2014) Evaluating user-level fault tolerance for MPI applications. In: Proceedings of the 21st European MPI Users’ Group Meeting (EuroMPI/ASIA), p. 57, 9–12 September, Kyoto, Japan. ACM.
+
+Go to Reference
+
+18.
+
+Message Passing Interface Forum (2012, September) MPI: A Message-Passing Interface Standard, Version 3.0.
+
+Go to Reference
+
+19.
+
+Moody A Bronevetsky G Mohror K . (2010) Design, modeling, and evaluation of a scalable multi-level checkpointing system. In: Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis, SC’10, New Orleans, LA, 13–19, November 2010, pp. 1–11.
+
+Go to Reference
+
+20.
+
+Pullum LL (2001) Software Fault Tolerance Techniques and Implementation. Boston: Artech House.
+
+Go to Reference
+
+21.
+
+Richards DF Glosli JN Chan B . (2009) Beyond homogeneous decomposition: scaling long-range forces on massively parallel systems. In: Proceedings of the Conference on High Performance Computing Networking, Storage and Analysis, Portland, OR, 14–20 November 2009, pp. 60:1–60:12. New York: ACM.
+
++ Show References
+
+22.
+
+Roman E (2002) A Survey of Checkpoint/Restart Implementations. Berkeley: Lawrence Berkeley National Laboratory.
+
+Go to Reference
+
+23.
+
+Sankaran S Squyres JM Barrett B . (2005) The LAM/MPI checkpoint/ restart framework: system-initiated checkpointing. International Journal of High Performance Computing Applications19(4): 479–493.
+
+Go to Reference
+
+24.
+
+Sato K Moody A Mohror K . (2014) FMI: fault tolerant messaging interface for fast and transparent recovery. In: 2014 IEEE 28th International Parallel and Distributed Processing Symposium, Phoenix, Arizona, 19–23 May 2014, pp. 1225–1234. Washington, DC: IEEE.
+
+Go to Reference
+
+25.
+
+Shalf J Dosanjh S Morrison J. Exascale computing technology challenges. In: Palma JMLM Dayde M Marques O . (eds) High Performance Computing for Computational Science–VECPAR 2010, pp. 1–25. Heidelberg: Springer, 2011.
+
+Go to Reference
+
+26.
+
+Streitz FH Glosli JN Patel MV . (2006) Simulating solidification in metals at high pressure: the drive to petascale computing. Journal of Physics: Conference Series46(1): 254.
+
++ Show References
+
+27.
+
+Teranishi K Heroux MA (2014) Toward local failure local recovery resilience model using MPI-ULFM. In: Proceedings of the 21st European MPI Users’ Group Meeting (EuroMPI/ASIA ’14), Kyoto, Japan, pp. 51:51–51:56. New York: ACM.
+
++ Show References

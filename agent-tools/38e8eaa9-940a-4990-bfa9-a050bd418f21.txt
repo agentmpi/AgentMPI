@@ -1,0 +1,343 @@
+What is the Agent2Agent (A2A) protocol? How AI agents delegate work
+
+# What is the Agent2Agent (A2A) protocol? How AI agents delegate work
+
+A2A is a shared standard for one agent to hand work to another on a remote server. This walks through its five-object data model, the agent card, the eight task states, the three ways to watch a task, how trust is decided before work is sent, and how Mastra implements both sides on the official @a2a-js/sdk.
+
+Sam Bhagwat·
+
+Jun 22, 2026
+
+·
+
+19 min read
+
+On this page
+
+Toggle
+
+Back in the 90s, we went from local-only computers to machines that could reach any other machine over the web.
+
+A2A, the Agent2Agent protocol, is a similar transformation for AI agents. It's a shared standard for one agent to hand work to another on a remote server.
+
+Google released the A2A protocol on April 9, 2025, and donated it to the Linux Foundation. The spec reached 1.0 under a committee of Google, Microsoft, AWS, Salesforce, IBM, and others, and we built both sides of A2A into Mastra on the official`@a2a-js/sdk`.
+
+The A2A protocol gives you six features:
+
+- One GET against a fixed URL tells you what a remote agent does, the formats it accepts, and the credentials it wants.
+- Work pauses for a human answer and resumes from the same task ID, even days later.
+- Your stream drops, you resubscribe, and it reopens with a full snapshot, so you miss nothing.
+- The same task supports polling, streaming, and webhooks, so a cron job, a dashboard, and a serverless function can all monitor the same piece of work.
+- A forged card or a version mismatch fails loudly, before any work is sent.
+- On Mastra, publishing an agent over A2A is zero extra code, and a remote agent drops in as a verified subagent.
+
+## What is agent-to-agent communication?
+
+Agent-to-agent communication is a protocol for two agents, built by different teams on different frameworks, to exchange work over a network while cooperating on nothing more than declared capabilities and the messages they pass.
+
+No other data moves between them. The two agents share no memory, see none of each other's prompts, and call none of each other's tools, and that opacity is the design principle on which the rest of the protocol is built.
+
+People routinely mix A2A and MCP, but MCP is your agent talking to its own tools and pulling data from an external source, while A2A is your agent talking to a different agent, on a different server for that matter. Production agents run both.
+
+IBM's ACP was folded into A2A in a merger announced by the Linux Foundation on August 29, 2025.
+
+## Why is agent delegation not a tool call?
+
+Calling another remote agent from inside your agent looks like one more tool call, but it's a common mistake to assume they're the same. Here are four differences where the A2A protocol earns its place.
+
+- A remote agent tells you nothing until you fetch its card. You learn its abilities, its endpoint, and the credentials it expects only at runtime.
+- Delegated work runs for minutes or hours, and it stops mid-run to ask a human a question.
+- The remote agent sees only what you put inside the request. Your agent's memory stays on your side of the wire.
+- The remote agent runs on infrastructure where identities can be spoofed, and protocol versions drift.
+
+| | Tool call (MCP) | Delegation (A2A) |
+| --- | --- | --- |
+| Where it runs | inside your process or a local server | on another network |
+| How long it takes | milliseconds | minutes to hours, pauses included |
+| Who holds the context | the caller's memory | the request plus the task's saved history |
+| Where state lives | the call stack | a server-side task, addressable by ID |
+| How the callee is found | configured by the host | a fetched agent card |
+| What can go wrong | an in-process exception | drops, missed events, forged cards, version mismatch |
+
+## How does the A2A protocol structure delegation?
+
+The spec defines its data model once, in Protocol Buffers, and treats that file as the single source of truth. The whole thing rests on five objects:
+
+- Task
+- Message
+- Agent card
+- Part
+- Artifact
+
+The schema holds more than those five, and those five carry the protocol. Every operation descends from that one definition, which is why a gRPC agent and a JSON-RPC agent agree on what a "task" is.
+
+### One data model binds to three interchangeable transports
+
+There are three transports that carry the model: JSON-RPC 2.0, gRPC, and HTTP/REST. The A2A spec requires all three to behave identically.
+
+A team already running gRPC services exposes its agent over the gRPC binding, a team on plain HTTP uses the REST binding, and a client on one can still call an agent on the other, since every binding carries the identical Protocol Buffers task and message definitions underneath.
+
+That layering charges a permanent tax. Keeping three transports identical is ongoing work, because every operation, every error, and every streaming behavior gets specified three times and held in alignment as the protocol evolves. The spec ships explicit method-mapping and error-mapping tables for exactly this reason.
+
+My bet is that the earliest interoperability bugs are simply cross-transport mismatches. For instance, ask a gRPC agent for a task that doesn't exist, and you get a`NOT_FOUND` status. So a JSON-RPC client that only knows`-32001` would slip right past the gRPC error unless it's explicitly coded in or mentioned somewhere in the system prompt.
+
+At Mastra, we picked JSON-RPC 2.0 and built deep on it. I think that is the right call for a first implementation.
+
+### An agent card describes a remote agent in one fetch
+
+Every A2A agent publishes a card at a fixed URL on its domain,`/.well-known/agent-card.json`. One unauthenticated GET returns it, with no SDK, no docs, and no onboarding call.
+
+The card lays out everything you need to decide whether to use the agent:
+
+- Its name and a description of what it does.
+- The URL where you send work.
+- The capabilities it advertises, including streaming, push notifications, and a fuller card for authenticated callers.
+- The input and output formats it accepts and produces.
+- The skills it offers, each tagged.
+- The credentials it requires.
+- The transports and protocol versions it speaks.
+
+So, for example, a weather agent whose card says it can stream data and lists a weather skill has already told you what it does and how to talk to it in one read. That's the whole handshake, before any work changes hands.
+
+Some agents keep their better skills behind a login. They hand a short public card to everyone while reserving a fuller card for those they already trust, and when the public card says a fuller version exists, you fetch it once you've authenticated, get the longer card back, and swap it in.
+
+There's a catch, though. A2A only lets you connect to another agent with a domain or name that you already know. You can't discover new agents with this protocol. ANP, the Agent Network Protocol, takes the discovery part with decentralized identifiers.
+
+### Work travels as messages and comes back as artifacts
+
+Think of this as any interaction with a chat agent like Claude, for instance. You send a message and get back a finished output based on the context, skills, and expectations.
+
+A message is just one turn in the conversation. In the context of A2A, it carries a role, either user or agent, and an array of parts that hold the actual content. A part can be plain text, a blob of structured JSON, raw bytes, or a URL pointing at a file.
+
+Parts are also how the two sides agree on formats. Your agent lists the output types it can handle, and if the server agent can't produce any of them, it sends back`ContentTypeNotSupportedError` instead of dumping something on your agent that it has no way to read.
+
+| | Message | Artifact |
+| --- | --- | --- |
+| Purpose | a communication turn | the task's output |
+| Carries | role and parts | parts |
+| Survives a disconnect | No, may be missed on reconnect | Yes, held in task state |
+| Use it for | questions, status, instructions | results the caller must keep |
+
+If your connection drops and you reconnect, you can miss any status messages the server sent while you were gone, so anything you genuinely can't lose has to live in an artifact or in the task's saved history.
+
+### The remote agent rebuilds context from three inputs
+
+The remote agent has none of your memory to lean on, so it rebuilds the picture from scratch every turn, out of whatever the message carries, the task's own saved history, and a server-issued`contextId` that ties related tasks into one session.
+
+It's the same opacity we talked about earlier, showing up as a hard wall around what the other side can actually know.
+
+The server creates the`contextId`. You send a message with both a`contextId` and a`taskId`, and they need to match the server's records, or it rejects the message. Alternatively, you can send just a`taskId`, and the server works out the session from there.
+
+You point back at earlier work by sharing prior task IDs, and the server resolves them against its own stored tasks. So two agents can build on everything they've done together without either one revealing its database, prompts, or internal state.
+
+The task ID is the only thing they need to share.
+
+### A delegated task moves through eight states
+
+Sketch a delegated task on a whiteboard, and you'd probably draw four states: pending, running, failed, and done.
+
+The A2A protocol has eight steps, grouped into running, finished, and paused, because delegated work can stop to wait for more information or can get turned down, and each of those earns a state of its own.
+
+The three groups are:
+
+- Running covers`submitted` and`working`.
+- Finished covers`completed`,`failed`,`canceled`, and`rejected`.
+- Paused covers`input-required` and`auth-required`.
+
+A paused task sitting in`input-required` or`auth-required` is parked, waiting on you for an answer or for credentials, and it picks right back up the moment you send a new message with the same`taskId`, whether that's four seconds later or four days later.
+
+And if the request is small enough to answer in one shot, the server can skip making a task at all and just reply with a plain message.
+
+### A caller watches a running task by polling, streaming, or a webhook
+
+Since a task can run for a long time, A2A lets you keep track of your agent in multiple ways: polling, streaming, and webhooks.
+
+Each option is gated behind a capability the agent advertises on its card, so you never reach for streaming or webhooks unless the remote actually offers them.
+
+| Mechanism | Connection model | Gated on | Best for |
+| --- | --- | --- | --- |
+| Polling | none, caller asks on its own schedule | always available | cron jobs, simple integrations |
+| Streaming | one persistent connection (SSE over HTTP) | the agent advertising streaming | dashboards, live progress |
+| Webhook push | server posts to a callback URL | the agent advertising push notifications | serverless, disconnected backends |
+
+There are a few more nuances to the watch methods:
+
+- Polling reads one task with`tasks/get` and lists many with`tasks/list`, paginated by a cursor that hands back fifty tasks a page by default and a hundred at most.
+- A stream opens with a full snapshot before it sends a single delta, so even if you join late, you see the whole current state, and several clients can watch the same task and get the same ordered events until it finishes and the stream closes.
+- Webhook delivery is best-effort, and the protocol never promises it lands, which is exactly why polling stays underneath as the thing that always works.
+
+### Trust is decided before any work is sent
+
+You can't read the other agent's code or watch it think, so every trust decision has to happen right before you send a thing. The A2A protocol provides three ways to make that call.
+
+- The card declares which credentials the agent takes, from a fixed set of API key, HTTP auth, OAuth 2.0, OpenID Connect, and mutual TLS. OAuth 2.0 dropped the old implicit and password grant flows, which nobody recommends anymore (RFC 8628).
+- The card is wrapped in a JSON Web Signature (RFC 7515) computed over a canonical form of it from the JSON Canonicalization Scheme, or JCS (RFC 8785), so the signature still checks out no matter how the JSON gets reindented or reordered on the way to you.
+- Version negotiation happens on every request as part of the`A2A-Version` header, too. Even if a version is not supported, the A2A protocol allows communication on an older version.
+
+A well-done signature clarifies two things: who published the card, and that nobody touched the bytes since they signed it.
+
+What it doesn't tell you is which keys to trust, and the spec is still unclear on that part. I think that's a good move, because which keys you trust is a question about your threat model, and no protocol can answer that for you, just as it's always been in TLS or anywhere else you check a signature.
+
+## Where does A2A delegation break, and how do you design around it?
+
+Every channel I discussed above can break, and the one idea that makes all of it survivable is that the task on the server is the source of truth.
+
+When something looks off, you read the task back instead of trusting whatever your local copy thinks happened.
+
+- The stream drops mid-task. Resubscribe and it replays a full snapshot before any new events, so you've lost nothing.
+- A status message goes missing. The outcome is still sitting in the task's artifacts and history, which the message was only echoing anyway.
+- A webhook never shows up. It was best-effort to begin with, so fall back to polling.
+- A card is forged or tampered with. The signature check and your own acceptance rule both run before any work goes out.
+- Two agents disagree on the version. The`A2A-Version` header turns that into a loud`VersionNotSupportedError` instead of quietly misreading fields.
+- The remote can't produce a format you accept. You get`ContentTypeNotSupportedError` at the boundary, not a garbage response to clean up.
+- A paused task never wakes up. The timeout is yours to set,`tasks/cancel` kills it, and`TaskNotCancelableError` tells you when it's already too far along to stop.
+- The network flakes. The client retries with backoff.
+
+## How does Mastra handle each stage?
+
+Mastra implements both sides of A2A. You can expose a Mastra agent so that other systems can delegate work to it over the protocol, and you can call a remote A2A agent from inside your own Mastra agent.
+
+Both are built on the official`@a2a-js/sdk`, and Mastra uses the standard A2A task, message, and card types and works with any A2A agent, not only other Mastra ones.
+
+### Publishing a Mastra agent over A2A takes no extra code
+
+Register an agent on a Mastra server, and it's reachable over A2A right away without extra code, because the server builds the card, serves it from the well-known path, and opens the execution endpoint for you.
+
+For instance, register one as a`weather-agent` under the default`/api` prefix, and its card shows up at`/api/.well-known/weather-agent/agent-card.json`.
+
+To prove a card really came from you and wasn't altered on the way, turn on signing. It's one config block with an ES256 key.
+
+```
+import { Mastra } from '@mastra/core/mastra'
+ 
+export const mastra = new Mastra({
+  server: {
+    a2a: {
+      agentCardSigning: {
+        privateKey: process.env.A2A_AGENT_CARD_PRIVATE_KEY!,
+        protectedHeader: { alg: 'ES256', kid: 'agent-card-key' },
+      },
+    },
+  },
+})
+```
+
+With that in place, every card Mastra publishes carries a signature, and a caller can check that it came from you before trusting the card. You can leave the block out, and cards go out unsigned, so signing is optional.
+
+### A remote agent plugs in as a subagent
+
+A remote A2A agent slots into a Mastra agent exactly like a local subagent would.`A2AAgent` from`@mastra/core/a2a` takes a card URL, and the parent delegates to it through the same interface it uses for everything else.
+
+```
+import { Agent } from '@mastra/core/agent'
+import { A2AAgent } from '@mastra/core/a2a'
+ 
+const remoteWeatherAgent = new A2AAgent({
+  url: 'https://weather.example.com/api/.well-known/weather-agent/agent-card.json',
+  headers: { Authorization: `Bearer ${process.env.WEATHER_AGENT_TOKEN}` },
+})
+ 
+export const supportAgent = new Agent({
+  id: 'support-agent',
+  name: 'Support Agent',
+  instructions: 'Answer user questions and delegate weather questions when needed.',
+  model: 'anthropic/claude-sonnet-4-6',
+  agents: { remoteWeatherAgent },
+})
+```
+
+Point it at the card's URL, or just the agent's domain, and Mastra fetches the card once and caches it. It streams when the remote supports streaming and returns a single buffered result when it doesn't, so your code is the same either way.
+
+Retries and timeouts are configurable, and the defaults are conservative.
+
+```
+// A2AAgent constructor defaults
+this.#retries = options.retries ?? 0
+this.#backoffMs = options.backoffMs ?? 250
+this.#maxBackoffMs = options.maxBackoffMs ?? 1_000
+this.#timeoutMs = options.timeoutMs            // undefined by default
+```
+
+Left alone, a request runs once and waits as long as the remote agent takes.
+
+When a task pauses for input, you resume it by keying the`runId`. Mastra sends your follow-up as a fresh message carrying the original context ID and naming the prior task, so the remote agent ties the new turn back to the old work through the protocol's own citation mechanism.
+
+### Application code tracks and resumes work through the client SDK
+
+When it's plain application code calling a Mastra A2A endpoint, you reach for the client SDK.
+
+```
+const a2a = client.getA2A('weather-agent')
+ 
+const stream = a2a.sendMessageStream({
+  message: {
+    kind: 'message',
+    role: 'user',
+    messageId: crypto.randomUUID(),
+    parts: [{ kind: 'text', text: "What's the weather in Prague?" }],
+  },
+})
+ 
+for await (const event of stream) {
+  if (event.kind === 'artifact-update') console.log(event.artifact.parts)
+}
+ 
+// connection dropped? reattach to the same task and keep watching.
+for await (const event of a2a.resubscribeTask({ id: 'task-123' })) {
+  console.log(event)
+}
+```
+
+`MastraClient.getA2A('weather-agent')` gives you an object that covers the whole flow and can verify the card's signature against keys you hand it.
+
+In the case of a serverless agent, you register a callback, and Mastra POSTs the current task snapshot to that URL when the task hits`completed`,`failed`,`canceled`, or`input-required`, the four states you'd actually want to react to.
+
+### Mastra verifies an agent card before any work is sent
+
+Mastra runs your trust check before a single byte of work goes out.
+
+The signature check confirms the card came from a key you trust and arrived unchanged, and then the`verifyAgentCard` hook runs whatever rule you wrote against the fetched card and throws before delegating if the card doesn't pass.
+
+```
+import { A2AAgent } from '@mastra/core/a2a'
+ 
+const remoteWeatherAgent = new A2AAgent({
+  url: 'https://weather.example.com/api/.well-known/weather-agent/agent-card.json',
+  headers: { Authorization: `Bearer ${process.env.WEATHER_AGENT_TOKEN}` },
+  verifyAgentCard: {
+    verify: async (card, context) => {
+      // refuse to delegate if the publishing organization is not who we expect
+      if (card.provider?.organization !== 'Weather Inc') {
+        throw new Error(`Unexpected provider for ${context.cardUrl}`)
+      }
+    },
+  },
+})
+```
+
+Going from the top to the bottom, the URL finds and fetches the card, the`Authorization` header satisfies a credential scheme the card asked for, and the`verifyAgentCard` hook runs your rule, here a check on who published it, and throws before anything leaves your process if the card doesn't match.
+
+The hook fires right after the agent card is fetched and before the execution URL is ever read, which is the only order that makes sense, since you want to decide whether to trust the card before you commit to calling.
+
+## Wrapping up
+
+Every piece of A2A is paying back something that a tool call never has to think about:
+
+- Describe yourself on a card, because the caller can't read your code.
+- Send the context with the work, because none of your memory follows it across the wire.
+- Keep the state in a server-side task, because the connection won't outlive the job.
+- Reconcile against that task whenever anything drops, because the network is the one piece you can't make reliable.
+
+The moment the agent on the other end is not yours, you need all four.
+
+A2A flat-out refuses a couple of jobs you'd think belong to it, finding agents out on the open internet and deciding which signing keys to trust, and that refusal is a big part of why the rest of it stays coherent. Both are real problems, both belong to someone, just not to the protocol.
+
+None of this really lands until you run it. Read the data model section of the spec, spin up a Mastra server with one agent, and GET its card from the well-known URL. Watching these things turn into real JSON on your own machine will do more for you than any diagram here, mine included.
+
+Share: Share on X (Twitter) Share on LinkedIn
+
+Sam Bhagwat on LinkedIn Sam Bhagwat on X
+
+Sam Bhagwat is the founder and CEO of Mastra. He co-founded Gatsby, which was used by hundreds of thousands of developers. A Stanford graduate and veteran of web development, he authored 'Principles of Building AI Agents' (2025).
+
+All articles by Sam Bhagwat →

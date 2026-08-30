@@ -1,0 +1,209 @@
+ReproBLAS - Reproducible Basic Linear Algebra Sub-programs
+
+eproBLAS: Reproducible BLAS
+
+#### What are ReproBLAS ?
+
+`ReproBLAS` stands for Reproducible Basic Linear Algebra Subprograms.
+
+By reproducibility, we mean getting bitwise identical results from multiple runs of a program on the same input. Floating point summation is not associative because of roundoff errors, so the computed sum depends on the order of summation. Modern processors, which may dynamically assign resources, such as variable numbers of processors, do not guarantee the same order of summation from run-to-run of the same program or subroutine. Reproducibility is needed for debugging, verification and validation, correctness, and even contractual obligations.
+
+`ReproBLAS` aims at providing users with a set of (Parallel and Sequential) Basic Linear Algebra Subprograms that guarantee reproducibility regardless of the number of processors, of the data partitioning, of the way reductions are scheduled, and more generally of the order in which the sums are computed. We assume only that
+
+1. Floating point numbers are binary and correspond to the IEEE Floating Point Standard 754-2008
+2. Floating point operations are performed in ROUND-TO-NEAREST mode (ties may be broken arbitrarily)
+3. Underflow occurs gradually (denormal numbers must be supported). It is possible to adapt the algorithms to handle abrupt underflow as well. [1]
+
+The BLAS are commonly used in scientific programs, and the reproducible versions provided in the`ReproBLAS` will provide high performance while reducing user effort for debugging, correctness checking and understanding the reliability of programs. Main Goals
+
+In order to support computing environments ranging from multi-core laptops to highly parallel systems, including PetaScale and Cloud Computing, the main goals of the`ReproBLAS` are:
+
+1. Reproducible summation, independent of summation order, assuming only a subset of the IEEE 754 Floating Point Standard . This is our primary goal. In particular, we only use binary arithmetic (any precision) with the default round-to-nearest-even rounding mode. We need to make some assumptions on the maximum number of summands, which turn out to be \(2^{64}\) and \(2^{33}\) for double and single precision, resp., which is more than enough in practice.
+2. Accuracy at least as good as conventional summation, and tunable . The internal representation used by ReproBLAS lets us choose the desired precision. Our default in double precision is to carry at least 80 bits of precision. Our algorithm has an error bound of \[ error \leq n 2^{-80} \max|x_j| + 7 \epsilon|\sum\limits_{j = 0}^{n - 1} x_j| \] where \(\epsilon = 2^{-53}\).
+3. Handle overflow, underflow, and other exceptions reproducibly . It is easy to construct small sets of finite floating point numbers, where depending on the order of summation, one might compute`+Inf`(positive infinity),`-Inf`,`NaN`(Not-a-Number), 0 or 1 (the correct answer); Our algorithm guarantees that no overflows can occur until the final rounding to a single floating point number (assuming the above bounds on the number of summands). Summands that are`+Inf`,`-Inf`, or`NaN` propagate in a reproducible way to the final sum. Underflows are handled reproducibly by assuming default IEEE 754 gradual underflow semantics, but abrupt underflow may be handled as well.
+4. One read-only pass over the summands . This property is critical for efficient implementation of the BLAS, where summands (like \(A_{ik} \cdot B_{kj}\) in matrix multiply \(C = A \cdot B\)) are computed once on the fly and discarded immediately.
+5. One reduction .
+6. In parallel environments, the cost of a parallel reduction may dominate the total cost of a sum, so analogously to performing a single read-only pass over the data, it is important to be able to perform one parallel reduction operation (processing the data in any order) to compute a reproducible sum.
+7. Use as little memory as possible, to enable tiling . Many existing algorithms for reproducible summation represent intermediate sums by a data structure that we called a ``reproducible accumulator'' above. BLAS3 operations like matrix-multiplication require many such reproducible accumulators in order to exploit common optimizations like tiling; otherwise they are forced to run at the much slower speeds of BLAS1 or BLAS2. In order to fit as many of these reproducible accumulators into the available fast memory as needed, they need to be as small as possible. Our default-sized reproducible accumulator occupies 6 double precision floating point words, which is small enough for these optimization purposes.
+8. Usability. ReproBLAS is composed of basic operations that can be applied in many situations.
+
+Structure
+
+`reproBLAS.h`
+
+`binnedBLAS.h`
+
+`binned.h`
+
+`binnedMPI.h`
+
+The`ReproBLAS` are structured so that different layers may be used, depending on what sources of non-reproducibility are present. We first describe the layers, and then how to use them.
+
+At the core of`ReproBLAS` is the package`binned.h` which defines a new data type, the Binned Floating Point Number, as well as lower-level functions to perform reproducible arithmetic operations on binned and native floating point data types.`binned.h` provides the basic operations (conversion, addition, negation, allocation, etc.) for other modules in the library. However, even with just`binned.h`, one can easily implement reproducible operations, no matter how the input values are ordered.
+
+The package`binnedMPI.h` provides special reduction operators and datatypes for binned numbers in an MPI environment, allowing the user to to reproducibly compute the sum of binned or native floating point numbers distributed across a number of processors regardless of the reduction tree shape used by MPI.
+
+Package`binnedBLAS.h` provides performance-optimized sequential versions of the BLAS which take in vectors of native floating point data types and return a result in binned floating point format.
+
+The package`reproBLAS.h` is built on top of`binnedBLAS.h` and returns reproducible results in native floating point data types instead of binned floating point format. Currently,`reproBLAS.h` only supports single-core computations. In future versions,`reproBLAS.h` may have a multi-threaded mode. Future versions of ReproBLAS may also include a separate module for distributed memory BLAS.
+
+Usage
+
+As stated above, non-reproducibility occurs because round-off makes floating point addition non-associative, so the answer depends on the order of summation. There are a variety of reasons the order of summation can vary from run to run, including changing the
+
+- Data partitioning across processors
+- Number of available processors
+- Choice of instructions (eg. 2 doubles for SSE instructions vs. 4 doubles for AVX instructions)
+- Data alignment in memory (which may affect the order of loading data into multi-word registers)
+- Reduction tree shape, which could be scheduled statically or dynamically
+- Order of the input data
+
+Depending on the level of control over these sources of non-reproducibility, i.e. which ones the user can rule out, the user can use the fewest layers of the`ReproBLAS` necessary to obtain reproducibility at a minimum cost. Here are some examples:
+
+1. Everything is the same from run to run The data ordering is fixed, number of processors is fixed, the data partitioning is fixed, the choice of instructions is fixed (eg. using SSE instructions only), the data alignment is fixed, and the reduction tree shape is fixed and scheduled deterministically, then the computed results will be be reproducible: There is no need to use`ReproBLAS`.
+2. Fixed Data Ordering and Partitioning If the number of processors is fixed and the data is partitioned in a deterministic way, with the same order of data on each processor, then the local summations may be carried out in a deterministic sequential order without the`ReproBLAS`. The only source of non-reproducibility is the reduction tree shape, so a final reproducible can be computed using only`binned.h` and`binnedMPI.h` package.
+3. Fixed Data Ordering and Layout There is no assumption about the number of processors, or reduction tree shape and scheduling. However the data is laid out in blocks of both fixed size and fixed ordering inside each block. This is sometimes referred as an over-decomposition technique. In this case, summation inside each block can again be carried out in a deterministic sequential order without the`ReproBLAS`. Then`binned.h` and`binnedMPI.h` can be used to aggregate the intermediate values and produce the final reproducible result.
+4. No control over data/resources If there is no assumption about any of the above mentioned sources, i.e. even the data ordering is not known, then`binnedBLAS.h` and`binnedMPI.h` are needed to guarantee reproducibility.
+
+Performance
+
+ReproBLAS is comparable in speed to commercially available optimized non-reproducible BLAS. Using our default settings, reproducibly summing n floating point types requires approximately 9n floating point operations (arithmetic, comparison, and absolute value). In theory, this count can be reduced to 5n using the new "augmented addition" and "maximum magnitude" instructions in the proposed IEEE Floating Point Standard 754-2018. For example, in the case of a dot product the slowdown of the`ReproBLAS` compared to a performance-optimized non-reproducible dot product is 4x on a single Intel "Sandy Bridge" core; here the result is reproducible regardless of how the input vector is permuted. [1] And on a large scale system of more than 512 Intel "Ivy Bridge" cores (the Edison machine at NERSC), the slowdown is less than 1.2x for the summation of`1,000,000` double precision floating point numbers [2]; here the result is also reproducible regardless of how the input vector is partitioned among nodes as well as how the local input vector is stored within a node.
+
+Status
+
+The current version only supports BLAS that perform matrix-matrix multiply, matrix-vector multiply, and reductions (namely summation, absolute value summation, dot product, and 2-norm) for the 4 basic types of data:`double`,`float`,`double complex`, and`float complex`.
+
+Future versions (under development) will include:
+
+- The higher level BLAS routines`trsv, trsm`
+- Multi-threaded mode (OpenMP for`reproBLAS.h`)
+- Distributed memory routines (MPI)
+
+Details about development status of`ReproBLAS` can be checked here.
+
+#### People
+
+Primary contributors to`ReproBLAS` include:
+
+- Willow Ahrens, Massachusetts Institute of Technology, Cambridge
+- Hong Diep Nguyen, University of California, Berkeley
+- Prof. James Demmel, University of California, Berkeley
+
+#### Contact
+
+We appreciate any possible feedback, bug reports, suggestions, or comments that you might have to improve the product. Please email us at:
+
+- willow@csail.mit.edu
+- hdnguyen@eecs.berkeley.edu
+- demmel@berkeley.edu
+
+#### Publications
+
+- Effcient Reproducible Floating Point Summation and BLAS EECS Department, UC Berkeley, Technical Report No. UCB/EECS-2016-121, June 18, 2016.
+- Reproducible Tall-Skinny QR Factorization In the proceedings of ARITH 22, Lyon, France, June 22-26, 2015
+- Parallel Reproducible Summation IEEE Transactions on Computer, v.64, i. 7, July 2015. DOI: 10.1109/TC.2014.2345391
+- Numerical Accuracy and Reproducibility at ExaScale [invited Paper] (Special Session on ExaScale Compputing: Managing Computation, Precision, Accuracy, and Performance on ExaScale Systems) ARITH 21, Austin, Texas, April 7-10, 2013
+- Fast Reproducible Floating-Point Summation(slides) ARITH 21, Austin, Texas, April 7-10, 2013
+
+#### Talks
+
+- Reproducible BLAS (Basic Linear Algebra Subprograms)(Birds-of-a-Feather Session on: Reproducibility of High Performance Codes and Simulations: Tools, Techniques, Debugging) SC 2015, Austin, TX, Nov 15-20, 2015
+- Toward hardware support for Reproducible Floating-Point Computation SCAN 2014, 16th GAMM-IMACS International Symposium on Scientific Computing, Computer Arithmetic and Validated Numerics, Wurzburg, Germany, Sep 21-26, 2014
+- ReproBLAS: Reproducible BLAS(Workshop on: Obtaining Bitwise Reproducible Results: Perspectives and Latest Advances) SC 2013, Denver, CO, Nov 18-22, 2013
+- Efficient Reproducible Floating-Point Reduction Operations on Large Scale Systems(Minisymposium on: Regarding Reproducible and Repeatable Computations) SIAM Annual Metting 2013, July 8-12, 2013
+- Numerical Accuracy and Reproducibility at ExaScale(Special Session on ExaScale Compputing: Managing Computation, Precision, Accuracy, and Performance on ExaScale Systems) ARITH 21, Austin, Texas, April 7-10, 2013
+- Fast Reproducible Floating-Point Summation ARITH 21, Austin, Texas, April 7-10, 2013
+
+#### Class Projects
+
+- Reproducible Parallel Matrix-Vector Multiply CS 267 Final Report, UC Berkeley, May 11, 2015.
+
+#### Related Links
+
+#### Related References
+
+Bibliography
+
+Ahrens, W., J. Demmel, and H. D. Nguyen. 2016. “Efficient Reproducible Floating Point Summation and BLAS.” UCB/EECS-2016-121. EECS Department, University of California, Berkeley. http://www2.eecs.berkeley.edu/Pubs/TechRpts/2016/EECS-2016-121.html.
+
+Ansel, J., S. Kamil, K. Veeramachaneni, J. Ragan-Kelley, J. Bosboom, U. O’Reilly, and S. Amarasinghe. 2014. “OpenTuner: An Extensible Framework for Program Autotuning.” In International Conference on Parallel Architectures and Compilation Techniques (PACT), 303–316. PACT ’14. New York, NY, USA: ACM. https://doi.org/10.1145/2628071.2628092.
+
+Arteaga, A., O. Fuhrer, and T. Hoefler. 2014. “Designing Bit-Reproducible Portable High-Performance Applications.” In International Parallel and Distributed Processing Symposium (IPDPS), 1235–44. https://doi.org/10.1109/IPDPS.2014.127.
+
+Chohra, C., P. Langlois, and D. Parello. 2015. “Efficiency of Reproducible Level 1 BLAS.” In Scientific Computing, Computer Arithmetic, and Validated Numerics (SCAN), 99–108. Lecture Notes in Computer Science. Springer, Cham. https://doi.org/10.1007/978-3-319-31769-4_8.
+
+———. 2016a. “Reproducible, Accurately Rounded and Efficient BLAS.” In Euro-Par Parallel Processing Workshops, 609–20. Lecture Notes in Computer Science. Springer, Cham. https://doi.org/10.1007/978-3-319-58943-5_49.
+
+———. 2016b. “Parallel Experiments with RARE-BLAS.” In Symposium on Symbolic and Numeric Algorithms for Scientific Computing (SYNASC), 135–38. https://doi.org/10.1109/SYNASC.2016.032.
+
+Collange, S., D. Defour, S. Graillat, and R. Iakymchuk. 2015. “Numerical Reproducibility for the Parallel Reduction on Multi- and Many-Core Architectures.” Parallel Computing 49 (November): 83–97. https://doi.org/10.1016/j.parco.2015.09.001.
+
+Dekker, T. J. 1971. “A Floating-Point Technique for Extending the Available Precision.” Numerische Mathematik 18 (3): 224–42. https://doi.org/10.1007/BF01397083.
+
+Demmel, J., D. Eliahu, A. Fox, S. Kamil, B. Lipshitz, O. Schwartz, and O. Spillinger. 2013. “Communication-Optimal Parallel Recursive Rectangular Matrix Multiplication.” In International Symposium on Parallel and Distributed Processing (SPDP), 261–72. https://doi.org/10.1109/IPDPS.2013.80.
+
+Demmel, J., M. Gates, G. Henry, X.S. Li, J. Riedy, and P.T.P. Tang. n.d. “A Proposal for a Next-Generation BLAS.” https://docs.google.com/document/d/1DY4ImZT1coqri2382GusXgBTTTVdBDvtD5I14QHp9OE/edit?usp=sharing.
+
+Demmel, J., G. Gopalakrishnan, M. Heroux, W. Keyrouz, and K. Sato. 2015. “Reproducibility of High Performance Codes and Simulations: Tools, Techniques, Debugging.” In SC 2015 Birds of a Feather Sessions. Austin, TX, United States. https://gcl.cis.udel.edu/sc15bof.php.
+
+Demmel, J., and Y. Hida. 2004. “Accurate and Efficient Floating Point Summation.” SIAM Journal on Scientific Computing 25 (4): 1214–48. https://doi.org/10.1137/S1064827502407627.
+
+Demmel, J., and H. D. Nguyen. 2013. “Fast Reproducible Floating-Point Summation.” In Symposium on Computer Arithmetic (ARITH), 163–72. https://doi.org/10.1109/ARITH.2013.9.
+
+———. 2015. “Parallel Reproducible Summation.” IEEE Transactions on Computers 64 (7): 2060–70. https://doi.org/10.1109/TC.2014.2345391.
+
+Diethelm, K. 2010. “Reproducible Parallel Solvers for Linear Systems.” NA Digest, V. 10, # 36. September 1, 2010. http://www.netlib.org/na-digest-html/10/v10n36.html#1.
+
+Dongarra, J., S. Hammarling, N. Higham, S. D. Relton, P. Valero-Lara, and M. Zounon. 2017. “The Design and Performance of Batched BLAS on Modern High-Performance Computing Systems.” Procedia Computer Science, International Conference on Computational Science, ICCS 2017, 12-14 June 2017, Zurich, Switzerland, 108 (January): 495–504. https://doi.org/10.1016/j.procs.2017.05.138.
+
+Dukhan, M., R. Vuduc, and J. Riedy. 2016. “Wanted: Floating-Point Add Round-off Error Instruction.” ArXiv:1603.00491 [Cs], March. http://arxiv.org/abs/1603.00491.
+
+Geijn, R. A. Van De, and J. Watts. 1997. “SUMMA: Scalable Universal Matrix Multiplication Algorithm.” Concurrency: Practice and Experience 9 (4): 255–74. https://doi.org/10.1002/(SICI)1096-9128(199704)9:4<255::AID-CPE250>3.0.CO;2-2.
+
+Hida, Y., X. S. Li, and D. H. Bailey. 2001. “Algorithms for Quad-Double Precision Floating Point Arithmetic.” In Symposium on Computer Arithmetic (ARITH), 155–62. https://doi.org/10.1109/ARITH.2001.930115.
+
+Higham, N. 1993. “The Accuracy of Floating Point Summation.” SIAM Journal on Scientific Computing 14 (4): 783–99. https://doi.org/10.1137/0914050.
+
+———. 2002. Accuracy and Stability of Numerical Algorithms. 2nd ed. Other Titles in Applied Mathematics. Society for Industrial and Applied Mathematics. https://doi.org/10.1137/1.9780898718027.
+
+Iakymchuk, R., S. Collange, D. Defour, and S. Graillat. 2015. “ExBLAS: Reproducible and Accurate BLAS Library.” In SC 2015 Numerical Reproducibility at Exascale Workshops (NRE). Austin, TX, United States. https://hal.archives-ouvertes.fr/hal-01202396.
+
+Iakymchuk, R., D. Defour, S. Collange, and S. Graillat. 2015a. “Reproducible Triangular Solvers for High-Performance Computing.” In International Conference on Information Technology - New Generations (ITNG), 353–58. https://doi.org/10.1109/ITNG.2015.63.
+
+———. 2015b. “Reproducible and Accurate Matrix Multiplication.” In Scientific Computing, Computer Arithmetic, and Validated Numerics (SCAN), 126–37. Lecture Notes in Computer Science. Springer, Cham. https://doi.org/10.1007/978-3-319-31769-4_11.
+
+“IEEE Standard for Floating-Point Arithmetic.” 2008. IEEE Std 754-2008, August, 1–70. https://doi.org/10.1109/IEEESTD.2008.4610935.
+
+———. IEEE Standard for Floating-Point Arithmetic. 2018. New York, NY: Institute of Electrical and Electronics Engineers. http://754r.ucbtest.org/drafts/P754-238.pdf.
+
+Kahan, W. 1965. “Pracniques: Further Remarks on Reducing Truncation Errors.” Communications of the ACM 8 (1): 40–. https://doi.org/10.1145/363707.363723.
+
+Knuth, D. E. 1969. The Art of Computer Programming 2: Seminumerical Algorithms. Reading, Mass.: Addison-Wesley.
+
+Kornerup, P., V. Lefevre, N. Louvet, and J. Muller. 2012. “On the Computation of Correctly Rounded Sums.” IEEE Transactions on Computers 61 (3): 289–98. https://doi.org/10.1109/TC.2011.27.
+
+Kulisch, U. 2012. Computer Arithmetic and Validity: Theory, Implementation, and Applications. 2nd ed. Walter de Gruyter.
+
+Lefèvre, V. 2017. “Correctly Rounded Arbitrary-Precision Floating-Point Summation.” IEEE Transactions on Computers 66 (12): 2111–24. https://doi.org/10.1109/TC.2017.2690632.
+
+Li, X. S., J. W. Demmel, D. H. Bailey, G. Henry, Y. Hida, J. Iskandar, W. Kahan, et al. 2002. “Design, Implementation and Testing of Extended and Mixed Precision BLAS.” ACM Transactions on Mathematical Software 28 (2): 152–205. https://doi.org/10.1145/567806.567808.
+
+Lutz, D. R., and C. N. Hinds. 2017. “High-Precision Anchored Accumulators for Reproducible Floating-Point Summation.” In Symposium on Computer Arithmetic (ARITH), 98–105. https://doi.org/10.1109/ARITH.2017.20.
+
+Nguyen, H. D., and J. Demmel. 2015. “Reproducible Tall-Skinny QR.” In Symposium on Computer Arithmetic (ARITH), 152–59. https://doi.org/10.1109/ARITH.2015.28.
+
+Rump, S. M. 2009. “Ultimately Fast Accurate Summation.” SIAM Journal on Scientific Computing 31 (5): 3466–3502. https://doi.org/10.1137/080738490.
+
+Rump, S. M., T. Ogita, and S. Oishi. 2010. “Fast High Precision Summation.” Nonlinear Theory and Its Applications, IEICE 1: 2–24. https://doi.org/10.1587/nolta.1.2.
+
+Rump, S., T. Ogita, and S. Oishi. 2008a. “Accurate Floating-Point Summation Part I: Faithful Rounding.” SIAM Journal on Scientific Computing 31 (1): 189–224. https://doi.org/10.1137/050645671.
+
+———. 2008b. “Accurate Floating-Point Summation Part II: Sign, K-Fold Faithful and Rounding to Nearest.” SIAM Journal on Scientific Computing 31 (2): 1269–1302. https://doi.org/10.1137/07068816X.
+
+Solomonik, E., and J. Demmel. 2011. “Communication-Optimal Parallel 2.5D Matrix Multiplication and LU Factorization Algorithms.” In International Conference on Parallel Processing (ICPP), Part II:90–109. Euro-Par’11. Berlin, Heidelberg: Springer-Verlag. https://doi.org/10.1007/978-3-642-23397-5_10.
+
+#### Acknowledgements
+
+This research is supported in part by NSF grants NSF OCI-1032639, NSF ACI-1339676, DOE grants DOE DE-SC0010200, DOE DE-SC0003959, DOE DE-SC0005136, DOE DE-SC0008699, DOE DE-SC0008700, DOE DE-SC0004938, DOE AC02-05CH11231, and DARPA grant HR0011-12-2-0016, ASPIRE Lab industrial sponsors and affiliates Intel, Google, Nokia, NVIDIA, and Oracle. Any opinions, findings, conclusions, or recommendations in this paper are solely those of the authors and does not necessarily reflect the position or the policy of the sponsors.
+
+Last update August 17, 2018.

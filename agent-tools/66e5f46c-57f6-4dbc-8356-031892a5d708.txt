@@ -1,0 +1,424 @@
+Test Suite for Evaluating Performance of MPI Implementations That Support MPI THREAD MULTIPLE
+
+Rajeev Thakur and William Gropp
+
+Mathematics and Computer Science Division Argonne National Laboratory Argonne, IL 60439, USA { thakur, gropp} @mcs.anl.gov
+
+Abstract. MPI implementations that support the highest level of thread safety for user programs, MPI THREAD MULTIPLE, are becoming widely available. Users often expect that different threads can execute inde pendently and that the MPI implementation can provide the necessary level of thread safety with only a small overhead. The MPI Standard, however, requires only that no MPI call in one thread block MPI calls in other threads; it makes no performance guarantees. Therefore, some way of measuring an implementation’s performance is needed. In this paper, we propose a number of performance tests that are motivated by typical application scenarios. These tests cover the overhead of provid ing the MPI THREAD MULTIPLE level of thread safety for user programs, the amount of concurrency in different threads making MPI calls, the ability to overlap communication with computation, and other features. We present performance results with this test suite on several plat forms (Linux cluster, Sun and IBM SMPs) and MPI implementations (MPICH2, Open MPI, IBM, and Sun).
+
+1 Introduction With thread-safe MPI implementations becoming increasingly commonly avail able, users are able to write multithreaded MPI programs that make MPI calls concurrently from multiple threads. Thread safety, however, does not come for free because the implementation must protect certain data structures or parts of the code with mutexes or critical sections. Developing a thread-safe MPI im plementation is a fairly complex task and the implementers must make several design choices, both for correctness and performance [4]. To simplify the task, implementations often focus on correctness first and performance later (if at all). As a result, even though an MPI implementation may support multithreading, its performance may be far from optimized. Users, therefore, need a way to deter mine how efficiently can an implementation support multiple threads. Similarly, as implementers experiment with potential performance optimizations, they need a way to measure the outcome of their efforts. (We ourselves face this need in MPICH2.) To meet these needs, we have created a test suite that can shed light
+
+1
+
+on the performance of an MPI implementation in the multithreaded case. We describe the various tests in the suite, the rationale behind them, and their per formance with several MPI implementations (MPICH2, Open MPI, IBM MPI, and Sun MPI) on several platforms.
+
+Related Work. Related work includes all the work on developing thread-safe MPI implementations. Protopopov and Skjellum discuss a number of issues related to threads and MPI, including a design for a thread-safe version of MPICH 1 [7, 8]. Plachetka describes a mechanism for making a thread-unsafe PVM or MPI implementation quasi-thread-safe by adding an interrupt mechanism and two functions to the implementation [6]. Garc´ıa et al. present MiMPI, a thread safe implementation of MPI [3]. TOMPI [2] and TMPI [9] are thread-based MPI implementations, where each MPI process is actually a thread. USFMPI is a multithreaded implementation of MPI that internally uses a separate thread for communication [1]. A good discussion of the issues in developing a thread safe MPI implementation is given in [4]. The MPI benchmarks from Ohio State University [5] contain a multithreaded latency test, which is a ping-pong test with one thread on the sender side and two (or more) threads on the receiver side.
+
+2 Overview of MPI and Threads 
+To understand the test suite and the rationale behind each test, it is essential 
+to understand the thread-safety specification in MPI. Below, we briefly describe 
+the relevant features of MPI’s thread-safety specification. 
+For performance reasons, MPI defines four “levels” of thread safety and allows 
+the user to indicate the level desired—the idea being that the implementation 
+need not incur the cost for a higher level of thread safety than the user needs. 
+The four levels of thread safety are: 
+1. MPI THREAD SINGLE Each process has a single thread of execution. 
+2. MPI THREAD FUNNELED A process may be multithreaded, but only the thread that initialized MPI may make MPI calls. 
+3. MPI THREAD SERIALIZED A process may be multithreaded, but only one thread at a time may make MPI calls. 
+4. MPI THREAD MULTIPLE A process may be multithreaded and multiple threads may simultaneously call MPI functions (with some restrictions mentioned below). An implementation is not required to support levels higher than MPI THREAD SINGLE; that is, an implementation is not required to be thread safe. A fully thread compliant implementation, however, will support MPI THREAD MULTIPLE. MPI provides a function, MPI Init thread, by which the user can indicate the level of thread support desired, and the implementation will return the level sup ported. A portable program that does not call MPI Init thread should assume 
+
+2
+
+Thread 0 Thread 1 MPI_Recv(src=1) MPI_Send(dest=1) MPI_Recv(src=0) MPI_Send(dest=0)
+
+## Thread 0 Thread 1
+
+Process 0 Process 1
+
+Fig. 1. An implementation must ensure that this example never deadlocks for any ordering of thread execution.
+
+that only MPI THREAD SINGLE is supported. The tests described in this paper focus on the MPI THREAD MULTIPLE (fully multithreaded) case. For MPI THREAD MULTIPLE, the MPI Standard specifies that when multiple threads make MPI calls concurrently, the outcome will be as if the calls exe cuted sequentially in some (any) order. Also, blocking MPI calls will block only the calling thread and will not prevent other threads from running or executing MPI functions. MPI also says that it is the user’s responsibility to prevent races when threads in the same application post conflicting MPI calls. For example, the user cannot call MPI Info set and MPI Info free on the same info ob ject concurrently from two threads of the same process; the user must ensure that the MPI Info free is called only after MPI Info set returns on the other thread. Similarly, the user must ensure that collective operations on the same communicator, window, or file handle are correctly ordered among threads. A straightforward implication of the MPI thread-safety specification is that an implementation cannot implement thread safety by simply acquiring a lock at the beginning of each MPI function and releasing it at the end of the function: A blocked function that holds a lock may prevent MPI functions on other threads from executing, which in turn might prevent the occurrence of the event that is needed for the blocked function to return. An example is shown in Figure 1. If thread 0 happened to get scheduled first on both processes, and MPI Recv simply acquired a lock and waited for the data to arrive, the MPI Send on thread 1 would not be able to acquire its lock and send its data, which in turn would cause the MPI Recv to block forever. Therefore, the implementation must release the lock at least before blocking within the MPI Recv and then reacquire the lock if needed after the data has arrived. (The tests described in this paper provide some information about the fairness and granularity of how blocking MPI functions are handled by the implementation.)
+
+3 The Test Suite Users of threads in MPI often have expectations of the performance of threads, both those making MPI calls and those performing computation concurrently with threads that are making MPI calls. In particular, threads are often used for hiding latency by allowing the user to begin an operation that may need to block while waiting for data, with the expectation that, while blocked, the thread will consume little or no CPU resources. More specifically, users often have the following expectations:
+
+3
+
+– The cost of thread safety, compared with lower levels of thread support, such as MPI THREAD FUNNELED, is low. – Multiple threads making MPI calls, such as MPI SEND or MPI Bcast, can make progress simultaneously. – A blocking MPI routine in one thread does not consume excessive CPU resources while waiting. Our tests are designed to test these expectations. These tests are described in more detail below; in terms of the above categories, they are: Cost of thread safety One simple test to measure MPI THREAD MULTIPLE over head. Concurrent progress Tests to measure concurrent bandwidth by multiple threads of a process to multiple threads of another process, as compared with mul tiple processes to multiple processes. Both point-to-point and collective op erations are included. Computation overlap Tests to measure the overlap of communication with computation and the ability of the application to use a thread to provide a nonblocking version of a communication operation for which there is no corresponding MPI call, such as nonblocking collectives or I/O operations that involve several steps. We describe the tests below and present performance results on the following platforms and MPI implementations. Linux Cluster We used the Breadboard cluster at Argonne, in which each node has two dual-core 2.8 GHz AMD Opteron CPUs. The nodes are connected by gigabit ethernet. We used MPICH2 1.0.5 and Open MPI 1.2.1. Sun Fire SMP We used a Sun Fire SMP from the Sun cluster at the RWTH Aachen University. The specific machine we ran on was a Sun Fire E2900 with eight dual-core UltraSPARC IV 1.2 GHz CPUs. It runs Sun’s MPI (ClusterTools 5). IBM SMP We also used an IBM p655+ SMP from the DataStar cluster at the San Diego Supercomputer Center. The machine has eight 1.7 GHz POWER4+ CPUs and runs IBM’s MPI.
+
+3.1 MPI THREAD MULTIPLE Overhead
+
+This test measures the ping-pong latency for two cases of a single-threaded pro gram: initializing MPI with just MPI Init and initializing it with MPI Init thread for MPI THREAD MULTIPLE. It demonstrates the overhead of ensuring thread safety for MPI THREAD MULTIPLE—typically implemented by acquiring and releasing locks—even though no special steps are needed in this case because the pro cess is single threaded (but the implementation does not know that). Figure 2 shows the results. On the Linux cluster, with both MPICH2 and Open MPI, the overhead of MPI THREAD MULTIPLE is less than 0.5 µs. On the IBM SMP with IBM MPI, it is less than 0.25 µs. On the other hand, on the Sun SMP with Sun MPI, the overhead is very high—more than 3 µs.
+
+4
+
+100
+
+9
+
+MPICH2 thread-single MPICH2 thread-multiple Open MPI thread-single Open MPI thread-multiple
+
+SUN MPI thread-single SUN MPI thread-multiple IBM MPI thread-single IBM MPI thread-multiple
+
+8
+
+90
+
+7
+
+6
+
+70 (m (m
+
+T
+
+T
+
+60
+
+4
+
+50
+
+3
+
+40
+
+2
+
+0 200 400 600 800 1000
+
+0 200 400 600 800 1000
+
+Size (bytes)
+
+Size (bytes)
+
+Fig. 2. Overhead of MPI THREAD MULTIPLE on the Linux cluster (left) and Sun and IBM SMPs (right).
+
+3.2 Concurrent Bandwidth
+
+This test compares the cumulative bandwidth obtained when multiple threads of a process communicate with multiple threads of another process, versus doing the same with multiple processes instead of threads (see Figure 3). It demonstrates how much thread locks affect the cumulative bandwidth; ideally, the multiprocess and multithreaded cases should perform similarly. Figure 4 shows the results. On the Linux cluster, the tests were run on two nodes, with all communication happening across nodes. We ran two cases: one where there were as many processes/threads as the number of processors on a node (four) and one where there were eight processes/threads running on four processors. In both cases, there was no measurable difference in bandwidth between threads and processes with MPICH2. With Open MPI, there was decline in bandwidth with threads in the oversubscribed case. On the Sun and IBM SMPs, on the other hand, there was a substantial decline (more than 50% in some cases) in the bandwidth when threads were used instead of processes. Using threads on these machines has high overhead.
+
+| | | On | the | | Sun and | IBM SMPs, | on | the other | | hand, | | there was a substantial | | |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| | | decline | (more | | than | 50% in | some cases) | in the | | bandwidth | | when threads | were | |
+| | | used | instead | | of processes. | Using | threads | on these | | machines | | has high | overhead. | |
+| | | | T | | | T | | | | | P | | P | |
+| | | | T | | | T | | | | | P | | P | |
+| | | | T | | | T | | | | | P | | P | |
+| | | | T | | | T | | | | | P | | P | |
+| | | Fig. | 3. Communication | | | test when | using | multiple | threads | | (left) | versus multiple | pro | |
+| | | cesses | (right). | | | | | | | | | | | |
+
+5
+
+0
+
+200
+
+400
+
+600
+
+800
+
+1000
+
+1200
+
+MPICH2 Open MPI
+
+4P-4P 
+4T-4T 
+8P-8P 
+8T-8T 
+0.5 
+
+1
+
+1.5
+
+2
+
+2.5
+
+3
+
+3.5
+
+4
+
+4.5
+
+5
+
+Sun MPI IBM MPI
+
+4P-4P 
+4T-4T 
+8P-8P 
+8T-8T 
+
+Fig. 4. Concurrent bandwidth test on Linux cluster (left) and Sun and IBM SMPs (right).
+
+3.3 Concurrent Latency
+
+This test is similar to the concurrent bandwidth test except that it measures the time for individual short messages instead of concurrent bandwidth for large messages. Figure 5 shows the results. On the Linux cluster with MPICH2, there is a 20 µs overhead in latency when using concurrent threads instead of processes; with Open MPI, the overhead is about 30 µs. With Sun and IBM MPI, the latency with threads is about 10 times the latency with processes, which again indicates that there is a substantial performance penalty with using threads on these machines.
+
+60
+
+70
+
+80
+
+90
+
+100
+
+110
+
+120
+
+130
+
+140
+
+150
+
+0 200 400 600 800 1000
+
+Size (bytes)
+
+MPICH2 4P-4P MPICH2 4T-4T Open MPI 4P-4P Open MPI 4T-4T
+
+0
+
+5
+
+10
+
+15
+
+20
+
+25
+
+30
+
+35
+
+40
+
+0 200 400 600 800 1000
+
+Size (bytes)
+
+Sun MPI 4P-4P Sun MPI 4T-4T IBM MPI 4P-4P IBM MPI 4T-4T
+
+Fig. 5. Concurrent latency test on Linux cluster (left) and Sun and IBM SMPs (right).
+
+6
+
+0
+
+200
+
+400
+
+600
+
+800
+
+1000
+
+1200
+
+1400
+
+1600
+
+1800
+
+2000
+
+10 20 30 40 50 60 70 80 90
+
+Iteration
+
+MPICH2 (with processes) MPICH2 (with threads) Open MPI (with processes) Open MPI (with threads)
+
+0
+
+20
+
+40
+
+60
+
+80
+
+100
+
+120
+
+140
+
+10 20 30 40 50 60 70 80 90
+
+Iteration
+
+Sun MPI (with processes) Sun MPI (with threads) IBM MPI (with processes) IBM MPI (with threads)
+
+Fig. 6. Concurrent short-long messages test on Linux cluster (left) and Sun and IBM SMPs (right).
+
+3.4 Concurrent Short-Long Messages
+
+This test is a blend of the concurrent bandwidth and concurrent latency tests. It has two versions. In the threads version, rank 0 has two threads: one sends a long message to rank 1 and the other sends a series of short messages to rank 2. The second version of the test is similar except that the two senders are processes instead of threads. This test tests the fairness of thread scheduling and locking. If they were fair, one would expect each of the short messages to take roughly the same amount of time. The results are shown in Figure 6. With both MPICH2 and Open MPI, the cost of communicating the long message is evenly distributed among a number of short messages. A single short message is not penalized for the entire time the long message is communicated. This demonstrates that, in the threaded case, locks are fairly held and released and that the thread blocked in the long-message send does not block the other thread. With Sun and IBM MPI, however, one sees spikes in the graphs, indicating that the scheduling and lock releasing are not really fair.
+
+3.5 Computation/Communication Overlap
+
+This test measures the ability of an implementation to overlap communication with computation and provides users an alternative way of achieving the same if the implementation does not do so. The test has two versions. One version has an iterative loop in which a process communicates with its four nearest neighbors by posting nonblocking sends and receives, followed by a computation phase, followed by an MPI Waitall for the communication to complete. The second version is similar, except that before the iterative loop, each process spawns a thread that blocks on an MPI Recv. The matching MPI Send is called by the main thread only at the end of the program, just before MPI Finalize. The thread
+
+7
+
+0
+
+200
+
+400
+
+600
+
+800
+
+1000
+
+1200
+
+1400
+
+MPICH2 Open MPI Open MPI, progress thread
+
+6 procs, no overlap 
+6 procs, overlap 
+12 procs, no overlap 
+12 procs, overlap 
+0 
+
+1000
+
+2000
+
+3000
+
+4000
+
+5000
+
+6000
+
+7000
+
+8000
+
+9000
+
+Sun MPI IBM MPI
+
+6 procs, no overlap 
+6 procs, overlap 
+8 procs, no overlap 
+8 procs, overlap 
+
+Fig. 7. Computation/communication overlap test on Linux cluster (left) and Sun and IBM SMPs (right).
+
+thus blocks in the MPI Recv while the main thread is in the communication computation loop. Since the thread is executing an MPI function, whenever it gets scheduled by the operating system, it can cause progress to occur on the communication initiated by the main thread. This technique effectively simulates asynchronous progress by the MPI implementation. If the total time taken by the communication-computation loop is less than in the nonthreaded version, it indicates that the MPI implementation on its own cannot overlap communication with computation. Figure 7 shows the results. “no overlap” refers to the test without the thread and “overlap” is the test with the thread. The results with MPICH2 demonstrate that it does not do asynchronous progress as the overlap version of the test per forms better. With Open MPI, we ran two experiments. We first used the default build, and the results indicate that it performs similar to MPICH2—no overlap of computation and communication. Open MPI can also be optionally built to use an extra thread internally for asynchronous progress. With this version of the library, we see that indeed there is asynchronous progress, as the performance is nearly the same as for the “overlap” test with the default build. That is, the case with the implementation-created progress thread performs similarly to the case with the user-created thread. The results on the Sun and IBM SMPs indicate no overlap. In fact, with eight processes, the performance was worse with the overlap thread because of the high overhead with using threads with these MPI implementations.
+
+3.6 Concurrent Collectives
+
+This test compares the performance of concurrent calls to a collective func tion (MPI Allreduce) issued from multiple threads to that when issued from multiple processes. The test uses multiple communicators, and processes are ar ranged such that the processes belonging to a given communicator are located
+
+8
+
+0.25
+
+0.3
+
+0.35
+
+0.4
+
+0.45
+
+0.5
+
+0.55
+
+12 (4x3) processes/threads 24 (4x6) processes/threads
+
+Concurrent Collectives 
+MPICH2, processes 
+MPICH2, threads 
+Open MPI, processes 
+Open MPI, threads 
+
+35
+
+40
+
+45
+
+50
+
+55
+
+60
+
+65
+
+70
+
+75
+
+3 SMP nodes 6 SMP nodes
+
+Concurrent Collectives and Computation MPICH2 with allreduce thread MPICH2 without allreduce thread Open MPI with allreduce thread Open MPI without allreduce thread
+
+Fig. 8. Left: Concurrent collectives test on the Linux cluster (4x3 refers to 4 pro cess/threads each on 3 nodes). Right: Concurrent collectives and computation test on the Linux cluster.
+
+on different nodes. In other words, collective operations are issued by multiple threads/processes on a node, with all communication taking place across nodes (similar to Figure 3 but for collectives and using multiple nodes). Figure 8 (left) shows the results on the Linux cluster. MPICH2 has relatively small overhead for the threaded version, compared with Open MPI.
+
+3.7 Concurrent Collectives and Computation
+
+This test evaluates the ability to use a thread to hide the latency of a collec tive operation while using all available processors to perform computations. It uses p+1 threads on a node with p processors. Threads 0–(p-1) perform some computation iteratively. Thread p does an MPI Allreduce with its corresponding threads on other nodes. When the allreduce completes, it sets a flag, which stops the iterative loop on the other threads. The number of iterations completed on the threads is reported. This number is compared with the case when there is no allreduce thread (the higher the better). Figure 8 (right) shows the results on the Linux cluster. MPICH2 demon strates a better ability to hide the latency of the allreduce, compared with Open MPI.
+
+4 Concluding Remarks
+
+As MPI implementations supporting MPI THREAD MULTIPLE become increasingly available, there is a need for tests that can shed light on the performance and overhead associated with using multiple threads. We have developed such a test suite and presented its performance on multiple platforms and implementations. The results indicate relatively good performance with MPICH2 and Open MPI
+
+9
+
+on Linux clusters, but poor performance with IBM and Sun MPI on IBM and Sun SMP systems.
+
+We plan to add more tests to the suite, such as to measure the overlap of computation/communication with the MPI-2 file I/O and connect-accept fea tures. We plan to make the test suite ready for public use and release it soon.
+
+We will also accept contributions from others to the test suite.
+
+Acknowledgments We thank the RWTH Aachen University and the San Diego Supercomputer Center for providing computing time on their systems. This work was supported by the Mathematical, Information, and Computational Sciences Division subpro gram of the Office of Advanced Scientific Computing Research, Office of Science, U.S. Department of Energy, under Contract DE-AC02-06CH11357.
+
+References
+
+1. Sadik G. Caglar, Gregory D. Benson, Qing Huang, and Cho-Wai Chu. USFMPI: A multi-threaded implementation of MPI for Linux clusters. In Proceedings of the IASTED Conference on Parallel and Distributed Computing and Systems, 2003. 
+2. Erik D. Demaine. A threads-only MPI implementation for the development of parallel programs. In Proceedings of the 11th International Symposium on High Performance Computing Systems, pages 153–163, July 1997. 
+3. Francisco Garc´ıa, Alejandro Calder´on, and Jesus ´ Carretero. MiMPI: A multithread safe implementation of MPI. In Recent Advances in Parallel Virtual Machine and Message Passing Interface, 6th European PVM/MPI Users’ Group Meeting, pages 207–214. Lecture Notes in Computer Science 1697, Springer, September 1999. 
+4. William Gropp and Rajeev Thakur. Thread safety in an MPI implementation: Requirements and analysis. Parallel Computing, 2007. 
+5. OSU MPI benchmarks. http://mvapich.cse.ohio-state.edu/benchmarks. 
+6. Tomas Plachetka. (Quasi-) thread-safe PVM and (quasi-) thread-safe MPI without active polling. In Recent Advances in Parallel Virtual Machine and Message Passing Interface, 9th European PVM/MPI Users’ Group Meeting, pages 296–305. Lecture Notes in Computer Science 2474, Springer, September 2002. 
+7. Boris V. Protopopov and Anthony Skjellum. A multithreaded message passing interface (MPI) architecture: Performance and program issues. Journal of Parallel and Distributed Computing, 61(4):449–466, April 2001. 
+8. Anthony Skjellum, Boris Protopopov, and Shane Hebert. A thread taxonomy for MPI. In Proceedings of the 2nd MPI Developers Conference, pages 50–57, June 1996. 
+9. Hong Tang and Tao Yang. Optimizing threaded MPI execution on SMP clusters. In Proceedings of the 15th ACM International Conference on Supercomputing, pages 381–392, June 2001. 
+
+The submitted manuscript has been created by UChicago Argonne, LLC, Operator of Argonne National Laboratory (“Argonne”). Argonne, a U.S. Department of Energy Office of Science labora tory, is operated under Contract No. DE-AC02-06CH11357. The U.S. Government retains for itself, and others acting on its behalf, a paid-up nonexclusive, irrevocable worldwide license in said article to reproduce, prepare derivative works, distribute copies to the public, and perform publicly and display publicly, by or on behalf of the Government.
+
+10
+

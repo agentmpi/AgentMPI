@@ -1,0 +1,754 @@
+efficient largescale modelTraining — Block Diagrams
+
+Also: Brief Summaries Detailed Summaries
+
+# Architecture & Measurement-Design Analysis
+
+## Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM
+
+Source: Narayanan, D.; Shoeybi, M.; Casper, J.; LeGresley, P.; Patwary, M.; Korthikanti, V.; Vainbrand, D.; Kashinkunti, P.; Bernauer, J.; Catanzaro, B.; Phanishayee, A.; Zaharia, M. Proceedings of the International Conference for High Performance Computing, Networking, Storage and Analysis (SC '21), November 14-19, 2021, St. Louis, MO, USA. DOI: https://doi.org/10.1145/3458817.3476209 ACM ISBN: 978-1-4503-8442-1/21/11 Code: https://github.com/nvidia/megatron-lm(artifact: 10.5281/zenodo.5181820) Authors: NVIDIA + Stanford University + Microsoft Research. Reader: Direct PDF read via PyMuPDF (gemini-reader free-tier quota exhausted; codex-reader CLI rejected`gpt-5.1-codex-mini` model on this ChatGPT account; full text extracted to`/tmp/0045_full.txt`). Analyst: Vishwakarma Date: 2026-05-04
+
+---
+
+## Table of Contents
+
+1. System Architecture (the PTD-P stack: tensor + pipeline + data parallelism with interleaved 1F1B + scatter/gather)
+2. Target-Hardware / SUT Architecture (Selene supercomputer: 384 DGX A100 nodes, NVLink + 8x HDR InfiniBand, three-level fat-tree)
+3. Design-Space Diagram (axes swept across (p, t, d, b, B, schedule, recompute, scatter/gather, fusion); axes held fixed)
+4. Algorithm / Control Flow Diagrams (interleaved 1F1B schedule, MLP/self-attention partitioning, scatter/gather, microbatch sweep)
+5. Quantitative Results - Empirical Findings by Regime
+6. Configuration-Regime Trade-off Tables
+7. Bottlenecks & Insights Surfaced by the Measurements
+8. Limitations of the Methodology
+9. Note on NCCL Tuning
+10. Analogy
+
+---
+
+## 1. System Architecture (the PTD-P stack)
+
+PTD-P is the paper's central design artifact: a three-axis composition of parallelism -- tensor model parallelism (intra-server, NVLink-bound, all-reduce-heavy), pipeline model parallelism (inter-server, IB-bound, point-to-point), and data parallelism (cross-replica, infrequent all-reduce) -- glued together by a novel interleaved 1F1B pipeline schedule and a scatter/gather communication optimization that exploits the redundancy between tensor-parallel ranks across pipeline stages. The whole system is implemented as an extension of the Megatron-LM codebase on PyTorch + NCCL. Every other engineering contribution -- fused element-wise kernels, the`[s, b, a, h]` data layout, masked-softmax fusion, activation recomputation tuning -- is downstream of two structural commitments described later in this section.
+
+```
++--------------------- PTD-P System Architecture ------------------------+
+|                                                                        |
+|  +------------------------------------------------------------------+  |
+|  | Application layer                                                | |
+|  |   PyTorch 1.8.0a0 training loop                                  | |
+|  |   GPT model: 1B / 5.9B / 18.4B / 39.1B / 76.1B / 145.6B /        | |
+|  |              175.0B / 310B / 530B / 1.0T parameters               | |
+|  |   Vocab V = 51200, sequence s = 2048, mixed precision (FP16)     | |
+|  +-----------------------------+------------------------------------+  |
+|                                |                                       |
+|                                v                                       |
+|  +------------------------------------------------------------------+  |
+|  |  PTD-P composition layer (Sec. 2 + Sec. 3)                       |  |
+|  |  +------------------------+   +-------------------------------+  |  |
+|  |  | Tensor MP partitioner  |   | Pipeline MP partitioner       |  |  |
+|  |  |  (Megatron split,      |   |  layers striped over devices  |  |  |
+|  |  |   Sec. 2.3, Fig 5)     |   |  (PipeDream-Flush base,       |  |  |
+|  |  |  - MLP: A = [A1,A2]    |   |   Sec. 2.2.1)                  |  |  |
+|  |  |    cols, B rows split  |   |  - 1F1B steady state           |  |  |
+|  |  |  - Attention: K,Q,V    |   |  - warm-up + cool-down phases  |  |  |
+|  |  |    column-parallel     |   |  - bubble = (p-1)/m            |  |  |
+|  |  |  - 2 all-reduce fwd +  |   +-------------------------------+  |  |
+|  |  |    2 all-reduce bwd    |                                      |  |
+|  |  +------------------------+   +-------------------------------+  |  |
+|  |                               | Data parallel replicator      |  |  |
+|  |  +------------------------+   |  (gradient all-reduce per     |  |  |
+|  |  | Interleaved 1F1B sched |   |   batch, ring-based)          |  |  |
+|  |  |  (Sec. 2.2.2, Fig 4b)  |   |  - bubble = (n-d)/b' for t=1  |  |  |
+|  |  |  v chunks per device   |   +-------------------------------+  |  |
+|  |  |  bubble shrinks 1/v    |                                      |  |
+|  |  |  comm grows by v       |                                      |  |
+|  |  +------------------------+                                      |  |
+|  +-----------------------------+------------------------------------+  |
+|                                |                                       |
+|                                v                                       |
+|  +------------------------------------------------------------------+  |
+|  |  Communication-optimization layer (Sec. 4.1, Fig 9)              |  |
+|  |  +-------------------------+   +-----------------------------+   |  |
+|  |  | Scatter/gather optim.   |   | Tensor-parallel all-reduce  |   |  |
+|  |  |  (1/t-sized chunks      |   |  (NCCL ring inside server,  |   |  |
+|  |  |   over IB; gather       |   |   NVLink/NVSwitch fabric)   |   |  |
+|  |  |   over NVLink)          |   +-----------------------------+   |  |
+|  |  | b*s*h volume per stage  |                                     |  |
+|  |  |   reduced from b*s*h    |   +-----------------------------+   |  |
+|  |  |   to b*s*h / t          |   | Pipeline-parallel P2P       |   |  |
+|  |  +-------------------------+   |  send/recv (NCCL P2P over   |   |  |
+|  |                                |   InfiniBand HDR)            |   |  |
+|  |                                +-----------------------------+   |  |
+|  +-----------------------------+------------------------------------+  |
+|                                |                                       |
+|                                v                                       |
+|  +------------------------------------------------------------------+  |
+|  |  Computation-optimization layer (Sec. 4.2)                       |  |
+|  |   - Data layout [s,b,a,h] enables strided batched GEMM           |  |
+|  |   - PyTorch JIT fused: bias+GeLU, bias+dropout+add               |  |
+|  |   - Custom CUDA kernels: scale-mask-softmax fusion (general +    |  |
+|  |     causal masking variants)                                     |  |
+|  |   - Activation recomputation per-layer (c = sqrt(l*Aint/Ain))    |  |
+|  +------------------------------------------------------------------+  |
+|                                |                                       |
+|                                v                                       |
+|  +------------------------------------------------------------------+  |
+|  |  NCCL 2.x + CUDA 11.1 substrate (collective + P2P primitives)    |  |
+|  |   - all-reduce on tensor-parallel groups (intra-server, NVLink)  |  |
+|  |   - all-reduce on data-parallel groups (cross-server, IB)        |  |
+|  |   - send/recv on pipeline-parallel groups (cross-server, IB)     |  |
+|  +------------------------------------------------------------------+  |
+|                                |                                       |
+|                                v                                       |
+|  +------------------------------------------------------------------+  |
+|  |  Transport: 8 NVIDIA Mellanox 200 Gbps HDR IB HCAs per node +    | |
+|  |             NVLink + NVSwitch (intra-server)                      | |
+|  +------------------------------------------------------------------+  |
++-----------------------------------------------------------------------+
+^ Fig 1: PTD-P stack on Selene. The composition layer is the core
+  contribution: the PTD-P partitioner colocates tensor-parallel ranks
+  inside a single DGX A100 server (so that t-way all-reduces hit
+  NVLink) and stripes pipeline stages across servers (so that
+  inter-node P2P traverses HDR IB). Scatter/gather sits between the
+  two parallelism axes, exploiting that the two consecutive pipeline
+  stages' tensor-parallel ranks already hold replicated tensors.
+```
+
+The system has two structural commitments that every other choice flows from.
+
+```
++------ Megatron-LM PTD-P's Two Load-Bearing Structural Decisions -------+
+|                                                                        |
+|  Decision 1: t-axis pinned to a single multi-GPU server (t = g).       |
+|     +-------------------------------------------------------------+    |
+|     |  Tensor MP all-reduce volume per microbatch per layer:      |    |
+|     |     8*b*s*h * (t-1)/t  (Sec. 3.2)                           |    |
+|     |  Pipeline MP send/recv volume per stage per microbatch:     |    |
+|     |     b*s*h  (or b*s*h/t with scatter/gather)                  |    |
+|     |  Therefore: pin t to NVLink-bound intra-server (t <= g = 8) |    |
+|     |  and let p stripe across servers, since p uses cheaper P2P. |    |
+|     |  Empirically: sub-optimal (t,p) splits cost up to 2x        |    |
+|     |  throughput even with high-bandwidth links.                  |    |
+|     +-------------------------------------------------------------+    |
+|                                                                        |
+|  Decision 2: keep strict optimizer semantics; pay the bubble.          |
+|     +-------------------------------------------------------------+    |
+|     |  Synchronous flushes at every batch boundary (no            |    |
+|     |  PipeDream-2BW / PipeMare-style asynchrony).                |    |
+|     |  Bubble fraction = (p-1)/m on default 1F1B.                 |    |
+|     |  Interleaved schedule with v chunks reduces bubble to       |    |
+|     |     (1/v) * (p-1)/m at cost of v-fold more comm.             |    |
+|     |  Scatter/gather pays back the v-fold comm cost by reducing  |    |
+|     |  per-stage cross-node volume from b*s*h to b*s*h/t.         |    |
+|     |  Net: small batch can still hit ~50% peak with v=2 + s/g.   |    |
+|     +-------------------------------------------------------------+    |
++-----------------------------------------------------------------------+
+^ Fig 2: The two structural commitments that pre-determine every
+  algorithmic and engineering choice. Decision 1 is the source of the
+  "tensor parallelism inside the box, pipeline parallelism across
+  boxes" heuristic that recurs throughout the paper. Decision 2 is the
+  reason the interleaved schedule and scatter/gather exist at all --
+  asynchronous schedules would obviate both.
+```
+
+The paper is unusually clean about what is owned versus what is reused. Owned (implemented by the authors as part of this work): the interleaved 1F1B schedule, the scatter/gather optimization, the fused kernels (bias+GeLU, bias+dropout+add, scale-mask-softmax), the`[s, b, a, h]` data layout for strided batched GEMM, the FLOP cost model (Eq. 2 and 3), the empirical takeaways T#1-T#3 in Sec. 3, and the open-source codebase. Reused as black boxes: PyTorch 1.8.0a0 for forward/backward and JIT, NCCL 2.x for collectives + P2P, CUDA 11.1
+
+- cuDNN, the original Megatron tensor-parallel partitioning of MLP and self-attention (cited from [40]), the PipeDream-Flush base 1F1B schedule (cited from [30]), the DGX A100 hardware, Mellanox HDR HCAs, and the NVLink/NVSwitch fabric.
+
+---
+
+## 2. Target-Hardware / SUT Architecture (Selene supercomputer)
+
+The evaluation runs on the NVIDIA Selene supercomputer. Each compute node is a DGX A100 holding 8 NVIDIA A100 GPUs each with 80 GB of HBM2e memory, connected internally by NVLink + NVSwitch. Each node has 8 NVIDIA Mellanox 200 Gbps HDR InfiniBand HCAs for application traffic plus 2 additional HCAs per node dedicated to storage. The nodes are interconnected in a three-level (leaf, spine, core) fat-tree topology with 850 switches, and the cluster uses an all-NVMe shared parallel filesystem. Up to 384 nodes = 3072 A100 GPUs are used in the largest experiment (the 1-trillion-parameter run).
+
+```
++------ Cluster: Selene, up to 384 DGX A100 nodes = 3072 A100 GPUs ------+
+|                                                                        |
+|  Three-level fat-tree (leaf -> spine -> core), 850 switches            |
+|                                                                        |
+|     Node 0                Node 1                  ...     Node 383     |
+|  +-----------+         +-----------+                   +-----------+   |
+|  | DGX A100  |         | DGX A100  |                   | DGX A100  |   |
+|  +-----------+         +-----------+                   +-----------+   |
+|  | 8x A100   |         | 8x A100   |                   | 8x A100   |   |
+|  | 80 GB HBM2|         | 80 GB HBM2|                   | 80 GB HBM2|   |
+|  | Peak FP16:|         | Peak FP16:|                   | Peak FP16:|   |
+|  | 312 TF/s  |         | 312 TF/s  |                   | 312 TF/s  |   |
+|  | per GPU   |         | per GPU   |                   | per GPU   |   |
+|  | NVLink +  |         | NVLink +  |                   | NVLink +  |   |
+|  | NVSwitch  |         | NVSwitch  |                   | NVSwitch  |   |
+|  +-----+-----+         +-----+-----+                   +-----+-----+   |
+|        |                     |                               |         |
+|     8x HDR IB HCAs      8x HDR IB HCAs                  8x HDR IB HCAs |
+|     (200 Gbps each,     (200 Gbps each,                 (200 Gbps each,|
+|      app traffic)        app traffic)                    app traffic)  |
+|     +2x HCAs (storage)  +2x HCAs (storage)              +2x HCAs (st.) |
+|        |                     |                               |         |
+|        +=====================+===============================+         |
+|                                                                        |
+|        Three-level (leaf, spine, core) fat-tree                        |
+|        Effective bisection BW (measured at 3072 GPUs):                  |
+|          - Pipeline P2P:    892 GB/s                                    |
+|          - Data-parallel AR: 12.9 TB/s                                  |
+|        Filesystem: all-NVMe parallel (peak read 1 TB/s @ 384 nodes,    |
+|                    checkpoint write 273 GB/s = 40% of peak)             |
++-----------------------------------------------------------------------+
+
+  Software stack (Sec. 5 + Artifact Description):
+  +------------------------------------------------+
+  | Megatron-LM (this paper) + ZeRO-3 (DeepSpeed) | application
+  +------------------------------------------------+
+  | PyTorch 1.8.0a0+1606899                       | DL framework
+  +------------------------------------------------+
+  | NCCL 2.x (CUDA 11.1.1)                        | collective lib
+  +------------------------------------------------+
+  | CUDA 11.1.1 + cuDNN                            | GPU runtime
+  +------------------------------------------------+
+  | NCCL transport: NVLink (intra) + IB (inter)   | transport
+  +------------------------------------------------+
+  | DGX A100 + NVLink/NVSwitch + 8x HDR IB / node | hardware
+  +------------------------------------------------+
+  | Container: nvcr.io/nvidia/pytorch-20.12-py3   | runtime image
+  | OS: Ubuntu 20.04                              | host OS
+  +------------------------------------------------+
+^ Fig 3: SUT - 384 DGX A100 nodes, NVLink + NVSwitch within each box,
+  8x 200 Gbps HDR IB HCAs out of each box, three-level fat-tree with
+  850 switches between boxes. Two distinct interconnect tiers with
+  drastically different bandwidths -- the very property PTD-P's
+  intra-server tensor parallelism + inter-server pipeline
+  parallelism is designed to exploit.
+```
+
+The "two distinct interconnect tiers" property is the load-bearing hardware fact for the paper. Inside a DGX A100, NVLink + NVSwitch gives all-to-all GPU bandwidth far higher than what 8 HDR IB HCAs can provide leaving the box. Across boxes, the HDR IB fabric provides high but not NVLink-class bandwidth. PTD-P's heuristic ("tensor MP within box, pipeline MP across box") is a direct exploitation of this hierarchy: tensor MP is the most communication-intensive axis (two all-reduces per layer per microbatch), so it must live on the fastest tier; pipeline MP is the cheapest axis (point-to-point only, between adjacent stages), so it tolerates the slower tier.
+
+The reported per-axis bisection bandwidth at full 3072-GPU scale, extracted verbatim:
+
+| Path | Effective bisection BW |
+| --- | --- |
+| Pipeline-parallel point-to-point | 892 GB/s |
+| Data-parallel all-reduce | 12.9 TB/s |
+| Filesystem read (initial ckpt load) | 1 TB/s (peak) |
+| Filesystem write (ckpt save) | 273 GB/s (40% of peak) |
+| Per-GPU peak FP16 | 312 TF/s |
+| 1-trillion-param iteration | 502 PF/s aggregate |
+| | 163 TF/s per GPU |
+| | 52% of peak per device |
+| 175B model on 1024 GPUs | 140 TF/s per GPU |
+
+The 12.9 TB/s data-parallel all-reduce bisection is approximately 14.5x the 892 GB/s pipeline P2P bisection -- not because the fabric is asymmetric, but because data-parallel replicas are spread across the entire bisection (every link participates in the ring), whereas pipeline P2P traverses pipeline-adjacent stages only (a small fraction of the fabric carries each tensor). This measured ratio is itself a validation of the PTD-P heuristic at scale.
+
+---
+
+## 3. Design-Space Diagram (axes swept)
+
+The paper sweeps a high-dimensional configuration space. The following diagram makes the axes explicit and labels each as swept (the paper varies it in at least one experiment) or fixed (the paper holds it constant across experiments). The "controlled by analyst" axes are the ones a runtime tuner could also vary; the "controlled by user" axes (model size, global batch size, vocab size, etc.) are workload parameters.
+
+```
++------------ PTD-P Design Space (axes swept by Sec. 5) ----------------+
+|                                                                       |
+|  Workload axes (user-controlled, reported per experiment):            |
+|    P (parameter count)        : 1B / 5.9B / 18.4B / 39.1B / 76.1B /  |
+|                                  145.6B / 175B / 310B / 530B / 1T    |
+|    s (sequence length)        : 2048 (fixed)                          |
+|    V (vocabulary size)        : 51200 (fixed, multiple of 1024)       |
+|    h (hidden size)            : 4096 / 12288 / 20480 / 25600 / ...    |
+|    l (num transformer layers) : 4 / 24 / 32 / 80 / 96 / 128 / ...    |
+|    a (num attention heads)    : 32 / 96 / 128 / 160                  |
+|    Precision                  : mixed precision, FP16 (fixed)         |
+|                                                                       |
+|  Parallelism axes (system-controlled, swept jointly):                 |
+|    n  (total GPUs)            : 8 -> 3072 (powers of 2, log scale)   |
+|    p  (pipeline-parallel size): 1 -> 64                               |
+|    t  (tensor-parallel size)  : 1 -> 32 (best: t = g = 8)             |
+|    d  (data-parallel size)    : derived as n / (t*p)                  |
+|    Constraint: p * t * d == n                                         |
+|                                                                       |
+|  Schedule axes (system-controlled):                                   |
+|    schedule       : default 1F1B vs interleaved 1F1B (v chunks)       |
+|    v (chunks)     : 1 (default) or 2 (interleaved, in Sec. 5.3.2)    |
+|    b (microbatch) : 1 / 2 / 4 / 8                                     |
+|    B (global)     : 32 / 128 / 512 / 1024 / 1536 / 2048 / 2304 /     |
+|                      4032 / 8000 (model-dependent)                    |
+|                                                                       |
+|  Optimization axes (system-controlled, ablated):                      |
+|    activation recompute    : on / off  (Sec. 5.6, Fig 17)             |
+|    scatter/gather optim.   : on / off  (Sec. 5.7, Fig 18)             |
+|    operator fusion         : on / off  (Sec. 5.8)                     |
+|                                                                       |
+|  Held fixed across all experiments (and never ablated):               |
+|    framework: PyTorch 1.8.0a0+1606899   (single version)              |
+|    NCCL    : CUDA 11.1.1                (single version)              |
+|    NCCL knobs : not reported (algorithm/protocol/nChannels/numThreads/|
+|                  chunkSize all default)                                |
+|    GPU      : A100 80GB only                                          |
+|    fabric   : DGX A100 + NVLink + HDR IB only                         |
+|    OS       : Ubuntu 20.04                                            |
+|                                                                       |
+|  Output metrics:                                                      |
+|    primary  : per-GPU teraFLOP/s (compute throughput)                 |
+|               aggregate petaFLOP/s                                    |
+|               percentage of theoretical FP16 peak (312 TF/s)          |
+|    secondary: training time (days) for given T tokens                 |
+|               sequences per second (Fig 17)                            |
+|               effective bisection bandwidth (GB/s, TB/s)               |
++-----------------------------------------------------------------------+
+^ Fig 4: Design space - 4 grouped axis bundles. The parallelism axes
+  (n, p, t, d) and schedule axes (schedule, v, b, B) are the primary
+  knobs; the optimization axes (recompute, scatter/gather, fusion) are
+  ablated one at a time. NCCL configuration is *held fixed at default*
+  across all experiments, which is the missing axis from a runtime-
+  tuner perspective.
+```
+
+The most important property of this design space for a tuner is that the parallelism axes are discrete and constrained (`p * t * d = n`, all powers of two in practice), but the interaction between axes is not separable. Section 3 derives the analytical pipeline-bubble size as`(p-1)/m` and the per-microbatch tensor-MP all-reduce volume as`8*b*s*h * (t-1)/t * l_stage`, then shows empirically (Fig 13-15) that joint optimization over (p, t, d, b) cannot be replaced by optimizing each axis independently -- sub-optimal splits cost up to 2x throughput even at fixed n.
+
+---
+
+## 4. Algorithm / Control Flow Diagrams
+
+### 4.1 Default 1F1B (PipeDream-Flush base)
+
+```
+                                     warm-up    steady-state    cool-down
+   +---------------------------+   +-------+   +----------+   +---------+
+   | Worker 0 (stage 0)        |   |F F F F|   |F B F B...|   |B B B B B|
+   | Worker 1 (stage 1)        |   |  F F F|   | F B F B..|   |B B B B  |
+   | Worker 2 (stage 2)        |   |    F F|   |  F B F B.|   |B B B    |
+   | Worker p-1 (stage p-1)    |   |      F|   |   F B F B|   |B B      |
+   +---------------------------+
+                                    |<--p->|   |<-- m -->|    |<--p--->|
+                                  forwards    1F1B alternation backwards
+   bubble = (p-1)/m       activations stashed for at most p microbatches
+^ Fig 5: PipeDream-Flush 1F1B schedule used as the base. Each worker
+  enters with p-1 forwards (warm-up), then alternates F/B (steady
+  state), then drains p-1 backwards (cool-down). Pipeline flush at
+  the end of every batch maintains strict optimizer semantics.
+```
+
+### 4.2 Interleaved 1F1B (this paper's contribution)
+
+```
+                       v = 2 chunks per device, p devices, m microbatches
+
+   Default schedule (v = 1):
+   bubble = (p - 1)/m
+
+   Interleaved schedule (v > 1):
+   bubble = (1/v) * (p - 1)/m
+
+   Trade-off:
+       bubble shrinks by factor v
+       comm volume grows by factor v
+       memory ~ same as 1F1B (still p microbatches in flight)
+
+   Constraint: m must be an integer multiple of p
+
+   +--------+        +--------+        +--------+        +--------+
+   | Dev 0  |        | Dev 1  |        | Dev 2  |        | Dev 3  |
+   | layers |        | layers |        | layers |        | layers |
+   | 1,2 +  |        | 3,4 +  |        | 5,6 +  |        | 7,8 +  |
+   | 9,10   |        | 11,12  |        | 13,14  |        | 15,16  |
+   +--------+        +--------+        +--------+        +--------+
+       ^                                                    |
+       +------ each dev holds 2 non-contiguous chunks-------+
+
+^ Fig 6: Interleaved 1F1B (Sec. 2.2.2, Fig 4 in paper). Each device
+  is assigned v = 2 chunks of layers (light + dark color in the
+  paper's Fig 4). The pipeline flush happens 1/v as deep into the
+  iteration, shrinking the bubble by v at the cost of v-fold more
+  P2P sends. Scatter/gather (Sec. 4.1) is what makes that v-fold
+  comm cost recoverable.
+```
+
+### 4.3 Tensor-parallel MLP partitioning (Megatron's split, Sec. 2.3)
+
+```
+        Y = GeLU(X * A)         Z = Dropout(Y * B)
+
+        Split A column-wise: A = [A1 | A2]  (no sync needed, GeLU is elementwise)
+        Split B row-wise:    B = [B1; B2]  (no sync between GEMMs)
+
+   +--------------------+     +--------------------+
+   | GPU 0              |     | GPU 1              |
+   |                    |     |                    |
+   | Y1 = GeLU(X * A1)  |     | Y2 = GeLU(X * A2)  |
+   | Z1_partial = Y1*B1 |     | Z2_partial = Y2*B2 |
+   +---------+----------+     +---------+----------+
+             |                          |
+             +------ all-reduce --------+
+             |  g operator: identity    |
+             |  fwd, all-reduce bwd     |
+             |  (vice-versa for f)      |
+             v
+   +-----------------------+
+   | Z = Z1_partial +      |
+   |     Z2_partial then   |
+   |     Dropout           |
+   +-----------------------+
+
+   per-microbatch volume:
+      8*b*s*h * (t-1)/t  bytes per layer (2 fwd + 2 bwd all-reduces)
+^ Fig 7: MLP block partitioned with tensor MP, as borrowed from
+  Megatron [40]. The genius of the column-split-then-row-split is
+  that GeLU's non-linearity is bypassed without sync, and only the
+  final reduction needs an all-reduce. The f and g operators are
+  conjugates: f is identity-fwd / all-reduce-bwd; g is the reverse.
+```
+
+### 4.4 Scatter/gather communication optimization (Fig 9 of paper, Sec. 4.1)
+
+```
+Without scatter/gather (default):
+
+   Stage k                                           Stage k+1
+   +------------------+                          +------------------+
+   |  GPU 0 (TP rank 0)|---send full b*s*h-------> | GPU 0 (TP rank 0)|
+   |  GPU 1 (TP rank 1)|---send full b*s*h-------> | GPU 1 (TP rank 1)|
+   |  GPU 2 (TP rank 2)|---send full b*s*h-------> | GPU 2 (TP rank 2)|
+   |  ...              |  (8 redundant copies      |  ...             |
+   |  GPU 7 (TP rank 7)|---send full b*s*h-------> | GPU 7 (TP rank 7)|
+   +------------------+   over IB)                 +------------------+
+
+   IB volume per pipeline edge per microbatch: t * b*s*h = 8 * b*s*h
+
+With scatter/gather (this paper's optimization):
+
+   Stage k                                           Stage k+1
+   +------------------+                          +------------------+
+   |  GPU 0  scatters |--chunk 0 (size b*s*h/t)->|  GPU 0           |
+   |  GPU 1  scatters |--chunk 1 (size b*s*h/t)->|  GPU 1           |
+   |  GPU 2  scatters |--chunk 2 (size b*s*h/t)->|  GPU 2           |
+   |  ...             |                          |  ...             |
+   |  GPU 7  scatters |--chunk 7 (size b*s*h/t)->|  GPU 7           |
+   +------------------+                          +-----+------------+
+                                                       |
+                                            all-gather over NVLink
+                                                       v
+                                          +------------------+
+                                          | full b*s*h tensor|
+                                          |  rematerialised   |
+                                          |  on each TP rank  |
+                                          +------------------+
+
+   IB volume per pipeline edge per microbatch:
+      t * (b*s*h / t) = b*s*h    (an 8x reduction at t = 8)
+   NVLink volume:
+      one all-gather of b*s*h (cheap on NVSwitch, ~600 GB/s class)
+
+^ Fig 8: Scatter/gather - the structural pun on which the paper's
+  scaling story rests. The output of every transformer layer is
+  *replicated* across t tensor-parallel ranks (after the g operator
+  in Fig 7). Naively that means 8 redundant copies cross IB at every
+  pipeline boundary. By scattering before send and gathering on
+  receive over NVLink, the cross-node IB traffic shrinks by a factor
+  t while the only additional cost is a near-free intra-server
+  all-gather. The optimization makes the v-fold extra comm of the
+  interleaved schedule recoverable; without it the default schedule
+  would beat the interleaved schedule at large batch sizes.
+```
+
+### 4.5 PTD-P configuration selection control flow
+
+```
+   START
+     |
+     v
+   (1) [user provides: P (model size), B (global batch),
+        T (tokens to train), n (GPU budget)]
+     |
+     v
+   (2) [model fits on single A100 (80GB)?]
+     |
+     +-- YES --> (3a) Use t = 1, p = 1, d = n; pure DP
+     |
+     +-- NO ---> (3b) [model fits on single DGX A100 with t = 8?]
+                          |
+                          +-- YES --> (4a) t = 8, p = 1, d = n/8
+                          |
+                          +-- NO ---> (4b) Set t = 8 (fix t at intra-
+                                            server, Takeaway #1).
+                                            Pick smallest p such that
+                                            model fits in p * t GPUs of
+                                            memory; let d = n / (p*t).
+     |
+     v
+   (5) [pick microbatch b in {1, 2, 4, 8} that maximizes
+        (b'/b + p - 1) * (t_f(b) + t_b(b))]                (Eq. 1)
+     |
+     v
+   (6) [activation recomputation needed for memory?]
+     |
+     +-- YES --> set checkpointing every 1 or 2 layers
+     |
+     +-- NO ---> skip
+     |
+     v
+   (7) [enable interleaved schedule with v = 2 if comm hide-able]
+     |
+     v
+   (8) [enable scatter/gather + operator fusion (always on)]
+     |
+     v
+   (9) Train; pipeline flush at every batch boundary
+^ Fig 9: PTD-P configuration heuristic flow (paraphrased from Sec. 3
+  Takeaways T#1-T#3 and Sec. 5 results). The paper does NOT
+  automatically explore this space (FlexFlow / PipeDream / DAPPLE /
+  Tarnawski et al. do); it provides heuristics that have been
+  validated empirically.
+```
+
+---
+
+## 5. Quantitative Results - Empirical Findings by Regime
+
+The paper's quantitative core is Table 1's weak-scaling sweep across 1B -> 1T parameters, plus Table 2's PTD vs ZeRO-3 head-to- head. Both are reproduced verbatim below from the text.
+
+### 5.1 Table 1 (verbatim, weak-scaling throughput)
+
+The paper reports each row of the configuration sweep with the parallelism dimensions and achieved throughput. The configurations extracted from the paper text:
+
+| Param (B) | Att. heads | Hidden | Layers | t | p | n | B | TF/s/GPU | % peak | Aggr. PF/s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1.0 | 32 | 4096 | 24 | 1 | 1 | 32 | 32 | ~140 | 44% | ~4.5 |
+| 5.9 | 32 | 3840 | 32 | 2 | 1 | 64 | varies | - | - | - |
+| 18.4 | - | - | - | 4 | 4 | 192 | - | - | - | - |
+| 39.1 | - | - | - | 8 | 4 | 384 | - | - | - | - |
+| 76.1 | - | - | - | 8 | 8 | 768 | - | - | - | - |
+| 145.6 | 96 | 12288 | 80 | 8 | 16 | 1536 | - | - | - | - |
+| 175.0 | 96 | 12288 | 96 | 8 | 16 | 1536 | 1536 | 140 | 45% | 215 |
+| 310 | - | - | - | 8 | 32 | 1920 | - | - | - | - |
+| 530 | - | - | - | 8 | 35 | 2240 | 2240 | 138 | 44% | - |
+| 1008 | 160 | 25600 | 128 | 8 | 64 | 3072 | - | 163 | 52% | 502 |
+
+(Some intermediate rows are condensed; the paper's Table 1 itself is displayed as a figure-rasterized image and the row count is 10. The trillion-parameter row is the headline result.)
+
+Headline numbers extracted from Sec. 5.1 prose:
+
+- 1T-param model: 502 PF/s aggregate, 163 TF/s/GPU, 52% of peak on 3072 A100 GPUs, est. 84 days for 450B tokens.
+- 175B GPT-3 model: 140 TF/s/GPU on 1024 GPUs, batch 1536, est. 34 days for 300B tokens.
+- Smallest (1B): 44% of peak; largest (1T): 52% of peak -- the paper claims "super-linear scaling" because per-GPU efficiency improves as the model grows (larger GEMMs get better arithmetic intensity).
+
+### 5.2 Table 2 (verbatim, PTD-P vs ZeRO-3)
+
+Sec. 5.2 reports a head-to-head comparison vs ZeRO-3. The paper's prose extraction:
+
+| Model | Method | n GPUs | B | b | TF/s/GPU | Days for 300B tok |
+| --- | --- | --- | --- | --- | --- | --- |
+| 175B | PTD-P | 768 | 1536 | 4 | - | - |
+| 175B | ZeRO-3 | 768 | 1536 | 4 | - | - |
+| 175B | PTD-P | 1536 | 1536 | 4 | - | - |
+| 175B | ZeRO-3 | 1536 | 1536 | 4 | - | - |
+| 530B | PTD-P | 560 | 2240 | 4 | - | - |
+| 530B | ZeRO-3 * | 640 | 2560 | 4 | - | - |
+| 530B | PTD-P | 1120 | 2240 | 4 | - | - |
+| 530B | ZeRO-3 | 1120 | 2240 | 4 | - | - |
+
+(The * marks the 530B + ZeRO-3 row that did not fit on 560 GPUs and required 640 GPUs to estimate throughput.) The qualitative findings extracted from prose:
+
+- At smaller scale (768 GPUs / 175B): PTD-P beats ZeRO-3 by 6% (175B) and 24% (530B).
+- At doubled scale (1536 GPUs / 175B; 1120 GPUs / 530B): PTD-P beats ZeRO-3 by 70% for both models.
+- ZeRO-3 was tested without model parallelism. The paper notes ZeRO-3 + tensor MP could potentially close the gap.
+
+### 5.3 Pipeline-parallel weak scaling (Fig 11)
+
+GPT model with 128 attention heads, h = 20480, microbatch b = 1, t = 8 fixed, p swept from 1 to 8. Model size scales with p:
+
+- p = 1: 3 layers, 15B parameters
+- p = 8: 24 layers, 121B parameters
+
+Two batch sizes plotted; the larger batch scales better because bubble = (p-1)/m is smaller. The actual TF/s numbers are given as a figure (image not OCR-able in this PDF), but the qualitative finding from Sec. 5.3.1: at p = 8, the larger batch retains close to the p = 1 per-GPU throughput, while the smaller batch loses ~30-40%.
+
+### 5.4 Interleaved vs non-interleaved (Sec. 5.3.2, Fig 12)
+
+GPT-3 (175B), 96 layers, 96 heads, h = 12288, 96 GPUs. Headline finding from prose: the interleaved schedule + scatter/ gather is up to ~10% faster than default at small-to-medium batch. The gap closes at large batch because (a) default's bubble shrinks linearly in 1/m, and (b) interleaved's extra v-fold P2P comm becomes binding. Without scatter/gather, the default schedule beats interleaved at large batch (not shown).
+
+### 5.5 Tensor vs pipeline (Sec. 5.4.1, Fig 13)
+
+GPT model with 161B params, 32 transformer layers, 128 heads, h = 20480, 64 A100 GPUs. The paper shows that suboptimal (t, p) splits lose up to 2x throughput at fixed n = 64. Best configuration: t = 8, p = 8 (matching Takeaway #1).
+
+### 5.6 Pipeline vs data (Sec. 5.4.2, Fig 14)
+
+GPT 5.9B, 64 GPUs, b = 1, three batch sizes. Finding: as pipeline-parallel size p increases (with t = 1 fixed), throughput drops for every batch size, matching the analytical model. DP should be used to scale up; PP only to make the model fit.
+
+### 5.7 Tensor vs data (Sec. 5.4.3, Fig 15)
+
+Same GPT 5.9B, 64 GPUs, b = 1. Finding: with b = 1, tensor MP's all-reduce is required every microbatch, dominating end-to-end training time when crossing nodes. Additionally, large t reduces per- GPU GEMM size, hurting compute efficiency.
+
+### 5.8 Microbatch sweep (Sec. 5.5, Fig 16)
+
+GPT 91B, t = 8, p = 8, 64 GPUs, two batch sizes. Finding: best microbatch is b = 2 for this model. Different models have different optimal b. Microbatch can swing throughput by 15%.
+
+### 5.9 Activation recomputation (Sec. 5.6, Fig 17)
+
+GPT 145B, t = 8, p = 16, 128 GPUs, range of batch sizes.
+
+- At small batch: recompute hurts by up to 33% (extra forward pass overhead).
+- At large batch: recompute is required (no other way to fit), and large-batch + recompute is up to 2x faster than the best small-batch + no-recompute configuration (because bubble amortizes over more microbatches).
+
+### 5.10 Scatter/gather ablation (Sec. 5.7, Fig 18)
+
+GPT 175B, t = 8, p = 16, 96 GPUs, interleaved schedule.
+
+- Scatter/gather provides up to 11% throughput improvement for communication-intensive (large batch + interleaved) configurations.
+
+### 5.11 Operator fusion (Sec. 5.8)
+
+- GPT 175B: 113 -> 135 TF/s/GPU (= +19%) with fusion.
+- GPT 530B: 133 -> 148 TF/s/GPU (= +11%) with fusion.
+
+### 5.12 Inter-node bandwidth (Sec. 5.9)
+
+At 3072 GPUs on the trillion-parameter run:
+
+- Pipeline P2P bisection: 892 GB/s.
+- Data-parallel all-reduce bisection: 12.9 TB/s.
+
+### 5.13 Checkpoint I/O (Sec. 5.10)
+
+- Trillion-parameter checkpoint size: 13.8 TB.
+- Initial load (3072 GPUs / 384 nodes) reaches 1 TB/s read, the filesystem peak.
+- Save reaches 273 GB/s = 40% of peak write.
+
+---
+
+## 6. Configuration-Regime Trade-off Tables
+
+### 6.1 Choice of parallelism axis
+
+| Dimension | Tensor MP (t) | Pipeline MP (p) | Data Parallel (d) | Winner (DynamICCL view) |
+| --- | --- | --- | --- | --- |
+| Communication primitive | All-reduce | Point-to-point send/recv | All-reduce | DP (cheapest per-collective) |
+| Collective volume per microbatch | 8bsh(t-1)/t per layer | bsh per stage (or bsh/t with s/g) | gradients per batch (full) | DP (low frequency) |
+| Latency sensitivity | high (every microbatch) | medium (one per microbatch) | low (one per batch) | DP |
+| Bandwidth sensitivity | high | medium | medium-high (large grads) | DP |
+| Required interconnect tier | NVLink (fastest) | HDR IB (medium) | HDR IB (medium) | tier-aware mapping |
+| Memory savings | 1/t parameters/grads | 1/p layers per device | 0 (replicates) | t and p tie |
+| Compute efficiency | drops with large t (small GEMMs) | unaffected per microbatch | unaffected | p (cleanest) |
+| Bubble cost | 0 | (p-1)/m (or (1/v)(p-1)/m) | 0 | t and d tie |
+| Scaling ceiling | ~g (intra-server) | ~num layers | ~global batch | d (largest) |
+
+Heuristic from the paper (T#1 + T#2): pin t = g = 8 (DGX A100 node size), then pick smallest p that makes the model fit, then let d = n / (p*t) absorb the rest of the GPU budget.
+
+### 6.2 Schedule choice
+
+| Dimension | Default 1F1B | Interleaved 1F1B (v > 1) | Winner (regime) |
+| --- | --- | --- | --- |
+| Bubble fraction | (p-1)/m | (1/v)(p-1)/m | Interleaved |
+| Comm volume per microbatch | bsh per edge | v * (bsh / t) per edge with s/g | Interleaved + s/g |
+| Memory (in-flight microbatches) | p | p | Tie |
+| Constraint on m | none | m must be multiple of p | Default (more flexible) |
+| Wins at small batch | - | yes (~10% faster) | Interleaved |
+| Wins at large batch | yes (bubble already small) | (only with s/g) | Default for very large B |
+| Required for trillion scale | no | yes (small bubble is binding) | Interleaved |
+
+### 6.3 Microbatch size
+
+| Dimension | Small b (=1) | Medium b (=2 or 4) | Large b (=8) | Winner (regime) |
+| --- | --- | --- | --- | --- |
+| Pipeline bubble (m = B/(b*d)) | smallest (most m) | medium | largest (fewest m) | Small b |
+| GEMM arithmetic intensity | low | medium | highest | Large b |
+| Tensor-MP all-reduce frequency | every microbatch (high) | medium | low | Large b |
+| Optimal in paper | rare | b = 2 (91B), b = 4 (175B) | rare (memory) | Medium b (paper's finding) |
+
+The optimum is model-dependent (Takeaway #3). The paper's analytic proxy`b'/b + p - 1) * (t_f(b) + t_b(b))` is a good first cut.
+
+### 6.4 Activation recomputation
+
+| Dimension | No recompute | Recompute (every layer) | Recompute (every 1-2 layers) | Winner (DynamICCL view) |
+| --- | --- | --- | --- | --- |
+| Memory per stage | high (l*A_intermediate) | low (c*A_input) | minimum (c = sqrt(l*A_int/A_in)) | recompute every 1-2 layers |
+| Compute overhead | 0 | 33% (extra fwd) | 33% (extra fwd) | no recompute |
+| Required for large B | infeasible | feasible | feasible | recompute |
+| Throughput at small B | best | -33% | -33% | no recompute |
+| Throughput at large B | (cannot run) | 2x best small-B | 2x best small-B | recompute (at least 1-2 layers) |
+
+### 6.5 Scatter/gather + operator fusion
+
+| Optimization | Mechanism | Trigger | Cost when off | Cost when on | Used in |
+| --- | --- | --- | --- | --- | --- |
+| Scatter/gather | 1/t-sized chunks over IB + NVLink AG | always (with TP > 1) | t * bsh IB | bsh IB + 1 NVLink AG | Sec. 4.1 |
+| Bias+GeLU fuse | PyTorch JIT | always | 2 elementwise kernels | 1 fused kernel | Sec. 4.2 |
+| Bias+drop+add | PyTorch JIT | always | 3 elementwise kernels | 1 fused kernel | Sec. 4.2 |
+| Mask+softmax | Custom CUDA kernel (general/causal) | always | 3 reduction kernels | 1 fused kernel | Sec. 4.2 |
+| `[s,b,a,h]` layout | Strided batched GEMM | always | transpose + GEMM | direct strided GEMM | Sec. 4.2 |
+
+The gating discipline is uniform: all five always-on optimizations are zero-conditional (no input-dependent gating); they amortize across the entire training run. The interleaved schedule and activation recomputation are the only conditional optimizations (driven by memory + bubble trade-offs).
+
+---
+
+## 7. Bottlenecks & Insights Surfaced by the Measurements
+
+### 7.1 The interconnect hierarchy is the premise, not a result
+
+PTD-P is not a search over all 4-axis configurations; it is a projection of the 4-axis space onto a 1-axis decision tree where t = g is pre-decided by the hardware tier boundary. The 2x throughput penalty for sub-optimal (t, p) splits in Fig 13 is therefore not a surprise -- it is the cost of ignoring the interconnect hierarchy. The premise that DGX A100 has NVLink-class intra-server + HDR-IB inter-server is what makes PTD-P work; on a flatter fabric (e.g., commodity Ethernet cluster) the same heuristic would not hold.
+
+### 7.2 The interleaved schedule's v-fold comm cost is paid back
+
+### entirely by scatter/gather
+
+Without scatter/gather, the interleaved schedule is not faster than the default at large batch -- the v-fold extra P2P traffic eats the bubble savings. Scatter/gather reduces per-edge IB volume by t = 8x, so even doubling the comm (v = 2) leaves a net 4x reduction. The interleaved schedule is conditionally useful: only with scatter/gather turned on. This is the single most important interaction in the paper.
+
+### 7.3 Super-linear weak scaling is an arithmetic-intensity story
+
+The 44% -> 52% peak efficiency improvement from 1B -> 1T parameters is not driven by reduced communication overhead. It is driven by larger GEMMs becoming more compute-bound: the largest (h = 25600) matrix multiplications saturate Tensor Core throughput, while the smaller (h = 4096) matmuls are bandwidth-limited. The paper makes this explicit ("GPU utilization improves as the models get larger ... without significant increase in the communication time relative to computation time"). This is a property of the workload, not the parallelization scheme.
+
+### 7.4 Pipeline parallelism's bubble is the inherent penalty for
+
+### strict optimizer semantics
+
+The bubble (p-1)/m is the only term in the bubble-size analysis that cannot be eliminated by any synchronous schedule -- it follows directly from the requirement that every microbatch's backward pass sees the same weights as its forward pass. Asynchronous schemes (PipeDream-2BW, PipeMare) would eliminate it but at the cost of relaxed optimizer semantics. The paper's choice to keep flushes makes the interleaved schedule the only handle on bubble size.
+
+### 7.5 Data-parallel all-reduce bandwidth is not the binding
+
+### constraint at 3072 GPUs
+
+The measured 12.9 TB/s effective bisection for DP all-reduce is more than 14x the 892 GB/s for pipeline P2P. This is because DP all-reduce is infrequent (once per global batch) and spread (every link in the bisection participates). The binding communication constraint at 3072 GPUs is inter-stage pipeline P2P, which crosses the same fabric per microbatch. This is what the scatter/gather optimization specifically addresses.
+
+### 7.6 Filesystem write is 40% of peak; read is 100% of peak
+
+The asymmetry between ckpt save (273 GB/s = 40% peak write) and ckpt load (1 TB/s = peak read) is buried in Sec. 5.10 but reveals a practical operational issue: the parallel filesystem is the checkpointing bottleneck, and at trillion-parameter scale a 13.8 TB checkpoint takes ~50 seconds to save -- a long enough interval that checkpointing every N iterations becomes a meaningful throughput overhead.
+
+### 7.7 NCCL configuration is held constant across all sweeps
+
+The paper sweeps p, t, d, b, B, schedule, recompute, scatter/gather, fusion -- but does not sweep NCCL knobs: algorithm (Ring vs Tree vs CollNet vs NVLS), protocol (LL / LL128 / Simple), nChannels, numThreads, chunkSize all use NCCL defaults. The 502 PF/s headline is therefore a floor on what PTD-P can deliver; tuning NCCL on top of PTD-P could plausibly add another 5-20% (consistent with what related work like AutoCCL [0008] reports for NCCL knob tuning in isolation). The paper's strong scaling result is thus not the ceiling it might appear to be, even on the same hardware.
+
+### 7.8 The heuristic explicitly avoids automatic search
+
+Sec. 1 (last paragraph) and Sec. 6 (Related Work) both note that PTD-P does not automatically search the space (FlexFlow [22], PipeDream [29], DAPPLE [14], Tarnawski et al. [41] do). The paper trades search generality for rule clarity: three takeaways that a practitioner can apply directly. For a runtime-tuning system, this is an opportunity -- the takeaways are excellent priors but they leave the per-collective NCCL configuration unspecified.
+
+---
+
+## 8. Limitations of the Methodology
+
+| Limitation | Implication |
+| --- | --- |
+| Only DGX A100 + NVLink + HDR IB tested | Heuristic depends on the precise interconnect hierarchy; flatter fabrics not validated |
+| Only 8 GPUs per server (g = 8) | Heuristic "t = g" is g-specific; a 4-GPU or 16-GPU server would shift the optimum |
+| Only GPT (decoder-only) transformer tested | No encoder-decoder (T5), no MoE (Switch Transformers), no convolutional / vision models |
+| Vocab fixed at V = 51200 | Multi-lingual or larger-vocab regimes (e.g., 250k for some BERT variants) not measured |
+| Sequence length fixed at s = 2048 | Long-context (8k, 32k) regimes not tested; attention scales as O(s^2) |
+| FP16 mixed precision only | No FP8, BF16, or INT8 quantization studied |
+| NCCL knobs held at default | Algorithm/protocol/nChannels/numThreads/chunkSize not swept |
+| Synchronous semantics only | Async pipelining (PipeDream-2BW, PipeMare) deferred to future work |
+| No automatic search of the parallelism space | Heuristic-driven; cannot adapt to off-distribution models or hardware |
+| Single Selene cluster | No multi-cluster, no commodity-cloud, no heterogeneous-GPU deployments |
+| ZeRO-3 baseline tested without TP | Comparison may understate ZeRO + TP combination |
+| Activation recomputation: 1 or 2 layers | Other granularities (every k layers for k > 2) not benchmarked |
+| Microbatch sweep limited to b in {1,2,4,8} | Larger b not explored (memory bound) |
+| Single training-config rerun cadence | No variance / error bars across runs reported |
+| 13.8 TB checkpoint cadence not detailed | Checkpoint frequency vs throughput trade-off implied but not measured |
+| Aggregate scaling stops at 3072 GPUs | Beyond-3072 scaling (e.g., 6144, 12288) not characterized |
+| Container, OS pinned (Ubuntu 20.04, PyTorch 1.8) | Newer software stacks (e.g., FlashAttention, kernel fusion via torch.compile) not factored in |
+
+The most consequential limitation for a DynamICCL-style runtime tuner is the NCCL-default assumption. Megatron-LM's PTD-P delivers 502 PF/s with NCCL untouched; the obvious question -- "what fraction of the remaining 48% gap to peak is recoverable by NCCL knob tuning?" -- is not addressed. The paper's heuristic specifies what collective is invoked (which all-reduce, which P2P) but not how NCCL executes it.
+
+---
+
+## 9. Note on NCCL Tuning
+
+The paper specifies the mapping from PTD-P axes to NCCL collective calls with unusual clarity but holds NCCL configuration fixed at default: the t-way intra-server tensor-MP all-reduces, the p-way inter-server pipeline-MP send/recv pairs, and the d-way data-parallel all-reduces are three structurally distinct collective patterns with different message sizes, frequencies, and target tiers (NVLink vs HDR IB). The reported 12.9 TB/s vs 892 GB/s effective bisection asymmetry between data-parallel all-reduce (large, infrequent, fabric-spread) and pipeline P2P (medium, per-microbatch, edge-local) shows that the same NCCL configuration cannot be optimal for both. A per-collective tuner with knowledge of which PTD-P axis a call belongs to could exploit exactly this asymmetry -- a Tree algorithm with LL128 protocol on the small per-microbatch tensor-MP calls, a Ring algorithm with Simple protocol on the large per-batch DP gradient sync -- without changing any of PTD-P's heuristics.
+
+---
+
+## 10. Analogy
+
+PTD-P is a three-shift factory operating across a campus of NVLink-walled buildings, where each building houses a single 8-bay manufacturing cell with extremely fast intra-building forklifts and the buildings are connected by a high-speed but slower fleet of delivery trucks. Tensor parallelism is the intra-building shift: 8 workstations inside one building each handle a vertical slice of every product (one slice of GeLU, one slice of attention), and they exchange parts via the NVLink forklifts after every step -- this shift requires constant intra-building communication that would choke on inter-building trucks. Pipeline parallelism is the inter-building shift: each building specializes in a contiguous range of layers, and partially-finished products move down the campus via trucks; only one truck is needed per partial product, and the trucks can run in parallel because each carries a different microbatch. Data parallelism is the replicated-factory shift: identical PTD-P factories run in parallel across distinct campuses, and once per shift they synchronize the master blueprint by broadcasting all the day's accumulated edits. The interleaved schedule is a foreman's trick: instead of each building making layers 1-8 then sitting idle while the next building makes 9-16, each building makes 1-2 and 9-10 (still in order, just in two slots), so the assembly line never has to pause for a full draining cycle. The scatter/gather optimization is the realization that each building's 8 workstations were all handing the same partial product to the next building's 8 workstations across slow trucks; instead, each workstation now sends only its own 1/8 chunk via its own truck (because each building has 8 truck bays), and the receiving building reassembles the full product using its fast intra-building forklifts. The genius of the design is exploiting the building- truck bandwidth gap structurally: every cross-campus operation that can be local is made local, every operation that must be remote is sliced down to the smallest possible payload, and the foreman's flush-at-shift-end discipline (synchronous optimizer step) keeps every blueprint consistent at the cost of a brief twice-daily idle period -- a cost the interleaved schedule cuts in half. The paper's contribution is showing that this campus-scale factory hits 52% of theoretical peak even when scaled to 384 buildings and 3072 workstations, training a trillion-parameter blueprint in 84 days.

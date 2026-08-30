@@ -1,0 +1,408 @@
+MediumHow AI Agents Learned to Think: The Reinforcement-Learning Recipe Behind Agentic RAG and Deep Research in 2026 | by Abdullah Grewal | Jul, 2026 | Medium
+
+Sign up
+
+Get app
+
+Sign up
+
+Technology
+
+Programming
+
+Artificial Intelligence
+
+Rag
+
+Machine Learning
+
+# How AI Agents Learned to Think: The Reinforcement-Learning Recipe Behind Agentic RAG and Deep Research in 2026
+
+19 min read
+
+Jul 6, 2026
+
+--
+
+2
+
+Share
+
+For two years, the standard way to give a language model “search” was retrieval-augmented generation (RAG) wrapped in a hand-written agent loop: retrieve some chunks, stuff them into the prompt, and hope for the best. In 2026 that recipe is being replaced by something fundamentally different, AI agents that are trained to search with reinforcement learning, deciding for themselves when to query, what to ask, and when they finally know enough to answer. It’s the leap from prompt-orchestrated agentic RAG to reinforcement-learned Deep Research, and the clearest proof is a single number: Moonshot’s Kimi-Researcher climbed from 8.6% to 26.9% on Humanity’s Last Exam almost entirely through end-to-end RL[13], no new base model, no bigger context, just a better-trained search policy. Here’s how that recipe works, from Search-R1 to Deep Research, with the verified numbers, and the caveats the leaderboards don’t advertise.
+
+Press enter or click to view image in full size
+
+The 2026 recipe in one loop: an agent is trained, by reinforcement learning, to decide when to search, what to read, and when to answer, rewarded on the final result rather than following a hand-written script.
+
+## 1. Introduction: The End of the Prompted Search Agent
+
+If you built a retrieval-augmented AI agent in 2023 or 2024, you built a scaffold. ReAct, Self-Ask, plan-and-execute, the agentic-RAG loop, all of them were prompt-engineered control flow around a frozen model: “think, then call the search tool, then read the results, then decide whether to search again.” The model never learned the policy. It improvised one, badly, every single time.
+
+The 2025–2026 breakthrough is to stop scripting the loop and start training it. Treat search as a policy the model learns by trial and error: let it fire queries mid-reasoning, reward it when the final answer is right, and let gradient descent discover when to search, what to search for, and when to stop. This is reinforcement learning for search, and it works alarmingly well.
+
+The receipts are piling up:
+
+- Kimi-Researcher went from 8.6% to 26.9% on Humanity’s Last Exam through end-to-end RL alone[13].
+- OpenAI’s Deep Research, a version of o3 optimized for web browsing and “trained using end-to-end reinforcement learning on hard browsing and reasoning tasks,” scored 26.6% on HLE with tools, versus ~9% for the reasoning models it was built from[11].
+- Tongyi DeepResearch, an open-weights 30-billion-parameter model, reached 32.9% on HLE and 70.9% on GAIA[14], matching closed products.
+
+These aren’t bigger models. They’re the same class of model with a trained search policy bolted into the reasoning loop. This post walks the full recipe: the canonical training setup (Search-R1), the reward engineering that taught agents to think in steps rather than one lucky shot, the calibration trick that stops them from searching too much, the wild idea of training a search agent with no search engine at all (ZeroSearch), and finally how all of it gets productized as Deep Research. Two 2025 surveys, one on deep-search agents[21] and one specifically on RL-based agentic search[22], map the field if you want the aerial view; this is the ground tour.
+
+## 2. Background: Why Prompted Agentic RAG Hit a Ceiling
+
+Vanilla RAG, chunk, embed, retrieve top-k, prepend, is a single shot. Agentic RAG improved on it by adding a loop: the model can retrieve, judge, rewrite, and retrieve again. But in the prompt-only era, that loop was a fixed human-authored scaffold wrapped around a model that was never optimized to live inside it. That mismatch produces four predictable failures:
+
+- Bad query formulation. The model asks the search engine the question verbatim instead of decomposing it. Retrieval quality caps the whole system.
+- Over-search. The model queries even when it already knows the answer, wasting tokens and injecting distracting passages.
+- Under-search. The model answers from parametric memory when it should have looked, and hallucinates confidently.
+- No recovery. A weak first retrieval poisons the context, and there’s no learned signal that says “that was a dead end, back up.”
+
+The reinforcement-learning insight is to stop hand-tuning that behavior and reward the outcome instead. Give the model tools, let it interleave reasoning and search however it wants, and give it a reward only when the final answer is correct. Over millions of rollouts, the model discovers a search strategy that maximizes that reward, one no prompt engineer wrote down. The RL-based agentic-search survey frames this as three questions the training has to answer: what RL optimizes (query control, reasoning-retrieval integration), how it’s trained (real, simulated, or synthetic environments), and where the reward is applied (whole-trajectory vs. per-step)[22]. The rest of this post is those three questions, answered by real systems.
+
+## 3. The Canonical Recipe: Search-R1
+
+Search-R1[1] (Jin et al., UIUC + Google, March 2025) is the reference implementation everyone else forks. The setup is deceptively simple. The model generates a reasoning trace, and whenever it wants information it emits a special block:
+
+```
+<think> I need the release year of the sequel... </think><search> release year of the film's sequel </search><information> [retrieved passages inserted here] </information><think> The sequel came out in 2019, so... </think><answer> 2019 </answer>
+```
+
+The environment intercepts each` `, runs the retrieval, and pastes results into an` ` block. The model can do this as many times as it needs. Then a single scalar reward, exact match against the gold answer, is used to train the whole trajectory with policy-gradient RL.
+
+## 3.1 The one trick that makes it stable: retrieved-token masking
+
+There’s a subtle but critical detail. In ordinary RL fine-tuning, you compute the loss over every token the model produced. But the tokens inside` ` weren't produced by the model, they were pasted in by the retriever. If you let the policy gradient flow through them, you're training the model to "predict" text it never chose, which destabilizes training badly. Search-R1's fix is retrieved-token masking: mask the retrieved passages out of the loss entirely, so gradients only shape the tokens the model actually generated[1]. It's a small change, and it's the difference between convergence and collapse. Nearly every subsequent system keeps it.
+
+## 3.2 PPO vs. GRPO
+
+Search-R1 supports both PPO and GRPO as the optimizer. PPO is the classic actor-critic setup, more stable but heavier (it trains a separate value network). GRPO (Group Relative Policy Optimization, the algorithm DeepSeek-R1 made famous) drops the critic and instead normalizes each answer’s reward against a group of sampled answers for the same question, cheaper and faster to converge, but more prone to reward collapse if the reward is too sparse. This PPO-vs-GRPO tension runs through the entire field.
+
+Search-R1 supports both RL algorithms, and this is the structural difference. PPO (top) trains a separate value network and computes advantages with GAE; GRPO (bottom) drops the critic entirely and instead normalizes each answer’s reward against a sampled group. In both, the search engine sits inside the rollout, so retrieval is part of the trained policy. Source: Jin et al., 2025.
+
+## 3.3 The numbers, and the honest caveat
+
+Trained on Qwen2.5, Search-R1 reports a 41% relative improvement with the 7B model and 20% with the 3B model over RAG baselines across seven QA datasets, under the same setting[1]. Concretely, the 7B model’s average exact match rises to roughly 0.43 (with strong per-dataset scores like TriviaQA ~0.64 and HotpotQA ~0.43) versus ~0.30 for standard RAG.
+
+Keep one thing in mind, and it’s a theme for this whole post: that “41%” is measured against plain RAG. Against the strongest non-RL baseline the paper tests, the margin is closer to +24%. Impressive, but every headline number in this space is quoted against a favorable comparison. We’ll return to why that matters in §10.
+
+## 3.4 The concurrent origins
+
+Search-R1 didn’t arrive alone. R1-Searcher[2] (Renmin University, same month) reached the same idea via a two-stage outcome-based RL scheme. And DeepRetrieval[3] attacked a narrower slice, using RL to teach a model to rewrite queries for a real search engine, with a startling result: a 3B model trained with RL hit 65.07% recall on a literature-search task, versus 24.68% for the previous state of the art, roughly triple the recall of GPT-4o (17.6%) and Claude-3.5-Sonnet (20.9%) on the same task, despite being a fraction of their size[3]. The lesson landed early: for search, a small model with a trained policy beats a big model improvising.
+
+Press enter or click to view image in full size
+
+DeepRetrieval trains an LLM to rewrite queries for a live search engine, rewarded directly by retrieval quality. A 3B RL-trained rewriter beat GPT-4o and Claude-3.5 on literature-search recall. Source: DeepRetrieval.
+
+## 4. Teaching the Agent to Think: From Outcome Rewards to Process Rewards
+
+Search-R1’s reward is outcome-only: right answer, reward 1; wrong answer, reward 0. That’s a brutally sparse signal for a task that might take ten search-and-reason steps. The model has to stumble onto a fully correct trajectory before it learns anything, and when it does, every step in that trajectory gets credit equally, even the useless detours. This is the classic credit-assignment problem, and solving it is exactly what “learning to think” means. The 2026 wave of work is a ladder of increasingly fine-grained rewards:
+
+- Outcome reward (Search-R1): did the final answer match? Sparse, but unbiased.
+- Format reward: did the model use the tags correctly and stay parseable? A cheap shaping signal.
+- Process (step-level) reward: was each turn actually useful? Dense, and much harder to specify.
+- Rubric reward: when the output is a long-form report with no single gold answer, grade it against a checklist of criteria (see §7). This is the 2026 frontier.
+
+Three 2026 systems show how far the step-level idea has run:
+
+- IGPO[4] (Information-Gain Policy Optimization, Ant Group + Renmin, ICLR 2026) gives each turn a reward equal to the marginal increase in the policy’s own probability of the gold answer after that turn. In plain terms: a search step is “good” if it made the model more confident of the right answer. It’s an intrinsic signal, no external reward model, no expensive Monte-Carlo rollouts, and it lifts the average over seven QA sets to 60.2, a +6.3 gain over DeepResearcher[4].
+- CriticSearch[5] trains a frozen, asymmetric critic that grades each turn using privileged information (the full trajectory plus the gold answer) the actor never sees, producing a dense turn-level reward. It improves on dense-reward baselines by about 6.7% (relative) at 7B, an absolute gain of roughly 4 EM points over the strongest one[5].
+- Graph-distance credit[6] (“Beyond Trajectory Rewards,” May 2026) scores each newly retrieved entity by its shortest-path distance to the answer node in a knowledge graph, so a step that pulls in a directly-connected fact is rewarded more than one that wanders off. On a 30B model it takes BrowseComp from 14.9 (plain GRPO) to 42.8, an enormous jump on one of the hardest browsing benchmarks[6].
+
+The through-line: the more precisely you can tell the agent which of its steps helped, the more it behaves like a deliberate researcher instead of a lucky guesser. Dense rewards are how a search agent “learns to think.”
+
+## 5. Knowing When to Stop: The Over-Search Problem
+
+Once you train a model to search, it develops an addiction: it searches for everything, including things it already knows. Every needless query burns tokens and, worse, drags in passages that distract the reasoning. The opposite failure, under-search, is even more dangerous: the model answers from memory when it should have checked, and hallucinates. Calibrating that boundary, search only when you need to, is a distinct 2026 research thread.
+
+- R1-Searcher++[7] teaches the model to tag whether a fact is` `(already known) or` `(must be retrieved), then adds a group reward that pushes toward minimal retrieval. Result: about 30% fewer retrievals than R1-Searcher at comparable accuracy[7].
+- SAAS[8] (Self-Aware Agentic Search, mid-2026) explicitly models the search boundary by contrasting search-disabled and search-enabled rollouts to label when a query was actually needed. On a 7B model it reaches 48.7% accuracy at just 0.97 searches per question, versus a baseline’s 49.8% at 2.19 searches, roughly the same accuracy for less than half the searching, and against plain outcome-only GRPO it uses about 67% fewer searches[8].
+- AutoSearch[9] (adaptive search depth, arXiv preprint, April 2026) learns the minimal sufficient depth per query: on HotpotQA it matches Search-R1’s exact match (~42.7 vs. 43.7) at roughly half the search depth, and drops the over-search rate from as high as ~37% to under 3%[9].
+
+The over-search problem, visualized: agents trained purely on outcome rewards learn to query even when the answer is already in their weights. Calibrating “when to search” turns a fixed accuracy into far fewer tool calls, which is where the real inference savings live. Source: SAAS, 2026.
+
+Notice the metric that matters here isn’t just accuracy, it’s searches-per-answer. In production, every search call is latency and money. An agent that hits the same accuracy at one-third the queries is the one you can actually afford to run at scale, and it’s a knob you only get by training for it.
+
+## 6. Training a Search Agent Without a Search Engine: ZeroSearch
+
+Here’s the operational nightmare of everything above: RL needs millions of rollouts, and every rollout fires real search queries. Hit Google or Bing’s API that many times and the bill is staggering, the results are non-reproducible (the web changes under you), and the returned document quality is a random variable you can’t control. Training on a live search engine is expensive and noisy.
+
+ZeroSearch[10] (Alibaba Tongyi, May 2025) proposes something that sounds like cheating: don’t use a search engine at all. Instead, take another LLM and lightly fine-tune it to simulate retrieval, given a query, it generates documents that look like search results. Because it’s a model, you can dial its behavior: a curriculum progressively degrades the quality of the simulated documents over training, forcing the agent to get robust to noisy retrieval, exactly the skill it needs against the real web.
+
+Press enter or click to view image in full size
+
+The surprise in one chart: an agent trained against ZeroSearch’s simulated retrieval (green) tracks one trained against a real search engine (Search-R1, blue) step for step, and ends up matching it, at a fraction of the API cost. Source: ZeroSearch, 2025.
+
+Two results make this more than a curiosity:
+
+- Cost. The paper’s own analysis puts a ~64K-query training run at roughly $70 using a simulated 14B search module, versus about $587 using a commercial search API, an ~88% saving (and a 3B simulator is cheaper still)[10].
+- Quality. Astonishingly, training on the simulator doesn’t hurt, it helps. A 7B simulated-search module matches real-search performance, and a 14B module surpasses it[10]. Apples-to-apples, the ZeroSearch-trained agent slightly beats the equivalent Search-R1 agent trained on real retrieval.
+
+There’s also a cautionary reward-design tale buried here. ZeroSearch initially used exact match as its reward and watched the model reward-hack by padding answers to game the metric; switching to an F1-based reward fixed it. It’s a tidy reminder that in RL, the model optimizes exactly what you measure, not what you meant, which is the whole story of §10.
+
+The simulated-environment idea has only grown since. LiteResearcher[30] (2026) trains a 4B agent entirely inside a “lite virtual world” that mimics search dynamics with no real search API, and still reaches 71.3% on GAIA, open-weights state of the art, more evidence that you can manufacture most of the training signal a search agent needs.
+
+## 7. When There’s No Gold Answer: Rubric Rewards
+
+Every reward so far, exact match, F1, information gain, assumes there is a short, checkable answer. But the flagship output of a deep-research agent isn’t a span of text; it’s a multi-page report with citations, and there is no single gold string to match against. So how do you compute a reward for “write a good research report”?
+
+The 2025–2026 answer the field converged on is rubrics: grade the report against a checklist of criteria (did it cover the key sub-questions? are the claims cited? is the synthesis coherent?) and turn that score into the RL reward. The subtlety is that a fixed rubric is easy to game, so the best systems make the rubric adapt.
+
+- DR Tulu[25] (Allen Institute for AI) is the anchor: the first fully open, end-to-end deep-research recipe, trained with RLER, Reinforcement Learning with Evolving Rubrics, where the grading rubric co-evolves with the policy so the agent can’t overfit a static checklist. It reports beating Tongyi DeepResearch by 15.6% (the open model we meet in the next section) and edging out OpenAI’s Deep Research on average across four long-form benchmarks, at roughly 1,000× lower cost per query[25].
+- RubricEM[26] (May 2026) pushes further with stage-structured GRPO and a reflection meta-policy that conditions its plan on self-generated, stage-aware rubrics. RubricEM-8B averages 55.5 versus DR Tulu-8B’s 53.6 across four report benchmarks, with its biggest jump on DeepResearch Bench (47.8 vs 43.4), using fewer RL steps[26].
+- DeepRubric[27] (June 2026) attacks the cost: it synthesizes query–rubric pairs from an evidence tree and matches prior open state of the art on three benchmarks while using about 13× fewer RL GPU-hours (~750), trained on just 9K query–rubric pairs[27].
+
+Press enter or click to view image in full size
+
+How a rubric reward actually works: RubricEM breaks a research task into stages (plan → research → review → answer) and grades each one against explicit stagewise rubrics, criteria like “causal framing,” “search precision,” and “mechanistic completeness”, which turns the vague goal “write a good report” into a trainable signal. Source: RubricEM, 2026.
+
+This is the reward ladder’s top rung, and arguably the most consequential one for real products: it’s what lets you train an agent to produce a report rather than a lookup. That fully open recipes now rival closed Deep Research is the tell, the moat was never the base model, it was the reward.
+
+## 8. The Recipe, Productized: Deep Research
+
+Everything above is the open-source engine room. The commercial “Deep Research” products are that same recipe at scale, an AI agent trained end-to-end with RL to browse, read, and synthesize over long horizons.
+
+## Get Abdullah Grewal’s stories in your inbox
+
+Join Medium for free to get updates from this writer.
+
+Subscribe
+
+Subscribe
+
+Remember me for faster sign in
+
+OpenAI Deep Research (February 2025) is the archetype: a version of o3 “trained using end-to-end reinforcement learning on hard browsing and reasoning tasks”[11]. It posted 26.6% on Humanity’s Last Exam with tools (up from ~9% for the base reasoning models) and 51.5% on BrowseComp[11][12]. Gemini Deep Research and Perplexity Deep Research (the latter reporting 21.1% on HLE and 93.9% on SimpleQA[15]) followed within weeks.
+
+But the most instructive systems are the ones that published the recipe:
+
+- Kimi-Researcher[13] (Moonshot, June 2025) trained a k-series model with end-to-end agentic RL, using the REINFORCE algorithm with on-policy rollouts, a gamma-decay factor to reward efficiency, and context management for trajectories exceeding 50 tool calls. The payoff is the cleanest “RL did this” delta in the field: HLE 8.6% → 26.9% (40.17% pass@4), and 69% on xbench-DeepSearch[13].
+- Tongyi DeepResearch[14] (Alibaba, October 2025) is the open-weights milestone: a 30.5B-parameter (3.3B-active) mixture-of-experts model trained with agentic mid-training plus on-policy GRPO on a fully synthetic data pipeline (no human-labeled trajectories). It reports HLE 32.9%, BrowseComp-EN 43.4%, BrowseComp-ZH 46.7%, GAIA 70.9%, and FRAMES 90.6%[14], frontier-class numbers you can download.
+
+Press enter or click to view image in full size
+
+Deep-research agents compared on DeepResearch Bench, which scores both report quality (RACE) and citation faithfulness (FACT). The gap between “sounds good” and “is actually grounded in sources” is exactly what these agents are trained, and evaluated, to close. Source: DeepResearch Bench.
+
+One more architectural fork matters at product scale: single-agent vs. multi-agent. Anthropic’s multi-agent research system, an orchestrator delegating to parallel sub-agents, beat its single-agent baseline by 90.2% on an internal research eval, but at a cost: multi-agent setups burned roughly 15× the tokens of a chat, and token usage alone explained about 80% of the performance variance on BrowseComp[20]. Deep Research is powerful precisely because it’s allowed to spend enormous test-time compute, which is only economically sane if you’ve also trained the agent to not waste it (see §5).
+
+## 9. The Benchmarks That Keep Them Honest
+
+Every number above depends on the benchmark behind it, and the 2025–2026 benchmarks were purpose-built to be nearly unbeatable by memorization, forcing real search:
+
+- BrowseComp[12] (OpenAI) is “inverted”: questions are easy to verify but require finding an obscure needle across the live web. Human trainers solved only 29.2% and gave up on 70.8% after two hours; a bare GPT-4o scores ~1.9% even with browsing, while a trained Deep Research agent hits 51.5%[12]. The gap is the training.
+- BrowseComp-Plus[17] freezes the corpus (about 100K documents) so you can isolate the retriever from the reasoner. The tell: GPT-5 goes from 55.9% with BM25 to 70.1% with a strong dense retriever on the identical questions[17], proof that retrieval quality, not just reasoning, still governs the ceiling (the oracle upper bound is 93.5%).
+- Humanity’s Last Exam[16] is 2,500 expert questions where the story is the tools-vs-no-tools split, search agents with tools land in the 20–33% range, far above their tool-less selves.
+- GAIA[19] tests general assistant tasks needing multi-step tool use, and DeepResearch Bench[18] scores full reports on two axes, RACE (quality) and FACT (citation accuracy, where Perplexity’s agent leads at ~90%).
+
+Press enter or click to view image in full size
+
+Why the benchmarks keep moving: models saturate older tests almost as fast as they ship, so evaluations like Humanity’s Last Exam are deliberately built to stay hard, and to reward genuine tool-use and search over memorized facts. Source: Humanity’s Last Exam.
+
+And the target keeps moving. As frontier agents push BrowseComp past 90%, mid-2026 successors raise the ceiling again: LoHoSearch[29] auto-generates long-horizon questions from a 7-million-entity knowledge graph, and the strongest model so far clears just 34.7% of its 544 verified questions[29]. The benchmarks are now in an arms race with the agents, which is exactly how you keep an evaluation honest.
+
+## 10. The Fine Print: Why the Numbers Don’t Always Compare
+
+This field moves fast and markets hard, so a skeptic’s checklist is mandatory before you believe any leaderboard:
+
+- The metrics aren’t interchangeable. Search-R1 and ZeroSearch report Exact Match; R1-Searcher uses cover-EM plus an LLM judge; DeepResearcher and R1-Searcher++ use F1 plus a judge. Different corpora, different test-set sizes. You cannot line up their headline tables and rank them, though blog posts constantly do.
+- Every gain is quoted against a favorable baseline. Search-R1’s “+41%” is vs. plain RAG; vs. the strongest baseline it’s roughly +24%. Always ask “better than what?”
+- Reward hacking is real. ZeroSearch’s exact-match-to-F1 switch is one example; agents will happily pad answers, spam searches, or exploit a judge if the reward lets them.
+- Benchmark contamination and validation-vs-test splits. Some widely-cited GAIA numbers are on the public validation split, not the hidden leaderboard. And a leak unique to search agents: a 2026 study found deep-research agents can retrieve a benchmark’s own published questions and answers mid-search (“search-time contamination”), inflating scores by up to ~4% on average and by ~10 points on individual QA sets[28]. Treat any live-web number with a skeptic’s eye.
+- The 2026 leaderboard churns weekly. Post-launch model versions and their advertised deep-research scores are often press- or aggregator-sourced. The 2025 core facts in this post are verified against primary papers; treat the newest “our model hit X” claims as directional until a primary report lands.
+
+None of this means the progress is fake, it’s very real. It means the right comparison is almost never the one in the headline.
+
+## 11. The Road Ahead
+
+Where RL-for-search is heading through the rest of 2026 and into 2027:
+
+- Process and rubric rewards become the default. Outcome-only RL already looks primitive. Expect info-gain, critic-based, and graph-distance step rewards[4][6] for short answers, and evolving-rubric rewards[25] for long-form reports, to be standard, because dense, well-specified credit is what turns a searcher into a reasoner.
+- Environments are the new data. The bottleneck is shifting from model weights to training environments, RL with verifiable rewards (RLVR) run inside reproducible “gyms.” Prime Intellect’s Environments Hub and its`verifiers`/`prime-rl` stack[24], and the broader agentic-RL survey[23], point to a world where whoever owns the best search-agent environments owns the best agents. ZeroSearch's simulated engine is an early instance of exactly this.
+- Calibration graduates to a headline metric. Searches-per-answer, and cost-per-correct-answer, will sit next to accuracy on the scoreboards, because that’s what production actually pays for.
+- Retriever and reasoner co-train. Query-rewriting RL (DeepRetrieval), reasoning-trained retrievers, and search-policy RL are converging; the next systems will optimize the whole pipeline end-to-end rather than freezing the retriever.
+- Deep Research becomes a product category, not a feature. With open weights like Tongyi DeepResearch[14] matching closed products, the moat isn’t the model, it’s the training environment, the reward design, and the eval discipline.
+
+## 12. Conclusion
+
+For two years, “make the model search” meant writing a smarter loop around a frozen brain. In 2026 it means training the brain to search, with retrieved-token masking to keep RL stable, process rewards to teach deliberate multi-step reasoning, calibration to stop it over-querying, and even simulated engines so you can afford the millions of rollouts. The proof is unambiguous: Kimi-Researcher’s leap from 8.6% to 26.9% on Humanity’s Last Exam, an open 30B model matching closed Deep Research products, a 3B query-rewriter beating GPT-4o, all of it from training the search policy, not scaling the model.
+
+The practical takeaway mirrors the one from every other corner of the 2026 stack: the teams shipping the best AI agents won’t be the ones with the biggest models. They’ll be the ones who treat retrieval, the whole path from RAG to agentic RAG to Deep Research, as a learned skill: designed, rewarded, and evaluated like any other piece of production software. Your search agent no longer needs a better prompt. It needs a better teacher.
+
+## References & Further Reading
+
+1. Jin et al., Search-R1: Training LLMs to Reason and Leverage Search Engines with Reinforcement Learning, arXiv:2503.09516 (UIUC + Google; retrieved-token masking, PPO/GRPO, +41% vs RAG).
+2. Song et al., R1-Searcher: Incentivizing the Search Capability in LLMs via Reinforcement Learning, arXiv:2503.05592 (Renmin University).
+3. DeepRetrieval: Hacking Real Search Engines and Retrievers with LLMs via Reinforcement Learning, arXiv:2503.00223 (RL query rewriting; 3B beats GPT-4o on literature-search recall).
+4. IGPO: Information-Gain-based Policy Optimization for search agents, arXiv:2510.14967 (ICLR 2026; intrinsic per-turn information-gain reward).
+5. CriticSearch: asymmetric turn-level critic rewards for agentic search, arXiv:2511.12159.
+6. Beyond Trajectory Rewards: graph-distance step-level credit assignment for search agents, arXiv:2605.29697.
+7. R1-Searcher++: Incentivizing the Dynamic Knowledge Acquisition of LLMs via Reinforcement Learning, arXiv:2505.17005 (internal/external knowledge tags; ~30% fewer retrievals).
+8. SAAS: Self-Aware Reinforcement Learning for Over-Search Mitigation in Agentic Search, arXiv:2605.29796.
+9. AutoSearch: Adaptive Search Depth for Efficient Agentic RAG via Reinforcement Learning, arXiv:2604.17337 (arXiv preprint, April 2026).
+10. ZeroSearch: Incentivize the Search Capability of LLMs without Searching, arXiv:2505.04588 (Alibaba Tongyi; LLM-simulated retrieval, ~88% cheaper training).
+11. OpenAI, Introducing Deep Research, Feb 2 2025 (a version of o3 optimized for browsing; end-to-end RL; HLE 26.6% with tools).
+12. Wei et al., BrowseComp: A Simple Yet Challenging Benchmark for Browsing Agents, arXiv:2504.12516 (OpenAI).
+13. Moonshot AI, Kimi-Researcher: End-to-End RL Training for Emerging Agentic Capabilities, Jun 20 2025 (HLE 8.6% → 26.9%).
+14. Tongyi Lab (Alibaba), Tongyi DeepResearch Technical Report, arXiv:2510.24701 (open 30.5B-A3B MoE; agentic mid-training + GRPO; HLE 32.9%, GAIA 70.9%).
+15. Perplexity AI, Introducing Perplexity Deep Research, Feb 14 2025 (HLE 21.1%, SimpleQA 93.9%).
+16. Phan et al., Humanity’s Last Exam, arXiv:2501.14249 (CAIS + Scale AI).
+17. BrowseComp-Plus: A Fixed-Corpus Benchmark Disentangling Retrieval and Reasoning for Deep-Research Agents, arXiv:2508.06600 (Waterloo / CMU).
+18. Du et al., DeepResearch Bench: A Comprehensive Benchmark for Deep Research Agents, arXiv:2506.11763 (RACE + FACT metrics).
+19. Mialon et al., GAIA: a benchmark for General AI Assistants, arXiv:2311.12983.
+20. Anthropic, How we built our multi-agent research system, Jun 13 2025 (+90.2% over single-agent; ~15× tokens; token use explains ~80% of variance).
+21. Xi et al., A Survey of LLM-based Deep Search Agents: Paradigm, Optimization, Evaluation, and Challenges, arXiv:2508.05668 (Shanghai Jiao Tong University).
+22. Lin et al., A Comprehensive Survey on Reinforcement Learning-based Agentic Search: Foundations, Roles, Optimizations, Evaluations, and Applications, arXiv:2510.16724 (Penn State et al.).
+23. The Landscape of Agentic Reinforcement Learning for LLMs: A Survey, arXiv:2509.02547.
+24. Prime Intellect, The Environments Hub(RL environments,`verifiers`,`prime-rl`; RL with verifiable rewards).
+25. Allen Institute for AI, DR Tulu: Reinforcement Learning with Evolving Rubrics (RLER) for open end-to-end Deep Research, arXiv:2511.19399 (see also allenai.org/blog/dr-tulu).
+26. RubricEM: rubric-based reward RL for long-form deep research (stage-structured GRPO + rubric-conditioned reflection), arXiv:2605.10899 (May 2026).
+27. DeepRubric: evidence-tree rubric supervision for efficient deep-research RL, arXiv:2606.17029 (June 2026).
+28. Search-Time Contamination: How Live Retrieval Inflates Deep-Research Benchmark Scores, arXiv:2606.05241 (June 2026).
+29. LoHoSearch: A Long-Horizon Search Benchmark Auto-Constructed from a Knowledge Graph, arXiv:2606.12837 (Meituan et al., June 2026).
+30. LiteResearcher: Training Deep-Search Agents in a Simulated “Lite Virtual World”, arXiv:2604.17931 (April 2026).
+
+## Connect
+
+If you found this useful, follow me here on Medium for more deep dives on LLM architecture, retrieval systems, agents, and AI infrastructure. Building or training a search agent, and want to compare notes? I’d love to hear about it.
+
+- Email: abdullahramzan120@gmail.com
+- GitHub: github.com/buzzgrewal
+
+## Tags
+
+#AgenticRAG #RAG #RetrievalAugmentedGeneration #SearchAgents #SearchR1 #ZeroSearch #R1Searcher #DeepRetrieval #ReinforcementLearning #RL #RLVR #AgenticRL #GRPO #PPO #REINFORCE #ProcessRewards #RewardModeling #CreditAssignment #RubricRewards #DRTulu #RubricEM #EvolvingRubrics #DeepResearch #OpenAIDeepResearch #KimiResearcher #TongyiDeepResearch #Moonshot #Perplexity #Anthropic #Gemini #BrowseComp #HumanitysLastExam #HLE #GAIA #DeepResearchBench #DeepSearchAgents #TestTimeCompute #MultiAgent #Orchestration #LLM #LLMs #LargeLanguageModels #GenerativeAI #GenAI #AI #ArtificialIntelligence #MachineLearning #ML #DeepLearning #NLP #InformationRetrieval #VectorSearch #Embeddings #SemanticSearch #Qwen #DeepSeek #veRL #AIAgents #Agents #AgenticAI #ContextEngineering #PromptEngineering #AIInfrastructure #MLOps #AIEngineering #AIResearch #arxiv #ICLR #ACL #AI2026 #FutureOfAI #TechBlog #DeepDive #AIExplained #OpenSource
+
+Technology
+
+Programming
+
+Artificial Intelligence
+
+Rag
+
+Machine Learning
+
+## Written by Abdullah Grewal
+
+Caffeine-fueled tech maestro, equally at home, building intelligent AI, machine learning, NLP models, and crafting seamless web applications.
+
+## Responses (2)
+
+```
+the structure of this piece is so clean
+```
+
+--
+
+Reply
+
+```
+The point about agents learning when to stop querying rather than just how to reason better matches what I've run into building these loops myself. The part that's underdiscussed is that the decision to keep searching or stop depends on how…more
+```
+
+--
+
+Reply
+
+## More from Abdullah Grewal
+
+·
+
+May 12
+
+## AI Agents Don’t Need Vector Search Anymore: Inside the Agentic Search Stack Replacing RAG in 2026
+
+### In May 2025, Anthropic did something that should have been a bigger deal than it was: they took vector search out of Claude Code. The…
+
+·
+
+May 4
+
+## Beyond Chunk-and-Embed: How LazyGraphRAG, A-RAG, and ColQwen2 Are Rewriting Retrieval-Augmented…
+
+### Until recently, every RAG stack looked roughly the same: split documents into chunks, embed them, drop the vectors into a database, run…
+
+·
+
+Jun 2
+
+## AI Agent Memory in 2026: How Mem0, Letta, and Zep Cut Tokens 90% (and Rakuten Cut Errors 97%)
+
+### Most AI agents are professional amnesiacs. Open a new session and they have no idea who you are, what you’re working on, or that they…
+
+·
+
+Jun 8
+
+## How AI Finally Killed Quadratic Attention: NSA, Mamba-3, and the Architectures Making Million-Token…
+
+### Self-attention has carried the transformer for nearly a decade, and quietly overcharged it the whole time. Because every token attends to…
+
+See all from Abdullah Grewal
+
+## Recommended from Medium
+
+In
+
+by
+
+·
+
+Jul 3
+
+## Beyond RAG: How Google’s Open Knowledge Format (OKF) is Replacing the Vector Database
+
+### For the last three years, the default engineering response to any enterprise AI context problem was automated: “Just build a RAG pipeline.”
+
+In
+
+by
+
+·
+
+Jul 3
+
+## Stop Wasting LLM Tokens: Building a Self-Updating Codebase Knowledge Graph with OKF
+
+### Google's new Open Knowledge Format (OKF) standardizes context. Here's how to build a pipeline to keep your codebase memory self-updating.
+
+In
+
+by
+
+·
+
+Jun 24
+
+## How to Create Loops with Claude Code: A Practical Guide to Agentic Automation
+
+### Claude Loop Engineering: How to Design Agents That Iterate, Verify, and Remember
+
+RESHMA DUDHAT ( Self- Growth & Online Income )
+
+·
+
+Apr 16
+
+## I Woke Up at 4:30 AM for 30 Days — The Truth Nobody Tells You
+
+### What actually happens when you force yourself into the “5 AM Club” — and whether it’s actually worth it.
+
+·
+
+Jun 29
+
+## You only have weeks left to vibe code
+
+### Then it’s over. You better hurry up!
+
+In
+
+by
+
+·
+
+Apr 25
+
+## I Wasted 6 Months Using Claude Code Wrong. Here Are the 14 Commands That Changed Everything.
+
+### From frustrated beginner to power user: The hidden command ecosystem nobody talks about.
