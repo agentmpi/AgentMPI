@@ -150,22 +150,12 @@ def conformance(dev: SqliteDevice, job_dir: str, job_id: str) -> dict:
         with open(path, encoding="utf-8") as fh:
             assigned[rank] = json.load(fh).get("chapter", "")
 
+    # A rank that evaluates the operator folds its own value in locally, so its
+    # contribution is the first operand of its *first* upcall.  Take that in
+    # preference to anything it sent: under a tree schedule what an internal
+    # rank sends is its merged subtree, not its own chapter, and reading the
+    # message would score a correct rank as non-conforming.
     sent: dict[int, str] = {}
-    for row in dev.query(
-        "SELECT src, body FROM message WHERE job_id=? AND body IS NOT NULL ORDER BY msg_id",
-        (job_id,),
-    ):
-        rank = int(row["src"])
-        if rank in sent:
-            continue  # the first contribution is the one the rank was asked for
-        payload = util.loads(row["body"], {})
-        value = payload.get("v") if isinstance(payload, dict) else None
-        if isinstance(value, dict) and "chapter" in value:
-            sent[rank] = value["chapter"]
-
-    # A rank that evaluates the operator contributes locally rather than by
-    # sending, so its own value appears as the first operand of its first
-    # upcall.  Without this the root always looks silent.
     for row in dev.query(
         "SELECT assignee, operands FROM pending_op WHERE job_id=? ORDER BY created_at",
         (job_id,),
@@ -176,6 +166,20 @@ def conformance(dev: SqliteDevice, job_dir: str, job_id: str) -> dict:
         operands = util.loads(row["operands"], [])
         if operands and isinstance(operands[0], dict) and "chapter" in operands[0]:
             sent[rank] = operands[0]["chapter"]
+
+    # Leaves never evaluate the operator, so for them the first message sent is
+    # the contribution.
+    for row in dev.query(
+        "SELECT src, body FROM message WHERE job_id=? AND body IS NOT NULL ORDER BY msg_id",
+        (job_id,),
+    ):
+        rank = int(row["src"])
+        if rank in sent:
+            continue
+        payload = util.loads(row["body"], {})
+        value = payload.get("v") if isinstance(payload, dict) else None
+        if isinstance(value, dict) and "chapter" in value:
+            sent[rank] = value["chapter"]
 
     matches, mismatches, silent = [], [], []
     for rank, expected in sorted(assigned.items()):
@@ -267,14 +271,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", default=os.path.join(os.path.dirname(__file__), "runs"))
     parser.add_argument("--algos", default="linear,binomial")
+    parser.add_argument("--job", action="append", default=[], metavar="ALGO=PATH",
+                        help="explicit job directory for one arm, repeatable; overrides --root")
     parser.add_argument("--out", default=os.path.join(os.path.dirname(__file__),
                                                       "..", "..", "results",
                                                       "ampi_e2_semantic.json"))
     args = parser.parse_args()
 
+    explicit = dict(pair.split("=", 1) for pair in args.job)
     configurations = []
     for algo in args.algos.split(","):
-        job_dir = os.path.join(os.path.abspath(args.root), f"job-{algo}")
+        job_dir = os.path.abspath(explicit.get(algo,
+                                               os.path.join(args.root, f"job-{algo}")))
         if not os.path.exists(os.path.join(job_dir, "job.db")):
             print(f"skipping {algo}: no job database")
             continue
