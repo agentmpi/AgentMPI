@@ -76,7 +76,7 @@ export default function Home() {
         <p className="mt-3 max-w-3xl text-muted">
           The claim is not metaphorical. The implementation uses the same algorithms
           MPICH documented for short-message collectives (Thakur, Rabenseifner, Gropp,
-          2005) and the same failure vocabulary ULFM added to MPI.
+          2005) and the failure vocabulary ULFM proposed for MPI.
         </p>
         <div className="mt-6 overflow-x-auto rounded-xl border border-rule bg-card">
           <table className="w-full min-w-[40rem] text-left text-sm">
