@@ -257,7 +257,24 @@ These are the five failure modes named in the introduction, each turned into a c
 
 285 fables scattered across 100 ranks (~2–3 each). Each rank analyzes word counts and morals; `allreduce` sums words; `gather` assembles reports. Result: 285 reports, 36,823 words, **all 100 ranks agree on the sum**, 396 sends (21 rendezvous), 7.86 s. The 32-rank comparison is 0.73 s. Growth is superlinear in this transport, as expected for a shared filesystem with `O(p log p)` metadata operations; the *correctness* property that matters for agents is the allreduce agreement, not the last millisecond.
 
-### 7.6 Threats to validity
+### 7.6 Live Cursor executors
+
+A parallel campaign in this repository already ran **true** multi-agent jobs
+through AgentMPI, not mocks:
+
+- **Alice in Wonderland → French.** Eight draft ranks plus four reviewers
+  produced a glossary-compliant French text (`experiments/results/translation/`).
+  Mechanical checks: all review contracts followed, glossary exact-hit rate 1.0,
+  estimated input-token reduction 0.73 from artifact-not-transcript sharing.
+- **Collaborative `minidag`.** Twelve software ranks wrote a small DAG
+  scheduler (`experiments/results/software_artifact/`) with parser, executor,
+  tests, and a 1,732-event protocol trace.
+- **100-rank Aesop wave.** Work packets for ranks 0–99 live under
+  `experiments/results/.ampi/cursor-scale/`. Each Cursor subagent is a rank:
+  it reads its shard, writes a Spanish title and moral, and heartbeats
+  `finalized`. That is `mpirun` with language models as the processes.
+
+### 7.7 Threats to validity
 
 Process-mode executors are threads, not language models. They validate the protocol, not the quality of a translation or a code review. Cursor-subagent runs close that gap but introduce model variance we do not control. The filesystem transport is a reference fabric, not a claim about datacenter RPC. Token estimates are `len/4`, not a vendor tokenizer. Shrink membership uses heartbeat freshness plus explicit `failed`; a partition that keeps heartbeats alive is not detected (the same limitation ULFM has with respect to silent data corruption).
 
