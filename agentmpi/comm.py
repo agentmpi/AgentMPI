@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import os
 import time
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from agentmpi.algorithms.doubling import doubling_partners, is_pow2
 from agentmpi.algorithms.trees import binomial_children, binomial_parent
@@ -24,7 +25,6 @@ from agentmpi.constants import (
     DEFAULT_HEARTBEAT_S,
     DEFAULT_POLL_S,
     LOCK_EXCLUSIVE,
-    LOCK_SHARED,
     TAG_COLLECTIVE,
 )
 from agentmpi.errors import (
@@ -43,7 +43,6 @@ from agentmpi.util import (
     read_json,
     release_dir_lock,
 )
-
 
 ReduceFn = Callable[[Any, Any], Any]
 
@@ -345,7 +344,6 @@ class Communicator:
         """Binomial gather: each parent concatenates child subtree slices."""
         cid = self._next_cid()
         tag = TAG_COLLECTIVE + (cid % 100)
-        rel = (self.rank - root) % self.size
         assembled = [obj]
         for child in binomial_children(self.rank, root, self.size):
             part = self.recv(source=child, tag=tag, timeout_s=timeout_s)
@@ -355,7 +353,7 @@ class Communicator:
             # assembled is in relative-preorder; restore rank order
             out: list[Any] = [None] * self.size
             order = self._binomial_preorder(root)
-            for r, val in zip(order, assembled):
+            for r, val in zip(order, assembled, strict=True):
                 out[r] = val
             return out
         self.send(assembled, dest=parent, tag=tag)

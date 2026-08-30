@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-import time
 
 from agentmpi.comm import Communicator
 from agentmpi.errors import ContextBudgetExceeded, DeadRankError
