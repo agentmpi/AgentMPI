@@ -13,6 +13,7 @@ from agentmpi import (
     CommunicatorRevoked,
     DeliveryMode,
     LockUnavailable,
+    ProtocolViolation,
     ReduceOp,
     ResourceExhausted,
     Runtime,
@@ -125,6 +126,20 @@ def test_collectives_have_rank_consistent_results(tmp_path: Path) -> None:
                 )
             )
         assert broadcasts == [{"policy": "bounded"}] * 4
+    finally:
+        close_all(rs)
+
+
+def test_collective_order_mismatch_fails_all_participants(tmp_path: Path) -> None:
+    rs = runtimes(tmp_path, 2)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            barrier = pool.submit(rs[0].barrier, timeout=1)
+            broadcast = pool.submit(rs[1].bcast, "value", root=1, timeout=1)
+            with pytest.raises(ProtocolViolation, match="collective ordinal 0 mismatch"):
+                broadcast.result(timeout=2)
+            with pytest.raises(ProtocolViolation, match="collective ordinal 0 mismatch"):
+                barrier.result(timeout=2)
     finally:
         close_all(rs)
 
