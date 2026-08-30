@@ -7,7 +7,7 @@ from enum import StrEnum
 from typing import Any
 
 ANY_SOURCE = -1
-ANY_TAG = "*"
+ANY_TAG = "\x00agentmpi:any-tag"
 
 
 class AgentState(StrEnum):
@@ -90,6 +90,13 @@ class Communicator:
 
     def rank(self, world_rank: int) -> int:
         return self.members.index(world_rank)
+
+    def world_rank(self, local_rank: int) -> int:
+        if local_rank < 0 or local_rank >= self.size:
+            raise ProtocolViolation(
+                f"local rank {local_rank} is outside communicator size {self.size}"
+            )
+        return self.members[local_rank]
 
     @property
     def size(self) -> int:
