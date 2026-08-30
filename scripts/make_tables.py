@@ -464,11 +464,21 @@ def table_software() -> None:
         d = load(Path(f))
         if d and "acceptance" in d:
             by_label.setdefault(str((d.get("config") or {}).get("label") or "?"), []).append(d)
-    res = (
-        max(by_label.values(), key=lambda rows: (len(rows), sum(r["job"]["agent_calls"] for r in rows)))
-        if by_label
-        else []
-    )
+    # Keep every label whose runs were executed by real agents; the vague-spec pair
+    # runs under its own campaign prefix but belongs in the same table, since it is
+    # scored by the same oracle. Synthetic smoke runs are excluded by their executor.
+    res = [
+        d
+        for rows in by_label.values()
+        for d in rows
+        if (d.get("config") or {}).get("executor") == "broker"
+    ]
+    if not res:
+        res = (
+            max(by_label.values(), key=lambda rows: (len(rows), sum(r["job"]["agent_calls"] for r in rows)))
+            if by_label
+            else []
+        )
     if not res:
         emit("tab_software.tex", MISSING)
         emit("tab_software_contention.tex", MISSING)
@@ -483,10 +493,25 @@ def table_software() -> None:
             bits.append("\\textbf{no locks}")
         if not c.get("review"):
             bits.append("\\textbf{no review}")
+        if c.get("vague_spec"):
+            bits.append("\\emph{vague spec}")
         return ", ".join(bits)
 
     lines = []
-    for d in sorted(res, key=lambda x: (-(x["config"].get("ranks") or 0), not x["config"].get("shared_interfaces"))):
+    ordered = sorted(
+        res,
+        key=lambda x: (
+            bool(x["config"].get("vague_spec")),
+            -(x["config"].get("ranks") or 0),
+            not x["config"].get("shared_interfaces"),
+        ),
+    )
+    prev_vague: bool | None = None
+    for d in ordered:
+        vague = bool(d["config"].get("vague_spec"))
+        if prev_vague is not None and vague != prev_vague:
+            lines.append(r"\midrule")
+        prev_vague = vague
         # Prefer the offline re-evaluation: it scores every configuration against the
         # *same* oracle, which the in-run numbers do not, because the oracle was
         # corrected partway through the campaign.

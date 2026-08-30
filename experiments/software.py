@@ -83,6 +83,56 @@ from .errors import QueryError
 __all__ = ["query", "QueryError"]
 '''
 
+#: A module table that names responsibilities but *not* signatures.
+#:
+#: The first version of this experiment produced a near-null ablation: withholding the
+#: shared interface window cost one acceptance case out of sixty. The reason is a
+#: confound in the design rather than a fact about the protocol -- the broadcast
+#: specification already pins every module's exported signatures, so it *is* a shared
+#: interface, and the window had nothing left to contribute.
+#:
+#: Interface publication can only pay to the extent that the specification
+#: underdetermines the boundaries. This layout deliberately underdetermines them: it
+#: says what each module is responsible for and what it may import, and leaves every
+#: signature to be negotiated. With it, the window is the only channel through which a
+#: rank can learn what its dependencies actually expose, which is the condition the
+#: mechanism was designed for.
+VAGUE_LAYOUT = """## Module layout
+
+Each module is owned by exactly one implementer. Do not create files you do not own,
+and do not modify files you do not own.
+
+| module | responsibility | may import |
+| --- | --- | --- |
+| `minidb/errors.py` | the error type this system raises | stdlib only |
+| `minidb/tokens.py` | turning SQL text into a sequence of tokens | `errors` |
+| `minidb/nodes.py` | the abstract syntax tree representation | stdlib only |
+| `minidb/parser.py` | turning tokens into a syntax tree | `tokens`, `nodes`, `errors` |
+| `minidb/functions.py` | scalar and aggregate function behaviour, pattern matching, value comparison | `errors` |
+| `minidb/planner.py` | name resolution, aggregate classification, validation | `nodes`, `errors` |
+| `minidb/engine.py` | evaluating a validated query against tables | `planner`, `functions`, `errors` |
+| `minidb/api.py` | the public `query` entry point that ties the above together | all of the above |
+
+`minidb/__init__.py` is provided by the harness and re-exports `query` and
+`QueryError`; do not write it.
+
+The exported names and signatures of each module are **not specified here**. They are
+yours to choose and to publish, and the modules that depend on you must be written
+against what you publish. Do not guess at another module's interface: use the
+interface that module has published, and if it is insufficient, work within it and say
+so rather than inventing a different signature for someone else's module.
+"""
+
+
+def apply_vague_layout(spec: str) -> str:
+    """Replace the specification's signature-bearing module table with a vague one."""
+    start = spec.find("## Module layout")
+    end = spec.find("## Examples")
+    if start < 0 or end < 0 or end <= start:
+        raise ValueError("could not locate the module-layout section to replace")
+    return spec[:start] + VAGUE_LAYOUT + "\n" + spec[end:]
+
+
 INTERFACE = ampi.Contract(
     name="Interface",
     kind="json",
@@ -583,6 +633,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--no-shared-interfaces", dest="shared_interfaces", action="store_false")
     ap.add_argument("--no-locks", dest="locks", action="store_false")
     ap.add_argument("--no-review", dest="review", action="store_false")
+    ap.add_argument(
+        "--vague-spec",
+        action="store_true",
+        help="withhold module signatures from the specification, so the interface window is the only channel",
+    )
     ap.add_argument("--barrier-timeout", type=float, default=2400.0)
     ap.add_argument("--lock-timeout", type=float, default=600.0)
     ap.add_argument("--acceptance-timeout", type=float, default=180.0)
@@ -593,6 +648,8 @@ def main(argv: list[str] | None = None) -> int:
     cfg = ap.parse_args(argv)
 
     spec = (SPEC_DIR / "SPEC.md").read_text(encoding="utf-8")
+    if cfg.vague_spec:
+        spec = apply_vague_layout(spec)
     root = Path(cfg.root) if cfg.root else Path("runs") / f"{cfg.label}-p{cfg.ranks}"
     workdir = root / "workspace"
     workdir.mkdir(parents=True, exist_ok=True)
@@ -655,6 +712,7 @@ def main(argv: list[str] | None = None) -> int:
     variant = (
         f"p{cfg.ranks}-{'shared' if cfg.shared_interfaces else 'noshared'}"
         f"-{'locks' if cfg.locks else 'nolocks'}-{'review' if cfg.review else 'noreview'}"
+        f"-{'vague' if cfg.vague_spec else 'precise'}-r{cfg.rounds}"
     )
     path = write_result(f"{cfg.label}-{variant}", payload, subdir="software")
     print(json.dumps({"result": str(path), "acceptance": payload["acceptance"], "per_round": payload["per_round"], "job": payload["job"]}, indent=2))
