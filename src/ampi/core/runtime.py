@@ -28,6 +28,7 @@ have:
 
 from __future__ import annotations
 
+import hashlib
 import time
 from collections.abc import Iterable
 from typing import Any
@@ -1141,12 +1142,23 @@ class Runtime:
         renumbering is the price of shrinking, and it is why applications that
         want to survive failures must not hard-code rank identities into
         durable state --- the same discipline ULFM demands.
+
+        The default name is derived from the survivor set, not from a counter.
+        An earlier version numbered them ``#s0``, ``#s1``, ``#s2``, which meant
+        that survivors calling shrink concurrently --- the only way it is ever
+        called --- each invented a different name and the group fragmented into
+        singleton communicators instead of regrouping.  Three separate agents
+        diagnosed that independently in one run.  Deriving the name from the
+        membership makes shrink idempotent and convergent: ranks that agree on
+        who survived land on the same communicator without having to
+        coordinate, and ranks that disagree get a name collision they can see
+        rather than a silent split.
         """
         self._assert_not_terminated()
         comm = self.comms.get(comm_name)
         failed = self.failed_ranks()
         survivors = [w for w in comm.members if w not in failed]
-        target = new_name or f"{comm.name}#s{len(self.device.query('SELECT 1 FROM comm WHERE job_id=? AND name LIKE ?', (self.job_id, comm.name + '#s%')))}"
+        target = new_name or _shrunk_name(comm.name, survivors)
         with self.device.write_tx():
             new_comm = self.comms.create(
                 target,
@@ -1264,6 +1276,12 @@ class Runtime:
         sql += " ORDER BY ckpt_id DESC LIMIT 1"
         row = self.device.query_one(sql, params)
         return dict(row) if row else None
+
+
+def _shrunk_name(base: str, survivors: list[int]) -> str:
+    """A name that every rank agreeing on the survivor set will compute."""
+    digest = hashlib.sha256(",".join(str(r) for r in sorted(survivors)).encode()).hexdigest()
+    return f"{base}#s{len(survivors)}-{digest[:8]}"
 
 
 def _find_cycle(edges: dict[int, set[int]]) -> list[int] | None:

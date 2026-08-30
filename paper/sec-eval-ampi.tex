@@ -366,13 +366,15 @@ that may already be full.
 The failure mode is a scheduling deadlock.  A collective over $p$ ranks cannot
 complete until all $p$ have called it, so six agents blocked in a barrier
 occupy six of ten slots indefinitely while the two ranks they are waiting for
-cannot be launched, because the slots are occupied.  We hit this directly.  In the collaborative software-development run of
+cannot be launched, because the slots are occupied.  We hit this directly.  In the collective-based software run of
 \S\ref{sec:eval-software}, 24.7 minutes elapsed between the first and the last
 of eight ranks joining, purely because slots were unavailable, and the job's
-first barrier stayed open for 1877\,s before timing out with one rank still
-not having entered it.  Nothing had failed; the trace records zero suspected
-and zero confirmed failures.  The job simply could not assemble.  It resolves
-only when unrelated agents finish, which is outside the job's control.
+first barrier stayed open for 1877\,s.  Nothing had failed when it opened.  But
+a rank idling inside a barrier is not calling the library, so its heartbeat
+lease expired, a peer condemned it, and a third revoked the communicator ---
+turning a scheduling delay into a fault-recovery episode.  The job did finish,
+after the survivors negotiated their way back onto a shared communicator, but
+the recovery was caused by the pool, not by any failure.
 
 Two consequences follow, and both are properties of the protocol's use rather
 than of its semantics.
@@ -406,61 +408,97 @@ not: modules share interfaces, the interfaces move while the modules are being
 written, two agents editing the same file lose each other's work, and two
 agents that both decide to implement the parser have wasted a turn each.  Those
 are the coordination failures the multi-agent literature reports most often,
-and they are the ones message passing has primitives for.  We asked eight
-agents to build one working Python package --- a token-budgeting library of six
-modules with a written interface contract --- and used exactly four protocol
-mechanisms to coordinate them.
+and they are the ones message passing has primitives for.
 
-We ran it twice, and the two runs answer different questions.
+We asked eight agents to build one working Python package --- a token-budgeting
+library of six modules with a written interface contract --- and ran it twice,
+changing only the coordination idiom.  The first run uses collectives: the
+architect broadcasts the contract, a barrier separates implementation from
+integration.  The second carries every phase transition in the window instead:
+the contract is a cell rather than a broadcast, module assignment is a
+compare-and-swap claim, the implementation-to-integration handoff is a counter
+incremented with \code{AMPI\_Fetch\_and\_op}, and the shared
+\code{\_\_init\_\_.py} is edited under an exclusive lease.
 
-\paragraph{With a barrier.}  The first design put a barrier between
-implementation and integration, which is the natural translation of the
-phase discipline a human team would use.  It did not finish, for the reason
-\S\ref{sec:eval-scheduling} describes: the eight ranks were admitted to the
-executor pool over 24.7 minutes, and the barrier stayed open for 1877\,s before
-timing out with one rank still not having entered it.  The trace records zero
-suspected and zero confirmed failures.  Nothing broke; the job could not
-assemble.
+\textbf{Both delivered working software}, and the difference is entirely in
+what it cost to get there (Table~\ref{tab:software}).
 
-\paragraph{Without one.}  The second design carries every phase transition in
-the window instead of in a collective.  The contract is a window cell rather
-than a broadcast, so a rank that arrives late reads it instead of having missed
-it.  Module assignment is a compare-and-swap claim rather than a prompt
-instruction.  The implementation-to-integration transition is a counter
-incremented with \code{AMPI\_Fetch\_and\_op} rather than a barrier, so the
-integrator waits on a value rather than on a rendezvous.  The shared
-\code{\_\_init\_\_.py} is edited under an exclusive lease.  No rank ever blocks
-another, and the six implementers were in fact admitted over several minutes
-without any of them noticing.
+\begin{table}[t]
+\centering
+\small
+\caption{The same package, built twice by eight agents. Test counts are not
+comparable across columns --- two spare ranks in the collective run wrote large
+contract-conformance suites --- but the coordination columns are.}
+\label{tab:software}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & collectives & window \\
+\midrule
+ranks joined / finalized      & 8 / 8   & 8 / 8 \\
+executor admission spread (s) & 1484    & 1358 \\
+collective calls              & 68      & \textbf{0} \\
+communicators created         & 5       & \textbf{1} \\
+modules claimed               & 6       & 6 \\
+claim grants issued           & 10      & \textbf{6} \\
+modules that changed hands    & 4       & \textbf{0} \\
+implementers left with no module & 2    & \textbf{0} \\
+leases on the shared file     & 0       & 6 \\
+overlapping lease holds       & 0       & 0 \\
+tests passing                 & 625     & 86 (+1 xfail) \\
+\bottomrule
+\end{tabular}
+\end{table}
 
-The coordination outcome is clean, and the trace says so without relying on
-anything the agents reported.  The eight ranks were admitted over 1357\,s ---
-22.6 minutes --- and the job completed anyway, because nothing in it waits for a
-rendezvous: the run made \emph{zero} collective calls.  All six modules were
-claimed, six claims granted and none refused, each by a distinct rank, with
-every claim cell still at version 1: no module was claimed twice and no agent
-wrote a module it had not claimed.  The completion counter reached exactly 6.
-Six separate agents took the exclusive lease on the shared
-\code{\_\_init\_\_.py} to add their exports, and no two lease holds overlapped.
-The delivered package is 998 lines across six modules and six test files, and
-its 79 unit tests pass.
+\paragraph{What the collective run cost.}  It finished, but by a route nobody
+designed.  The eight ranks were admitted over 24.7 minutes, so the first
+barrier blocked for 1877\,s; while a rank sat idle inside it its heartbeat
+lease expired, a peer declared it failed, and a third revoked \code{world}.
+Several survivors then called \code{AMPI\_Comm\_shrink} concurrently and each
+got a differently-numbered communicator, splitting the group across
+\code{world\#s0}, \code{\#s1}, \code{\#s2} before they negotiated --- through
+the window, which still worked --- onto a shared name.  Five communicators
+existed by the end.  Nothing had actually died: the rank came back the moment
+it made a call.
 
-Two caveats we would rather state than let a reader infer.  First, the claim
-mechanism was not stressed: we gave each implementer a rotated preference order
-so that in the common case no two agents want the same module first, and
-consequently every claim succeeded on the first attempt.  That is the correct
-engineering choice and it means this run measures the mechanism working, not
-the mechanism resolving a race; the contention behaviour is characterised
-separately in Figure~\ref{fig:contention}.  Second, an earlier attempt at this
-run had the architect publish the contract, and because only it and the
-integrator were ever scheduled, it went on to write all six modules itself
-without claiming any of them --- the duplicated-work failure the claim
-mechanism exists to prevent, arriving through the one participant that had no
-reason to claim.  Seeding the contract in the harness and telling the architect
-in as many words that the modules are not its to write fixed it.  The general
-lesson is uncomfortable and worth keeping: a coordination primitive only
-protects the agents that use it, and the participant most likely to skip it is
-the one that believes it is in charge.
+The claim mechanism also saw real contention here, and this is where the run is
+more informative than the clean one.  One implementer looped over the module
+list instead of stopping at its first win and momentarily held five of the six.
+There is no release verb in the protocol, so it handed them back with a
+version-checked \code{AMPI\_Put} setting the owner to null, and two other ranks
+re-claimed from there --- ten grants for six modules, with four cells reaching
+version 3.  By then two implementers had already tried all six names, lost
+every one, and become spares.  They wrote contract-conformance suites instead,
+which is the largest part of the 625 tests and the reason that number is not a
+quality measure.  The protocol behaved correctly throughout --- no module was
+ever written by an agent that did not hold its claim --- but a mechanism that
+is correct under contention is not the same as a harness that avoids it, and
+the over-claim cost two of six implementers their assignment.
+
+\paragraph{What the window run cost.}  Nothing comparable.  Zero collective
+calls, so the 22.6-minute admission spread was invisible: each implementer
+arrived, read the contract from a cell, claimed a module, and left.  Six
+claims for six modules, each to a distinct rank, no cell above version 1, no
+module changing hands, no spares.  Six separate agents took the exclusive lease
+on the shared \code{\_\_init\_\_.py} to add their exports and no two holds
+overlapped.  One communicator existed at the end, the one the job started with.
+
+\paragraph{On the software itself.}  The window run's integrator wrote eight
+cross-module integration tests and validated them by mutation: it copied the
+tree, introduced five deliberate defects, found its first pass caught only
+four, and added the assertions that closed the gap.  Those tests then found a
+real defect that every module's own unit tests had missed --- the CLI appends a
+newline to \code{head\_tail}'s output, and because \code{head\_tail} binary-searches
+to saturate its budget exactly, the printed stream is one token over; fuzzing
+300 text/budget pairs overran in 254 of them.  The architect's independent
+audit, re-deriving 64 checks from the contract text and running 10{,}000
+randomised cases, found the same defect and no others.  It is recorded as a
+strict \code{xfail} rather than fixed, since the module belongs to another
+rank.
+
+That is the outcome we would most want from a multi-agent build and the one
+that is hardest to get: not that the tests were green, but that two independent
+reviewers converged on the same real defect at a module boundary, and that the
+protocol gave them a place to record it that its owner could see.
 
 \subsection{Surviving agent death}
 \label{sec:eval-fault}

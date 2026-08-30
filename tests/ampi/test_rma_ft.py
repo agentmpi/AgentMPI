@@ -500,3 +500,28 @@ def test_rank_zero_is_attributed_to_rank_zero(make_job):
     row = rt.device.query_one(
         "SELECT revoked_by FROM comm WHERE job_id=? AND name='world'", (rt.job_id,))
     assert row["revoked_by"] == 0
+
+
+def test_concurrent_shrinks_converge_on_one_communicator(make_job):
+    """Shrink is only ever called concurrently, so it must converge.
+
+    Naming the result from a counter meant each caller invented a different
+    name (#s0, #s1, #s2) and the survivors fragmented into singletons instead
+    of regrouping. Three agents diagnosed that independently in one run.
+    """
+    job = make_job(6)
+    setup = job.runtime(0)
+    setup.init(0)
+    setup.declare_failed(2, "injected", confirmed=True)
+    setup.declare_failed(4, "injected", confirmed=True)
+
+    names = set()
+    for rank in (0, 1, 3, 5):
+        rt = job.runtime(rank)
+        rt.init(rank)
+        names.add(rt.comm_shrink("world")["name"])
+        rt.device.close()
+
+    assert len(names) == 1, f"survivors fragmented across {names}"
+    comm = setup.comms.get(next(iter(names)))
+    assert comm.members == [0, 1, 3, 5]
