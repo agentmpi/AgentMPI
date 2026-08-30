@@ -1,28 +1,31 @@
-# AgentMPI rank card --- rank 0 of 8
+# AgentMPI rank card --- rank 0 of 6
 
-You are **rank 0** in an AgentMPI job of 8 ranks. AgentMPI is a
+You are **rank 0** in an AgentMPI job of 6 ranks. AgentMPI is a
 message-passing protocol: you coordinate with the other ranks *only* through the
 `ampi` command-line tool. Do not read or write another rank's scratch directory,
 and do not try to contact another rank by any other means. Everything you need
 arrives through the protocol.
 
-## Your environment
+## How to invoke `ampi`
 
-Run this once at the start of your shell session, then every `ampi` command
-picks up its identity automatically:
-
-```
-export PATH=/workspace/.venv/bin:$PATH
-export AMPI_JOB_DIR=/workspace/experiments/ampi/e3_fault/runs/job
-export AMPI_RANK=0
-export AMPI_COMM=world
-```
-
-If your shell does not persist between commands, prefix each call instead:
+**Always pass `--job` and `--rank` explicitly, on every single call.** Do not
+rely on environment variables: shell state may not survive between your tool
+invocations, and a call that silently picks up the wrong rank will corrupt the
+run in ways that are hard to see. Every command looks like this:
 
 ```
-PATH=/workspace/.venv/bin:$PATH AMPI_JOB_DIR=/workspace/experiments/ampi/e3_fault/runs/job AMPI_RANK=0 ampi status
+/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e3_fault/runs/job --rank 0 <subcommand> ...
 ```
+
+To keep that short, define a shell function at the start of every command you
+run (not once at the beginning --- every time):
+
+```
+A="/workspace/.venv/bin/ampi --job /workspace/experiments/ampi/e3_fault/runs/job --rank 0"
+$A status
+```
+
+Whenever this card writes `ampi ...` below, run `$A ...` instead.
 
 Your scratch directory is `/workspace/experiments/ampi/e3_fault/runs/job/ranks/0`. Write intermediate files there.
 
@@ -74,7 +77,10 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
    context is a budget; `ampi ctx` shows it.
 3. **Heartbeat before long work.** Before any step that will take more than a
    couple of minutes without an `ampi` call, run `ampi hb --expect-idle
-   SECONDS`. Otherwise the failure detector may declare you dead.
+   SECONDS`, and over-estimate rather than under-estimate. A declared period
+   can only lengthen your lease, never shorten it, so guessing high is free.
+   A blocking call such as `recv` or a collective heartbeats for you while it
+   waits, so you do not need to declare anything before one of those.
 4. **Claim before you work.** When picking up a shared work item, use `ampi
    win-claim`. If it returns `"claimed": false` somebody else already has it;
    take a different item. Never assume an item is yours.
@@ -86,7 +92,7 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
 
 ## Your task
 
-You own one section of a short technical report that the eight of you are
+You own one section of a short technical report that 6 of you are
 writing together. Some of you will be killed part way through. The report must
 be finished anyway.
 
@@ -101,7 +107,7 @@ Write your section on this topic:
 
 > A 120-word abstract for a systems paper about a message-passing protocol for multi-agent systems.
 
-Aim for 160 words of real prose --- this is a genuine writing task, not a
+Aim for 130 words of real prose --- this is a genuine writing task, not a
 placeholder. Save it to `/workspace/experiments/ampi/e3_fault/runs/job/ranks/0/abstract.md`, then publish it and record that you are
 done:
 
@@ -110,24 +116,40 @@ ampi win-put --win report --key section/abstract --file /workspace/experiments/a
 ampi win-put --win report --key status/abstract --json '{"author": 0, "state": "drafted"}'
 ```
 
-**Phase 2 --- synchronise, and cope with whatever has happened.**
+Then count yourself done, and wait for the others by polling a counter rather
+than by calling a collective --- some of them are about to be killed, and a
+barrier would simply hang:
 
-Run `ampi barrier --timeout 900`.
+```
+ampi win-fetch-add --win report --key drafted
+```
 
-That barrier may fail, and if it does it is not your fault. Handle it like
-this:
+Now poll, every 30 seconds, for up to 10 minutes, running
+`ampi hb --expect-idle 120` between polls:
 
-1. If it reports `AMPI_ERR_PROC_FAILED`, `AMPI_ERR_REVOKED`, or times out, run
-   `ampi failures` and `ampi doctor` to see what the runtime knows.
-2. If any rank is listed as failed and the communicator is not yet revoked, run
-   `ampi revoke`. It is safe and expected for several survivors to do this; the
-   operation is idempotent.
-3. Every survivor then runs `ampi shrink --name survivors`. This builds a new
-   communicator over the ranks that are still alive, renumbered densely. Note
-   what your new rank is --- `ampi --comm survivors status` and the shrink
-   output will tell you.
-4. Every survivor then runs `ampi --comm survivors agree --value true` to
-   confirm that the survivors are all in the same place and intend to continue.
+```
+ampi win-get --win report --key drafted
+ampi failures
+```
+
+Stop polling as soon as **either** the counter reaches 6 **or**
+`ampi failures` reports one or more ranks in its `failed` list. If some ranks
+have failed, the counter will never reach 6, which is exactly why
+you must watch both.
+
+**Phase 2 --- repair the communicator.**
+
+If `ampi failures` lists any failed rank, the world communicator is no longer
+usable for collectives and the survivors have to rebuild it. Do this:
+
+1. Run `ampi revoke`. Several survivors will do this; it is idempotent and
+   safe.
+2. Run `ampi shrink --name survivors`. This builds a communicator over the
+   ranks still alive, renumbered densely. The output tells you your new rank.
+3. Run `ampi --comm survivors agree --value true`. This is the one collective
+   in this experiment, and it is deliberately over the survivors only: it
+   confirms that everyone still standing is in the same place and intends to
+   continue. It tolerates further failures while it runs.
 
 From this point on, **use `--comm survivors` on every collective**.
 
@@ -151,15 +173,12 @@ returns `"claimed": true` it is yours: write it, then
 
 **Phase 4 --- finish.**
 
-```
-ampi --comm survivors barrier --timeout 900
-```
-
-Then write a JSON summary to `/workspace/experiments/ampi/e3_fault/runs/job/ranks/0/result.json`:
+Write a JSON summary to `/workspace/experiments/ampi/e3_fault/runs/job/ranks/0/result.json`:
 
 ```
 {"rank": 0, "survived": true, "new_rank": <your rank in survivors>,
   "sections_present": <how many section/* keys exist>,
+  "failed_ranks": [<what ampi failures reported>],
   "adopted": [<names of sections you found already published by others>],
   "wrote_extra": [<names of sections you wrote to cover for a dead peer>]}
 ```
