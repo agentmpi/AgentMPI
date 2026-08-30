@@ -101,6 +101,27 @@ The retained live-agent evidence records 25 distinct Cursor executor IDs in
 excluded from that count. The 100-rank Aesop file lacks equivalent launch
 provenance and is explicitly treated as a dry run in the paper.
 
+## Results from the v0.2 runs
+
+Everything below is recomputed from committed job traces by
+`experiments/ampi/*/collect.py`; nothing is taken from what an agent said it
+did.
+
+| Experiment | Ranks | Finding |
+|---|---|---|
+| Microbenchmarks (scripted) | 2–32 | alpha = 2.5 ms/step, beta = 5.4e-7 s/token. Recursive-doubling allreduce holds 1.5n tokens at every p; recursive-halving reduce-scatter falls from 0.68n at p=4 to **0.09n at p=32**, the difference between "cannot run in a 128k window" and "uses 9% of it". |
+| Semantic reduction (real agents) | 8 x 2 | Both schedules do p−1 = 7 operator evaluations; the tree puts lg p = 3 on the critical path instead of 7, cutting critical-path model time **324.6 s → 108.2 s**. Identical coverage; the two merged documents share almost no sentences. |
+| Software build (real agents) | 8 x 2 | Both delivered working software. The collective run: 68 collectives, 5 communicators, 10 claim grants for 6 modules, 2 implementers left as spares. The window run: **0 collectives**, 6 clean claims, 6 non-overlapping leases, and cross-module tests that found a real defect two reviewers confirmed. |
+| Fault tolerance (real agents) | 6 | Two agents killed. Survivors revoked, shrank to a single communicator, and **adopted both dead agents' sections from the window rather than rewriting them**. Zero work lost. |
+
+The runs broke the runtime in eight distinct ways, each fixed with a regression
+test: detector oscillation (1091 condemnations in 20 minutes), a declared idle
+period that overrode its own heartbeats, a suspicion that could fail a peer's
+send, a poisoned collective slot with no recovery, a stale process consuming a
+later run's messages, rank 0 logged as the sentinel −1 because it is falsy, a
+killed rank resurrecting itself, and a `shrink` whose default naming fragmented
+the survivors it was meant to regroup.
+
 ## Paper and dashboard
 
 - Narrative paper: `paper/agentmpi.md`
