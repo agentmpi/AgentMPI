@@ -53,6 +53,12 @@ Envelope = {
 }
 ```
 
+The canonical production JSON binding is
+[`schemas/agentmpi-envelope.schema.json`](schemas/agentmpi-envelope.schema.json).
+The SQLite reference runtime persists the matching, sequencing, delivery,
+payload, artifact, and accounting subset; it does not claim wire-level
+interoperability.
+
 The reference implementation currently persists the semantic subset and derives
 checksums for artifacts. Production bindings MUST authenticate immutable header
 fields and SHOULD encrypt confidential values.
