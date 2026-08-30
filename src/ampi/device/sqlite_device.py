@@ -63,6 +63,11 @@ CREATE TABLE IF NOT EXISTS rank (
     ctx_limit      INTEGER NOT NULL,
     ctx_used       INTEGER NOT NULL DEFAULT 0,
     ctx_peak       INTEGER NOT NULL DEFAULT 0,
+    -- How many times this rank has been wrongly condemned.  The failure
+    -- detector widens its timeout for a rank in proportion, which is what
+    -- stops a slow-but-healthy agent oscillating between alive and failed.
+    suspicions     INTEGER NOT NULL DEFAULT 0,
+    retractions    INTEGER NOT NULL DEFAULT 0,
     tokens_sent    INTEGER NOT NULL DEFAULT 0,
     tokens_recvd   INTEGER NOT NULL DEFAULT 0,
     exit_note      TEXT,
@@ -318,6 +323,24 @@ class SqliteDevice(Device):
         # transaction of ours.  Concurrent initialisation is safe because every
         # statement in SCHEMA is CREATE ... IF NOT EXISTS.
         self.conn.executescript(SCHEMA)
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """Add columns introduced after a job database was first created.
+
+        Jobs outlive releases here: a run that is halfway through must not be
+        invalidated because the runtime grew a field.
+        """
+        have = {r["name"] for r in self.query("PRAGMA table_info(rank)")}
+        for column, ddl in (
+            ("suspicions", "ALTER TABLE rank ADD COLUMN suspicions INTEGER NOT NULL DEFAULT 0"),
+            ("retractions", "ALTER TABLE rank ADD COLUMN retractions INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in have:
+                try:
+                    self.conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
 
     def close(self) -> None:
         if self._conn is not None:

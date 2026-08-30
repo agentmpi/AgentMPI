@@ -323,3 +323,39 @@ def test_semantic_tree_reduction_has_logarithmic_depth(make_job):
     assert total == p - 1, "a tree performs p-1 operator evaluations in total"
     assert out[0]["upcalls"] == 3, "but only lg p of them lie on the root's critical path"
     assert sorted(out[0]["result"]) == sorted(f"note-{i}" for i in range(p))
+
+
+def test_failure_detector_widens_after_a_false_condemnation(make_job):
+    """An eventually-perfect detector must stop arguing with a slow rank.
+
+    A fixed timeout against heavy-tailed turn latency oscillates: condemn,
+    retract, condemn again.  Each retraction must widen that rank's timeout so
+    the detector converges on its actual latency instead.
+    """
+    job = make_job(2)
+    rt = job.runtime(0)
+    rt.init(0)
+    rt.failure_timeout = 0.05
+    rt.max_failure_timeout = 1e6
+
+    victim = job.runtime(1)
+    victim.init(1)
+    victim.failure_timeout = 0.05
+
+    import time
+
+    time.sleep(0.1)
+    assert 1 in rt.suspected()
+    rt.declare_failed(1, "slow")
+    assert rt.rank_row(1)["state"] == RANK_FAILED
+
+    victim._touch()  # the "dead" rank speaks: direct evidence it is alive
+    row = rt.rank_row(1)
+    assert row["state"] == "alive"
+    assert row["suspicions"] == 1
+    assert row["retractions"] == 1
+
+    # With one suspicion recorded the timeout has doubled, so the same pause
+    # that condemned it before no longer does.
+    time.sleep(0.06)
+    assert 1 not in rt.suspected()

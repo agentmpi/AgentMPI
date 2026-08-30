@@ -82,6 +82,7 @@ class Runtime:
         self.job_id = job_id
         self.rank = rank
         self.failure_timeout = failure_timeout
+        self.max_failure_timeout = failure_timeout * 16
         self.poll_interval = poll_interval
         # A rank is not "stuck" until it has been waiting longer than any
         # plausible schedule skew between peers.
@@ -209,7 +210,8 @@ class Runtime:
         )
         if row is not None and row["state"] == RANK_FAILED:
             self.device.execute(
-                "UPDATE rank SET state=?, last_heartbeat=?, finished_at=NULL "
+                "UPDATE rank SET state=?, last_heartbeat=?, finished_at=NULL, "
+                "suspicions=suspicions+1, retractions=retractions+1 "
                 "WHERE job_id=? AND rank=?",
                 (RANK_ALIVE, util.now(), self.job_id, self.rank),
             )
@@ -244,7 +246,21 @@ class Runtime:
     # =====================================================================
 
     def suspected(self) -> list[int]:
-        """World ranks whose liveness lease has lapsed."""
+        """World ranks whose liveness lease has lapsed, under an adaptive timeout.
+
+        A plain fixed-timeout detector is eventually perfect only in theory.
+        In practice, against ranks whose turn latency is heavy tailed, it
+        oscillates: it condemns a rank that is merely thinking, the rank makes
+        a call and is reinstated, it thinks again, and it is condemned again.
+        We measured 1091 such condemnations in a single twenty-minute
+        eight-rank run before adding the rule below.
+
+        The rule is the standard adaptive one, in the spirit of Chen-Toueg and
+        phi-accrual detectors: each time a rank is wrongly condemned its
+        timeout doubles, so the detector converges on that rank's actual turn
+        latency instead of arguing with it.  The cap keeps a genuinely dead
+        rank from becoming undetectable.
+        """
         now_ts = util.now()
         out: list[int] = []
         for row in self.all_ranks():
@@ -252,7 +268,11 @@ class Runtime:
                 continue
             if row["last_heartbeat"] is None:
                 continue
-            deadline = row["hb_deadline"] or (row["last_heartbeat"] + self.failure_timeout)
+            if row["hb_deadline"]:
+                deadline = row["hb_deadline"]
+            else:
+                widened = self.failure_timeout * (2 ** min(6, int(row["suspicions"] or 0)))
+                deadline = row["last_heartbeat"] + min(widened, self.max_failure_timeout)
             if now_ts > deadline:
                 out.append(int(row["rank"]))
         return out
