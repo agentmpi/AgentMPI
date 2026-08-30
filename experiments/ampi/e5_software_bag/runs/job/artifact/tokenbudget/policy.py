@@ -1,6 +1,8 @@
 """Budget objects that decide how much more a caller may spend.
 
-Skeleton placeholder: the owning implementer replaces this whole file.
+A :class:`Budget` is a plain value object: it holds no state about what has
+already been spent, and every query takes the current usage as an argument.
+Tracking usage is the ledger's job.
 """
 
 
@@ -9,15 +11,25 @@ class BudgetExceeded(Exception):
 
 
 class Budget:
-    """A token allowance with an optional reserved headroom."""
+    """A token allowance of ``limit``, of which ``reserved`` is held back."""
 
     def __init__(self, limit: int, reserved: int = 0) -> None:
-        raise NotImplementedError("policy.Budget is not implemented yet")
+        if limit < 0:
+            raise ValueError(f"limit must not be negative, got {limit}")
+        if reserved < 0:
+            raise ValueError(f"reserved must not be negative, got {reserved}")
+        if reserved > limit:
+            raise ValueError(f"reserved ({reserved}) must not exceed limit ({limit})")
+        self.limit = limit
+        self.reserved = reserved
+
+    def __repr__(self) -> str:
+        return f"Budget(limit={self.limit}, reserved={self.reserved})"
 
     def remaining(self, used: int) -> int:
-        """Return the tokens still available after ``used`` have been spent."""
-        raise NotImplementedError("policy.Budget.remaining is not implemented yet")
+        """Return the spendable tokens left once ``used`` have been spent."""
+        return max(0, self.limit - self.reserved - used)
 
     def admits(self, used: int, incoming: int) -> bool:
-        """Return whether ``incoming`` tokens still fit after ``used``."""
-        raise NotImplementedError("policy.Budget.admits is not implemented yet")
+        """Return whether ``incoming`` tokens still fit on top of ``used``."""
+        return incoming <= self.remaining(used)
