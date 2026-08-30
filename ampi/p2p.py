@@ -56,16 +56,97 @@ from .errors import (
 from .journal import Journal, now_ns
 
 #: Polling cadence for blocking calls. AgentMPI deliberately polls rather than
-#: blocking on a condition variable: agent-scale latencies are seconds to
-#: minutes, so a coarse poll is free, and polling keeps the runtime a library
-#: with no background threads to fail.
-POLL_MIN_S = 0.05
+#: blocking on a condition variable: agent-scale waits are seconds to minutes,
+#: so a coarse poll is free, and polling keeps the runtime a library with no
+#: background threads of its own to fail.
+#:
+#: The schedule is three-phase, for the same reason MPI implementations spin
+#: before they block: a brief fast spin keeps the *runtime's* own latency out of
+#: the measurement (and makes the multi-round tree collectives cheap), while the
+#: long tail backs off so that a rank waiting ten minutes for a peer costs
+#: nothing.
+POLL_SPIN_S = 0.002
+POLL_MID_S = 0.02
 POLL_MAX_S = 2.0
+POLL_SPIN_UNTIL_S = 0.1
+POLL_MID_UNTIL_S = 2.0
 
 
 def _poll_sleep(elapsed_s: float) -> None:
-    """Exponential-ish backoff: responsive at first, cheap when waiting long."""
-    time.sleep(min(POLL_MAX_S, max(POLL_MIN_S, elapsed_s / 20.0)))
+    if elapsed_s < POLL_SPIN_UNTIL_S:
+        time.sleep(POLL_SPIN_S)
+    elif elapsed_s < POLL_MID_UNTIL_S:
+        time.sleep(POLL_MID_S)
+    else:
+        time.sleep(min(POLL_MAX_S, elapsed_s / 20.0))
+
+
+class Progress:
+    """The progress engine: what a rank must do while it is blocked.
+
+    MPI has an analogous rule -- an implementation only guarantees progress while
+    the application is inside the MPI library -- but the consequences differ. A
+    blocked AgentMPI rank has three obligations, and getting any of them wrong
+    produces a spectacular failure:
+
+    1. **Renew its lease.** A rank waiting inside a barrier is not calling the
+       runtime, so without an explicit renewal the failure detector will declare
+       it dead for the crime of waiting. In an early version of this runtime that
+       is exactly what happened: every rank that reached a barrier first was
+       declared failed, and the job cascaded. Blocking is not evidence of death.
+    2. **Run the failure detector.** Detection is lazy and local, so the only
+       time it runs is when somebody is waiting -- which is precisely when
+       somebody cares.
+    3. **Notice revocation.** Revocation exists to unblock survivors, so a
+       blocked rank that does not check for it defeats the whole mechanism.
+
+    Both writes are throttled, because the poll loop spins every 2ms early on and
+    a write transaction per poll would turn the journal into a bottleneck.
+    """
+
+    HB_EVERY_S = 5.0
+    DETECT_EVERY_S = 1.0
+
+    def __init__(self, ctx: Ctx, *, check_revoked: bool = True, check_fenced: bool = True) -> None:
+        self.ctx = ctx
+        self.check_revoked = check_revoked
+        self.check_fenced = check_fenced
+        self._last_hb = 0.0
+        self._last_detect = 0.0
+
+    def __call__(self) -> None:
+        ctx = self.ctx
+        j = ctx.j
+        now = time.monotonic()
+        need_hb = now - self._last_hb >= self.HB_EVERY_S
+        need_detect = now - self._last_detect >= self.DETECT_EVERY_S
+        if need_hb or need_detect:
+            with j.tx() as c:
+                if need_hb:
+                    heartbeat(j, ctx.rank, ctx.epoch, conn=c)
+                    self._last_hb = now
+                if need_detect:
+                    detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
+                    self._last_detect = now
+        if self.check_fenced:
+            ctx.check_live()
+        if self.check_revoked:
+            row = j.q1("SELECT revoked, revoked_by, name FROM comm WHERE id=?", (ctx.comm,))
+            if row is not None and int(row["revoked"]):
+                raise RevokedError(
+                    f"communicator {row['name']!r} was revoked (by rank {row['revoked_by']}) "
+                    "while you were blocked",
+                    hint=(
+                        f"this is the intended way to unblock you. Run "
+                        f"`ampi comm shrink --comm {row['name']}` and continue on the new communicator."
+                    ),
+                    detail={"comm": str(row["name"]), "revoked_by": row["revoked_by"]},
+                )
+
+    def wait(self, started_s: float) -> None:
+        """One poll iteration: make progress, then sleep proportionally."""
+        self()
+        _poll_sleep(time.time() - started_s)
 
 
 # --------------------------------------------------------------------------
@@ -222,6 +303,7 @@ def _has_posted_recv(c: sqlite3.Connection, ctx: Ctx, src: int, tag: int) -> boo
 
 def _await_match(ctx: Ctx, seq: int, deadline_ns: int) -> str:
     start = time.time()
+    prog = Progress(ctx)
     while True:
         row = ctx.j.q1("SELECT status FROM msg WHERE seq=?", (seq,))
         st = str(row["status"]) if row else "dropped"
@@ -233,8 +315,7 @@ def _await_match(ctx: Ctx, seq: int, deadline_ns: int) -> str:
                 hint="the receiver may be slow or dead; re-run the same command to keep waiting",
                 detail={"seq": seq},
             )
-        with ctx.j.tx() as c:
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         _poll_sleep(time.time() - start)
 
 
@@ -474,6 +555,7 @@ def recv(
     start_ns = now_ns()
     deadline = start_ns + (timeout_ns if timeout_ns is not None else ctx.cfg.timeout_ns)
     start_s = time.time()
+    prog = Progress(ctx, check_revoked=False, check_fenced=False)
 
     with j.tx() as c:
         heartbeat(j, ctx.rank, ctx.epoch, conn=c)
@@ -517,7 +599,10 @@ def recv(
         if row is not None and row["status"] == "cancelled":
             raise RequestError("this receive was cancelled")
 
-        # No match yet: check the reasons we might never get one.
+        # No match yet: renew our lease, then check the reasons we might never
+        # get one. Renewing first matters: a rank blocked in a long receive must
+        # not be declared dead for waiting.
+        prog()
         _check_recv_failure_modes(ctx, source, recv_id)
         if now_ns() > deadline:
             waited = (now_ns() - start_ns) / 1e9
@@ -553,8 +638,6 @@ def _check_recv_failure_modes(ctx: Ctx, source: int, recv_id: int) -> None:
             "the communicator was revoked while this receive was pending",
             hint="call `ampi comm shrink` to rebuild over the survivors, then retry",
         )
-    with j.tx() as c:
-        detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
     dead = set(failed_ranks(j, ctx.comm))
     if not dead:
         return
@@ -604,6 +687,7 @@ def probe(
     ctx.check_live()
     j = ctx.j
     start_s = time.time()
+    prog = Progress(ctx, check_revoked=False, check_fenced=False)
     deadline = now_ns() + (timeout_ns if timeout_ns is not None else ctx.cfg.timeout_ns)
     while True:
         with j.tx(immediate=False) as c:
@@ -626,6 +710,7 @@ def probe(
             return None
         if now_ns() > deadline:
             raise TimeoutError_("AMPI_Probe timed out", hint="retry to keep waiting")
+        prog()
         _check_recv_failure_modes(ctx, source, -1)
         _poll_sleep(time.time() - start_s)
 
@@ -797,6 +882,7 @@ def wait(
 ) -> Dict[str, Any]:
     """``AMPI_Wait`` / ``Waitall`` / ``Waitany`` / ``Waitsome``."""
     start_s = time.time()
+    prog = Progress(ctx, check_revoked=False, check_fenced=False)
     deadline = now_ns() + (timeout_ns if timeout_ns is not None else ctx.cfg.timeout_ns)
     done: Dict[str, Any] = {}
     while True:
@@ -823,9 +909,7 @@ def wait(
                 hint="requests remain valid; re-run to keep waiting",
                 detail={"completed": list(done), "pending": [r for r in rids if r not in done]},
             )
-        with ctx.j.tx() as c:
-            heartbeat(ctx.j, ctx.rank, ctx.epoch, conn=c)
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         _poll_sleep(time.time() - start_s)
 
 

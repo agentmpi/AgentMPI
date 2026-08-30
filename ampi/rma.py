@@ -416,8 +416,10 @@ def lock(
     lease = lease_ns if lease_ns is not None else ctx.cfg.lock_lease_ns
     deadline = now_ns() + (timeout_ns if timeout_ns is not None else ctx.cfg.timeout_ns)
     start = time.time()
+    prog = p2p.Progress(ctx, check_revoked=False)
     while True:
         try:
+            prog()
             with j.tx() as c:
                 heartbeat(j, ctx.rank, ctx.epoch, conn=c)
                 c.execute("DELETE FROM win_lock WHERE win=? AND expires_ns<?", (wid, now_ns()))

@@ -199,9 +199,12 @@ def agree(
     deadline = now_ns() + (timeout_ns if timeout_ns is not None else ctx.cfg.timeout_ns)
     q = quorum if quorum is not None else 1.0
     start = time.time()
+    # Agreement is the one collective that must keep working on a *revoked*
+    # communicator: it is how survivors coordinate their recovery. So the
+    # progress engine here checks liveness but deliberately ignores revocation.
+    prog = p2p.Progress(ctx, check_revoked=False)
     while True:
-        with j.tx() as c:
-            detect_failures(j, cid, by=ctx.rank, conn=c)
+        prog()
         dead = set(failed_ranks(j, cid))
         live = [i for i, w in enumerate(comm_members(j, cid)) if w not in dead]
         parts = j.q("SELECT crank,flag,value FROM agree_part WHERE agree=?", (aid,))
@@ -269,8 +272,13 @@ def shrink(
     new_name = name or f"{old['name']}#g{gen}"
     existing = j.q1("SELECT * FROM comm WHERE job=? AND name=?", (j.job_id, new_name))
     if existing is not None:
+        # Another survivor already agreed the membership and built it. Every
+        # caller must report the same excluded set, or two survivors would
+        # disagree about who died -- so derive it from the two memberships
+        # rather than from this rank's local failure view.
         members = comm_members(j, str(existing["id"]))
-        return _shrink_result(ctx, existing, members, created=False)
+        excluded = sorted(set(comm_members(j, str(old["id"]))) - set(members))
+        return _shrink_result(ctx, existing, members, created=False, excluded=excluded)
 
     ag = agree(
         ctx,

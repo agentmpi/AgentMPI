@@ -115,8 +115,16 @@ def truncate_to_tokens(text: str, budget: int, *, marker: Optional[str] = None) 
     if count(text) <= budget:
         return text
     marker = marker if marker is not None else "\n...[truncated by AMPI_Type_view]..."
-    marker_cost = count(marker)
-    target = max(1, budget - marker_cost)
+    # The marker must fit inside the budget, or the "truncation" would itself
+    # overrun it. Degrade the marker before degrading the guarantee: a view that
+    # silently exceeds its budget defeats the whole point of context accounting.
+    for candidate in (marker, "\n...[truncated]...", " …", ""):
+        if count(candidate) < budget:
+            marker = candidate
+            break
+    else:
+        marker = ""
+    target = max(1, budget - count(marker))
     lo, hi = 0, len(text)
     while lo < hi:
         mid = (lo + hi + 1) // 2
@@ -124,4 +132,8 @@ def truncate_to_tokens(text: str, budget: int, *, marker: Optional[str] = None) 
             lo = mid
         else:
             hi = mid - 1
-    return text[:lo] + marker
+    out = text[:lo] + marker
+    while out and count(out) > budget:
+        lo = max(0, lo - max(1, lo // 8))
+        out = text[:lo] + marker
+    return out

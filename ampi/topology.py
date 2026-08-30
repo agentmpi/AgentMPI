@@ -95,9 +95,9 @@ def split(
     from . import p2p
 
     start = _time.time()
+    prog = p2p.Progress(ctx, check_revoked=False)
     while True:
-        with j.tx() as c:
-            detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         dead = set(failed_ranks(j, ctx.comm))
         votes: Dict[int, Dict[str, Any]] = {}
         for w in members:

@@ -115,6 +115,34 @@ def resolve_algo(op: str, algo: Optional[str]) -> str:
     return algo
 
 
+def select_reduce_algo(kind: str, algo: Optional[str], op: "ops_mod.Op") -> str:
+    """Automatic algorithm selection for reductions.
+
+    MPICH selects a collective algorithm from the message size, because message
+    size determines whether the latency term or the bandwidth term dominates.
+    The corresponding question for AgentMPI is *who evaluates the operator*, and
+    the answer flips the ranking:
+
+    * A **runtime** operator costs microseconds and can be applied by whoever
+      holds the data. Since the journal is a shared medium, the cheapest schedule
+      is to let one reader fold all contributions in place -- ``flat``, one round,
+      zero messages. A tree here would add rounds and buy nothing. This is the
+      in-network-aggregation regime.
+    * An **agent** operator costs seconds to minutes and consumes context. Now
+      the number of operator applications *on the critical path* is the entire
+      cost, so the classical tree matters: ``binomial`` puts ``ceil(log2 P)``
+      merges on the critical path where ``flat`` and ``chain`` put ``P-1``.
+
+    An explicitly requested algorithm always wins, so a harness (or a benchmark)
+    can override the rule.
+    """
+    if algo and algo != "auto":
+        return resolve_algo(kind, algo)
+    if op.fn is not None:
+        return "flat"
+    return "binomial" if kind == "reduce" else "reduce_bcast"
+
+
 # --------------------------------------------------------------------------
 # Collective identity: joining, sequencing, idempotent retry
 # --------------------------------------------------------------------------
@@ -395,9 +423,9 @@ def _barrier_central(ctx: Ctx, coll: sqlite3.Row, deadline: int) -> Dict[str, An
     cid = str(coll["id"])
     q = float(coll["quorum"])
     start = time.time()
+    prog = p2p.Progress(ctx)
     while True:
-        with j.tx() as c:
-            detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         live = _live_members(ctx)
         need = max(1, math.ceil(q * len(live)))
         arrived = [
@@ -406,8 +434,19 @@ def _barrier_central(ctx: Ctx, coll: sqlite3.Row, deadline: int) -> Dict[str, An
         ]
         arrived_live = [a for a in arrived if a in live]
         if len(arrived_live) >= need or coll["state"] == "closed":
-            if coll["state"] != "closed":
-                _close(j, cid)
+            # Reaching quorum *releases* the barrier but does not close it: a
+            # straggler that arrives afterwards must still be able to pass
+            # through, or a quorum barrier would guarantee that exactly the
+            # slowest ranks fail. The collective is marked closed only once
+            # every live rank has arrived, so `closed_ns` still records when the
+            # barrier released for the metrics.
+            all_in = len(arrived_live) >= len(live)
+            with j.tx() as c:
+                c.execute(
+                    "UPDATE coll SET closed_ns=COALESCE(closed_ns,?)" + (", state='closed'" if all_in else "")
+                    + " WHERE id=?",
+                    (now_ns(), cid),
+                )
             late = sorted(set(live) - set(arrived_live))
             return {
                 "released": True,
@@ -427,7 +466,7 @@ def _barrier_central(ctx: Ctx, coll: sqlite3.Row, deadline: int) -> Dict[str, An
                 detail={"arrived": len(arrived_live), "need": need},
             )
         p2p._poll_sleep(time.time() - start)
-        coll = j.q1("SELECT * FROM coll WHERE id=?", (cid,))  # refresh state
+        coll = j.q1("SELECT * FROM coll WHERE id=?", (cid,))  # refresh closed/revoked state
 
 
 def _barrier_dissemination(ctx: Ctx, coll: sqlite3.Row, deadline: int) -> Dict[str, Any]:
@@ -560,12 +599,12 @@ def bcast(
 
 def _await_result_obj(ctx: Ctx, cid: str, deadline: int, *, who: str) -> str:
     start = time.time()
+    prog = p2p.Progress(ctx)
     while True:
         row = ctx.j.q1("SELECT result_obj,state FROM coll WHERE id=?", (cid,))
         if row is not None and row["result_obj"]:
             return str(row["result_obj"])
-        with ctx.j.tx() as c:
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         if now_ns() > deadline:
             raise TimeoutError_(
                 f"collective result from {who} did not arrive before the deadline",
@@ -817,7 +856,7 @@ def reduce_(
     """
     kind = "allreduce" if all_ else "reduce"
     o = ops_mod.get_op(op, commute=commute)
-    algo = resolve_algo(kind, algo)
+    algo = select_reduce_algo(kind, algo, o)
     coll, part = join(
         ctx,
         kind,
@@ -842,10 +881,9 @@ def reduce_(
     elif not meta.get("acc") and text is None:
         raise ArgError("supply your contribution with --in (text or @file)")
 
-    if str(coll["algo"]) == "flat" or (o.fn is not None and str(coll["algo"]) != "chain"):
-        # Runtime-evaluable operators do not need a tree: the journal can fold
-        # the contributions itself once they have all landed. This is the
-        # in-network-aggregation regime.
+    if str(coll["algo"]) == "flat":
+        # The journal folds the contributions itself once they have landed: one
+        # round, no messages. Only available for runtime operators.
         return _reduce_flat(
             ctx,
             coll,
@@ -891,9 +929,9 @@ def _reduce_flat(
             "the 'flat' reduce algorithm cannot evaluate an agent operator",
             hint="use --algo binomial (or chain) for agent:<label> operators",
         )
+    prog = p2p.Progress(ctx)
     while True:
-        with j.tx() as c:
-            detect_failures(j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         live = _live_members(ctx)
         need = max(1, math.ceil(q * len(live)))
         rows = j.q(
@@ -1003,6 +1041,13 @@ def _reduce_tree(
         return _describe_step(ctx, coll, open_step)
 
     tg_base = internal_tag("reduce", 0)
+
+    if algo == "recursive_doubling":
+        return _reduce_recursive_doubling(
+            ctx, coll, o, meta=meta, deadline=deadline, root=root,
+            materialize=materialize, budget=budget, operand_budget=operand_budget,
+        )
+
     while mask < P:
         if algo == "chain":
             # Sequential pipeline: P-1 merges on the critical path. Included as
@@ -1096,6 +1141,83 @@ def _reduce_tree(
         "merges": merges,
         "note": f"your accumulator was folded upward; the result lands at root rank {root}",
     }
+
+
+def _reduce_recursive_doubling(
+    ctx: Ctx,
+    coll: sqlite3.Row,
+    o: ops_mod.Op,
+    *,
+    meta: Dict[str, Any],
+    deadline: int,
+    root: int,
+    materialize: Optional[bool],
+    budget: Optional[int],
+    operand_budget: Optional[int],
+) -> Dict[str, Any]:
+    """Recursive-doubling allreduce.
+
+    Every rank exchanges accumulators with the partner at distance ``2^k`` and
+    both apply the operator, so after ``log2 P`` rounds all ranks hold the full
+    reduction with no separate broadcast. In MPI this is the standard choice for
+    short messages: ``log P`` rounds, and the redundant arithmetic is free.
+
+    For an *agent* operator the arithmetic is emphatically not free: total
+    operator applications rise from ``P-1`` (binomial reduce plus broadcast) to
+    ``P log P``, at the same critical-path depth. The evaluation measures both,
+    because this is the clearest case where transplanting MPI's selection rule
+    unchanged would be a mistake -- the algorithm that wins for bytes loses for
+    agents.
+
+    Merge order is pinned by rank (lower rank is the left operand) so that all
+    ranks obtain byte-identical results even for a non-commutative operator.
+    """
+    j = ctx.j
+    cid = str(coll["id"])
+    P = ctx.size
+    rr = ctx.crank
+    if P & (P - 1):
+        raise ArgError(
+            f"recursive_doubling currently requires a power-of-two communicator size (got {P})",
+            hint="use --algo reduce_bcast, or size the communicator to a power of two",
+        )
+    mask = int(meta.get("mask", 1))
+    while mask < P:
+        partner = rr ^ mask
+        tg = internal_tag("reduce", 64 + int(math.log2(mask)))
+        if not _child_alive(ctx, partner):
+            # No fault-tolerant variant of recursive doubling exists that keeps
+            # the same result on all ranks, so we fail loudly rather than return
+            # silently different answers to different ranks.
+            raise ProcFailedError(
+                f"recursive_doubling partner rank {partner} has failed at round {int(math.log2(mask))}",
+                hint="revoke and shrink, then retry with --algo reduce_bcast, which tolerates gaps",
+                detail={"failed": [partner]},
+            )
+        _send_acc(ctx, coll, dest=partner, tag=tg, meta=meta)
+        got = _recv_operand(ctx, coll, partner, tg, deadline)
+        if got is None:
+            return _await_more(ctx, cid, [partner])
+        left_obj, right_obj = (str(meta["acc"]), got) if rr < partner else (got, str(meta["acc"]))
+        step_meta = dict(meta)
+        step_meta["acc"] = left_obj
+        res = _do_merge(
+            ctx, coll, o, step_meta, right_obj=right_obj, right_from=partner,
+            round_=int(math.log2(mask)), operand_budget=operand_budget, next_mask=mask << 1,
+        )
+        if res.get("action_required") == "merge":
+            return res
+        # Runtime operator: _do_merge recursed and completed the schedule.
+        return res
+    if rr == 0:
+        _close(j, cid, result_obj=str(meta["acc"]))
+    env = _present(ctx, str(meta["acc"]), materialize=materialize, budget=budget,
+                   what="allreduce result")
+    _set_part(j, cid, rr, state="done", out_obj=str(meta["acc"]), meta=meta, done=True)
+    env.update({"coll": cid, "complete": True, "algo": "recursive_doubling", "op": o.name,
+                "merges": int(meta.get("merges", 0)),
+                "rounds": int(math.log2(P)) if P > 1 else 0})
+    return env
 
 
 def _send_acc(ctx: Ctx, coll: sqlite3.Row, *, dest: int, tag: int, meta: Dict[str, Any]) -> None:
@@ -1364,9 +1486,9 @@ def gather(
 
     q = float(coll["quorum"])
     start = time.time()
+    prog = p2p.Progress(ctx)
     while True:
-        with ctx.j.tx() as c:
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         live = _live_members(ctx)
         need = max(1, math.ceil(q * len(live)))
         rows = ctx.j.q(
@@ -1554,6 +1676,7 @@ def scatter(
             )
         _close(ctx.j, cid, result_obj=manifest.obj)
     start = time.time()
+    prog = p2p.Progress(ctx)
     while True:
         row = ctx.j.q1("SELECT out_obj FROM coll_part WHERE coll=? AND crank=?", (cid, rr))
         if row is not None and row["out_obj"]:
@@ -1564,8 +1687,7 @@ def scatter(
                 f"AMPI_Scatter: root rank {root} has not published slices yet",
                 hint="re-run to keep waiting",
             )
-        with ctx.j.tx() as c:
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         p2p._poll_sleep(time.time() - start)
     env = _present(ctx, obj, materialize=materialize, budget=budget, what="scatter slice")
     _set_part(ctx.j, cid, rr, state="done", done=True)
@@ -1673,6 +1795,7 @@ def scan(
         # Runtime operator: fold prefixes directly out of the journal once the
         # predecessors have published. O(1) rounds.
         start = time.time()
+        prog = p2p.Progress(ctx)
         while True:
             rows = ctx.j.q(
                 "SELECT crank,in_obj FROM coll_part WHERE coll=? AND in_obj IS NOT NULL AND crank<=?"
@@ -1703,8 +1826,7 @@ def scan(
                     hint="re-run to keep waiting",
                     detail={"missing": missing},
                 )
-            with ctx.j.tx() as c:
-                detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+            prog()
             p2p._poll_sleep(time.time() - start)
 
     # Agent operator: chain schedule. Rank i receives the running prefix from
@@ -1847,6 +1969,7 @@ def reduce_scatter(
                       cfg=ctx.cfg, conn=c)
     _set_part(ctx.j, cid, rr, in_obj=pay.obj)
     start = time.time()
+    prog = p2p.Progress(ctx)
     while True:
         rows = ctx.j.q("SELECT crank,in_obj FROM coll_part WHERE coll=? AND in_obj IS NOT NULL", (cid,))
         live = set(_live_members(ctx))
@@ -1858,8 +1981,7 @@ def reduce_scatter(
                 f"AMPI_Reduce_scatter: {len(have)}/{len(live)} contributions arrived",
                 hint="re-run to keep waiting",
             )
-        with ctx.j.tx() as c:
-            detect_failures(ctx.j, ctx.comm, by=ctx.rank, conn=c)
+        prog()
         p2p._poll_sleep(time.time() - start)
     column = []
     for crank in sorted(have):
