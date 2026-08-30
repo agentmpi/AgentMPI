@@ -38,11 +38,17 @@ tables:
 
 # Three passes plus bibtex: the cross-references, the bibliography, and then the
 # page balancing all need a settled .aux file.
+#
+# SOURCE_DATE_EPOCH and FORCE_SOURCE_DATE make the output byte-reproducible. Without
+# them pdflatex embeds the build time, so the checked-in PDF shows a diff on every
+# rebuild even when nothing changed -- which trains you to ignore diffs on it.
+PAPER_EPOCH ?= 1700000000
+
 paper: tables
-	cd paper && pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
+	cd paper && SOURCE_DATE_EPOCH=$(PAPER_EPOCH) FORCE_SOURCE_DATE=1 pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
 	cd paper && bibtex agentmpi >/dev/null || true
-	cd paper && pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
-	cd paper && pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
+	cd paper && SOURCE_DATE_EPOCH=$(PAPER_EPOCH) FORCE_SOURCE_DATE=1 pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
+	cd paper && SOURCE_DATE_EPOCH=$(PAPER_EPOCH) FORCE_SOURCE_DATE=1 pdflatex -interaction=nonstopmode agentmpi.tex >/dev/null
 	@echo "built paper/agentmpi.pdf"
 
 campaign-status:
