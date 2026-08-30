@@ -31,7 +31,6 @@ import sys
 import time
 from typing import Any
 
-from . import util
 from .constants import DEFAULT_CTX_LIMIT
 from .core.runtime import Runtime
 from .device import open_device

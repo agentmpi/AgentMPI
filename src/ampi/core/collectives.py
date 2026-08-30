@@ -43,14 +43,14 @@ from __future__ import annotations
 import hashlib
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any, Callable
+from typing import Any
 
 from .. import util
 from ..constants import (
     ALGO_AUTO,
     ALGO_BINOMIAL,
-    ALGO_BRUCK,
     ALGO_CHAIN,
     ALGO_DISSEMINATION,
     ALGO_LINEAR,
@@ -1246,7 +1246,7 @@ def allgather(rt: Any, comm_name: str, payload: Any, *, algo: str = ALGO_AUTO,
     parts[engine.me] = payload
     initial = {"acc": payload, "parts": parts,
                "_selfblock": {str(engine.me): payload}}
-    result = engine.run(steps, initial)
+    engine.run(steps, initial)
     state = engine.load_state()
     blocks = state.slots.get("parts") or []
     return {"result": {str(i): blocks[i] for i in range(engine.p)}, "algo": engine.algo,

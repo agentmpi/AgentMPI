@@ -31,16 +31,12 @@ import json
 import os
 import shutil
 import statistics
-import subprocess
 import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "..", "..", "..", "src"))
 
-from ampi.core import collectives as coll  # noqa: E402
-from ampi.core.runtime import Runtime  # noqa: E402
-from ampi.device import open_device  # noqa: E402
 from ampi.launch import create_job, launch_processes, wait_for  # noqa: E402
 
 WORKER = os.path.join(HERE, "worker.py")
@@ -209,7 +205,15 @@ def model_fit(pingpong: list[dict]) -> dict:
         return {}
     mean_x, mean_y = sum(xs) / n, sum(ys) / n
     denom = sum((x - mean_x) ** 2 for x in xs)
-    beta = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys)) / denom if denom else 0.0
+    beta = (
+        sum(
+            (x - mean_x) * (y - mean_y)
+            for x, y in zip(xs, ys, strict=True)
+        )
+        / denom
+        if denom
+        else 0.0
+    )
     alpha = mean_y - beta * mean_x
     return {"alpha_seconds": round(alpha, 6), "beta_seconds_per_token": round(beta, 9),
             "note": "half round-trip = alpha + beta * tokens, fitted over the payload sweep"}

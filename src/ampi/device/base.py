@@ -27,7 +27,8 @@ without changing a line above this interface.
 from __future__ import annotations
 
 import abc
-from typing import Any, Iterable
+from collections.abc import Iterable
+from typing import Any
 
 
 class Device(abc.ABC):

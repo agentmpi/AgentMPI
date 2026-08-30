@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 
 import matplotlib
@@ -169,12 +168,23 @@ def fig_pingpong(data: dict) -> None:
     fig, ax = plt.subplots(figsize=(3.3, 2.3))
     xs = [max(1, r["payload_tokens"]) for r in rows]
     ys = [r["half_roundtrip_ms"]["p50"] for r in rows]
-    eager = [(x, y) for (x, y), r in zip(zip(xs, ys), rows) if r["mode"] == "eager"]
-    rend = [(x, y) for (x, y), r in zip(zip(xs, ys), rows) if r["mode"] != "eager"]
+    points = list(zip(xs, ys, rows, strict=True))
+    eager = [(x, y) for x, y, row in points if row["mode"] == "eager"]
+    rend = [(x, y) for x, y, row in points if row["mode"] != "eager"]
     if eager:
-        ax.plot(*zip(*eager), "o-", color=COLORS[0], label="eager (inline)")
+        ax.plot(
+            *zip(*eager, strict=True),
+            "o-",
+            color=COLORS[0],
+            label="eager (inline)",
+        )
     if rend:
-        ax.plot(*zip(*rend), "s-", color=COLORS[1], label="rendezvous (by handle)")
+        ax.plot(
+            *zip(*rend, strict=True),
+            "s-",
+            color=COLORS[1],
+            label="rendezvous (by handle)",
+        )
     if fit:
         model = [(fit["alpha_seconds"] + fit["beta_seconds_per_token"] * x) * 1000 for x in xs]
         ax.plot(xs, model, "k:", linewidth=1.0,

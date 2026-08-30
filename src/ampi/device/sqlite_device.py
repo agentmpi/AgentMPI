@@ -22,8 +22,9 @@ from __future__ import annotations
 import os
 import sqlite3
 import time
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
-from typing import Any, Iterable, Iterator
+from typing import Any
 
 from .. import util
 from .base import Device

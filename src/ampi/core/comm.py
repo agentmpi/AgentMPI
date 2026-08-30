@@ -269,7 +269,7 @@ def cart_rank(dims: list[int], coords: list[int], periods: list[bool]) -> int | 
     for d in dims:
         total *= d
     normalized: list[int] = []
-    for i, (coord, dim) in enumerate(zip(coords, dims)):
+    for i, (coord, dim) in enumerate(zip(coords, dims, strict=True)):
         if 0 <= coord < dim:
             normalized.append(coord)
         elif periods[i]:
@@ -277,7 +277,7 @@ def cart_rank(dims: list[int], coords: list[int], periods: list[bool]) -> int | 
         else:
             return None
     rank = 0
-    for coord, stride in zip(normalized, _strides(dims)):
+    for coord, stride in zip(normalized, _strides(dims), strict=True):
         rank += coord * stride
     return rank if rank < total else None
 
