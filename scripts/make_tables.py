@@ -765,25 +765,45 @@ def table_scaling_sim() -> None:
 
 
 def summary_macros() -> None:
-    """Single-number macros the prose refers to, so the prose cannot drift."""
+    """Single-number macros the prose refers to, so the prose cannot drift.
+
+    The evaluation-scale figures count only runs whose executor was the broker, i.e.
+    served by real agent ranks. Deterministic and simulated runs are excluded, because
+    quoting them in a total would overstate how much agent work backs the results.
+    """
     macros: list[str] = []
     tr = _tr_results()
-    n_calls = sum(d["job"]["agent_calls"] for _, d in tr)
-    sw_calls = 0
-    for f in glob.glob(str(RESULTS / "software" / "*.json")):
+
+    runs = 0
+    calls = tokens_in = tokens_out = 0
+    usd = 0.0
+    wall = 0.0
+    for f in glob.glob(str(RESULTS / "*" / "*.json")):
         d = load(Path(f))
-        if d:
-            sw_calls += d.get("job", {}).get("agent_calls", 0)
-    mb_calls = 0
+        cfg = (d or {}).get("config") or {}
+        job = (d or {}).get("job") or {}
+        if cfg.get("executor") != "broker" or not job:
+            continue
+        runs += 1
+        calls += job.get("agent_calls", 0)
+        tokens_in += job.get("tokens_in", 0)
+        tokens_out += job.get("tokens_out", 0)
+        usd += job.get("usd", 0.0)
+        wall += job.get("wall_s", 0.0)
+    micro = 0
     for f in glob.glob(str(RESULTS / "microbench" / "*.json")):
         d = load(Path(f))
         for b in (d or {}).get("benches", {}).values():
-            for r in (b or {}).get("rows", []) if isinstance(b, dict) else []:
-                mb_calls += r.get("agent_calls_total") or 0
-    macros.append(rf"\newcommand{{\NAgentCallsTranslation}}{{{n_calls:,}}}")
-    macros.append(rf"\newcommand{{\NAgentCallsSoftware}}{{{sw_calls:,}}}")
-    macros.append(rf"\newcommand{{\NAgentCallsMicro}}{{{mb_calls:,}}}")
-    macros.append(rf"\newcommand{{\NAgentCallsTotal}}{{{n_calls + sw_calls + mb_calls:,}}}")
+            if not isinstance(b, dict) or b.get("executor") != "broker":
+                continue
+            for r in b.get("rows", []):
+                micro += r.get("agent_calls_total") or 0
+
+    macros.append(rf"\newcommand{{\NRealRuns}}{{{runs}}}")
+    macros.append(rf"\newcommand{{\NAgentCallsTotal}}{{{calls + micro:,}}}")
+    macros.append(rf"\newcommand{{\NTokensTotal}}{{{(tokens_in + tokens_out) / 1e6:.1f}}}")
+    macros.append(rf"\newcommand{{\NSpendTotal}}{{{usd:.2f}}}")
+    macros.append(rf"\newcommand{{\NWallTotal}}{{{wall / 3600:.1f}}}")
     macros.append(rf"\newcommand{{\NTranslationConfigs}}{{{len(tr)}}}")
     bad = sorted(n for n in _MACROS if not n.isalpha())
     if bad:

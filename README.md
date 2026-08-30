@@ -234,7 +234,8 @@ because a protocol whose rationale is not written down gets reimplemented wrongl
 
 ## Some measured findings
 
-From runs with real agent populations, all reported in the paper with the code that
+From 14 harness runs executed by real agent ranks — 431 agent invocations, ~1.0M tokens,
+3.8 hours of cumulative harness wall time — all reported in the paper with the code that
 produced them:
 
 - **Strong scaling** on parallel translation: 3.46× speedup at `p=8` on identical
@@ -268,6 +269,15 @@ produced them:
   rendezvous completes at every size.
 - **Model and implementation agree exactly** on message counts and fold depths
   across 278 collective configurations — after the cross-check found four real bugs.
+- **Interface publication pays when the spec underdetermines boundaries**, and not
+  otherwise. With signatures withheld so the shared window is the only channel: green in
+  one round versus two, 2.1× less wall time, 2.5× lower cost, 4.6× less defensive
+  coupling. With a precise spec the window is redundant, because the spec is already
+  doing its job — so measure how much of your interface surface the spec pins, and
+  publish only the rest.
+- **Convention divergence is a coordination metric that needs no oracle.** Counting
+  surviving spellings of the same idea: one author converges on 1, eight ranks with a
+  shared window on 3, eight without on 6 — plus the translation code that bridges them.
 
 ## Status
 
