@@ -459,7 +459,7 @@ override the selection. The reference catalogue and selection rules:
 
 | Collective | Algorithms | Default rule |
 |---|---|---|
-| barrier | `central`, `dissemination`, `linear` | `central` for `P <= 32`, else `dissemination` |
+| barrier | `central`, `dissemination`, `linear` | `central` for `P <= 32`, else `dissemination` (measured crossover) |
 | bcast | `flat`, `binomial`, `chain`, `relay` | `flat` |
 | reduce | `flat`, `binomial`, `chain` | `flat` for runtime operators; `binomial` for agent operators |
 | allreduce | `flat`, `reduce_bcast`, `recursive_doubling` | `flat` for runtime operators; `reduce_bcast` for agent operators |

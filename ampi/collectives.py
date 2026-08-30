@@ -116,12 +116,12 @@ def resolve_algo(op: str, algo: Optional[str]) -> str:
 
 
 #: Rank count above which a journal-mediated barrier loses to a dissemination
-#: tree. Measured, not guessed: on the reference runtime the crossover sits
-#: between P=16 and P=32 (at P=128, central took 18.0s against dissemination's
-#: 7.4s before the liveness cache was added). The shared medium behaves like a
-#: switch with in-network aggregation up to a point, and like a contended
-#: resource past it -- the same reason MPI implementations abandon linear
-#: collectives at scale.
+#: tree. Measured, not guessed: with stub executors on the reference runtime,
+#: `central` wins at P=16 (0.31s vs 0.45s) and P=32 (0.67s vs 1.08s) and loses at
+#: P=64 (3.59s vs 2.59s) and P=128 (9.16s vs 6.28s), so the crossover lies
+#: between 32 and 64. The shared medium behaves like a switch with in-network
+#: aggregation up to a point and like a contended resource past it -- the same
+#: reason MPI implementations abandon linear collectives at scale.
 BARRIER_CENTRAL_MAX_P = 32
 
 

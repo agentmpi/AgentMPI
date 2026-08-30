@@ -391,14 +391,21 @@ def _agent_reduce_run(
     for rank, v in r.per_rank.items():
         merges_by_rank[rank] = int(v.get("merges", 0))
     total = sum(merges_by_rank.values())
-    critical = max(merges_by_rank.values()) if merges_by_rank else 0
+    # Two different quantities, and conflating them is a mistake we made once.
+    # `max_merges_per_rank` is how much work the busiest executor does. The
+    # *serialised depth* is the length of the longest dependency chain, which is
+    # what actually sets the makespan: a linear chain gives every rank exactly one
+    # merge, yet all P-1 of them are strictly ordered.
+    max_per_rank = max(merges_by_rank.values()) if merges_by_rank else 0
+    predicted_depth = math.ceil(math.log2(P)) if algo == "binomial" else max(0, P - 1)
     return {
         "P": P,
         "algo": algo,
         "wall_s": round(r.wall_s, 3),
         "merges_total": total,
-        "merges_critical_path": critical,
-        "predicted_critical": (math.ceil(math.log2(P)) if algo == "binomial" else P - 1),
+        "max_merges_per_rank": max_per_rank,
+        "predicted_serial_depth": predicted_depth,
+        "effective_serial_depth": (round(r.wall_s / merge_cost, 1) if merge_cost else None),
         "merge_cost_s": merge_cost,
         "errors": r.errors[:2],
     }

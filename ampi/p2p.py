@@ -62,12 +62,15 @@ from .journal import Journal, now_ns
 #:
 #: The schedule is three-phase, for the same reason MPI implementations spin
 #: before they block: a brief fast spin keeps the *runtime's* own latency out of
-#: the measurement (and makes the multi-round tree collectives cheap), while the
-#: long tail backs off so that a rank waiting ten minutes for a peer costs
-#: nothing.
+#: the measurement (and makes multi-round tree collectives cheap), while the long
+#: tail backs off so that a rank waiting ten minutes for a peer costs nothing.
+#: The tail is capped at half a second rather than allowed to grow without bound:
+#: an uncapped backoff added roughly 0.5s of dead time to every hop of a
+#: 63-hop chain reduction, which is measurement artefact rather than protocol
+#: cost.
 POLL_SPIN_S = 0.002
 POLL_MID_S = 0.02
-POLL_MAX_S = 2.0
+POLL_MAX_S = 0.5
 POLL_SPIN_UNTIL_S = 0.1
 POLL_MID_UNTIL_S = 2.0
 
