@@ -76,10 +76,9 @@ check("estimate", "leaf: imports no package module", lambda: (
 # ------------------------------------------------------------------ policy
 check("policy", "exports Budget/BudgetExceeded",
       lambda: hasattr(policy, "Budget") and issubclass(policy.BudgetExceeded, Exception))
-check("policy", "Budget(limit, reserved=0) signature",
-      lambda: str(inspect.signature(policy.Budget.__init__)) ==
-      "(self, limit: int, reserved: int = 0) -> None" or
-      f"got {inspect.signature(policy.Budget.__init__)}")
+check("policy", "Budget(limit, reserved=0) signature", lambda: (
+    lambda s: str(s).replace("'", "") == "(self, limit: int, reserved: int = 0) -> None"
+    or f"got {s}")(inspect.signature(policy.Budget.__init__)))
 check("policy", "remaining() == max(0, limit-reserved-used)",
       lambda: all(policy.Budget(lim, res).remaining(used) == max(0, lim - res - used)
                   for lim in (0, 1, 100, 1000) for res in (0, 1)
@@ -192,9 +191,14 @@ check("cli", "plan prints a JSON list, exit 0", lambda: (
     lambda r: (r[0] == 0 and json.loads(r[1]) == pf(1000, 4)) or f"exit={r[0]} out={r[1]!r}")(
     run(["plan", "--total", "1000", "--agents", "4"])))
 check("cli", "compact prints compacted text, exit 0", lambda: (
-    lambda r: (r[0] == 0 and estimate.count_tokens(r[1].rstrip("\n")) <= 30)
-    or f"exit={r[0]} tokens={estimate.count_tokens(r[1])}")(
-    run(["compact", "--file", str(TMP), "--budget", "30"])))
+    lambda r: (r[0] == 0
+               and r[1].rstrip("\n") == compact.head_tail(TMP.read_text(), 30).rstrip("\n"))
+    or f"exit={r[0]} out!=head_tail")(run(["compact", "--file", str(TMP), "--budget", "30"])))
+check("cli", "INT-1: compact stdout as printed fits the budget", lambda: (
+    lambda bad: bad == []
+    or f"printed stream exceeds budget by 1 token at budgets {bad[:6]}{'...' if len(bad) > 6 else ''}")(
+    [b for b in range(1, 40)
+     if estimate.count_tokens(run(["compact", "--file", str(TMP), "--budget", str(b)])[1]) > b]))
 check("cli", "missing --file path -> exit 2",
       lambda: run(["count", "--file", "/nonexistent/nope.txt"])[0] == 2)
 check("cli", "bad numeric arg -> exit 2",
@@ -243,6 +247,58 @@ check("package", "public functions have type annotations", lambda: (
                  for pn, p in inspect.signature(obj).parameters.items() if pn != "self")
              or inspect.signature(obj).return_annotation is inspect.Signature.empty)]))
 check("package", "pyproject.toml exists", lambda: (ART / "pyproject.toml").is_file())
+
+
+def _fuzz_head_tail() -> object:
+    rng = random.Random(20260830)
+    alphabet = "abcdefg \n\t.?"
+    for _ in range(4000):
+        text = "".join(rng.choice(alphabet) for _ in range(rng.randint(0, 300)))
+        budget = rng.randint(0, 90)
+        frac = rng.choice([0.0, 0.1, 0.35, 0.6, 0.9, 1.0])
+        out = compact.head_tail(text, budget, frac)
+        if estimate.count_tokens(out) > budget:
+            return f"over budget: len(text)={len(text)} budget={budget} frac={frac}"
+        if estimate.count_tokens(text) <= budget and out != text:
+            return f"altered text that already fit: budget={budget}"
+    return True
+
+
+def _fuzz_planner() -> object:
+    rng = random.Random(1234)
+    for _ in range(4000):
+        total = rng.randint(0, 5_000_000)
+        n = rng.randint(1, 200)
+        frac = rng.choice([0.0, 0.05, 0.1, 0.5, 0.9, 1.0])
+        shares = planner.plan_fanout(total, n, frac)
+        if len(shares) != n or any(s < 0 for s in shares):
+            return f"bad shape: total={total} n={n}"
+        if sum(shares) > total * (1 - frac) + 1e-9:
+            return f"over cap: total={total} n={n} frac={frac} sum={sum(shares)}"
+        if max(shares) - min(shares) > 1 or shares != sorted(shares, reverse=True):
+            return f"not even/earliest-first: total={total} n={n} frac={frac}"
+    return True
+
+
+def _fuzz_drop_oldest() -> object:
+    rng = random.Random(99)
+    for _ in range(2000):
+        msgs = [{"role": "u", "content": "z" * rng.randint(0, 120)}
+                for _ in range(rng.randint(1, 10))]
+        budget = rng.randint(0, 200)
+        kept = compact.drop_oldest(msgs, budget)
+        if not kept or kept[-1] is not msgs[-1]:
+            return "dropped the last message"
+        if kept != msgs[len(msgs) - len(kept):]:
+            return "kept messages are not a suffix"
+        if len(kept) > 1 and estimate.estimate_messages(kept) > budget:
+            return f"stopped dropping too early: budget={budget}"
+    return True
+
+
+check("compact", "fuzz: head_tail always fits budget (4000 cases)", _fuzz_head_tail)
+check("compact", "fuzz: drop_oldest suffix/keeps-last (2000 cases)", _fuzz_drop_oldest)
+check("planner", "fuzz: shape/cap/evenness (4000 cases)", _fuzz_planner)
 check("package", "tests/ directory exists", lambda: (ART / "tests").is_dir())
 
 TMP.unlink(missing_ok=True)

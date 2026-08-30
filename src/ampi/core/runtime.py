@@ -215,13 +215,24 @@ class Runtime:
         the retraction rate is itself a number worth reporting.
         """
         row = self.device.query_one(
-            "SELECT state, generation FROM rank WHERE job_id=? AND rank=?",
+            "SELECT state, generation, failure_confirmed FROM rank WHERE job_id=? AND rank=?",
             (self.job_id, self.rank),
         )
         if row is not None and row["state"] == RANK_FAILED:
+            if row["failure_confirmed"]:
+                # A confirmed death is a decision, not a guess, and the rank
+                # does not get to overrule it by speaking again. Only
+                # AMPI_Respawn clears it. Without this an administratively
+                # killed rank resurrects itself on its very next call, which
+                # makes the kill unobservable and fault injection impossible.
+                raise AmpiProcFailed(
+                    f"rank {self.rank} has been terminated and may not continue; "
+                    "a replacement must be started with AMPI_Respawn",
+                    rank=self.rank,
+                )
             self.device.execute(
                 "UPDATE rank SET state=?, last_heartbeat=?, finished_at=NULL, "
-                "failure_confirmed=0, suspicions=suspicions+1, retractions=retractions+1 "
+                "suspicions=suspicions+1, retractions=retractions+1 "
                 "WHERE job_id=? AND rank=?",
                 (RANK_ALIVE, util.now(), self.job_id, self.rank),
             )

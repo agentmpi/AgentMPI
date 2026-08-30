@@ -400,17 +400,33 @@ def test_a_suspicion_does_not_fail_a_peers_send(make_job):
         sender.send("world", 1, 1, "this must not be")
 
 
-def test_a_returning_rank_clears_its_confirmation(make_job):
-    job = make_job(2)
+def test_a_returning_rank_clears_a_suspicion_but_not_a_kill(make_job):
+    """Speaking again refutes a guess; it does not overrule a decision.
+
+    If a confirmed kill were retractable by the rank itself, an
+    administratively terminated agent would resurrect on its very next call,
+    which makes the kill unobservable and fault injection impossible.
+    """
+    job = make_job(3)
     rt = job.runtime(0)
     rt.init(0)
-    victim = job.runtime(1)
-    victim.init(1)
-    rt.declare_failed(1, "timed out", confirmed=True)
-    victim._touch()
-    row = rt.rank_row(1)
-    assert row["state"] == "alive"
-    assert row["failure_confirmed"] == 0
+
+    suspected = job.runtime(1)
+    suspected.init(1)
+    rt.declare_failed(1, "timed out", confirmed=False)
+    suspected._touch()
+    assert rt.rank_row(1)["state"] == "alive"
+
+    killed = job.runtime(2)
+    killed.init(2)
+    rt.declare_failed(2, "administratively terminated", confirmed=True)
+    with pytest.raises(AmpiProcFailed):
+        killed._touch()
+    assert rt.rank_row(2)["state"] == RANK_FAILED
+
+    # Only respawn brings it back.
+    rt.respawn(2)
+    assert rt.rank_row(2)["state"] == "init"
 
 
 def test_a_stale_process_abandons_a_rank_that_was_taken_over(make_job):
