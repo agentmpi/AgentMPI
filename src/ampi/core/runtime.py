@@ -193,6 +193,32 @@ class Runtime:
         return self.rank_row(self.rank)
 
     def _touch(self) -> None:
+        """Record liveness, and retract a false suspicion if one was recorded.
+
+        An eventually-perfect failure detector is allowed to make mistakes and
+        obliged to correct them.  Here the correction is cheap and exact: a
+        rank that is executing a library call is, by direct evidence, alive, so
+        if some peer condemned it on a timeout the condemnation was wrong and
+        is withdrawn.  With LLM ranks this is not a corner case --- turn
+        latency is heavy tailed enough that false suspicion is routine --- and
+        the retraction rate is itself a number worth reporting.
+        """
+        row = self.device.query_one(
+            "SELECT state, generation FROM rank WHERE job_id=? AND rank=?",
+            (self.job_id, self.rank),
+        )
+        if row is not None and row["state"] == RANK_FAILED:
+            self.device.execute(
+                "UPDATE rank SET state=?, last_heartbeat=?, finished_at=NULL "
+                "WHERE job_id=? AND rank=?",
+                (RANK_ALIVE, util.now(), self.job_id, self.rank),
+            )
+            self.device.execute(
+                "INSERT INTO event (job_id, rank, ts, op, phase, meta) VALUES (?,?,?,?,?,?)",
+                (self.job_id, self.rank, util.now(), "AMPI_Failure_retracted", "exit",
+                 util.dumps({"reason": "the condemned rank made a library call"})),
+            )
+            return
         self.device.execute(
             "UPDATE rank SET last_heartbeat=? WHERE job_id=? AND rank=?",
             (util.now(), self.job_id, self.rank),
@@ -630,11 +656,20 @@ class Runtime:
         if src != AMPI_ANY_SOURCE:
             src_world = comm.world_of(src)
             if self.rank_row(src_world)["state"] == RANK_FAILED:
-                raise AmpiProcFailed(
-                    f"rank {src} (world {src_world}) failed while we waited for it "
-                    f"on {comm.name!r}",
-                    peer=src,
-                )
+                # A dead sender only matters if it died still owing us data.
+                # If the message is already in the store the transfer can
+                # complete, and failing here would discard work that survived
+                # the sender -- the whole point of a durable message log.
+                pending = self.device.scan("message", {
+                    "comm_id": comm.comm_id, "dst": comm.rank_of(self.rank),
+                    "src": src, "state": "posted",
+                })
+                if not pending:
+                    raise AmpiProcFailed(
+                        f"rank {src} (world {src_world}) failed while we waited for it "
+                        f"on {comm.name!r}",
+                        peer=src,
+                    )
         cycle = self.detect_deadlock()
         if cycle:
             raise AmpiDeadlock(
