@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS rank (
     -- confirmed death may fail a peer's operation; a suspicion must not,
     -- because suspicions are routinely wrong.
     failure_confirmed INTEGER NOT NULL DEFAULT 0,
+    -- Bumped by every AMPI_Init. A long-running operation captures the value
+    -- it started under and aborts if it changes, so a process left over from
+    -- an earlier attempt cannot go on acting as a rank that somebody else has
+    -- since taken over. This is the fencing-token pattern.
+    incarnation    INTEGER NOT NULL DEFAULT 0,
     tokens_sent    INTEGER NOT NULL DEFAULT 0,
     tokens_recvd   INTEGER NOT NULL DEFAULT 0,
     exit_note      TEXT,
@@ -343,6 +348,8 @@ class SqliteDevice(Device):
             ("retractions", "ALTER TABLE rank ADD COLUMN retractions INTEGER NOT NULL DEFAULT 0"),
             ("failure_confirmed",
              "ALTER TABLE rank ADD COLUMN failure_confirmed INTEGER NOT NULL DEFAULT 0"),
+            ("incarnation",
+             "ALTER TABLE rank ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0"),
         ):
             if column not in have:
                 try:
