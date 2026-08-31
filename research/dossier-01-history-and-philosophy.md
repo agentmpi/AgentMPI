@@ -6,154 +6,139 @@
 
 ## 0. How to read this dossier
 
-Claims are cited inline in the form `[bibkey, locator]`. Where a claim is drawn from a
-*primary* source — the standard document itself, an MPI Forum minute, or a technical report by
-a protagonist — that is noted. Where I could not verify something to the standard I would want
-for a camera-ready HPC paper, the claim is tagged **`[UNVERIFIED]`** with a note on what would
-settle it. Section 5 is explicitly *my analysis*, not history, and is marked as such throughout.
+Claims are cited inline as `[bibkey, locator]`. Where I could not verify something to the
+standard a camera-ready HPC paper requires, the claim is tagged **`[UNVERIFIED]`** with a note on
+what would settle it. Section 5 is explicitly *my analysis*, not history.
 
-Two textual hazards affected this research and are worth recording, because they will affect
-anyone re-checking my work. First, the widely circulated PDFs of the MPI-1.0 and MPI-1.1 reports
-were typeset from LaTeX in which the bibliography cross-references sometimes fail to resolve in
-extracted text, so the standard's own citations appear as `[?]`. Second, several convenient
-survey PDFs (notably the Wiley Encyclopedia chapter by Dongarra, Fagg, Hempel and Walker
-[@dongarra2000messagepassing]) survive online only as OCR in which *digits have been stripped*:
-"p4" reads as "p", "CM-5" as "CM", "MPI-2" as "MPI". I have therefore used that source only for
-qualitative claims and have taken every date and number from a source where the digits survive.
+Two textual hazards will affect anyone re-checking this work. The circulating PDFs of MPI-1.0 and
+MPI-1.1 lose their bibliography cross-references in text extraction, so the standard's own
+citations appear as `[?]`. And several convenient survey PDFs — notably the Wiley Encyclopedia
+chapter by Dongarra, Fagg, Hempel and Walker [@dongarra2000messagepassing] — survive online only
+as OCR in which *digits have been stripped*: "p4" reads as "p", "CM-5" as "CM". I have used that
+source only for qualitative claims, taking every date and number from a source where the digits
+survive.
 
 ---
 
 ## 1. Prehistory, 1978–1992: what MPI was assembled from, and what each predecessor failed to solve
 
-The message-passing model did not originate with MPI, and MPI's designers were explicit that it
-did not. The MPI-1.1 standard opens by saying that "in designing MPI we have sought to make use
-of the most attractive features of a number of existing message passing systems, rather than
-selecting one of them and adopting it as the standard," and then names its influences: work at
-IBM T. J. Watson, Intel's NX/2, Express, nCUBE's Vertex, p4, PARMACS, Zipcode, Chimp, PVM,
-Chameleon and PICL [@mpiforum1995mpi11, §1.1, p. 1]. That sentence is the single most important
-methodological statement in the MPI corpus, and it is quoted again below in §3.1.
+MPI's designers were explicit that the message-passing model did not originate with them. The
+MPI-1.1 standard opens by saying that "in designing MPI we have sought to make use of the most
+attractive features of a number of existing message passing systems, rather than selecting one of
+them and adopting it as the standard," then names its influences: work at IBM T. J. Watson,
+Intel's NX/2, Express, nCUBE's Vertex, p4, PARMACS, Zipcode, Chimp, PVM, Chameleon and PICL
+[@mpiforum1995mpi11, §1.1, p. 1]. That is the single most important methodological statement in
+the MPI corpus; it recurs in §3.1.
 
 ### 1.1 The theoretical substrate: CSP and Occam
 
 Hoare's *Communicating Sequential Processes* [@hoare1978csp] argued "that input and output are
 basic primitives of programming and that parallel composition of communicating sequential
-processes is a fundamental program structuring method" [@hoare1978csp, p. 666]. CSP supplied the
-conceptual vocabulary — processes with private state, communication as the only coupling — that
-message passing inherited wholesale. Occam, running on Inmos transputers in the Meiko Computing
-Surface, was CSP made executable: processes communicated over named channels using *only*
-synchronous, blocking send and receive [@dongarra2000messagepassing, §"The Meiko Computing
-Surface"].
+processes is a fundamental program structuring method" [@hoare1978csp, p. 666], supplying the
+vocabulary — processes with private state, communication as the only coupling — that message
+passing inherited wholesale. Occam, on Inmos transputers, made CSP executable: processes
+communicated over statically declared named channels using *only* synchronous, blocking send and
+receive [@dongarra2000messagepassing].
 
-**What CSP/Occam failed to solve.** Rigidity. Communication was bound to statically declared
-channels, and the only send available was fully synchronous, which forbids overlap of
-computation and communication and makes many natural algorithms deadlock-prone in a way the
-programmer must hand-verify. The compensating benefit — that Occam programs could be proved
-correct before execution, which underwrote a good deal of early ESPRIT work
-[@dongarra2000messagepassing] — is real, and is the thing the AgentMPI paper should be careful
-not to dismiss. MPI's answer was to keep CSP's process/channel *semantics* while providing four
-send modes (standard, buffered, synchronous, ready) and non-blocking variants of each, so that
-synchrony became a per-call choice rather than a language-level commitment.
+**What CSP/Occam failed to solve.** Rigidity. Fully synchronous channels forbid overlap of
+computation and communication and make many natural algorithms deadlock-prone in ways the
+programmer must hand-verify. The compensating benefit — Occam programs could be proved correct
+before execution, which underwrote much early ESPRIT work [@dongarra2000messagepassing] — is
+real, and the AgentMPI paper should not dismiss it. MPI kept CSP's process/channel *semantics*
+while providing four send modes (standard, buffered, synchronous, ready) and non-blocking
+variants of each, making synchrony a per-call choice rather than a language-level commitment.
 
 ### 1.2 Vendor-specific systems: CrOS, NX/2, Vertex, EUI, CMMD
 
 The Caltech Hypercube's Crystalline Operating System (CrOS) addressed processes by physical node
 and allowed communication only with topological neighbours or the host
 [@dongarra2000messagepassing]. Intel's NX, and later NX/2 on the iPSC and Paragon
-[@pierce1988nx2], broke that coupling: processes got integer identifiers independent of
-topology, messages could be tagged, and non-blocking operations returned message identifiers
-(*mids*) that could be tested for completion later. nCUBE's Vertex [@ncube1990vertex] and IBM's
-External User Interface (EUI, from the Vulcan project that became the SP series) occupied the
-same design space; EUI added logical process groups addressable by a single group ID, and
-collective operations over those groups — barrier, shift, broadcast, gather/scatter, combine,
-reduction [@dongarra2000messagepassing]. Thinking Machines' CMMD for the CM-5 layered a
-point-to-point library, virtual channels and a cooperative-communications library over an Active
-Message Layer that manipulated the interconnect directly [@dongarra2000messagepassing].
+[@pierce1988nx2], broke that coupling: processes got integer identifiers independent of topology,
+messages could be tagged, and non-blocking operations returned message identifiers (*mids*)
+testable for completion later. nCUBE's Vertex [@ncube1990vertex] and IBM's External User
+Interface (EUI, from the Vulcan project that became the SP series) occupied the same design
+space; EUI added logical process groups addressable by a single group ID, with collective
+operations over them. Thinking Machines' CMMD for the CM-5 layered a point-to-point library,
+virtual channels and a cooperative-communications library over an Active Message Layer that drove
+the interconnect directly [@dongarra2000messagepassing].
 
-**What the vendor systems failed to solve.** Portability, obviously — but the more interesting
-failures are semantic. The original NX did not permit filtering a receive by *both* sender
-identity and message type simultaneously; the workaround was to smuggle the sender's ID into the
-type field [@dongarra2000messagepassing]. NX also truncated messages that overran the receive
-buffer, silently discarding the excess. EUI fixed the two-dimensional selection problem and
-introduced the two-phase status-handle discipline for non-blocking operations that MPI later
-adopted [@dongarra2000messagepassing]. These are exactly the kind of small semantic defects that
-a standard exists to eliminate once, everywhere.
+**What the vendor systems failed to solve.** Portability, obviously — but the semantic failures
+are more interesting. The original NX did not permit filtering a receive by *both* sender identity
+and message type at once; the workaround was to smuggle the sender's ID into the type field. NX
+also silently truncated messages that overran the receive buffer. EUI fixed the two-dimensional
+selection problem and introduced the two-phase status-handle discipline for non-blocking
+operations that MPI later adopted [@dongarra2000messagepassing]. These are exactly the small
+semantic defects a standard exists to eliminate once, everywhere.
 
 ### 1.3 The portability APIs: p4, PARMACS, Chameleon, Express, PICL, Zipcode, PVM
 
-p4 (Butler and Lusk, Argonne) descended from a set of Fortran monitor macros called MonMacs
-written for the Denelcor HEP, processed by the Unix `m4` preprocessor; the name comes from the
-book *Portable Programs for Parallel Processors* [@butler1994p4;
-@dongarra2000messagepassing]. The mature system was procedure-based, supported C and Fortran on
-shared- and distributed-memory machines and clusters, gave the user direct access to buffers, and
-offered collective operations including a user-defined `p4_global_op`. It had, notably, *no*
-non-blocking or locally-blocking calls at all: sends returned when the data had been sent
-[@dongarra2000messagepassing]. p4's most consequential legacy was as plumbing — it and Chameleon
+p4 (Butler and Lusk, Argonne) descended from Fortran monitor macros called MonMacs, written for
+the Denelcor HEP and processed by the Unix `m4` preprocessor; the name comes from the book
+*Portable Programs for Parallel Processors* [@butler1994p4; @dongarra2000messagepassing]. The
+mature system was procedure-based, spanned shared- and distributed-memory machines and clusters,
+gave the user direct access to buffers, and offered collective operations including a user-defined
+`p4_global_op` — but had *no* non-blocking or locally-blocking calls at all
+[@dongarra2000messagepassing]. Its most consequential legacy was as plumbing: p4 and Chameleon
 [@gropp1993chameleon] were the substrates on which MPICH was built [@gropp1996mpich].
 
 PARMACS (Hempel, GMD) grew from the Argonne/GMD macros [@bomans1990argonne], a grid-oriented
-descendant of the same MonMacs lineage, and became the *de facto* European standard, adopted as
-the programming model of the ESPRIT Genesis, PPPE and RAPS projects [@calkin1994parmacs;
-@dongarra2000messagepassing]. Its distinctive contribution was **virtual topologies**: a mapping
-between process addresses and a torus/grid of up to four dimensions, or an arbitrary graph, so
-that a program could say "send to my successor" rather than computing an absolute address
-[@dongarra2000messagepassing]. MPI's Chapter on process topologies is PARMACS's idea, and the
-MPI-1.1 text says so, citing PARMACS among its influences [@mpiforum1995mpi11, §1.1].
+descendant of the same MonMacs lineage, and became the *de facto* European standard, adopted by
+the ESPRIT Genesis, PPPE and RAPS projects [@calkin1994parmacs; @dongarra2000messagepassing]. Its
+distinctive contribution was **virtual topologies**: a mapping between process addresses and a
+torus/grid of up to four dimensions or an arbitrary graph, so a program could say "send to my
+successor" rather than compute an absolute address [@dongarra2000messagepassing]. MPI's
+process-topologies chapter is PARMACS's idea, and MPI-1.1 names PARMACS among its influences
+[@mpiforum1995mpi11, §1.1].
 
-Express (ParaSoft) was the commercialisation of CrOS, with topology-aware collective libraries
-(`exgrid`, `exlayout`, `exdist`) sufficient that a well-structured application could be written
-with *no explicit send or receive calls at all* [@parasoft1992express;
-@dongarra2000messagepassing]. That is a striking data point for the AgentMPI paper: the
-highest-level predecessor was the one that most nearly eliminated the primitive it was built on.
-
-**Zipcode** (Skjellum et al., beginning at Caltech in July 1988) is the single most important
+Express (ParaSoft) commercialised CrOS, with topology-aware collective libraries (`exgrid`,
+`exlayout`, `exdist`) sufficient that a well-structured application could be written with *no
+explicit send or receive calls at all* [@parasoft1992express; @dongarra2000messagepassing] — a
+striking data point: the highest-level predecessor most nearly eliminated the primitive it was
+built on. **Zipcode** (Skjellum et al., from Caltech in July 1988) is the most important
 predecessor for our purposes and is treated separately in §3.3.
 
-PVM (Sunderam at Emory, with Geist and Dongarra at ORNL and Tennessee) was, by the time the MPI
-process began, the most widely used message-passing system in the world [@sunderam1990pvm;
-@geist1994pvm; @dongarra2000messagepassing]. Its design centre was different from everyone
-else's: heterogeneity (XDR-based data conversion across mixed architectures), *dynamic*
-membership (hosts could be added, removed, or simply fail while the rest continued; tasks could
-be spawned and killed at will), and process-level failure detection and recovery
-[@sunderam1990pvm]. PVM sends never blocked, because the system buffered everything
-[@dongarra2000messagepassing] — a decision MPI explicitly reversed, for reasons analysed in §3.4.
+PVM (Sunderam at Emory, with Geist and Dongarra at ORNL and Tennessee) was, when the MPI process
+began, the most widely used message-passing system in the world [@sunderam1990pvm; @geist1994pvm;
+@dongarra2000messagepassing]. Its design centre was unlike everyone else's: heterogeneity (XDR
+conversion across mixed architectures), *dynamic* membership (hosts could be added, removed or
+simply fail while the rest continued; tasks could be spawned and killed at will), and
+process-level failure detection and recovery [@sunderam1990pvm]. PVM sends never blocked, because
+the system buffered everything [@dongarra2000messagepassing] — a decision MPI explicitly
+reversed, for reasons analysed in §3.4.
 
 **What the portability APIs failed to solve.** Three things. (i) They multiplied: portability
-across hardware was purchased at the cost of incompatibility across APIs, so a program written
-against Express could not link against a library written against PARMACS
-[@dongarra2000messagepassing]. (ii) Performance. PVM in particular chose heterogeneity over
-speed; its per-message buffer management cost enough on MPPs that the authors later added
-`pvm_psend`/`pvm_precv` to bypass it [@dongarra2000messagepassing]. (iii) With the sole
-exception of Zipcode, none of them made it safe to *write a library*. That is the argument of
-§3.3.
+across hardware was bought at the cost of incompatibility across APIs, so a program written
+against Express could not link a library written against PARMACS
+[@dongarra2000messagepassing]. (ii) Performance: PVM chose heterogeneity over speed, and its
+per-message buffer management cost enough on MPPs that the authors later added
+`pvm_psend`/`pvm_precv` to bypass it [@dongarra2000messagepassing]. (iii) With the sole exception
+of Zipcode, none made it safe to *write a library*. That is the argument of §3.3.
 
 ### 1.4 Linda: the blackboard ancestor
 
-Gelernter's Linda [@gelernter1985linda] is the one system in this list that is not
-message-passing at all. Processes do not address one another; they add tuples to a shared,
-associatively addressed "tuple space" (TS) with `out()`, remove them with `in()`, and read them
-non-destructively with `rd()`, matching by template. Gelernter's own framing is that
-communication is *generative*: "until it is explicitly withdrawn, the tuple generated by A has an
-independent existence in TS. A tuple in TS is equally accessible to all processes within TS, but
-is bound to none" [@gelernter1985linda, p. 81]. The consequences he names are **time- and
-space-uncoupling** of the communicating processes: the consumer need not exist when the tuple is
-created, and neither party ever learns the other's address [@gelernter1985linda;
-@dongarra2000messagepassing].
+Gelernter's Linda [@gelernter1985linda] is the one system here that is not message-passing at
+all. Processes do not address one another; they add tuples to a shared, associatively addressed
+"tuple space" (TS) with `out()`, remove them with `in()`, and read them non-destructively with
+`rd()`, matching by template. Communication is *generative*: "until it is explicitly withdrawn,
+the tuple generated by A has an independent existence in TS. A tuple in TS is equally accessible
+to all processes within TS, but is bound to none" [@gelernter1985linda, p. 81]. The consequences
+Gelernter names are **time- and space-uncoupling**: the consumer need not exist when the tuple is
+created, and neither party ever learns the other's address [@gelernter1985linda].
 
-For the AgentMPI paper this is the crucial ancestor, because *this is what contemporary
-multi-agent frameworks actually are*. Shared scratchpads, blackboard memories, vector-store
-"context" shared across agents, and message buses with topic subscription are all tuple spaces
-with worse matching semantics. The historical lesson is therefore directly on point: Linda was
-elegant, was implementable competitively for medium-to-large payloads once compile-time analysis
-of tuple fields was added [@dongarra2000messagepassing], and *lost*. The Williamsburg workshop
-placed Linda explicitly in the "higher-level abstractions" tier of its Onion Skin Model and
-concluded that the standard should sit at an *intermediate* level, below Linda and above raw
-channels [@walker1992standards, §3].
+This is the crucial ancestor for the AgentMPI paper, because *this is what contemporary
+multi-agent frameworks actually are*: shared scratchpads, blackboard memories, shared vector-store
+"context" and topic-subscription buses are tuple spaces with worse matching semantics. The
+historical lesson is on point — Linda was elegant, became competitive for medium-to-large payloads
+once compile-time analysis of tuple fields was added [@dongarra2000messagepassing], and *lost*.
+Williamsburg placed Linda in the "higher-level abstractions" tier of its Onion Skin Model and put
+the standard at an *intermediate* level, below Linda and above raw channels [@walker1992standards,
+§3].
 
 **What Linda failed to solve.** Locality and cost transparency. A tuple-space operation has no
-statically visible cost, so the programmer cannot reason about communication volume, and the
+statically visible cost, so the programmer cannot reason about communication volume and the
 implementation cannot pick an algorithm without global analysis. This is precisely the objection
-the AgentMPI paper should reuse against shared-scratchpad agent architectures, where a "read from
-the blackboard" has an unbounded and invisible token cost.
+AgentMPI should reuse against shared-scratchpad agent architectures, where a "read from the
+blackboard" has an unbounded and invisible token cost.
 
 ---
 
@@ -171,48 +156,46 @@ proceedings summary is **ORNL/TM-12147**, by David W. Walker, dated **August 199
 A correction to the framing in the AgentMPI project brief: the workshop was **organised by Jack
 Dongarra and David Walker**, not by Kennedy. Ken Kennedy of Rice moderated the closing panel and
 "encouraged the message passing community to set up a working group in order to carry the
-standardization process forward" [@dongarra2000messagepassing; @walker1992standards, Appendix
-A]. The wrap-up was given by Walker and Dongarra. The distinction matters if the paper credits
+standardization process forward" [@dongarra2000messagepassing; @walker1992standards, Appendix A];
+the wrap-up was given by Walker and Dongarra. The distinction matters if the paper credits
 organisers by name.
 
 Two findings from the report are load-bearing. First, the **Onion Skin Model**: the workshop
-explicitly reasoned about *at what level* to standardise, ranging from channel-addressed
-primitives at the bottom through process-addressed systems (NX, Vertex, Express, PARMACS) to
-Linda, MetaMP and Shared Objects at the top, and concluded that "the hardware of different
-distributed memory computing systems is sufficiently varied that it is difficult to impose a
-low-level standard that is efficient on all machines. Therefore, it is more appropriate to define
-a standard at an intermediate level, and to implement this as efficiently as possible on each
-machine" [@walker1992standards, §3]. Second, **message contexts were in the requirements list on
-day one**, justified in exactly one sentence: "Often a parallel program divides naturally into
-different computational phases. Message contexts can be used to prevent nonblocking messages from
-different phases interfering with one another without the need for a time-consuming barrier
-synchronization between phases" [@walker1992standards, §3.1].
+reasoned explicitly about *at what level* to standardise — from channel-addressed primitives at
+the bottom, through process-addressed systems (NX, Vertex, Express, PARMACS), to Linda, MetaMP and
+Shared Objects at the top — and concluded that "the hardware of different distributed memory
+computing systems is sufficiently varied that it is difficult to impose a low-level standard that
+is efficient on all machines. Therefore, it is more appropriate to define a standard at an
+intermediate level, and to implement this as efficiently as possible on each machine"
+[@walker1992standards, §3]. Second, **message contexts were in the requirements list on day one**:
+"Often a parallel program divides naturally into different computational phases. Message contexts
+can be used to prevent nonblocking messages from different phases interfering with one another
+without the need for a time-consuming barrier synchronization between phases"
+[@walker1992standards, §3.1].
 
 The report closes by forming a Working Group of about 30 people with **Dongarra as Chair and
 Walker as Executive Director**, and states the method: "Rather than taking one of the existing
 message passing systems and anointing it as the standard, the intent is to settle on the
-functional and semantic requirements (drawing where appropriate on existing systems for
-guidance), and then to define the detailed syntax of the standard" [@walker1992standards,
-§5]. The group expected to meet "about once every 4 to 6 *months*" and to take about 12 months
-[@walker1992standards, §5]. It actually met every six *weeks*. The acceleration is itself a
+functional and semantic requirements (drawing where appropriate on existing systems for guidance),
+and then to define the detailed syntax of the standard" [@walker1992standards, §5]. The group
+expected to meet "about once every 4 to 6 *months*" and to finish in about 12 months
+[@walker1992standards, §5]. It actually met every six *weeks*; the acceleration is itself a
 finding.
 
 ### 2.2 Formalisation and cadence, 1992–1994
 
 A preliminary draft, "MPI1", was put forward by **Dongarra, Hempel, Hey and Walker** in November
-1992, with a revised version completed in February 1993 as ORNL/TM-12231 [@mpiforum1995mpi11,
-§1.1; @dongarra1993proposal]. MPI1 covered point-to-point communication only, had no collectives,
-and was not thread-safe [@mpiforum1995mpi11, §1.1].
+1992, revised in February 1993 as ORNL/TM-12231 [@mpiforum1995mpi11, §1.1;
+@dongarra1993proposal]. MPI1 covered point-to-point communication only, had no collectives, and
+was not thread-safe [@mpiforum1995mpi11, §1.1].
 
-**Note on a common error.** The MPI Forum was *not* constituted at Supercomputing '92. The
-decisive meeting was a **meeting of the MPI working group held in Minneapolis in November 1992**,
-at which it was decided "to place the standardization process on a more formal footing, and to
+**Note on a common error.** The MPI Forum was *not* constituted at Supercomputing '92 as such. The
+decisive event was a **meeting of the MPI working group in Minneapolis in November 1992**, at
+which it was decided "to place the standardization process on a more formal footing, and to
 generally adopt the procedures and organization of the High Performance Fortran Forum"
-[@mpiforum1995mpi11, §1.1]. Minneapolis was the location of Supercomputing '92 (16–20 November
-1992), and the working-group meeting was held during the conference
-[@dongarra2000messagepassing], so the two statements are reconcilable — but "the Forum was formed
-at SC'92" is a compression, and the primary text says Minneapolis and HPF Forum procedure. I
-recommend the paper use the primary wording.
+[@mpiforum1995mpi11, §1.1]. Minneapolis hosted SC'92 and the working-group meeting took place
+during the conference [@dongarra2000messagepassing], so the two statements reconcile — but "the
+Forum was formed at SC'92" is a compression. Use the primary wording.
 
 The **procedural rules**, from the Forum's own newcomers' document [@mpiforum1993newcomers]:
 
@@ -227,26 +210,26 @@ The **procedural rules**, from the Forum's own newcomers' document [@mpiforum199
   vote at your first meeting)."** Not enforceable at the first two meetings.
 - Discussion ran under "loosely-enforced Robert's Rules of Order."
 
-A further rule, reported in Huss-Lederman's retrospective on the process, is that items **had to
-be approved at two separate meetings** [@husslederman_mpiprocess]. **`[UNVERIFIED]`** — I have
-this only from a slide deck of uncertain provenance; the primary confirmation would be the Forum
-minutes at `netlib.org/mpi/minutes-93/`, which I did not exhaustively read. Do not state the
-two-reading rule for MPI-1 as fact without checking those minutes. (It is uncontroversially true
-of the modern Forum.)
+A further rule, reported in Huss-Lederman's retrospective, is that items **had to be approved at
+two separate meetings** [@husslederman_mpiprocess]. **`[UNVERIFIED]`** — this comes only from a
+slide deck of uncertain provenance; confirmation would be the Forum minutes at
+`netlib.org/mpi/minutes-93/`, which I did not exhaustively read. Do not state the two-reading rule
+for MPI-1 as fact without checking those minutes. (It is uncontroversially true of the modern
+Forum.)
 
-Participation: "about 60 people from 40 organizations mainly from the United States and Europe"
-[@mpiforum1995mpi11, §1.1]. Seven meetings ran between January and September 1993
-[@dongarra2000messagepassing]. The draft was presented at Supercomputing '93 in Portland, Oregon
-in November 1993, followed by a public comment period; a January 1994 Forum meeting at INRIA
-Sophia Antipolis brought in the European community and produced `MPI_Pack`/`MPI_Unpack`, the
-buffered send mode, portable timers, error classes and a guaranteed tag range — all added for
-compatibility with PVM and PARMACS [@dongarra2000messagepassing].
+Participation was "about 60 people from 40 organizations mainly from the United States and Europe"
+[@mpiforum1995mpi11, §1.1], across seven meetings between January and September 1993
+[@dongarra2000messagepassing]. The draft was presented at Supercomputing '93 in Portland, followed
+by a public comment period; a January 1994 meeting at INRIA Sophia Antipolis brought in the
+European community and produced `MPI_Pack`/`MPI_Unpack`, the buffered send mode, portable timers,
+error classes and a guaranteed tag range — all for compatibility with PVM and PARMACS
+[@dongarra2000messagepassing].
 
 MPICH, maintained by Lusk and Gropp at Argonne in lockstep with the evolving draft, was complete
-and portable on the day MPI-1.0 was released [@gropp1996mpich]. Its authors contrast this
-explicitly with HPF, whose vendors waited for a stable specification and whose implementations
-were "only now (February 1996) becoming available, whereas a large community has been using MPI
-for over a year" [@gropp1996mpich].
+and portable on the day MPI-1.0 was released. Its authors contrast this with HPF, whose vendors
+waited for a stable specification and whose implementations were "only now (February 1996)
+becoming available, whereas a large community has been using MPI for over a year"
+[@gropp1996mpich].
 
 ### 2.3 Version chronology
 
@@ -268,44 +251,37 @@ The canonical list, taken verbatim from the front matter of the standard itself
 | MPI-4.1 | **November 2, 2023** | clarifications and minor extensions |
 | MPI-5.0 | **June 5, 2025** | **standard ABI** |
 
-**MPI-5.0 verification (this was flagged in the brief and is worth stating carefully).** MPI-5.0
-was ratified by the Forum on **5 June 2025** [@mpiforum2025bof]. Its headline feature is a
-standard **Application Binary Interface**: "The largest change is the addition of a standard
-Application Binary Interface (ABI) to allow interoperability of different implementations"
-[@mpiforum2025mpi50, §2]. The ABI is versioned independently of the API, starting at 1.0; the
-library must be named `mpi_abi`; and the ABI deliberately excludes everything deprecated in
-MPI-3.1 or earlier, with the rationale that "if deprecated features are included in the standard
-ABI, deleting them will cause a backwards-incompatibility issue in the ABI"
-[@mpiforum2025mpi50, §21.2.1].
+**MPI-5.0 verification.** MPI-5.0 was ratified on **5 June 2025** [@mpiforum2025bof]. Its headline
+feature is a standard **Application Binary Interface**: "The largest change is the addition of a
+standard Application Binary Interface (ABI) to allow interoperability of different
+implementations" [@mpiforum2025mpi50, §2]. The ABI is versioned independently of the API from 1.0,
+the library must be named `mpi_abi`, and it deliberately excludes everything deprecated in MPI-3.1
+or earlier, because "if deprecated features are included in the standard ABI, deleting them will
+cause a backwards-incompatibility issue in the ABI" [@mpiforum2025mpi50, §21.2.1].
 
-**ULFM did *not* land in MPI-5.0.** User-Level Failure Mitigation remains a *draft proposal* of
-the Forum's Fault Tolerance Working Group. Open MPI's current documentation, describing releases
-that postdate MPI-5.0, still states that "ULFM is still an extension to the MPI standard" and
-that users must `#include <mpi-ext.h>` to reach its error codes and functions
-[@openmpi2024ulfm]. The Forum's own issue tracker shows ULFM as an open standardisation item with
-readings in 2022 [@mpiforum_ulfm_issue20], and MPI Fault Tolerance appears on the Forum's list of
-targets for **MPI-6.0**, not as delivered work [@mpiforum2025bof]. Bland et al. wrote in 2015
-that ULFM was "the front-running solution for process fault tolerance in MPI. While not yet
-adopted into the MPI standard..." [@bland2015ulfm], and that sentence is still accurate a decade
-later. **This is the single most common secondary-source error about MPI's fault model, and the
-paper should say so explicitly.**
+**ULFM did *not* land in MPI-5.0.** User-Level Failure Mitigation remains a *draft proposal* of the
+Forum's Fault Tolerance Working Group. Open MPI documentation describing releases that postdate
+MPI-5.0 still states that "ULFM is still an extension to the MPI standard" and that users must
+`#include <mpi-ext.h>` to reach its error codes and functions [@openmpi2024ulfm]. The Forum's
+issue tracker shows ULFM as an open item with readings in 2022 [@mpiforum_ulfm_issue20], and MPI
+Fault Tolerance appears on the Forum's list of targets for **MPI-6.0**, not as delivered work
+[@mpiforum2025bof]. Bland et al. wrote in 2015 that ULFM was "the front-running solution for
+process fault tolerance in MPI. While not yet adopted into the MPI standard..." [@bland2015ulfm];
+that sentence is still accurate a decade later. **This is the single most common secondary-source
+error about MPI's fault model, and the paper should say so.**
 
-One further documentary discrepancy, which I flag because a reviewer may catch it. The MPI-1.1
-report's own front matter says "**Version 1.0: June, 1994**" [@mpiforum1995mpi11, front matter],
-whereas MPI-1.3 and every subsequent version say "**MPI-1.0 (May 5, 1994)**"
-[@mpiforum2008mpi13; @mpiforum2021mpi40]. The Wiley chapter says the specification "was then
-released through the Internet on May [5,] 1994" [@dongarra2000messagepassing]. **Recommendation:
-cite May 5, 1994 as the document date (it is what the standard now says of itself) and, if
-precision matters, note that MPI-1.1 dated the release to June 1994.** Do not write "June 1994"
-unqualified, which is what Wikipedia does [@wikipedia_mpi].
+A second documentary discrepancy a reviewer may catch: MPI-1.1's front matter says "**Version 1.0:
+June, 1994**" [@mpiforum1995mpi11], whereas MPI-1.3 and every later version say "**MPI-1.0 (May 5,
+1994)**" [@mpiforum2008mpi13; @mpiforum2021mpi40], and the Wiley chapter says the specification
+"was then released through the Internet on May [5,] 1994" [@dongarra2000messagepassing]. **Cite
+May 5, 1994 — what the standard now says of itself — and footnote the conflict.** Do not write
+"June 1994" unqualified, as Wikipedia does [@wikipedia_mpi].
 
-Page counts, for the size critique in §4: MPI-2.1 608pp, MPI-2.2 647pp, MPI-3.0 852pp, MPI-3.1
-868pp, MPI-4.0 **1139pp**, MPI-4.1 1166pp, MPI-5.0 1189pp [@schulz2026stateofmpi]. The 1139 for
-MPI-4.0 is independently confirmed by the document itself [@mpiforum2021mpi40]. Snir's count of
-functions: 128 functions / 231 pages at MPI-1.1; 330 / 586 at MPI-2.1; 451 / 836 at MPI-3.1
-[@snir_mpilevels]. **`[UNVERIFIED]`** — Snir's page figures differ slightly from Schulz's (836 vs
-868 for MPI-3.1), probably because of front matter; use one source consistently and prefer the
-Forum's own.
+Page counts, for the size critique in §4: MPI-2.1 608pp, 2.2 647pp, 3.0 852pp, 3.1 868pp, 4.0
+**1139pp**, 4.1 1166pp, 5.0 1189pp [@schulz2026stateofmpi]; the 1139 is independently confirmed by
+the document itself [@mpiforum2021mpi40]. Snir counts 128 functions / 231 pages at MPI-1.1, 330 /
+586 at MPI-2.1, 451 / 836 at MPI-3.1 [@snir_mpilevels] — **`[UNVERIFIED]`**, and his page figures
+differ from the Forum's (836 vs 868 for MPI-3.1), probably over front matter. Prefer the Forum's.
 
 ---
 
@@ -314,35 +290,32 @@ Forum's own.
 ### 3.1 "Standardise existing practice"
 
 The rule is stated in the MPI-1 goal list as a design constraint, not a slogan: **"Define an
-interface that is not too different from current practice, such as PVM, NX, Express, p4, etc.,
-and provides extensions that allow greater flexibility"** [@mpiforum1995mpi11, §1.1, p. 2]. It is
-reinforced by the framing sentence quoted at the head of §1 and by the Williamsburg report's
-statement of method [@walker1992standards, §5].
+interface that is not too different from current practice, such as PVM, NX, Express, p4, etc., and
+provides extensions that allow greater flexibility"** [@mpiforum1995mpi11, §1.1, p. 2], reinforced
+by the framing sentence quoted at the head of §1 and by Williamsburg's statement of method
+[@walker1992standards, §5]. Three refinements the paper should get right.
 
-Three refinements the paper should get right.
-
-**(a) It was never "codify only what exists."** The historical actors are explicit that MPI went
-beyond current practice: "although much of MPI standardizes the common practice of existing
+**(a) It was never "codify only what exists."** The actors are explicit that MPI went beyond
+current practice: "although much of MPI standardizes the common practice of existing
 message-passing systems, MPI goes further to define such advanced features as user-defined
 datatypes, persistent communication ports, powerful collective communication operations, and
 scoping mechanisms for communication. **No previous system incorporated all these features**"
 [@dongarra1996messagepassingstandard]. The rule is better stated as: *every mechanism must have
 been proved somewhere, but the combination may be new.*
 
-**(b) It was, in part, political.** The Wiley retrospective is blunt: "It would have been very
-difficult to make one of the existing message passing interfaces the universal standard. From the
-technical point of view no interface before MPI fulfilled the functionality requirements of the
-whole range of potential users... **At least as important was the political aspect**, since
-choosing an existing interface would have created opposition by vendors and users who preferred
-other choices" [@dongarra2000messagepassing, §"Lessons learned"].
+**(b) It was, in part, political.** "It would have been very difficult to make one of the existing
+message passing interfaces the universal standard. From the technical point of view no interface
+before MPI fulfilled the functionality requirements of the whole range of potential users... **At
+least as important was the political aspect**, since choosing an existing interface would have
+created opposition by vendors and users who preferred other choices" [@dongarra2000messagepassing,
+§"Lessons learned"].
 
 **(c) The Forum broke the rule in MPI-2 and knew it.** "One of the MPI-1 guidelines had been to
 keep the standard as close as possible to current practice... **In many cases during MPI-2 the
 borderline between current practice and research was passed and new features were included in the
-standard without any experience with available implementations**"
-[@dongarra2000messagepassing]. MPI-2 required sixteen meetings to MPI-1's seven, and its
-implementations arrived slowly. This is the cleanest natural experiment in the corpus on the
-value of the rule, and the AgentMPI paper should use it as such.
+standard without any experience with available implementations**" [@dongarra2000messagepassing].
+MPI-2 took sixteen meetings to MPI-1's seven, and its implementations arrived slowly: the cleanest
+natural experiment in the corpus on the value of the rule.
 
 ### 3.2 The non-goals of MPI-1
 
@@ -365,10 +338,10 @@ extensions by specific implementations" [@mpiforum1995mpi11, §1.5, p. 4].
 
 **Fault tolerance appears as a non-goal in disguise, phrased as a goal:** "**Assume a reliable
 communication interface: the user need not cope with communication failures. Such failures are
-dealt with by the underlying communication subsystem**" [@mpiforum1995mpi11, §1.1, p. 2]. Note
-what this actually says: it is a statement about *communication* reliability, not about process
-survival. Gropp and Lusk are emphatic that the standard does *not* mandate that a process death
-kills the job — that is a consequence of the default error handler, not of the semantics:
+dealt with by the underlying communication subsystem**" [@mpiforum1995mpi11, §1.1, p. 2]. That is
+a statement about *communication* reliability, not process survival. Gropp and Lusk are emphatic
+that the standard does *not* mandate that a process death kills the job — that is a consequence of
+the default error handler, not of the semantics:
 
 > "A common misconception about MPI is that the MPI Standard itself mandates that if any MPI
 > process dies, then all the MPI processes in the job must die as well. **This is not true.** The
@@ -379,21 +352,20 @@ kills the job — that is a consequence of the default error handler, not of the
 > users were new.)" [@gropp2004faulttolerance, §3]
 
 They also insist that "fault tolerance is a property of an MPI program coupled with an MPI
-implementation," not of an API, and that the assertion "MPI is not fault tolerant" is "not
-actually well formed and so is neither true nor false" [@gropp2004faulttolerance, §3]. What the
-standard *does* mandate is reliable delivery: a conforming implementation may not deliver a
-corrupted message, and "under no circumstances should an MPI application or library need to
-verify integrity of data received" [@gropp2004faulttolerance, §4.1].
+implementation," not of an API, and that the assertion "MPI is not fault tolerant" is "not actually
+well formed and so is neither true nor false" [@gropp2004faulttolerance, §3]. What the standard
+*does* mandate is reliable delivery: a conforming implementation may not deliver a corrupted
+message, and "under no circumstances should an MPI application or library need to verify integrity
+of data received" [@gropp2004faulttolerance, §4.1].
 
-**What the non-goals bought.** Smallness, and therefore near-universal vendor implementation. I
-can support the qualitative claim strongly — "most vendors if not all support MPI as their
-primary message passing interface" [@dongarra2000messagepassing, §"Lessons learned"], MPICH was
-complete on release day and "formed the basis of many hardware vendors' custom implementations"
-[@gropp1996mpich; @dongarra2000messagepassing] — but I could **not** verify the specific
-formulation "every vendor shipped it within ~2 years." **`[UNVERIFIED]`.** To make that claim
-precisely one would need the vendor-implementation survey tables from the mid-1990s MPI
-Developers Conference proceedings or from *MPI: The Complete Reference* [@snir1996mpicomplete];
-I recommend the paper make the weaker, fully supported claim instead.
+**What the non-goals bought.** Smallness, and therefore near-universal vendor implementation. The
+qualitative claim is well supported — "most vendors if not all support MPI as their primary message
+passing interface" [@dongarra2000messagepassing, §"Lessons learned"], and MPICH was complete on
+release day and "formed the basis of many hardware vendors' custom implementations"
+[@gropp1996mpich] — but I could **not** verify the specific formulation "every vendor shipped it
+within ~2 years." **`[UNVERIFIED]`**: settling it needs the vendor-implementation tables from the
+mid-1990s MPI Developers Conference proceedings or *MPI: The Complete Reference*
+[@snir1996mpicomplete]. Make the weaker, fully supported claim instead.
 
 ### 3.3 Communicators and the safe-library argument — the central citation
 
@@ -404,22 +376,18 @@ contexts of communication, static process group support, mailers (called communi
 and virtual topology support were all completed (and put in practice) in 1988 and early 1989.
 **Contexts, which provide separate, safe 'universes' of message passing, were one of the first
 features implemented during August, 1988**" [@skjellum1994zipcode, §1]. The mechanism was a
-system-supplied additional tag, *opaque to the user*, bound together with a static process group
-by an object called a **mailer** [@skjellum1994zipcode;
-@dongarra2000messagepassing]. Contemporaneously: "messages in a given context are guaranteed not
-to interfere with those in another context. This enables the development of large applications
-and libraries **without fear of message interference between applications and libraries**"
-[@skjellum1992zipcodesystem].
+system-supplied additional tag, *opaque to the user*, bound to a static process group by an object
+called a **mailer**: "messages in a given context are guaranteed not to interfere with those in
+another context. This enables the development of large applications and libraries **without fear
+of message interference between applications and libraries**" [@skjellum1992zipcodesystem].
 
-**The problem statement, retrospectively.** The clearest statement of *why* pre-MPI libraries
-were unsafe is in the Dongarra/Fagg/Hempel/Walker survey: "As message passing applications became
-more complex, for example through the use of third party libraries, insulating the message
-traffic in the application code from the communication inside a library became a non-trivial
-problem, **in particular if wild cards were used in receiving messages**"
-[@dongarra2000messagepassing, §"Zipcode"].
+**The problem statement, retrospectively.** The clearest account of *why* pre-MPI libraries were
+unsafe: "As message passing applications became more complex, for example through the use of third
+party libraries, insulating the message traffic in the application code from the communication
+inside a library became a non-trivial problem, **in particular if wild cards were used in receiving
+messages**" [@dongarra2000messagepassing, §"Zipcode"].
 
-**The primary citation to use — Gropp, "Learning from the Success of MPI" (HiPC 2001).** This is
-the sentence to quote:
+**The primary citation to use — Gropp, "Learning from the Success of MPI" (HiPC 2001):**
 
 > "MPI supports component oriented software. Both [to] describe the subset of processes
 > participating in a component and to ensure that all MPI communication is kept within the
@@ -428,17 +396,16 @@ the sentence to quote:
 > another component or by user code. MPI made reliable libraries possible.**"
 > [@gropp2001learning, §"Modularity"]
 
-Gropp adds, in a footnote to that passage, the attribution: **"The context part of the
-communicator was inspired by Zipcode"** [@gropp2001learning, §"Modularity", n.]. He elsewhere
-identifies the communicator as his exemplar of MPI's economy of concepts: "the MPI communicator
-both describes the group of communicating processes and provides a separate communication context
-that supports component oriented software" [@gropp2001learning, §"Simplicity and Symmetry"].
+A footnote to that passage supplies the attribution: **"The context part of the communicator was
+inspired by Zipcode"** [@gropp2001learning, §"Modularity", n.]. Gropp elsewhere makes the
+communicator his exemplar of MPI's economy of concepts: it "both describes the group of
+communicating processes and provides a separate communication context that supports component
+oriented software" [@gropp2001learning, §"Simplicity and Symmetry"].
 
 **The normative text in the standard.** MPI-1.1 §5.1.1 lists "the key features needed to support
-the creation of robust parallel libraries," first among which is "**Safe communication space,
-that guarantees that libraries can communicate as they need to, without conflicting with
-communication extraneous to the library**" [@mpiforum1995mpi11, §5.1.1, p. 133]. §5.1.2 then
-defines the mechanism:
+the creation of robust parallel libraries," first among which is "**Safe communication space, that
+guarantees that libraries can communicate as they need to, without conflicting with communication
+extraneous to the library**" [@mpiforum1995mpi11, §5.1.1, p. 133]. §5.1.2 defines the mechanism:
 
 > "Contexts provide the ability to have separate safe 'universes' of message passing in MPI. **A
 > context is akin to an additional tag that differentiates messages. The system manages this
@@ -468,22 +435,21 @@ states the caller/callee obligation that AgentMPI is transplanting:
 > **This form of safety is analogous to other common computer-science usages, such as passing a
 > descriptor of an array to a library routine.**" [@mpiforum1995mpi11, §5.8.1, p. 175]
 
-**The honest limits.** Hoefler and Snir, writing the definitive modern treatment, call contexts
-"the most important concept for libraries," offering "spatial and temporal isolation" — a
+**The honest limits.** Hoefler and Snir, in the definitive modern treatment, call contexts "the
+most important concept for libraries," offering "spatial and temporal isolation" — a
 "communication privatization" analogous to data privatization in object-oriented languages
 [@hoefler2011libraries, §3]. But they also record that "**the concept of communicators is not a
 complete solution because it has a static scope and does not support reentrant libraries.** Most
 parallel libraries are non-reentrant, in the sense that there can be at most one concurrent
 invocation per communicator (no recursion, no new invocation on some process while an old
-invocation on another process still goes on)" [@hoefler2011libraries, §3.2]. The standard itself
-had already conceded a version of this, in a worked example showing that "despite contexts,
-subsequent calls to `lib_call` with the same context need not be safe from one another
-(colloquially, 'back-masking')... **What this demonstrates is that libraries have to be written
-carefully, even with contexts**" [@mpiforum1995mpi11, §5.7, p. 168 region].
+invocation on another process still goes on)" [@hoefler2011libraries, §3.2]. The standard had
+already conceded a version of this in a worked example: "despite contexts, subsequent calls to
+`lib_call` with the same context need not be safe from one another (colloquially,
+'back-masking')... **What this demonstrates is that libraries have to be written carefully, even
+with contexts**" [@mpiforum1995mpi11, §5.7].
 
-The AgentMPI paper must inherit this caveat honestly. A context makes concurrent *distinct*
-callees safe from one another; it does not by itself make a *single* callee safe against its own
-re-entry.
+The AgentMPI paper must inherit this caveat. A context makes concurrent *distinct* callees safe
+from one another; it does not by itself make a *single* callee safe against its own re-entry.
 
 ### 3.4 Safe programs and the buffering question
 
@@ -530,28 +496,23 @@ the programmer's responsibility to prevent starvation") [@mpiforum1995mpi11, §3
 ### 3.5 Performance portability and the α–β cost model
 
 The Williamsburg reasoning — standardise semantics at an intermediate level, let each machine
-implement it as it likes [@walker1992standards, §3] — becomes, in Gropp's retrospective, the
-claim that "portability does not require taking a lowest common denominator approach. A good
-design allows the use of performance enhancing features without mandating them. For example, the
-message passing semantics of MPI allows for the direct copy of data from the user's send buffer
-to the receive buffer without any other copies. However, systems that can't provide this direct
-copy... are permitted under the MPI model to make one or more copies" [@gropp2001learning,
-§"Portability"]. Gropp's later slogan for this: MPI is a *greatest*, not a *lowest*, common
-denominator approach [@gropp2016onceandfuture].
+implement as it likes [@walker1992standards, §3] — becomes, in Gropp's retrospective, the claim
+that "portability does not require taking a lowest common denominator approach. A good design
+allows the use of performance enhancing features without mandating them. For example, the message
+passing semantics of MPI allows for the direct copy of data from the user's send buffer to the
+receive buffer without any other copies. However, systems that can't provide this direct copy...
+are permitted under the MPI model to make one or more copies" [@gropp2001learning,
+§"Portability"]. His later slogan: MPI is a *greatest*, not a *lowest*, common denominator
+approach [@gropp2016onceandfuture]. He also concedes the limit: MPI "does not achieve perfect
+performance portability, defined as providing a single source that runs at near achievable peak
+performance on all platforms. This lack is sometimes given as a criticism of MPI, but it is a
+criticism that most other programming models also share" [@gropp2001learning, §"Performance"].
 
-Gropp is also careful to concede the limit: MPI "does not achieve perfect performance
-portability, defined as providing a single source that runs at near achievable peak performance
-on all platforms. This lack is sometimes given as a criticism of MPI, but it is a criticism that
-most other programming models also share" [@gropp2001learning, §"Performance"].
-
-The cost model the community reasons in is Hockney's: the time to send a message of size $m$
-between two nodes is $\alpha + \beta m$, where $\alpha$ is the per-message latency and $\beta$ the
-reciprocal bandwidth [@hockney1994communication]. The canonical citation is R. Hockney, "The
-communication challenge for MPP: Intel Paragon and Meiko CS-2," *Parallel Computing* 20(3):389–398,
-March 1994. Its acknowledged weaknesses — no congestion modelling, no pipelining — are why LogP
-[@culler1993logp] and its descendants exist; a good survey is [@rico2019survey]. The
-crossover message size at which a transfer stops being latency-bound and becomes bandwidth-bound
-is $n^{*} = \alpha\beta$.
+The cost model the community reasons in is Hockney's: the time to send a message of size $m$ is
+$\alpha + \beta m$, with $\alpha$ the per-message latency and $\beta$ the reciprocal bandwidth
+[@hockney1994communication]; the crossover from latency-bound to bandwidth-bound is at
+$n^{*} = \alpha\beta$. Its acknowledged weaknesses — no congestion, no pipelining — are why LogP
+[@culler1993logp] and its descendants exist; see [@rico2019survey] for a survey.
 
 ### 3.6 Opaque objects and the handle discipline
 
@@ -563,20 +524,18 @@ MPI-1.1 §2.4.1:
 > and shape is not visible to the user. Opaque objects are accessed via handles, which exist in
 > user space.**" [@mpiforum1995mpi11, §2.4.1, p. 8]
 
-The rationale is given immediately: "This design hides the internal representation used for MPI
+The rationale follows immediately: "This design hides the internal representation used for MPI
 data structures, thus allowing similar calls in C and Fortran. It also avoids conflicts with the
 typing rules in these languages, and **easily allows future extensions of functionality**"
-[@mpiforum1995mpi11, §2.4.1, Rationale]. Allocation and deallocation are per-type; deallocation
-returns a null handle, and comparison against the per-type null constant is the validity test
-[@mpiforum1995mpi11, §2.4.1]. The standard also places the aliasing burden on the user: "It is
-the user's responsibility to avoid adding or deleting references to opaque objects, except as a
-result of calls that allocate or deallocate such objects" [@mpiforum1995mpi11, §2.4.1, Advice to
-users].
+[@mpiforum1995mpi11, §2.4.1, Rationale]. Allocation and deallocation are per-type, deallocation
+returns a null handle, and comparison against the per-type null constant is the validity test.
+The aliasing burden falls on the user: "It is the user's responsibility to avoid adding or
+deleting references to opaque objects, except as a result of calls that allocate or deallocate
+such objects" [@mpiforum1995mpi11, §2.4.1, Advice to users].
 
 Thirty-one years later, opacity is what made the MPI-5.0 ABI possible at all: because handles
 were never structures, an ABI can fix their representation without disturbing any conforming
-program [@mpiforum2025mpi50, ch. 21]. That is a strong empirical vindication of the principle and
-the paper should say so.
+program [@mpiforum2025mpi50, ch. 21]. That is a strong empirical vindication of the principle.
 
 ### 3.7 The Rationale / Advice to users / Advice to implementors device
 
@@ -591,46 +550,44 @@ The standard defines its own three-voice editorial structure in §2.2:
 
 with a parallel *Advice to implementors*. Why it mattered: it let the Forum record *contested
 design reasoning inside the normative document* without that reasoning becoming normative. A
-committee that must ship a specification in nine months cannot afford to relitigate settled
-questions, and cannot afford to lose the arguments either. The device also carries load: several
-of the load-bearing philosophical claims in this dossier — the definition of a safe program
-(§3.4), the aliasing rule for handles (§3.6), the amortisation hint for context allocation — live
-in Advice blocks, not in the normative text. Note the consequence: **the "safe program"
-definition on which AgentMPI's central discipline is modelled is formally non-normative.**
+committee shipping a specification in nine months can afford neither to relitigate settled
+questions nor to lose the arguments. The device also carries load: several of the philosophical
+claims in this dossier — the definition of a safe program (§3.4), the aliasing rule for handles
+(§3.6), the amortisation hint for context allocation — live in Advice blocks rather than
+normative text. Note the consequence: **the "safe program" definition on which AgentMPI's central
+discipline is modelled is formally non-normative.**
 
 ### 3.8 Retrospectives
 
 **Gropp, "Learning from the Success of MPI" (HiPC 2001, LNCS 2228, pp. 81–92)**
-[@gropp2001learning]. The six requirements: **portability, performance, simplicity and symmetry,
-modularity, composability, completeness**. Two of his sub-arguments are directly reusable:
+[@gropp2001learning]. Six requirements: **portability, performance, simplicity and symmetry,
+modularity, composability, completeness**. Two sub-arguments are directly reusable. On size: "The
+MPI model is often criticized as being large and complex, based on the number of routines...
+**The number of routines is not a relevant measure**, however... A better measure of complexity
+is the number of concepts that the user must learn, along with the number of exceptions and
+special cases. Measured in these terms, MPI is actually very simple." On symmetry: MPI keeps
+`MPI_Issend`, "rarely used," because removing it would create an exception, and "each such
+exception adds to the burden on the user... it is easy to forget about a routine that you never
+use; it is harder to remember arbitrary decisions on what is and is not available"
+[@gropp2001learning, §"Simplicity and Symmetry"]. He concedes MPI followed symmetry "too far" in
+the group-manipulation routines and in cancelling sends.
 
-- On size: "The MPI model is often criticized as being large and complex, based on the number of
-  routines... **The number of routines is not a relevant measure**, however... A better measure of
-  complexity is the number of concepts that the user must learn, along with the number of
-  exceptions and special cases. Measured in these terms, MPI is actually very simple"
-  [@gropp2001learning, §"Simplicity and Symmetry"].
-- On symmetry: MPI keeps `MPI_Issend`, which is "rarely used," because removing it would create an
-  exception, and "each such exception adds to the burden on the user... it is easy to forget about
-  a routine that you never use; it is harder to remember arbitrary decisions on what is and is not
-  available" [@gropp2001learning, §"Simplicity and Symmetry"]. He concedes MPI followed symmetry
-  "too far" in the group-manipulation routines and in cancelling sends.
+**Gropp and Lusk, "Fault Tolerance in MPI Programs"** [@gropp2004faulttolerance], quoted in §3.2.
+Their taxonomy of four "levels of survival" — implementation recovers transparently; the program
+is notified and repairs; some operations become invalid; abort and restart from checkpoint — is a
+good scaffold for the AgentMPI fault section.
 
-**Gropp and Lusk, "Fault Tolerance in MPI Programs"** [@gropp2004faulttolerance], quoted at length
-in §3.2. Their taxonomy of four "levels of survival" — implementation recovers transparently; the
-program is notified and repairs; some operations become invalid; abort and restart from checkpoint —
-is a good scaffold for the AgentMPI fault section.
-
-**Hoefler and Snir, "Writing Parallel Libraries with MPI"** (EuroMPI 2011, LNCS 6960, pp. 345–355)
-[@hoefler2011libraries]. Distils the requirements a parallel library places on its runtime:
+**Hoefler and Snir, "Writing Parallel Libraries with MPI"** (EuroMPI 2011, LNCS 6960, pp.
+345–355) [@hoefler2011libraries]. Distils what a parallel library needs from its runtime:
 "performance, scalability, usability, error handling, **isolation (a 'safe and private'
 communication space)** for point-to-point and collective communication, and virtualized process
-naming" [@hoefler2011libraries, §2.3]. Their best-practice list is essentially a style guide
-AgentMPI can transpose: don't use `MPI_COMM_WORLD` in a library; don't synchronise at entry or
-exit; cache library state as an attribute on the user's communicator; attach a library-specific
-error handler to the library's private communicator [@hoefler2011libraries, §4].
+naming" [@hoefler2011libraries, §2.3]. Their best-practice list transposes directly to AgentMPI:
+don't use `MPI_COMM_WORLD` in a library; don't synchronise at entry or exit; cache library state
+as an attribute on the user's communicator; attach a library-specific error handler to the
+library's private communicator [@hoefler2011libraries, §4].
 
 **Laguna et al., "A Large-Scale Study of MPI Usage in Open-Source HPC Applications" (SC'19)**
-[@laguna2019study]. A static analysis of **110 open-source HPC applications**. Findings, verbatim
+[@laguna2019study]. Static analysis of **110 open-source HPC applications**. Findings, verbatim
 where possible:
 
 - "The majority of MPI programs use only a small set of features from the MPI Standard — a
@@ -655,18 +612,18 @@ were in use by someone**" [@gropp2001learning, §"Summary"]. Laguna et al. in 20
 opposite at scale: whole chapters unused, minor versions dead on arrival [@laguna2019study]. The
 two are not strictly inconsistent — Gropp's claim is about coverage by *some* user, Laguna's about
 the median application, and eighteen years separate them — but the rhetorical uses are
-incompatible, and the 2019 evidence is far better. **This is the strongest single citation for
+incompatible and the 2019 evidence is far better. **This is the strongest single citation for
 AgentMPI's "small mandatory core plus optional levels" design.**
 
-**The rejected-subset finding.** Even stronger, and I have not seen it used in the modern
-literature: the MPI Forum *considered a mandatory core and rejected it*. "At one point in the
-development of MPI it was proposed to denote a subset of the MPI routines as being the essential
-ones that vendors should implement. **The existence of MPICH demonstrated that this subset MPI
-was not necessary and the idea was dropped**" [@dongarra2000messagepassing, §"MPI"]. The Forum
-could dispense with a mandatory core precisely because a high-quality free reference
-implementation of the *whole* standard existed on release day. AgentMPI's levels argument must
-therefore either (i) argue that no such reference implementation is achievable for agent
-harnesses, or (ii) commit to shipping one. There is no third option that this history supports.
+**The rejected-subset finding**, which I have not seen used in the modern literature: the MPI
+Forum *considered a mandatory core and rejected it*. "At one point in the development of MPI it
+was proposed to denote a subset of the MPI routines as being the essential ones that vendors
+should implement. **The existence of MPICH demonstrated that this subset MPI was not necessary
+and the idea was dropped**" [@dongarra2000messagepassing, §"MPI"]. The Forum could dispense with
+a mandatory core precisely because a high-quality free reference implementation of the *whole*
+standard existed on release day. AgentMPI's levels argument must therefore either argue that no
+such reference implementation is achievable for agent harnesses, or commit to shipping one. This
+history supports no third option.
 
 ---
 

@@ -99,6 +99,16 @@ class Ledger:
         self.releases += 1
         return freed
 
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> Ledger:
+        """Rebuild from a serialised ledger, ignoring derived fields.
+
+        ``to_dict`` reports ``remaining`` because that is the number an executor
+        needs; it is not state, so it must not be fed back in.
+        """
+        fields = {f for f in cls.__dataclass_fields__}
+        return cls(**{k: v for k, v in (raw or {}).items() if k in fields})
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "budget": self.budget,
