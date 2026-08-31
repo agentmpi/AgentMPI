@@ -94,7 +94,7 @@ def consistency(
         usage: Counter = Counter()
         passages_with_term = 0
         found_in = 0
-        for rank, rec in sorted(outputs.items()):
+        for _rank, rec in sorted(outputs.items()):
             passage = corpus["passages"][rec["passage"]]
             if term not in passage["terms"]:
                 continue
