@@ -228,7 +228,7 @@ The **procedural rules**, from the Forum's own newcomers' document [@mpiforum199
 - Discussion ran under "loosely-enforced Robert's Rules of Order."
 
 A further rule, reported in Huss-Lederman's retrospective on the process, is that items **had to
-be approved at two separate meetings** [@husslederman-reflections]. **`[UNVERIFIED]`** — I have
+be approved at two separate meetings** [@husslederman_mpiprocess]. **`[UNVERIFIED]`** — I have
 this only from a slide deck of uncertain provenance; the primary confirmation would be the Forum
 minutes at `netlib.org/mpi/minutes-93/`, which I did not exhaustively read. Do not state the
 two-reading rule for MPI-1 as fact without checking those minutes. (It is uncontroversially true
@@ -283,7 +283,7 @@ the Forum's Fault Tolerance Working Group. Open MPI's current documentation, des
 that postdate MPI-5.0, still states that "ULFM is still an extension to the MPI standard" and
 that users must `#include <mpi-ext.h>` to reach its error codes and functions
 [@openmpi2024ulfm]. The Forum's own issue tracker shows ULFM as an open standardisation item with
-readings in 2022 [@mpiforum-issue20], and MPI Fault Tolerance appears on the Forum's list of
+readings in 2022 [@mpiforum_ulfm_issue20], and MPI Fault Tolerance appears on the Forum's list of
 targets for **MPI-6.0**, not as delivered work [@mpiforum2025bof]. Bland et al. wrote in 2015
 that ULFM was "the front-running solution for process fault tolerance in MPI. While not yet
 adopted into the MPI standard..." [@bland2015ulfm], and that sentence is still accurate a decade
@@ -297,13 +297,13 @@ whereas MPI-1.3 and every subsequent version say "**MPI-1.0 (May 5, 1994)**"
 released through the Internet on May [5,] 1994" [@dongarra2000messagepassing]. **Recommendation:
 cite May 5, 1994 as the document date (it is what the standard now says of itself) and, if
 precision matters, note that MPI-1.1 dated the release to June 1994.** Do not write "June 1994"
-unqualified, which is what Wikipedia does [@wikipedia-mpi].
+unqualified, which is what Wikipedia does [@wikipedia_mpi].
 
 Page counts, for the size critique in §4: MPI-2.1 608pp, MPI-2.2 647pp, MPI-3.0 852pp, MPI-3.1
 868pp, MPI-4.0 **1139pp**, MPI-4.1 1166pp, MPI-5.0 1189pp [@schulz2026stateofmpi]. The 1139 for
 MPI-4.0 is independently confirmed by the document itself [@mpiforum2021mpi40]. Snir's count of
 functions: 128 functions / 231 pages at MPI-1.1; 330 / 586 at MPI-2.1; 451 / 836 at MPI-3.1
-[@snir-toohigh]. **`[UNVERIFIED]`** — Snir's page figures differ slightly from Schulz's (836 vs
+[@snir_mpilevels]. **`[UNVERIFIED]`** — Snir's page figures differ slightly from Schulz's (836 vs
 868 for MPI-3.1), probably because of front matter; use one source consistently and prefer the
 Forum's own.
 
@@ -674,7 +674,7 @@ harnesses, or (ii) commit to shipping one. There is no third option that this hi
 
 **Size.** MPI-4.0 is 1139 pages [@mpiforum2021mpi40; @schulz2026stateofmpi]; MPI-5.0 is 1189
 [@schulz2026stateofmpi]. Snir's function counts trace the same curve: 128 → 330 → 451
-[@snir-toohigh]. Gropp's rebuttal (§3.8) — count concepts, not routines — is the strongest
+[@snir_mpilevels]. Gropp's rebuttal (§3.8) — count concepts, not routines — is the strongest
 defence, and the observation that MPI supports usable six-function subsets is empirically borne
 out by Laguna [@laguna2019study]. The counter-rebuttal is Laguna's own: if the standard is mostly
 unused, standardisation effort is being misallocated regardless of whether users are *harmed* by
@@ -692,23 +692,23 @@ be tailored to any particular one**"; consequently MPI "does not require the exi
 underlying 'virtual machine' model," and processes spawned by one task may not even be visible to
 another [@mpiforum2015mpi31, §10.2]. In practice this vagueness meant no portable contract with
 the resource manager, and "major vendors simply don't support `MPI_Comm_spawn`"
-[@sultana2019mpijobs]. Laguna's data confirm near-zero use [@laguna2019study]. There is also a
+[@wozniak2019mpilaunch]. Laguna's data confirm near-zero use [@laguna2019study]. There is also a
 provenance argument that dynamic processes were included "at least in part as a political
 necessity" to answer the PVM community, without a strong initial technical case
-[@lumsdaine-spawn]. **`[UNVERIFIED]`** — that last is a well-informed column, not a primary
+[@clustermonkey_spawn]. **`[UNVERIFIED]`** — that last is a well-informed column, not a primary
 source; treat the political-necessity claim as reported opinion, or drop it. The load-bearing,
 citable version is the standard's own admission of runtime-environment diversity.
 
 **RMA is hard.** The MPI-2 one-sided chapter is widely held to have been semantically defective;
 MPI-3 substantially rewrote it, and the Balaji group's assessment is that MPI-3's additions
-"address most of the critiques raised about MPI-2 RMA" [@dinan2014caf]. Before that repair,
+"address most of the critiques raised about MPI-2 RMA" [@yang2014caf]. Before that repair,
 measured MPI-2 one-sided performance was "significantly worse than PGAS and in fact worse than the
 MPI two-sided" on at least one production platform [@shan2012onesided].
 
 **The fault model is inadequate.** This is now the mainstream view inside the Forum, not outside
 it: MPI Fault Tolerance is on the published roadmap for MPI-6.0 [@mpiforum2025bof], and ULFM has
 been under development since before 2015 without ratification [@bland2015ulfm;
-@mpiforum-issue20]. The most careful statement of the *defence* remains Gropp and Lusk's: fault
+@mpiforum_ulfm_issue20]. The most careful statement of the *defence* remains Gropp and Lusk's: fault
 tolerance is a property of a program plus an implementation, the standard does not require
 fail-stop-the-world, and useful fault-tolerant MPI programs can be written today within
 constraints [@gropp2004faulttolerance]. The most careful statement of the *charge* is ULFM's own
@@ -720,16 +720,16 @@ currently make.
 two-sided message passing is the wrong default because it forces the programmer to orchestrate
 both ends of every transfer, and that a partitioned global address space "combines the programming
 convenience of shared memory with the locality and performance control of message passing"
-[@debonis2015pgassurvey]. Their key move is one-sided access with an explicit local/remote
+[@dewael2015pgas]. Their key move is one-sided access with an explicit local/remote
 distinction preserved, so that locality remains visible while the sender/receiver rendezvous
-disappears [@debonis2015pgassurvey; @shan2012onesided]. The honest scorecard: PGAS is right that
+disappears [@dewael2015pgas; @shan2012onesided]. The honest scorecard: PGAS is right that
 manual packing and two-sided matching cost programmer effort, and demonstrably wrong that this
 cost would dominate adoption. "Neither of them however has been widely adopted by the user
 community; partly because of the lack of a developer environment, and partly because of the lack
 of convincing performance results for real applications, especially at large scale"
 [@shan2012onesided]; and "most parallel scientific applications still rely on MPI as their data
 movement model," partly because adopting a PGAS model means running a second runtime alongside
-MPI, duplicating resources and risking deadlock [@dinan2014caf]. **The composability argument
+MPI, duplicating resources and risking deadlock [@yang2014caf]. **The composability argument
 beat the productivity argument.** For AgentMPI, that is probably the most transferable single
 lesson in §4.
 
@@ -869,7 +869,7 @@ the levels argument carries the weight alone.
 
 **Composability over productivity — transfers, and is the sleeper lesson.** PGAS lost to MPI
 despite a genuine productivity advantage, largely because adopting it meant running a second
-runtime beside MPI [@dinan2014caf; @shan2012onesided]. Any agent protocol that cannot be adopted
+runtime beside MPI [@yang2014caf; @shan2012onesided]. Any agent protocol that cannot be adopted
 *incrementally* inside an existing harness — one sub-agent boundary at a time, coexisting with
 whatever is already there — will lose to whatever can, regardless of how much better it is. This
 should shape the paper's implementation section more than its design section.
