@@ -214,6 +214,35 @@ def e1_macros() -> None:
 # --------------------------------------------------------------------------
 
 
+def e2_macros() -> None:
+    d = load(RESULTS / "e2_faults.json")
+    if not d:
+        for k in ("eTwoUpheld", "eTwoTotal", "eTwoKilled", "eTwoSurvivors", "eTwoRevokeS",
+                  "eTwoShrinkers", "eTwoComms", "eTwoTasks", "eTwoCompleted",
+                  "eTwoOrphaned", "eTwoDuplicated", "eTwoSize"):
+            put(k, None)
+        return
+    put("eTwoUpheld", d["claims_upheld"])
+    put("eTwoTotal", d["claims_total"])
+    put("eTwoSize", d["size"])
+    by = {s["scenario"]: s for s in d["scenarios"]}
+    s1 = by["kill_before_collective"]
+    put("eTwoKilled", len(s1["killed"]))
+    put("eTwoSurvivors", s1["contributors"])
+    put("eTwoRevokeS", round(by["revoke_unblocks_a_blocked_survivor"]["freed_after_s"], 2), fmt=".2f")
+    s3 = by["concurrent_shrink_converges"]
+    put("eTwoShrinkers", s3["shrinking_ranks"])
+    put("eTwoComms", s3["distinct_communicators"])
+    s5 = by["claimed_work_survives_its_claimant"]
+    put("eTwoTasks", s5["tasks"])
+    put("eTwoCompleted", s5["tasks_completed"])
+    put("eTwoOrphaned", len(s5["tasks_orphaned"]))
+    put("eTwoDuplicated", len(s5["tasks_done_twice"]))
+    s4 = by["recovery_briefing"]
+    put("eTwoRecovered", s4["published_recovered"])
+    put("eTwoExpected", s4["published_expected"])
+
+
 def suite_macros() -> None:
     d = load(RESULTS / "suite.json")
     if not d:
@@ -228,6 +257,7 @@ def main() -> None:
     protocol_macros()
     e0_macros()
     e1_macros()
+    e2_macros()
     suite_macros()
 
     lines = [
