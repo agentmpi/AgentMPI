@@ -58,13 +58,13 @@ from ..constants import (
 )
 from ..errors import (
     AmpiArgError,
-    AmpiStaleIncarnation,
     AmpiCommError,
     AmpiDeadlock,
     AmpiProcFailed,
     AmpiRevoked,
-    AmpiTimeout,
+    AmpiStaleIncarnation,
     AmpiStaleRun,
+    AmpiTimeout,
 )
 from .collectives import allreduce_structural, barrier
 from .comm import CommRegistry, Communicator

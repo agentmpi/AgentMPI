@@ -154,7 +154,7 @@ def test_job_creation_allocates_identity_and_refuses_live_reuse(make_job):
     job = make_job(2)
     rt = job.runtime(0)
     first = rt.job()
-    assert first["run_id"].startswith("run-")
+    assert first["run_id"].startswith("run_")
 
     with pytest.raises(AmpiArgError, match="already exists"):
         rt.create_job(rt.device, job.job_id, 2)
