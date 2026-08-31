@@ -4,6 +4,10 @@
 
 This is not a multi-agent product. It is the interface people use to write their own: point-to-point matching, collectives, RMA windows and locks, communicator split/spawn, ULFM-shaped revoke/agree/shrink, and a context-token budget so a rank can fail with OOM instead of silently overflowing.
 
+The project name is always written **AgentMPI**. The acronym “AMPI” already
+denotes Charm++'s Adaptive Message Passing Interface; lowercase `ampi` and
+`AMPI_*` remain prototype command/API prefixes, not a claim to that acronym.
+
 ## Implementations
 
 | Package | Path | Fabric | Role |
@@ -21,9 +25,9 @@ Kafka, or gRPC.
 
 ```bash
 python3 -m pip install -e ".[dev,analysis]"
-python3 -m pytest tests/ -q            # 113 tests, both transports
+python3 -m pytest tests/ -q            # 125 tests, both transports
 
-ampirun new --job /tmp/job -n 8        # create a job
+ampirun new --job /tmp/job -n 8 --roll-call-timeout 3600
 AMPI_JOB_DIR=/tmp/job AMPI_RANK=0 ampi init --role worker
 AMPI_JOB_DIR=/tmp/job AMPI_RANK=0 ampi allreduce --op AMPI_MERGE_JSON \
     --json-file glossary.json --explain
@@ -42,6 +46,11 @@ ampi plan --collective allreduce -p 32 -n 127776 \
 `ampi doctor` reports wait-for cycles, stalled collectives and suspected
 failures; `ampi-analyse <jobdir>` recomputes every published metric from the
 job's trace.
+
+Every creation allocates an immutable `run_id`; creating over a live job is
+rejected and messages from another run cannot match. The roll-call timeout is
+separate from heartbeat failure detection: it applies only to ranks that never
+joined, while slow ranks that did join retain the longer failure lease.
 
 ## Quick start (filesystem binding)
 
