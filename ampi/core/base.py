@@ -517,6 +517,14 @@ class RuntimeBase:
         self._write_rank(view)
         return {"rank": view.rank, "lease_until": view.lease_until, "note": note}
 
+    #: A blocked rank renews its lease on every poll, and a poll loop runs many
+    #: times a second.  Writing the rank row each time is what turned a 100-rank
+    #: job's write-ahead log into 264 MB: the lease only needs renewing often
+    #: enough that the detector does not convict, so once per this interval is
+    #: three orders of magnitude more than sufficient and three orders of
+    #: magnitude cheaper.
+    _TOUCH_INTERVAL_S = 5.0
+
     def touch(self) -> None:
         """Renew the caller's own lease as a side effect of any operation.
 
@@ -525,7 +533,14 @@ class RuntimeBase:
         runtime calls, so the detector declared it dead for the crime of waiting,
         and every rank that arrived first was declared failed.  Blocking is not
         evidence of death.
+
+        Rate limited, because "on every operation" and "on every poll iteration"
+        are very different write volumes and only the first is required.
         """
+        now = time.time()
+        if now - getattr(self, "_last_touch", 0.0) < self._TOUCH_INTERVAL_S:
+            return
+        self._last_touch = now
         try:
             view = self._rankview()
         except AmpiError:
