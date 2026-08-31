@@ -146,6 +146,9 @@ took their early exit.
 - Narrative paper: `paper/agentmpi.md`
 - Conference LaTeX draft: `paper/main.tex`
 - Dashboard: `cd web && npm install && npm run dev` (port 43147)
+- Jumpshot-style trace viewer: `cd viz && npm ci && npm run dev` (port 43117)
+  with 32+ recorded traces and an optional live v0.2 API from
+  `python3 scripts/trace_server.py --runs <runs-directory>`
 
 ## Why this exists
 
