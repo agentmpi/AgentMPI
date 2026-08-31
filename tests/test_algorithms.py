@@ -110,14 +110,25 @@ def test_an_agent_operator_selects_a_tree_and_a_runtime_operator_selects_flat():
     assert select_algorithm("allreduce", 64, tokens=4000, op=get_op("union")).chosen == "flat"
 
 
-def test_a_near_tie_on_latency_is_broken_on_price():
-    """Recursive doubling ties reduce-then-broadcast on latency and costs 6x."""
+def test_price_is_what_separates_two_schedules_that_finish_together():
+    """Recursive doubling and reduce-then-broadcast tie on latency; one costs 6x.
+
+    Both put ceil(log2 p) operator applications on the critical path, so with a
+    thirty-second operator they finish within a millisecond of each other out of
+    180 seconds -- far inside any honest error bar on the latency model.  What
+    separates them is that recursive doubling performs p*log2(p) applications in
+    total against p-1, because every rank folds the whole reduction itself.  MPI
+    accepts that trade since the applications are additions.  Reporting price as a
+    second axis is what makes the choice defensible rather than lucky.
+    """
     det = Op("agent:det", None, associativity=APPROX, evaluator="agent", deterministic=True)
     d = select_algorithm("allreduce", 64, tokens=4000, op=det)
     by_name = {c.algorithm: c for c in d.considered}
-    assert by_name["recursive_doubling"].total_seconds <= by_name["reduce_bcast"].total_seconds
-    assert by_name["recursive_doubling"].price_units > 5 * by_name["reduce_bcast"].price_units
-    assert d.chosen == "reduce_bcast", "the cheaper of two schedules that finish together"
+    rd, rb = by_name["recursive_doubling"], by_name["reduce_bcast"]
+    assert rd.critical_path_applications == rb.critical_path_applications
+    assert abs(rd.total_seconds - rb.total_seconds) / rb.total_seconds < 0.05, "a tie on latency"
+    assert rd.price_units > 5 * rb.price_units
+    assert d.chosen == "reduce_bcast"
 
 
 def test_selection_refuses_a_schedule_the_operators_algebra_forbids():
