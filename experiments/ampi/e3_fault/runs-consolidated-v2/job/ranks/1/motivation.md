@@ -1,0 +1,5 @@
+Duplicated work appears when agents select tasks from a shared list without an atomic claim. Two workers can observe the same unassigned item, independently spend tokens and time solving it, and then publish incompatible versions. The wasted effort also delays genuinely unclaimed tasks and makes later integration depend on an arbitrary winner.
+
+Lost updates occur when several agents treat a shared file as ordinary local state. Each reads the same revision, edits a different concern, and writes the whole file back; the last writer silently erases earlier changes. File locks, compare-and-swap revisions, or append-only messages are needed to make concurrent intent visible.
+
+Silent context exhaustion is subtler: a worker may consume its context on oversized artifacts or repetitive coordination and continue with an incomplete view. Its output can remain syntactically plausible while omitting constraints learned earlier. Explicit budgets, compact digests, and fail-loud checks before dereferencing large payloads turn this hidden degradation into an observable, recoverable condition.

@@ -25,7 +25,7 @@ Kafka, or gRPC.
 
 ```bash
 python3 -m pip install -e ".[dev,analysis]"
-python3 -m pytest tests/ -q            # 125 tests, both transports
+python3 -m pytest tests/ -q            # 126 tests, both transports
 
 ampirun new --job /tmp/job -n 8 --roll-call-timeout 3600
 AMPI_JOB_DIR=/tmp/job AMPI_RANK=0 ampi init --role worker
@@ -121,7 +121,7 @@ did.
 | Microbenchmarks (scripted) | 2–32 | alpha = 2.5 ms/step, beta = 5.4e-7 s/token. Recursive-doubling allreduce holds 1.5n tokens at every p; recursive-halving reduce-scatter falls from 0.68n at p=4 to **0.09n at p=32**, the difference between "cannot run in a 128k window" and "uses 9% of it". |
 | Semantic reduction (real agents) | 8 x 2 | Both schedules do p−1 = 7 operator evaluations; the tree puts lg p = 3 on the critical path instead of 7, cutting critical-path model time **324.6 s → 108.2 s**. Identical coverage; the two merged documents share almost no sentences. |
 | Software build (real agents) | 8 x 2 | Both delivered working software. The collective run: 68 collectives, 5 communicators, 10 claim grants for 6 modules, 2 implementers left as spares. The window run: **0 collectives**, 6 clean claims, 6 non-overlapping leases, and cross-module tests that found a real defect two reviewers confirmed. |
-| Fault tolerance (real agents) | 6 | Two agents killed. Survivors revoked, shrank to a single communicator, and **adopted both dead agents' sections from the window rather than rewriting them**. Zero work lost. |
+| Fault tolerance (real agents) | 6 × 2 | Two agents killed per run. Survivors revoked, shrank to one communicator, and **adopted both dead agents' sections rather than rewriting them**. The hardened rerun had 4/4 survivors agree and finalize, zero post-kill calls, and zero work lost. |
 
 The runs broke the runtime in ten distinct ways, each fixed with a regression
 test:
