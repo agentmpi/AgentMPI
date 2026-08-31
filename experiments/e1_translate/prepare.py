@@ -65,7 +65,7 @@ def split_passages(body: str, target: int) -> list[dict[str, Any]]:
         current.append(para)
         size += len(para)
         remaining_bins = target - len(passages)
-        remaining_chars = total - sum(len(x) for pas in passages for x in [pas["text"]]) 
+        remaining_chars = total - sum(len(x) for pas in passages for x in [pas["text"]])
         # Rebalance the target after every emission so that a long paragraph early
         # on does not leave the tail with fewer passages than asked for.
         want = remaining_chars / max(1, remaining_bins)

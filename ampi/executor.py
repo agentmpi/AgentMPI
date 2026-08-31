@@ -32,9 +32,10 @@ import json
 import os
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 
 from .core.payload import Contract, canonical, check_contract
 from .errors import err
@@ -335,7 +336,7 @@ class BrokerExecutor:
             raise err(
                 "AMPI_ERR_IDENTITY",
                 f"task {aid} belongs to rank {rec['rank']}, not rank {rank}",
-                hint=f"You are working on another rank's task. Re-check AMPI_RANK.",
+                hint="You are working on another rank's task. Re-check AMPI_RANK.",
             )
         path = Path(rec["result_file"])
         if not path.exists():

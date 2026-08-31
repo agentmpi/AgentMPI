@@ -29,9 +29,10 @@ import concurrent.futures
 import json
 import time
 import traceback
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .constants import DEFAULT_CTX_BUDGET
 from .errors import AmpiError
