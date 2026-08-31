@@ -24,7 +24,6 @@ from ampi.core.ops import (
     APPROX,
     CONFLICT_KEY,
     EXACT,
-    LIFT,
     NONE,
     Op,
     arbitrate,
@@ -38,7 +37,6 @@ from ampi.core.ops import (
     value_of,
 )
 from ampi.errors import AmpiError
-
 
 # --------------------------------------------------------------------------
 # The algebra gates the schedule
@@ -86,7 +84,7 @@ def test_an_associative_commutative_operator_licenses_everything():
 def test_exact_operators_agree_with_the_serial_fold(name, algorithm):
     op = get_op(name)
     if name in ("bag", "union"):
-        values = [{"k%d" % i: i} for i in range(8)] if name == "union" else [[i] for i in range(8)]
+        values = [{f"k{i}": i} for i in range(8)] if name == "union" else [[i] for i in range(8)]
     else:
         values = [i + 1 for i in range(8)] if name in ("sum", "max", "min") else [True] * 8
     got = fold(op, list(values), algorithm=algorithm)["value"]

@@ -35,7 +35,7 @@ fact on a run that already happened.
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -195,7 +195,7 @@ class SafetyReport:
 
 
 def _tag_ok(want: int, have: int) -> bool:
-    return want == ANY_TAG or want == have
+    return want in (ANY_TAG, have)
 
 
 def _simulate(prog: Program, *, force_rendezvous: bool = False) -> tuple[dict[int, int], list[dict]]:
@@ -431,7 +431,12 @@ def check_collective_agreement(prog: Program) -> SafetyReport:
         participating = {r: per_rank.get(r, []) for r in members}
         distinct = {tuple(v) for v in participating.values()}
         if len(distinct) > 1:
-            reference = max(distinct, key=lambda s: len(s))
+            # The reference is the *majority* sequence, not the longest.  Naming
+            # the minority is the whole value of the diagnostic: telling a
+            # harness author that two ranks out of eight reordered two steps is
+            # actionable, and telling them that eight ranks disagree is not.
+            tally = Counter(tuple(v) for v in participating.values())
+            reference = max(tally, key=lambda s: (tally[s], len(s), s))
             offenders = {
                 r: " -> ".join(v) or "(no collectives)"
                 for r, v in participating.items()
