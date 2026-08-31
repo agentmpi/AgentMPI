@@ -430,6 +430,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ctx-limit", type=int, default=None)
     p.add_argument("--compact", action="store_true")
 
+    # -- the broker's worker side ------------------------------------------------
+    p = sub.add_parser("worker", help="claim and submit work from a per-rank pull queue")
+    _common(p)
+    p.add_argument("--campaign", required=True)
+    wksub = p.add_subparsers(dest="workercmd", required=True)
+    q = wksub.add_parser("next", help="claim the next task, blocking server-side")
+    q.add_argument("--timeout", type=float, default=240.0)
+    q = wksub.add_parser("submit", help="submit the result file named by the task")
+    q.add_argument("--aid", required=True)
+    q = wksub.add_parser("give-up", help="abandon a task you cannot do")
+    q.add_argument("--aid", required=True)
+    q.add_argument("--reason", required=True)
+    wksub.add_parser("stats", help="the campaign's task counts")
+
     p = sub.add_parser("trace", help="the event log")
     _common(p)
     p.add_argument("--kind", default=None)
@@ -805,6 +819,20 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
             return out, amp.rank, job
         p = amp.put_payload(_payload_of(a))
         return {"handle": p.envelope.handle, **p.envelope.to_dict()}, amp.rank, job
+
+    if cmd == "worker":
+        from .executor import BrokerExecutor
+
+        if a.workercmd == "next":
+            return (BrokerExecutor.next_task(amp, a.campaign, amp.rank, timeout=a.timeout),
+                    amp.rank, job)
+        if a.workercmd == "submit":
+            return BrokerExecutor.submit(amp, a.campaign, amp.rank, a.aid), amp.rank, job
+        if a.workercmd == "give-up":
+            return (BrokerExecutor.give_up(amp, a.campaign, amp.rank, a.aid, a.reason),
+                    amp.rank, job)
+        broker = BrokerExecutor(amp, campaign=a.campaign, work_dir=Path(amp.root) / "broker")
+        return broker.stats(), rank, job
 
     if cmd == "trace":
         events = amp.events(kind=a.kind, rank=a.of_rank, limit=a.limit)
