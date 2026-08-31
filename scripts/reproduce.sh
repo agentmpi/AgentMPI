@@ -90,12 +90,22 @@ python3 scripts/figures.py
 python3 scripts/check_tex.py || echo "  (structural problems above; usually a pending experiment)"
 
 say "9. Build the paper"
-if command -v latexmk >/dev/null 2>&1; then
-  (cd paper && latexmk -pdf -interaction=nonstopmode main.tex >/dev/null && echo "  paper/main.pdf")
+built=""
+if command -v tectonic >/dev/null 2>&1; then
+  (cd paper && tectonic -X compile main.tex --keep-intermediates --keep-logs >/dev/null 2>&1) && built=1
+elif command -v latexmk >/dev/null 2>&1; then
+  (cd paper && latexmk -pdf -interaction=nonstopmode main.tex >/dev/null) && built=1
+fi
+if [[ -n "$built" ]]; then
+  echo "  paper/main.pdf"
+  # A float too tall to place is dropped silently, and it takes every float
+  # queued behind it, and the engine still exits 0. Check the PDF, not the
+  # exit code.
+  python3 scripts/check_pdf.py || echo "  (the built PDF does not match the source; see above)"
 else
-  echo "  no LaTeX toolchain found. Install texlive-latex-recommended,"
+  echo "  no LaTeX toolchain found. Install tectonic, or texlive-latex-recommended,"
   echo "  texlive-latex-extra, texlive-bibtex-extra and latexmk, then:"
-  echo "      cd paper && latexmk -pdf main.tex"
+  echo "      cd paper && tectonic -X compile main.tex"
 fi
 
 say "10. Prepare the multi-agent experiments (launch requires an agent host)"
