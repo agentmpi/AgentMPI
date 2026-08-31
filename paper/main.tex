@@ -1,0 +1,1049 @@
+\documentclass[10pt,twocolumn]{article}
+
+\usepackage[margin=0.72in,columnsep=0.24in]{geometry}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{graphicx}
+\usepackage{hyperref}
+\usepackage{lmodern}          % scalable outlines; microtype font expansion needs them
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{url}
+
+\hypersetup{colorlinks=true,linkcolor=blue!50!black,citecolor=blue!50!black,urlcolor=blue!50!black}
+\setlist{leftmargin=*,nosep}
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  columns=fullflexible,
+  frame=single,
+  xleftmargin=2pt,
+  xrightmargin=2pt
+}
+
+\newcommand{\ampi}{AgentMPI}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\todo}[1]{\textcolor{red}{[TODO: #1]}}
+
+\title{\ampi: A Message Passing Interface for\\Portable Multi-Agent Harnesses}
+\author{Anonymous research artifact}
+\date{Research draft --- 30 August 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Multi-agent language-model systems are commonly assembled as bespoke
+orchestration graphs.  Their prompts, queues, failure behavior, context
+management, and communication topology are entangled with a particular
+framework.  This is analogous to parallel computing before the Message Passing
+Interface (MPI), when portable applications were impeded by incompatible
+vendor libraries.  We present \ampi, a transport-neutral interface for writing
+multi-agent harnesses.  \ampi{} adapts MPI's communication contexts, ranks,
+tagged matching, requests, collectives, and implementation-independent
+semantics, while rejecting an unsafe literal analogy between deterministic HPC
+processes and expensive, nondeterministic, fallible agents.  It adds executor
+incarnations, membership generations, revocation and shrink, context credits,
+content-addressed artifacts, semantic acknowledgments, capability boundaries,
+and fenced leases.
+
+We define point-to-point and collective semantics, connect each operation to
+an executable implementation, and provide a durable SQLite reference runtime
+for independent processes.  Its roughly 1.5\,k-line core persists protocol state in
+short transactions and supports four delivery modes, wildcard matching, eight
+collectives, heartbeat failure detection, communicator repair, bounded
+mailboxes, artifact spill, and append-only traces.  In a 20-trial local
+microbenchmark, fail-and-shrink of an eight-rank communicator takes a median
+1.36\,ms; externalizing a 16,253-token payload leaves a 36-token mailbox
+reference with byte-identical resolution.  SQLite collective latency rises
+from 5.58\,ms at two ranks to 476\,ms at 32 ranks, confirming that this binding
+is an inspectable reference rather than a cluster transport.  A separate
+process test completed correct allreduce and fan-in with 100 independent ranks;
+in a 16-process fail-stop test, rank 7 exited with status 99 and rank 0
+explicitly marked it failed; all 15 survivors observed
+revocation, agreed on membership, and completed post-repair allreduce.
+
+A second reference runtime adds the piece an interface needs to be worth
+having: a decision function that chooses a collective algorithm, constrained by
+inputs MPI does not have.  Because a language-model merge operator is at best
+approximately associative, the operator's declared algebra decides which
+schedules are sound; because the receive buffer is a finite context window,
+peak residency decides which are possible at all.  We measure the second
+directly: recursive-doubling and binomial allreduce hold $1.5n$ tokens at every
+communicator size, while recursive-halving reduce-scatter falls from $0.68n$ at
+$p{=}4$ to $0.09n$ at $p{=}32$, so at 128k tokens the first cannot run in a
+128k-token window and the second uses nine percent of it.
+
+We then run the protocol with real agents.  Sixteen Cursor subagents perform
+the same semantic reduction under two schedules: both do $p-1$ operator
+evaluations, the tree puts $\lg p$ of them on the critical path rather than
+$p-1$, and measured critical-path model time falls $3.0\times$ with identical
+coverage --- though the two merged artifacts, equal in length and agreeing on
+every rule, share almost no sentences, which is the agent form of the
+reproducibility MPI declines to promise.  Sixteen more build one Python package
+twice, once with collectives and once with every phase transition carried in a
+window; both deliver working software, the second with zero collective calls,
+no module claimed twice, and cross-module tests that found a real defect two
+independent reviewers confirmed.  Six more write a report while two of them are
+killed: the survivors revoke, shrink and continue, and both dead agents' work
+is adopted from the window rather than rewritten.
+
+These runs also did what simulation cannot: they broke the runtime in eight
+distinct ways, from a heartbeat detector that condemned healthy agents 1091
+times in twenty minutes to a shrink whose default naming fragmented the very
+survivors it was meant to regroup.  We report those failures, and the fixes
+they forced, as the substance of the evaluation rather than an appendix to it.
+The result is a concrete protocol, artifact, and evaluation agenda for
+separating multi-agent program logic from rapidly changing agent infrastructure.
+\end{abstract}
+
+\section{Introduction}
+
+An MPI program says that rank 0 broadcasts parameters, ranks compute, and a
+reduction combines results.  It does not say whether bytes traverse shared
+memory, TCP, InfiniBand, UCX, or a vendor interconnect.  That separation let a
+portable programming model survive several decades of machine evolution.
+Current multi-agent harnesses lack an equivalent waist.  A ``team'' is often a
+framework-specific set of Python objects; a ``message'' may be a list append, a
+prompt fragment, or an HTTP task; and ``memory'' may mean both durable state
+and text copied into every model context.
+
+The analogy is useful but dangerous.  An MPI process is comparatively cheap,
+deterministic between communications, and placed in a trusted allocation.
+An LLM agent can take minutes, return plausible nonsense, exceed a context
+window, pause for a tool or person, and execute outside the operator's trust
+domain.  A barrier can prove that every executor called the barrier; it cannot
+prove that every model understood a policy.  A broadcast can deliver identical
+bytes while attention and interpretation differ.  Natural-language synthesis
+is usually not an associative reduction.
+
+We therefore ask a narrower systems question:
+
+\begin{quote}
+Can a protocol preserve MPI's explicit and portable coordination semantics
+while making agent-specific uncertainty, context, lifecycle, and failure
+visible rather than pretending them away?
+\end{quote}
+
+This paper answers with \ampi, an interface rather than a prescribed
+multi-agent system.  Its intended user is a harness author.  Implementers can
+map it to local tasks, a durable broker, actor mailboxes, A2A, or provider APIs.
+Programs depend on observable semantics; implementations choose transports and
+algorithms.
+
+The contributions are:
+
+\begin{enumerate}
+\item a systematic translation of MPI objects and operations into agent-harness
+semantics, including explicit statements of where the analogy fails;
+\item point-to-point matching, completion, progress, collective, lifecycle,
+failure, context, synchronization, security, and tracing contracts;
+\item a durable, brokerless Python/SQLite reference implementation and canonical
+JSON envelope schema;
+\item conformance tests, fault hooks, and reproducible microbenchmarks grounded
+in machine-readable traces;
+\item true multi-agent translation and software-development case studies, plus
+an evaluation design that separates protocol mechanics from model quality.
+\end{enumerate}
+
+This is a first research artifact, not a completed standard.  In particular,
+one SQLite implementation cannot demonstrate interoperability, and pilot agent
+runs cannot establish a quality scaling law.  We state those boundaries because
+systems interfaces fail when aspirational semantics are reported as measured
+behavior.
+
+\section{What MPI Actually Contributed}
+\label{sec:history}
+
+\subsection{Before and through MPI-1}
+
+MPI emerged from a fragmented environment of vendor and research
+message-passing systems.  The 1992--1993 forum brought vendors, library
+implementers, and application authors together; over forty organizations
+participated, and MPI-1.0 was finalized in May 1994
+\cite{mpi1993,mpi41}.  The achievement was not invention of send, receive, or
+barrier.  It was agreement on a sufficiently precise, language-independent
+library contract that admitted efficient implementation on heterogeneous
+distributed-memory machines.
+
+Four philosophical choices matter to \ampi.
+
+\paragraph{Library, not language.}
+MPI did not require a new parallel language.  Existing C and Fortran programs
+could adopt a stable interface incrementally.  An agent protocol should
+similarly avoid requiring one workflow DSL or one model framework.
+
+\paragraph{Communication context plus group.}
+A communicator combines ordered membership with a private matching namespace.
+This is more than a list of workers: independently developed libraries can use
+the same tags without stealing each other's messages.  Rank is local to that
+context, not a global identity.
+
+\paragraph{Semantic room for optimization.}
+MPI defines when operations match and complete but leaves eager versus
+rendezvous protocols, buffering, progress, topology selection, and transport
+to implementations.  MPICH demonstrated that an abstract device layer could be
+both portable and performant \cite{gropp1996mpich}; Open MPI later emphasized a
+runtime-selected modular component architecture
+\cite{gabriel2004openmpi}.  \ampi{} similarly separates protocol, executor
+adapter, transport, artifact store, and control plane.
+
+\paragraph{Collectives as first-class intent.}
+A broadcast expressed as $P-1$ sends hides optimization opportunities and
+coordination intent.  A collective call exposes both.  MPI implementations can
+select binomial trees, rings, recursive doubling, or topology-aware algorithms
+without changing application code \cite{thakur2005collectives}.
+
+\subsection{Evolution: MPI-2 through MPI-4.1}
+
+MPI-2 added dynamic processes, one-sided communication, parallel I/O, and other
+facilities; MPI-3 expanded nonblocking collectives, neighborhood collectives,
+and shared-memory windows; MPI-4 added Sessions, partitioned communication, and
+persistent collectives.  Version 4.1, approved 2 November 2023, is primarily a
+clarification release \cite{mpi41}.  Two lessons follow.
+
+First, a small stable core can precede richer resource and topology facilities.
+\ampi{} defines conformance levels instead of claiming every mature MPI feature
+in version 0.1.  Second, global initialization became a composability problem:
+Sessions let components obtain process sets and construct communication
+contexts without assuming one global \code{WORLD}.  Agent harnesses need this
+from the beginning because nested teams and tools often have independent
+lifecycles.
+
+MPI-5.0, approved 5 June 2025, added a standard ABI and a small number of
+targeted changes rather than a new programming model \cite{mpi50}.  In
+particular, the released standard does not include revoke, shrink, agree, or
+the ULFM failure error classes; those remain research/``MPI next'' work.
+Keeping that distinction matters for \ampi: ULFM is a design source, not a
+feature that can be attributed to the current MPI standard.
+
+\subsection{MPI's fault boundary}
+
+Traditional MPI was optimized for tightly managed, mostly fail-stop jobs; a
+single process failure often made continued communication impractical.
+FT-MPI, MPICH-V, and User-Level Failure Mitigation (ULFM) investigated recovery
+\cite{bosilca2002mpichv,bland2013ulfm}.  ULFM's key abstraction is modest:
+repair communication capability through failure acknowledgment, revoke,
+agreement, and communicator shrink; application state recovery remains the
+application's responsibility \cite{bland2013recovery}.  This distinction is
+central for agents.  A protocol can reassign a task and restore a mailbox; it
+cannot reconstruct unrecorded reasoning or undo an unfenced side effect.
+
+MPI runtime work also separated launch/resource management from communication.
+PMIx offers a programming-model-neutral process-management interface
+\cite{castain2018pmix}.  \ampi{} follows that split: an executor adapter launches
+or invokes agents, while the communication layer owns matching and collectives.
+
+\section{Why Existing Agent Interfaces Are Insufficient}
+
+\subsection{Frameworks are programs, not a portable waist}
+
+AutoGen models applications as conversations among configurable agents
+\cite{wu2024autogen}; CAMEL uses role-playing communication
+\cite{li2023camel}; MetaGPT and ChatDev organize software-development roles and
+artifacts \cite{hong2024metagpt,qian2024chatdev}.  These systems provide useful
+orchestration policies.  They do not define a common matching, completion,
+collective, failure, context-credit, and repair contract that an independently
+written harness can carry between runtimes.
+
+This distinction mirrors the difference between a parallel application
+framework and MPI.  \ampi{} should be able to express a debate, software
+company, tree of reviewers, or simple ensemble; it should not standardize any
+one of them.
+
+\subsection{Interoperability protocols address adjacent layers}
+
+FIPA ACL standardizes message fields and communicative acts
+\cite{fipa2002acl}.  MCP standardizes host/client/server exchange for tools,
+resources, and prompts \cite{mcp2025}.  A2A 1.0 targets interoperability among
+opaque agentic services and defines discovery, tasks, messages, artifacts, and
+multiple protocol bindings \cite{a2a2026}.  These are complementary:
+an \ampi{} transport may carry envelopes over A2A, and an \ampi{} executor may
+use MCP tools.  Neither currently supplies MPI-like communicator isolation,
+ranked collectives, stream ordering, collective mismatch, context credits, or
+ULFM-like repair.
+
+\subsection{More communication is not automatically better}
+
+Sampling and voting can improve benchmark accuracy as ensemble size grows
+\cite{li2024moreagents}, and layered mixture-of-agents systems report quality
+gains \cite{wang2024moa}.  But carefully controlled studies find that debate
+does not reliably beat simpler self-consistency or voting
+\cite{smit2024mad,shi2025debatevote}.  Similar agents can converge to a shared
+misconception \cite{wang2024debate}; long interactions can drift away from the
+problem \cite{becker2026drift}.  The systems implication is not to encode
+``debate'' as a blessed primitive.  It is to provide measurable communication
+topologies and make simpler baselines easy.
+
+\section{Requirements and Failure Model}
+
+\ampi{} targets heterogeneous, high-latency executors connected by an
+asynchronous transport.  The core assumes crash-stop executor failures and
+non-Byzantine control metadata.  A lease detector may eventually suspect a
+silent executor, but in an asynchronous system silence cannot distinguish
+failure, partition, and delay \cite{chandra1996failure}.  Byzantine model
+outputs---including prompt injection and confidently wrong text---are
+application data requiring validation and provenance.
+
+The design requirements are:
+
+\begin{description}
+\item[Isolation.] Concurrent libraries and teams cannot consume each other's
+messages.
+\item[Explicit nondeterminism.] Wildcard matches, retries, and model sampling
+are traced; deterministic replay does not falsely promise identical generation.
+\item[Resource bounds.] Mailbox bytes, inline tokens, context materialization,
+and provider capacity have admission rules.
+\item[Failure visibility.] Strict collectives never silently drop a missing
+rank; membership changes create a new generation.
+\item[Transport independence.] A binding publishes capability, progress,
+delivery, and durability levels instead of leaking its queue implementation.
+\item[Semantic humility.] Delivery, match, and model acceptance are distinct.
+\item[Security.] A communicator is a capability boundary, not only an integer
+namespace.
+\end{description}
+
+\section{Protocol Objects}
+
+\subsection{Session, executor, and incarnation}
+
+A session isolates agents, communicators, messages, artifacts, locks, and a
+trace.  An \emph{agent} is a logical identity; an \emph{executor} is the
+process, remote service, human, or model invocation acting for it.  Restarting
+an executor increments an incarnation.  Delayed messages and commits from an
+older incarnation can then be rejected.
+
+The lifecycle is
+\[
+\textsc{Joining}\rightarrow\textsc{Active}\rightarrow
+\textsc{Draining}\rightarrow\textsc{Finalized},
+\]
+with \textsc{Active}$\rightarrow$\textsc{Suspect}$\rightarrow$\textsc{Failed}
+and a new incarnation returning through \textsc{Joining}.  Transitions are
+monotonic inside an incarnation.
+
+\subsection{Communicator and membership generation}
+
+A communicator is
+\[
+C=(\textit{session},\textit{context},\textit{generation},
+   \langle\textit{members}\rangle,\textit{attributes}).
+\]
+Rank is the index/name within the ordered membership.  The context isolates
+matching; the generation identifies an immutable membership epoch.  Split,
+grow, and shrink return a new object and an explicit old-to-new map.  No
+implementation may silently mutate membership behind a rank's handle.
+
+\subsection{Envelope and status}
+
+The production JSON schema accompanies the artifact.  Identity and matching
+fields include protocol version, message ID, session, communicator, generation,
+source rank and incarnation, destination, tag, and per-stream sequence.  The
+body is either inline typed JSON or a content-addressed artifact reference.
+Resource and provenance fields include bytes, estimated tokens, schema,
+deadline, trace context, capability proof, checksum, and creation time.
+
+The receiver validates identity, generation, destination, authorization, and
+integrity before exposure.  Status returns the actual source/tag selected by a
+wildcard, sequence, message ID, byte/token charge, and artifact reference.
+
+\section{Point-to-Point Semantics}
+
+\subsection{Matching and non-overtaking}
+
+\code{Send(v,d,t,C)} matches \code{Recv(s,t,C)} when communicator,
+generation, destination, source constraint, and tag constraint agree.
+\code{ANY\_SOURCE} and \code{ANY\_TAG} are explicit wildcards.  The earliest
+eligible admitted envelope wins.
+
+Non-overtaking is deliberately narrow.  For fixed
+$(C,g,s,d,t)$, if send $m_1$ precedes $m_2$, a receive that can match both
+cannot return $m_2$ first.  There is no total order across sources or tags.
+Lamport clocks can represent causality \cite{lamport1978time}, but are metadata,
+not hidden matching rules.  Wildcard match decisions are logged because they
+make replay schedule-dependent.
+
+\subsection{Four completion points}
+
+Agent communication needs more distinctions than a Boolean ``sent'':
+
+\begin{enumerate}
+\item \emph{local}: caller state can be reused;
+\item \emph{admitted}: the destination transport accepted responsibility;
+\item \emph{matched}: a posted destination receive selected the message;
+\item \emph{accepted}: destination application returned a typed semantic ACK.
+\end{enumerate}
+
+Standard/buffered send completes at admission; synchronous send waits for
+match.  Ready send is legal only if a compatible receive is already posted.
+None implies correct execution or durable external side effects.  Exactly-once
+model execution is not generally available: a provider may finish before its
+ACK is lost.  Durable bindings use stable message/task IDs and idempotent,
+fenced commits.
+
+\subsection{Requests, progress, and cancellation}
+
+Nonblocking operations return requests observed by \code{Test}, \code{Wait},
+\code{WaitAny}, \code{WaitSome}, and \code{WaitAll}.  A binding declares weak
+progress (calls/polling required) or strong progress (background progress).
+Cancellation is an attempt: cancelling a local request cannot retract an
+admitted task or prove cancellation of a remote model.
+
+Our v0.1 reference binding implements blocking operations, probe, and posted
+receives.  Nonblocking requests are specified but intentionally not claimed as
+implemented; this prevents a thread wrapper from being presented as a portable
+asynchronous progress guarantee.
+
+\section{Collectives and Their Agent Analogues}
+
+Collectives are ordered within a communicator generation.  Every live rank must
+enter the same operation signature at the same ordinal.  A mismatch is an
+error, not a different legal collective.  Table~\ref{tab:collectives} gives
+semantics and algorithms; optimized algorithms preserve results and completion.
+
+\begin{table*}[t]
+\centering
+\small
+\begin{tabular}{p{0.09\textwidth}p{0.33\textwidth}p{0.27\textwidth}p{0.20\textwidth}}
+\toprule
+Operation & Agent meaning & What it does \emph{not} mean & Candidate algorithm \\
+\midrule
+Barrier & No rank exits phase $k$ before every live member enters it. &
+Prompts understood; effects flushed; state agreed. &
+Dissemination: $\lceil\log_2 P\rceil$ rounds \cite{hensgen1988barrier}.\\
+Bcast & Root delivers one immutable policy, schema, glossary, or artifact
+digest to all ranks. & Identical attention or interpretation. &
+Binomial tree for small values; scatter+allgather for large.\\
+Scatter & Root assigns one rank-indexed shard. &
+Shards are independent or balanced. & Binomial/scattered tree.\\
+Gather & Root obtains rank-ordered outputs. &
+Outputs are mutually consistent. & Linear for small $P$; binomial tree.\\
+Allgather & Every rank obtains all rank-ordered summaries/proposals. &
+All full artifacts should enter every prompt. & Ring for large values;
+recursive doubling for small.\\
+Reduce & Deterministic associative operator combines typed values. &
+Arbitrary LLM synthesis is associative. & Trees, recursive doubling,
+Rabenseifner \cite{rabenseifner2004reduction}.\\
+Allreduce & Reduction result reaches all ranks. &
+Majority output is true or consensus-safe. & Reduce-scatter+allgather or
+recursive doubling.\\
+Alltoall & Personalized exchange, e.g., assigned peer reviews. &
+Every agent should converse with every peer. & Pairwise/radix/Bruck
+\cite{bruck1997alltoall}.\\
+Scan & Rank $i$ receives prefix reduction through $i$. &
+Later stages may mutate earlier committed state. & Recursive doubling.\\
+Neighborhood & Declared graph neighbors exchange values. &
+The graph captures all semantic dependencies. & Topology-specific.\\
+\bottomrule
+\end{tabular}
+\caption{MPI collectives translated into precise agent-harness semantics.}
+\label{tab:collectives}
+\end{table*}
+
+\subsection{Barrier}
+
+At dissemination round $k$, rank $r$ sends to
+$(r+2^k)\bmod P$ and receives from $(r-2^k)\bmod P$.  It takes
+$\lceil\log_2P\rceil$ rounds without a central hot spot.  Agent phases may last
+minutes, so barriers need deadlines and straggler diagnostics.  A strict
+barrier with a failed member fails; a quorum phase is a different operation
+that returns its participant set.
+
+\subsection{Broadcast and context}
+
+A policy or glossary should be stored once, addressed by digest, then broadcast
+as a reference.  Each adapter selectively resolves it when constructing an
+invocation.  An application that needs evidence of parsing follows broadcast
+with structured validation and \code{Allreduce(AND)}.  Even then the result
+means all validators returned true, not that the policy is true.
+
+\subsection{Reduction versus synthesis}
+
+A reduction declares input/output schema, identity, associativity,
+commutativity, conflict policy, determinism, and implementation version.  Numeric
+sum and Boolean conjunction qualify.  LLM ``merge these drafts'' normally does
+not: output depends on rank order, prompt, model, and sampling.  \ampi{}
+represents it honestly as \code{Gather} followed by a designated synthesis
+task.  This preserves optimization safety and makes model cost visible.
+
+\subsection{Agent-aware cost model}
+
+The Hockney-style network model motivates but does not describe agents.  We use
+\[
+T_{\mathrm{op}} =
+\alpha_h + \alpha_i + \beta_b n_{\mathrm{bytes}} +
+\beta_t n_{\mathrm{tokens}} + \gamma_m(x) + T_q + T_r ,
+\]
+where $\alpha_h$ is harness startup, $\alpha_i$ invocation startup, $\beta_b$
+transport cost, $\beta_t$ context ingestion, $\gamma_m$ task/model generation,
+$T_q$ queueing/backpressure, and $T_r$ expected recovery.  Token volume can
+change result quality as well as latency, so an implementation reports
+transport and model intervals separately.  Hierarchical collectives can
+summarize within cheap/local groups before crossing model or organization
+boundaries.  Section~\ref{sec:algebra} develops the special case of this model
+that governs reductions, where the operator's declared algebra fixes the depth
+term and the rank context bound turns a cost comparison into a feasibility
+test.
+
+\input{sec-collective-algebra}
+
+\section{Context Is a Flow-Control Resource}
+
+Long context is not uniformly usable; retrieval quality can depend strongly on
+position and can degrade in the middle even for long-context models
+\cite{liu2024lost}.  Therefore \ampi{} does not equate ``fits in the advertised
+window'' with ``safe to append.''
+
+Every destination advertises credits in queued messages, bytes, inline token
+estimate, and optional provider cost.  Admission that would exceed a bound
+blocks, fails with \code{RESOURCE\_EXHAUSTED}, or externalizes according to a
+negotiated policy.  It never silently truncates.
+
+Large bodies become immutable SHA-256 artifacts.  The mailbox contains a
+bounded summary, media type, size, token estimate, URI/capability, and digest.
+Resolution is explicit and charged when materialized.  This yields a hierarchy:
+authenticated header, small control value, summary, artifact reference, then
+selective ranges.  Credits return only after dequeue, expiration, or a durable
+compaction checkpoint.
+
+This mechanism addresses both harness OOM and context ``rot.''  It cannot force
+a model to attend to loaded text.  Adapters should build each prompt from the
+task's dependency slice rather than replay the full communicator transcript.
+
+\section{Lifecycle, Failure, and Synchronization}
+
+\subsection{Failure detector and fencing}
+
+Heartbeats renew an incarnation lease.  Expiry creates suspicion under
+configured timing assumptions; it is not proof.  Before a replacement can
+commit, the old incarnation is fenced.  This follows the distinction between
+failure detection and correctness in asynchronous systems
+\cite{chandra1996failure}.
+
+\subsection{Revoke, shrink, agree}
+
+On member failure, ordinary operations in the damaged generation return an
+error.  The recovery sequence is:
+
+\begin{lstlisting}
+AckFailed(old, failed_set)
+Revoke(old)
+new, rank_map = Shrink(old)
+ok = Agree(new, checkpoint_available)
+if ok: redistribute_incomplete_work(new)
+\end{lstlisting}
+
+No strict collective completes over an implicit survivor subset.  Shrink
+creates consistent ordered membership and a fresh generation.  Agree provides
+failure-aware Boolean conjunction; it is not general consensus.  FLP still
+applies to deterministic consensus in a fully asynchronous model with one
+failure \cite{fischer1985flp}.
+
+\subsection{Checkpoint and replay}
+
+A checkpoint contains generation, agent incarnations, delivered message IDs,
+unmatched envelopes, artifact digests, collective ordinal, application-state
+references, and trace position.  Hidden model state is not assumed portable.
+Replay can reproduce harness decisions and substitute captured model outputs;
+it cannot force a fresh model invocation to generate the same tokens.
+
+\subsection{Locks are fenced leases}
+
+A time-bounded lease without fencing is unsafe: an executor may pause through
+expiry, resume, and overwrite its successor.  \ampi{} lock acquisition returns
+a monotonically increasing token.  Protected storage rejects tokens lower than
+the latest accepted token, adapting lease practice from distributed storage
+\cite{gray1989leases}.  Long generation should not hold a lock; prefer immutable
+artifacts, ownership partitioning, and collective merge.
+
+\section{Security and Trust Boundaries}
+
+MPI commonly assumes a trusted allocation.  Internet- or enterprise-facing
+agents cannot.  A remote binding authenticates principals, binds credentials to
+session/communicator/rank/incarnation, authorizes artifact resolution, prevents
+cross-run replay, and protects transport integrity/confidentiality.
+
+Received natural language is untrusted input, not authority.  A tool-capable
+executor intersects delegated capability with local policy.  Traces retain
+hashes, schemas, timing, and provenance while redacting secrets and hidden
+reasoning.  Collectives over untrusted model output require validation or robust
+aggregation at the application layer; crash-stop repair is not Byzantine
+tolerance.
+
+\section{Reference Implementation}
+\label{sec:implementation}
+
+The artifact implements a durable semantic reference in Python 3.11+ using only
+the standard library at runtime.  Independent OS processes coordinate through
+SQLite in WAL mode; no resident broker is needed.  This choice favors
+inspectability and crash persistence over throughput.
+
+\subsection{Persistent state and transactions}
+
+Eleven tables represent sessions, agents, communicators, messages, posted
+receives, collective counters/signatures/contributions/results, locks,
+artifacts, and events.  Each transition executes in a short
+\code{BEGIN IMMEDIATE} transaction.  Message enqueue atomically checks mailbox
+bytes, assigns the next stream sequence, inserts the envelope, and appends a
+trace event.  Receive publishes a posted-receive row, repeatedly searches the
+matching index, atomically marks one row acknowledged, charges context, removes
+the posted receive, and emits the observed match.
+
+The matching query filters communicator, destination, pending state, optional
+source, and optional tag, then orders eligible rows by admission time, source,
+and sequence.  The index is
+\code{(comm, dst, state, src, tag, created)}.  Synchronous send polls the
+durable row until receive marks it acknowledged; ready send verifies a
+compatible posted receive.
+
+\subsection{Collective reference implementation}
+
+Each rank obtains a communicator-global ordinal and persists an operation
+signature and contribution.  A conflicting signature marks the instance failed
+so waiters report mismatch.  When every live member has contributed, one
+transaction computes a rank-ordered deterministic result and inserts it
+idempotently; all ranks read the same result row.  This centralized algorithm
+is intentionally a transparent reference.  Production bindings replace it with the
+tree/ring algorithms in Table~\ref{tab:collectives} and validate traces against
+the reference semantics.
+
+\subsection{Artifacts, failure, and traces}
+
+Bodies above the inline-token threshold are written to a temporary file,
+SHA-256 hashed, atomically renamed, and referenced in the message.  Resolution
+recomputes the digest before context charge.  Heartbeats update leases;
+failure marks affected communicators revoked.  Shrink inserts a new generation
+with failed/finalized ranks removed.  Lock rows store owner, lease expiry, and
+monotonic fencing token.  Every transition appends a session/rank event with a
+database sequence, time, kind, and JSON metadata, analogous in purpose to the
+PMPI profiling layer.
+
+\subsection{Implemented and specified surface}
+
+The prototype implements standard, buffered, synchronous, and ready sends;
+wildcard receive and probe; barrier, broadcast, scatter, gather, allgather,
+reduce, allreduce, and agree; context and mailbox bounds; content-addressed
+artifacts; heartbeat/failure hooks; revoke/shrink; fenced lock acquisition; a
+CLI; and trace export.  The schema specifies source incarnations, deadlines,
+capability proofs, and typed payload metadata beyond the SQLite subset.
+
+True asynchronous requests, optimized distributed collectives, dynamic spawn,
+one-sided windows, network authentication, decentralized control-plane
+recovery, and Byzantine tolerance remain future conformance levels.
+
+\section{Evaluation}
+\label{sec:evaluation}
+
+\subsection{Questions and methodology}
+
+We separate six questions:
+
+\begin{enumerate}
+\item Do tests establish matching, isolation, collective, resource, repair, and
+fencing invariants?
+\item What overhead does the transparent SQLite binding impose?
+\item Does artifact spill bound prompt-facing context without changing bytes?
+\item Can true independent agents execute a collective protocol?
+\item Can failure be identified and work reassigned without a stale commit?
+\item Does protocol structure affect task quality after controlling model,
+information, and inference budget?
+\end{enumerate}
+
+Questions 1--3 are deterministic protocol experiments.  Questions 4--5 are
+pilot macrobenchmarks.  Question 6 requires replicated, randomized comparison
+and blinded or external evaluation; we provide the design and do not infer it
+from one run.
+
+All measurements are generated by committed scripts.  Results retain raw
+samples and the metadata applicable to each experiment.  The SQLite
+microbenchmark uses 20 timed iterations (with two ping-pong warmups); the
+independent-process campaign performs five allreduces in each of seven tested
+configurations; the fail-stop experiment is one run.  The measured host runs
+CPython 3.12.3 on Linux and reports eight logical CPUs.  Values below describe
+one host, not a network transport.
+
+\subsection{Conformance tests}
+
+Sixteen SQLite-binding tests exercise ordered point-to-point/wildcard matching,
+synchronous rendezvous, rank-consistent collectives, artifact spill and context
+admission, mailbox backpressure, revoke/shrink, fencing-token takeover, and
+monotonic audit traces. Adversarial additions cover clock regression,
+cross-tag ordering, posted-receive priority, unjoined/stale incarnations,
+forged communicators, communicator-local rank remapping, shrink lineage and
+idempotence, and fencing persistence after clean release. A mismatch test
+deliberately enters different collectives at one communicator-global ordinal
+and verifies that both participants receive a persisted diagnostic rather than
+hang. Static type and lint checks pass. The artifact also
+contains explicit failure hooks and a required-invariants checklist.  A
+publication artifact should add property-based interleaving tests and a small
+TLA+/PlusCal model; Section~\ref{sec:limits} treats this as open work.
+
+\subsection{Microbenchmarks}
+
+Table~\ref{tab:micro} reports medians.  Ping-pong includes durable enqueue,
+matching, acknowledgment, polling, and transactions; it is not a network-only
+latency.  The 8\,KiB and 64\,KiB payloads crossed the configured token threshold
+in all 20 trials and therefore measured artifact-reference exchange.  Their
+nearly flat ping-pong time demonstrates bounded inline transport work, while
+artifact materialization cost is measured separately.
+
+\begin{table}[t]
+\centering
+\small
+\begin{tabular}{lrr}
+\toprule
+Operation & Scale & Median \\
+\midrule
+Ping-pong & 16 B & 4.23 ms\\
+Ping-pong & 1 KiB & 9.15 ms\\
+Ping-pong & 8 KiB (artifact descriptor) & 16.74 ms\\
+Ping-pong & 64 KiB (artifact descriptor) & 9.42 ms\\
+\midrule
+Barrier & 2 ranks & 5.58 ms\\
+Barrier & 8 ranks & 108 ms\\
+Barrier & 32 ranks & 476 ms\\
+Allreduce & 2 ranks & 8.09 ms\\
+Allreduce & 8 ranks & 113 ms\\
+Allreduce & 32 ranks & 489 ms\\
+\midrule
+Fail+shrink & 8 to 7 ranks & 1.36 ms\\
+\bottomrule
+\end{tabular}
+\caption{Local SQLite reference-runtime medians, 20 trials.  Variance is high;
+raw samples and p95 values are in the artifact.}
+\label{tab:micro}
+\end{table}
+
+Collective latency grows steeply because all ranks poll one SQLite writer and
+the reference coordinator serializes contributions.  At 32 ranks, median barrier and allreduce
+are 476 and 489\,ms, respectively.  This negative result is useful: the binding
+is appropriate for local harness debugging where model calls take seconds, but
+not for low-latency or cluster-scale collectives.  A broker or direct transport
+should implement logarithmic/ring algorithms.
+
+Failure injection followed by shrink from eight to seven ranks takes a median
+1.36\,ms (range 0.622--2.454\,ms), excluding failure-detection timeout and
+application-state restoration.  The separation matters: reporting only this
+number as ``agent recovery'' would be misleading.
+
+\subsection{Independent-process scaling and failure}
+
+Thread-level trials can hide process attachment and independent SQLite
+connections.  A second driver launches one OS process per rank and executes a
+strict start barrier, five allreduces, point-to-point fan-in at rank 0, and an
+exit barrier.  All configurations from 2 through 100 ranks completed with
+correct reduction and fan-in.  Median per-rank allreduce time rose from
+11.5\,ms at two ranks to 101\,ms at 32, 258\,ms at 64, and 944\,ms at 100.
+Total 100-process wall time was 10.45\,s.  These results establish functional
+process scale to the requested rank count; they reinforce, rather than weaken,
+the conclusion that a single SQLite writer is not a high-performance binding.
+
+The fail-stop driver launched 16 independent processes and terminated rank 7
+with exit status 99 after all ranks became ready.  Rank 0 published failure
+while survivors were entering a barrier.  All 15 survivors returned
+\code{COMM\_REVOKED}, independently obtained the identical ordered membership
+$\{0,\ldots,6,8,\ldots,15\}$, and completed an allreduce of survivor ranks with
+the correct result 113.  The full run took 0.335\,s and emitted 92 trace events.
+This includes process startup and a fixed 0.1\,s injection delay, but uses an
+explicit failure hook rather than heartbeat detection.
+
+\subsection{Context result}
+
+A synthetic JSON body estimated at 16,253 tokens crossed a 64-token inline
+threshold.  The pending mailbox held a 36-token artifact descriptor.  Explicit
+resolution returned 65,011 bytes whose parsed value was byte-equivalent to the
+source.  Thus reference exchange reduced prompt-facing admission charge by
+99.78\% for this payload.  This verifies storage and accounting behavior, not
+model comprehension or quality.
+
+\subsection{Translation macrobenchmark}
+
+The translation workload uses eight selected public-domain passages from
+Chapter I of Lewis Carroll's \emph{Alice's Adventures in Wonderland} (Project
+Gutenberg eBook 11).  Rank 0 broadcasts a French style/glossary contract and
+scatters one passage to each of eight translator agents.  Translators gather
+rank-ordered JSON drafts.  A second four-agent communicator broadcasts a review
+schema and scatters adjacent two-passage windows, including boundary neighbors,
+then gathers omissions, additions, grammar, glossary, and continuity findings.
+
+Every executor is a separately launched Cursor subagent.  It joins a durable
+session and calls the \ampi{} CLI for broadcast, scatter, gather, and finalize;
+task and result transfer is therefore through the protocol, not copied from a
+shared chat.  Unique per-rank JSON files, database trace, and the root's gathered
+result are retained.  A one-agent full-selection baseline controls for
+decomposition, while a no-review condition isolates review.
+
+Metrics include collective completion/rank order, glossary exact match, named
+entity/number/quote preservation, issue categories, cross-boundary term
+disagreement, revision acceptance, materialized tokens, and wall time.
+Literary preference needs blinded bilingual judges; an LLM judge from the same
+family is reported only as sensitivity analysis.
+
+The completed pilot produced all eight drafts, four two-passage reviews, one
+review-based synthesis, and a separately prompted one-agent baseline.  The
+draft and review communicators emitted 90 protocol events.  All eight applicable
+glossary checks matched exactly.  Reviewers reported 16 actionable issues
+(14 minor and two moderate) and supplied a revision for every passage.  Most
+importantly, a reviewer identified that our selected source accidentally
+omitted intervening text between passages 3 and 4; the synthesizer preserved
+the gap rather than hallucinating a bridge.  This makes a dataset defect
+visible; it is not evidence that the final prose is human-preferred.
+
+Our token estimator charges 1,899 aggregate input tokens for one-copy shards
+plus eight glossary/style deliveries, versus 6,848 for sending all selected
+text and style to all eight translators---a 72.3\% reduction.  This comparison
+excludes provider prompt caching and reviewer/synthesis cost.  The observed
+759\,s protocol span is dominated by intentionally staggered subagent launch
+under a concurrency cap and is not a speedup measurement.
+
+\subsection{Collaborative software macrobenchmark}
+
+The second task builds \code{minidag}, a dependency-free deterministic DAG
+execution library.  Rank 0 sends a versioned contract and file ownership.
+Eight producers implement graph, strict parser, scheduler, concurrent executor,
+CLI, tests, documentation, and an executable example.  Three staged reviewers
+wait on explicit producer \code{DONE} messages.  Rank 12 receives every report,
+runs integration checks, repairs only cross-module defects, and returns a final
+record.  Every file mutation acquires a named AgentMPI lease and records its
+fencing token.
+
+The live run exposed a lifecycle failure rather than producing an artificially
+clean trace: two initial launches were rejected by the executor-concurrency
+limit.  The strict broadcast timed out, rank 11 reported its missing rank-10
+dependency, and rank 12 returned a structured \code{blocked} result listing
+ranks 5, 10, and 11 instead of integrating partial work.  Replacement
+executors for ranks 5 and 10 then completed their queued tasks; rank 11 resumed
+after receiving the missing \code{DONE}.  A fresh two-rank recovery session
+assigned integration to a replacement, which independently passed 19 of 19
+tests, compilation, and the documented example.  The original blocked record,
+replacement outputs, recovered report, and 13 distinct software-agent IDs are
+retained.
+
+This event is useful evidence for explicit dependencies and lifecycle
+visibility, but it is not a ULFM communicator-repair result: the launch
+rejections occurred before those ranks joined.  Crash repair is evaluated
+separately in the 16-process experiment above.  Neither run establishes
+superiority over one expert developer.
+
+The comparison against a naive prose-only team is descriptive unless prompts
+contain equal information.  A proper ablation fixes model, sampling, role
+descriptions, token budget, tools, and task assignments, varying only explicit
+communication/repair semantics.
+
+\subsection{One-hundred-rank Aesop dry run}
+
+The artifact also contains 100 prepared Aesop-to-Spanish rank outputs and a
+collector result with an empty missing-rank set
+(\code{experiments/results/cursor\_scale.json}).  That result does not retain
+per-rank Cursor launch identifiers, so we conservatively classify it as a
+protocol/collector dry run and exclude it from the true-subagent count and all
+model-quality claims.  The independently reproducible 100-process experiment
+above is the supported scale result.
+
+\input{sec-eval-ampi}
+
+\subsection{Full experimental design}
+
+For a publishable quality claim, we propose a preregistered factorial study:
+
+\begin{itemize}
+\item topology: independent vote, star, tree, sparse DAG, all-to-all;
+\item protocol: implicit shared transcript versus \ampi{} typed messages;
+\item context: full replication versus summaries/artifact-on-demand;
+\item failure: none, crash before result, crash after result/before ACK,
+straggler, duplicated retry;
+\item scale: 1, 2, 4, 8, 16 agents;
+\item task: separable translation, dependency-rich software, factual reasoning,
+and adversarial correlated-error cases.
+\end{itemize}
+
+Use multiple model families and at least three random seeds per cell; randomize
+task-instance assignment; report paired effects with bootstrap confidence
+intervals and mixed-effects models over task/model.  Cost-normalize comparisons
+by input/output tokens and tool calls.  Report all failures and family-wise
+correction for multiple primary outcomes.  Protocol overhead is measured with
+deterministic replay of captured outputs; semantic benefit is measured with
+identical transport/control conditions.
+
+\section{Discussion}
+
+\subsection{What becomes portable}
+
+\ampi{} can make a harness's communication graph, matching assumptions,
+phase boundaries, resource policy, failure behavior, and trace schema portable.
+It gives runtime implementers optimization points and conformance tests.
+It also creates a vocabulary for comparing systems: ``synchronous send'' has a
+match completion condition, while ``semantic accept'' is separate.
+
+\subsection{What remains application-specific}
+
+Prompts, role policies, decomposition quality, validation, side-effect
+transactions, and domain semantics remain above the interface.  This is a
+feature.  MPI does not choose the numerical method; \ampi{} should not choose
+the deliberation method.
+
+\subsection{Actor and workflow comparison}
+
+Actors provide isolated state, asynchronous mailboxes, supervision, and
+location transparency \cite{hewitt1973actors,armstrong2010erlang,bykov2011orleans}.
+Workflow engines provide durable task state and retries.  \ampi{} can be
+implemented over either, but adds communicator-scoped matching and standardized
+collective intent.  Conversely, it should borrow supervision and durable
+idempotency rather than reproduce decades of runtime engineering.
+
+\subsection{Standardization path}
+
+A real standard requires at least two independent interoperable
+implementations, a conformance suite, wire/version negotiation, a stable
+governance forum, and application experience.  The MPI Forum's multi-party
+process is as important a precedent as its API.  Version 0.1 is a proposal to
+test, not a declaration that a new standard already exists.
+
+\section{Limitations and Threats to Validity}
+\label{sec:limits}
+
+\paragraph{Single implementation.}
+SQLite validates semantics locally but says little about broker, HTTP, or
+cross-organization interoperability.  The control plane and filesystem are
+single-host trust/failure domains.
+
+\paragraph{Central collective reference.}
+Measured collective scaling reflects write serialization and polling, not the
+tree/ring algorithms proposed for production.  It is useful as a lower-
+engineering-complexity reference, not a performance baseline for MPI.
+
+\paragraph{Failure model.}
+Hooks model crash-stop ranks.  Heartbeat timeout can falsely suspect a paused
+executor.  Provider-wide outages, malicious agents, inconsistent clocks, and
+coordinator failure need separate treatment.
+
+\paragraph{Context estimate.}
+The tokenizer-independent byte heuristic is not exact for any provider.
+Externalization controls admission but not attention, retrieval, or ``lost in
+the middle'' effects.
+
+\paragraph{Pilot agent evidence.}
+Cursor subagents can share a model family, training biases, environment, and
+scheduler.  Agent outputs are not independent samples.  Small runs cannot
+support universal quality claims, and agent-generated review is correlated.
+
+\paragraph{Task representativeness.}
+Translation is highly separable; software integration has a particular DAG.
+Other domains may need shared world models, low-latency interaction, or
+stronger transactional state.
+
+\paragraph{Specification/implementation gap.}
+The wire schema and specification include capabilities, incarnations, and
+future request semantics beyond the persisted subset.  Conformance levels and
+capability negotiation must make this gap machine-visible.
+
+\paragraph{Formal verification.}
+Tests cover concrete schedules but not all interleavings. The artifact now
+includes a TLA+ safety model for matching, communicator-global collective
+slots, crash/revoke/repair, and persistent fencing. With three agents and two
+bounded operations, TLC generated 45,073,807 states (11,152,584 distinct) to
+depth 24 without an invariant violation \cite{lamport2002tla}. An earlier version produced a
+counterexample when crash mutated membership in place; the repaired model keeps
+generation membership immutable and records failure separately. This remains a
+bounded design check, not an implementation-refinement proof or an unbounded
+liveness result. Credits, cancellation, and concrete transport refinement
+remain open; stateful model-based testing is also planned in the
+QuickCheck tradition \cite{claessen2000quickcheck}.
+
+\section{Conclusion}
+
+Multi-agent systems need fewer framework metaphors and more explicit contracts.
+MPI's durable lesson is not that every agent should impersonate an HPC process;
+it is that portable applications become possible when communication contexts,
+matching, completion, collectives, progress, and implementation freedom are
+specified precisely.
+
+\ampi{} applies that lesson while exposing the differences that matter:
+nondeterministic semantic work, expensive invocation, bounded and imperfect
+context, elastic executors, ordinary failure, external side effects, and
+cross-domain trust.  The protocol and SQLite runtime show that every central
+concept can be tied to an executable transition and trace.  The measurements
+also show the limits of that implementation.  The next milestone is not more
+API surface: it is independent bindings, model-checked invariants, and
+cost-controlled multi-provider experiments.
+
+\appendix
+
+\section{Normative Core API Sketch}
+
+\begin{lstlisting}
+Session.Init(required_capabilities) -> Session
+Session.GetPsets() -> [ProcessSet]
+Comm.Create(group, attributes) -> Comm
+Comm.Split(color, key) -> Comm
+
+Send(value, dest, tag, comm, mode) -> Status
+Recv(source|ANY, tag|ANY, comm) -> (value, Status)
+Isend/Irecv(...) -> Request
+Test/Wait/WaitAny/WaitSome/WaitAll(requests)
+Probe/MatchedProbe(source, tag, comm)
+
+Barrier(comm)
+Bcast(value, root, comm)
+Scatter(values, root, comm)
+Gather(value, root, comm)
+Allgather(value, comm)
+Reduce(value, operator, root, comm)
+Allreduce(value, operator, comm)
+Alltoall(values, comm)
+Scan(value, operator, comm)
+NeighborAllgather(value, graph_comm)
+
+AckFailed(comm, failures)
+Revoke(comm)
+Shrink(comm) -> (new_comm, rank_map)
+Agree(comm, flag) -> bool
+
+Artifact.Put(bytes, metadata) -> Ref
+Artifact.Get(ref, ranges?) -> bytes
+Context.Compact(checkpoint)
+Lock.Acquire(name, ttl) -> (lease, fence)
+\end{lstlisting}
+
+\section{Required Invariants}
+
+\begin{enumerate}
+\item No envelope is delivered outside its session, communicator, generation,
+and destination.
+\item One at-most-once admitted message is exposed at most once.
+\item Fixed-stream messages do not overtake.
+\item Only a compatible posted receive consumes a data envelope.
+\item A strict collective completes only after every current member enters the
+identical signature.
+\item A failed-member collective never silently succeeds on a subset.
+\item Membership changes advance generation and return an explicit map.
+\item Mailbox/context accounting never exceeds negotiated limits.
+\item Artifact resolution verifies content identity.
+\item An expired owner cannot commit after a newer fencing token.
+\item Every completion has a causally linked trace event.
+\item Protocol control messages cannot be consumed by wildcard application
+receives.
+\end{enumerate}
+
+\section{Artifact Layout}
+
+\begin{description}
+\item[\code{SPEC.md}] Normative draft and conformance levels.
+\item[\code{schemas/}] Canonical JSON transport envelope.
+\item[\code{src/agentmpi/}] Runtime, model, and CLI.
+\item[\code{tests/}] Conformance and failure tests.
+\item[\code{scripts/run\_benchmarks.py}] Raw microbenchmark generator.
+\item[\code{experiments/tasks/}] Public-domain inputs and exact executor
+protocols.
+\item[\code{experiments/results/}] Raw samples, traces, per-rank products, and
+gathered outputs.
+\item[\code{paper/}] This source and bibliography.
+\end{description}
+
+\bibliographystyle{plain}
+\bibliography{references}
+
+\end{document}
