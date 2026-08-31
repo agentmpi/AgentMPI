@@ -434,6 +434,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("worker", help="claim and submit work from a per-rank pull queue")
     _common(p)
     p.add_argument("--campaign", required=True)
+    p.add_argument("--serve", default="",
+                   help="comma-separated extra ranks this executor serves (oversubscription)")
     wksub = p.add_subparsers(dest="workercmd", required=True)
     q = wksub.add_parser("next", help="claim the next task, blocking server-side")
     q.add_argument("--timeout", type=float, default=240.0)
@@ -823,11 +825,13 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
     if cmd == "worker":
         from .executor import BrokerExecutor
 
+        serve = [int(x) for x in a.serve.split(",") if x.strip()] if a.serve else []
         if a.workercmd == "next":
-            return (BrokerExecutor.next_task(amp, a.campaign, amp.rank, timeout=a.timeout),
-                    amp.rank, job)
+            return (BrokerExecutor.next_task(amp, a.campaign, amp.rank, timeout=a.timeout,
+                                             serve=serve), amp.rank, job)
         if a.workercmd == "submit":
-            return BrokerExecutor.submit(amp, a.campaign, amp.rank, a.aid), amp.rank, job
+            return (BrokerExecutor.submit(amp, a.campaign, amp.rank, a.aid, serve=serve),
+                    amp.rank, job)
         if a.workercmd == "give-up":
             return (BrokerExecutor.give_up(amp, a.campaign, amp.rank, a.aid, a.reason),
                     amp.rank, job)

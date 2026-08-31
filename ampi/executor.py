@@ -29,6 +29,7 @@ polling is an agent that is burning context on nothing.
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -238,28 +239,62 @@ class BrokerExecutor:
 
     # -- worker side ----------------------------------------------------------
     @staticmethod
-    def next_task(amp: Any, campaign: str, rank: int, *, timeout: float = 240.0) -> dict[str, Any]:
-        """Claim the caller's next task, blocking server-side.
+    def next_task(
+        amp: Any,
+        campaign: str,
+        rank: int,
+        *,
+        timeout: float = 240.0,
+        serve: list[int] | None = None,
+    ) -> dict[str, Any]:
+        """Claim the next task for any rank this executor serves.
 
         Returns one of three shapes, and the worker prompt branches on exactly
         these three: ``task`` (do it), ``idle`` (nothing within the window; ask
         again), ``exit`` (the job is over).
+
+        ``serve`` is **oversubscription**, and it has an exact MPI analogue:
+        ``mpirun -np 100`` on an eight-core machine runs a hundred ranks on eight
+        cores.  It works here for the same reason it works there --- a rank is a
+        durable role whose state lives outside its executor --- and it is the
+        answer when the agent host caps concurrent sessions below the rank count,
+        which every host we have used does.
+
+        It works *only* when the protocol is in the harness.  An executor serving
+        ten ranks agent-side would have to be inside ten barriers at once and would
+        deadlock immediately.  Here the harness thread blocks in the collective and
+        the executor blocks on nothing, so one session can serve ten roles in
+        sequence within a single phase.
         """
+        from .device import In
+
+        serving = sorted({rank, *(serve or [])})
         deadline = time.time() + timeout
         wait = 0.2
         while True:
             rec = amp.device.match(
                 "task",
-                {"rank": rank, "campaign": campaign, "state": "queued",
+                {"rank": In(serving), "campaign": campaign, "state": "queued",
                  "run": amp.manifest.job_id},
                 {"state": "claimed", "claimed_at": amp.device.clock()},
             )
             if rec is not None:
-                amp.trace("broker.claim", rank=rank, aid=rec["aid"], label=rec["label"])
+                rank = rec["rank"]
+                # Record which executor took the task.  Provenance is not
+                # bookkeeping: a scale claim without per-executor evidence is
+                # indistinguishable from one process generating everything, and
+                # that distinction is the whole difference between a measurement
+                # and an assertion.
+                worker_id = os.environ.get("AMPI_WORKER_ID", "")
+                if worker_id:
+                    amp.device.update("task", rec["seq"], {"worker_id": worker_id})
+                amp.trace("broker.claim", rank=rank, aid=rec["aid"], label=rec["label"],
+                          worker=worker_id or None)
                 root = amp.root
                 return {
                     "status": "task",
                     "aid": rec["aid"],
+                    "rank": rank,
                     "label": rec["label"],
                     "prompt_file": rec["prompt_file"],
                     "result_file": rec["result_file"],
@@ -289,12 +324,14 @@ class BrokerExecutor:
             wait = min(2.0, wait * 1.4)
 
     @staticmethod
-    def submit(amp: Any, campaign: str, rank: int, aid: str) -> dict[str, Any]:
+    def submit(
+        amp: Any, campaign: str, rank: int, aid: str, *, serve: list[int] | None = None
+    ) -> dict[str, Any]:
         rows = amp.device.scan("task", {"aid": aid}, limit=1)
         if not rows:
             raise err("AMPI_ERR_ARG", f"no task {aid!r}")
         rec = rows[0]
-        if rec["rank"] != rank:
+        if rec["rank"] not in {rank, *(serve or [])}:
             raise err(
                 "AMPI_ERR_IDENTITY",
                 f"task {aid} belongs to rank {rec['rank']}, not rank {rank}",
@@ -381,7 +418,9 @@ class BrokerExecutor:
             "by_state": by_state,
             "requeued": sum(1 for r in rows if r.get("requeued")),
             "result_tokens": sum(r.get("result_tokens", 0) for r in done),
-            "workers": sorted({r["rank"] for r in rows}),
+            "ranks": sorted({r["rank"] for r in rows}),
+            "executors": sorted({r["worker_id"] for r in rows if r.get("worker_id")}),
+            "tasks_with_executor_id": sum(1 for r in rows if r.get("worker_id")),
         }
 
 
