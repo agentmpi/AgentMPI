@@ -1,4 +1,4 @@
-"""Named constants of the AgentMPI specification, v0.1.
+"""Named constants of the AgentMPI specification, v0.2.
 
 Naming follows the MPI standard closely enough that an HPC reader can transfer
 intuition directly, and diverges only where the underlying resource being
@@ -7,7 +7,7 @@ managed is different (tokens and context windows rather than bytes and memory).
 
 from __future__ import annotations
 
-SPEC_VERSION = "0.1"
+SPEC_VERSION = "0.2"
 
 # --- Wildcards -------------------------------------------------------------
 # MPI_ANY_SOURCE / MPI_ANY_TAG.  Negative sentinels so they can never collide
@@ -123,6 +123,7 @@ AMPI_ERR_DEADLOCK = 130
 AMPI_ERR_PROTOCOL_VIOLATION = 131
 AMPI_ERR_BUDGET_EXCEEDED = 132
 AMPI_ERR_STALE_INCARNATION = 133
+AMPI_ERR_STALE_RUN = 134
 
 ERROR_NAMES = {
     AMPI_SUCCESS: "AMPI_SUCCESS",
@@ -140,6 +141,7 @@ ERROR_NAMES = {
     AMPI_ERR_PROTOCOL_VIOLATION: "AMPI_ERR_PROTOCOL_VIOLATION",
     AMPI_ERR_BUDGET_EXCEEDED: "AMPI_ERR_BUDGET_EXCEEDED",
     AMPI_ERR_STALE_INCARNATION: "AMPI_ERR_STALE_INCARNATION",
+    AMPI_ERR_STALE_RUN: "AMPI_ERR_STALE_RUN",
 }
 
 # --- Defaults --------------------------------------------------------------
@@ -154,4 +156,5 @@ DEFAULT_HEARTBEAT_PERIOD = 20.0
 # deadline for ranks that know they are about to be slow.  Section
 # core/ft.py in the specification discusses the trade-off.
 DEFAULT_FAILURE_TIMEOUT = 900.0
+DEFAULT_ROLL_CALL_TIMEOUT = 3600.0
 DEFAULT_POLL_INTERVAL = 0.35

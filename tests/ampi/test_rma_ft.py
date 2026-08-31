@@ -11,7 +11,13 @@ import pytest
 from ampi.constants import LOCK_EXCLUSIVE, LOCK_SHARED, RANK_FAILED
 from ampi.core import collectives as coll
 from ampi.core.collectives import SemanticUpcall
-from ampi.errors import AmpiProcFailed, AmpiRevoked, AmpiTimeout
+from ampi.errors import (
+    AmpiArgError,
+    AmpiProcFailed,
+    AmpiRevoked,
+    AmpiStaleRun,
+    AmpiTimeout,
+)
 
 # ---------------------------------------------------------------------------
 # One-sided operations
@@ -141,6 +147,76 @@ def test_expired_lease_does_not_wedge_the_window(make_job):
 # ---------------------------------------------------------------------------
 # Failure mitigation
 # ---------------------------------------------------------------------------
+
+
+def test_job_creation_allocates_identity_and_refuses_live_reuse(make_job):
+    """A path is not a run identity, and creating over live state is unsafe."""
+    job = make_job(2)
+    rt = job.runtime(0)
+    first = rt.job()
+    assert first["run_id"].startswith("run-")
+
+    with pytest.raises(AmpiArgError, match="already exists"):
+        rt.create_job(rt.device, job.job_id, 2)
+
+
+def test_foreign_run_messages_cannot_match(make_job):
+    """An envelope left by another run must be invisible to receives."""
+    job = make_job(2)
+    sender = job.runtime(0)
+    receiver = job.runtime(1)
+    sender.init(0)
+    receiver.init(1)
+    sent = sender.send("world", 1, 7, "old run payload")
+
+    with sender.device.write_tx():
+        sender.device.execute(
+            "UPDATE message SET run_id=? WHERE msg_id=?",
+            ("run-from-reused-path", sent["msg_id"]),
+        )
+
+    assert receiver.probe("world", 0, 7) is None
+    assert receiver.recv("world", 0, 7, blocking=False) is None
+
+
+def test_stale_runtime_is_fenced_when_store_run_identity_changes(make_job):
+    job = make_job(1)
+    rt = job.runtime(0)
+    rt.init(0)
+    original = rt.run_id
+
+    with rt.device.write_tx():
+        rt.device.execute(
+            "UPDATE job SET run_id=? WHERE job_id=?",
+            ("run-replacement", job.job_id),
+        )
+
+    with pytest.raises(AmpiStaleRun) as excinfo:
+        rt.heartbeat()
+    assert excinfo.value.detail["started_under"] == original
+    assert excinfo.value.detail["current"] == "run-replacement"
+
+
+def test_roll_call_separates_never_joined_from_quiet_ranks(make_job):
+    """Only ranks that never registered use the short admission deadline."""
+    job = make_job(2, roll_call_timeout=0.03)
+    observer = job.runtime(0)
+    observer.init(0)
+    time.sleep(0.06)
+
+    classification = observer.refresh_failures()
+    assert classification["never_joined"] == [1]
+    assert observer.failed_ranks() == {1}
+    assert observer.rank_row(0)["state"] == "alive"
+
+    late = job.runtime(1)
+    with pytest.raises(AmpiProcFailed, match="roll-call deadline"):
+        late.init(1)
+
+    observer.respawn(1)
+    joined = late.init(1)
+    assert joined["state"] == "alive"
+    assert observer.failed_ranks() == set()
 
 
 def test_revoke_unblocks_a_waiting_rank(make_job):

@@ -6,7 +6,6 @@ from typing import Any
 
 from .constants import (
     AMPI_ERR_ARG,
-    AMPI_ERR_STALE_INCARNATION,
     AMPI_ERR_BUDGET_EXCEEDED,
     AMPI_ERR_COLLECTIVE_MISMATCH,
     AMPI_ERR_COMM,
@@ -16,6 +15,8 @@ from .constants import (
     AMPI_ERR_PROTOCOL_VIOLATION,
     AMPI_ERR_RANK,
     AMPI_ERR_REVOKED,
+    AMPI_ERR_STALE_INCARNATION,
+    AMPI_ERR_STALE_RUN,
     AMPI_ERR_TIMEOUT,
     ERROR_NAMES,
 )
@@ -124,3 +125,14 @@ class AmpiStaleIncarnation(AmpiError):
     """
 
     error_class = AMPI_ERR_STALE_INCARNATION
+
+
+class AmpiStaleRun(AmpiError):
+    """The job store now belongs to a different run.
+
+    Paths are deployment details and may be reused.  A runtime that captured
+    one run identity must never act on state belonging to a later run at the
+    same path.
+    """
+
+    error_class = AMPI_ERR_STALE_RUN

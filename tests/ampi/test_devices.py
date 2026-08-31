@@ -50,7 +50,8 @@ def _reopen(device):
 
 def _append_message(device, **fields):
     record = {
-        "job_id": "j", "comm_id": "c", "src": 0, "dst": 1, "tag": 0, "seq": 0,
+        "job_id": "j", "run_id": "run-test", "comm_id": "c",
+        "src": 0, "dst": 1, "tag": 0, "seq": 0,
         "mode": "eager", "body": "x", "handle": None, "digest": None, "tokens": 1,
         "state": "posted", "sent_at": util.now(), "meta": "{}",
     }

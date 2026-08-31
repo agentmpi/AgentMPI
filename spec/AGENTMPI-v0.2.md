@@ -65,14 +65,23 @@ Where AgentMPI differs from MPI, it is for a stated reason, not for novelty.
 
 ## 1. Model
 
+A **run** is one execution instance with an immutable, implementation-generated
+`run_id`. A filesystem path, database name, user label, or job name is not a run
+identity and MAY be reused only after the earlier run is no longer reachable.
+Every message envelope MUST carry its `run_id`; a message from another run MUST
+NOT match, even if every other field agrees. An implementation SHOULD refuse to
+create a run over a live store.
+
 A **job** is a set of **ranks** that share a **device**. A rank is one
 participant: a process running an agent loop, a scripted process, or a thread.
 Rank identity is a small dense integer within a communicator.
 
-A rank has an **incarnation** (`generation`), incremented when a failed rank is
-replaced. Protocol state addressed to rank *r* generation *g* MUST NOT be
-delivered to rank *r* generation *g+1* as though it were live; a replacement
-recovers deliberately, through §10.3, not by accident.
+A rank has a **generation**, incremented when a failed rank is replaced, and an
+**incarnation**, incremented whenever a process claims that rank with
+`AMPI_Init`. Generation names a logical replacement; incarnation fences
+competing processes within one generation. Protocol state addressed to rank
+*r*, generation *g*, MUST NOT be delivered to generation *g+1* as though it
+were live; a replacement recovers deliberately, through §10.3, not by accident.
 
 A **communicator** is an ordered group of ranks plus an opaque **context id**.
 Two communicators over the same group MUST NOT be able to intercept each
@@ -116,6 +125,15 @@ not by inspection.
 | `AMPI_Finalize(note?)` | leave cleanly. Distinguishable from a crash. |
 | `AMPI_Heartbeat(expect_idle?)` | assert liveness, optionally declaring a period during which the rank will be busy and silent. |
 | `AMPI_Respawn(rank)` | reset a failed rank so a replacement may take its place; increments its generation. |
+
+**Roll call.** Run creation fixes an absolute join deadline for every initial
+rank. A rank that has never called `AMPI_Init` by that deadline is a
+`never_joined` failure and MAY be excluded or respawned. A rank that did join
+MUST instead receive the normal, longer heartbeat/failure timeout: admission
+delay and post-admission silence are different conditions. The deadline is
+configurable because executor pools may admit fewer ranks concurrently than the
+communicator contains; implementations MUST expose it in run metadata and
+SHOULD default conservatively.
 
 **Incarnation fencing.** A rank is a name, and any process holding the job can
 claim it, so a call left blocked by an abandoned attempt will happily consume a
@@ -384,8 +402,9 @@ them. A harness that needs that guarantee must build it above the protocol, and
 | `AMPI_ERR_DEADLOCK` | a wait-for cycle was detected |
 | `AMPI_ERR_PROTOCOL_VIOLATION` | a call was made in a state that forbids it |
 | `AMPI_ERR_STALE_INCARNATION` | another process has since claimed this rank |
+| `AMPI_ERR_STALE_RUN` | the backing store now belongs to another run |
 
-The last four have no MPI counterpart. MPI leaves the corresponding
+The last five have no MPI counterpart. MPI leaves the corresponding
 conditions undefined, which is a reasonable choice when participants are
 compiled programs debugged once. It is not reasonable when participants are
 language models.

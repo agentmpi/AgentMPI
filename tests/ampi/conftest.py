@@ -19,13 +19,25 @@ from ampi.device import open_device
 
 
 class Job:
-    def __init__(self, job_dir: str, world_size: int, ctx_limit: int = 200_000) -> None:
+    def __init__(
+        self,
+        job_dir: str,
+        world_size: int,
+        ctx_limit: int = 200_000,
+        roll_call_timeout: float = 3600.0,
+    ) -> None:
         self.job_dir = job_dir
         self.job_id = os.path.basename(job_dir)
         self.world_size = world_size
         os.makedirs(job_dir, exist_ok=True)
         device = open_device(os.path.join(job_dir, "job.db"))
-        Runtime.create_job(device, self.job_id, world_size, ctx_limit=ctx_limit)
+        Runtime.create_job(
+            device,
+            self.job_id,
+            world_size,
+            ctx_limit=ctx_limit,
+            roll_call_timeout=roll_call_timeout,
+        )
         device.close()
 
     def runtime(self, rank: int) -> Runtime:
@@ -70,7 +82,16 @@ class Job:
 
 @pytest.fixture
 def make_job(tmp_path):
-    def _make(world_size: int, ctx_limit: int = 200_000) -> Job:
-        return Job(str(tmp_path / f"job{world_size}"), world_size, ctx_limit)
+    def _make(
+        world_size: int,
+        ctx_limit: int = 200_000,
+        roll_call_timeout: float = 3600.0,
+    ) -> Job:
+        return Job(
+            str(tmp_path / f"job{world_size}"),
+            world_size,
+            ctx_limit,
+            roll_call_timeout,
+        )
 
     return _make

@@ -41,6 +41,7 @@ from .constants import (
     AMPI_ANY_TAG,
     AMPI_COMM_WORLD,
     DEFAULT_CTX_LIMIT,
+    DEFAULT_ROLL_CALL_TIMEOUT,
     LOCK_EXCLUSIVE,
     LOCK_SHARED,
     PROJ_DIGEST,
@@ -178,12 +179,27 @@ def cmd_new(args: argparse.Namespace) -> int:
     os.makedirs(job_dir, exist_ok=True)
     device = open_device(os.path.join(job_dir, "job.db"))
     job_id = os.path.basename(job_dir.rstrip("/"))
-    Runtime.create_job(device, job_id, args.n, ctx_limit=args.ctx_limit,
-                       meta=json.loads(args.meta) if args.meta else {})
+    runtime = Runtime.create_job(
+        device,
+        job_id,
+        args.n,
+        ctx_limit=args.ctx_limit,
+        roll_call_timeout=args.roll_call_timeout,
+        meta=json.loads(args.meta) if args.meta else {},
+    )
     for r in range(args.n):
         scratch_dir(job_dir, r)
-    return emit({"job_id": job_id, "job_dir": job_dir, "world_size": args.n,
-                 "ctx_limit": args.ctx_limit, "db": os.path.join(job_dir, "job.db")})
+    return emit(
+        {
+            "job_id": job_id,
+            "run_id": runtime.run_id,
+            "job_dir": job_dir,
+            "world_size": args.n,
+            "ctx_limit": args.ctx_limit,
+            "roll_call_timeout": args.roll_call_timeout,
+            "db": os.path.join(job_dir, "job.db"),
+        }
+    )
 
 
 def cmd_init(args: argparse.Namespace) -> int:
@@ -597,9 +613,12 @@ def cmd_kill(args: argparse.Namespace) -> int:
 
 def cmd_failures(args: argparse.Namespace) -> int:
     rt, _ = make_runtime(args)
+    classification = rt.refresh_failures()
     return emit({
+        "run_id": rt.run_id,
         "failed": sorted(rt.failed_ranks()),
         "suspected": rt.suspected(),
+        "never_joined": classification["never_joined"],
         "records": rt.device.query(
             "SELECT rank, generation, detected_at, detected_by, reason FROM failure "
             "WHERE job_id=? ORDER BY failure_id", (rt.job_id,)),
@@ -641,8 +660,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     job = rt.job()
     ranks = rt.all_ranks()
     return emit({
-        "job_id": job["job_id"], "world_size": job["world_size"],
+        "job_id": job["job_id"], "run_id": job["run_id"], "world_size": job["world_size"],
         "spec_version": job["spec_version"],
+        "roll_call_timeout": job["roll_call_timeout"],
         "ranks": [{"rank": r["rank"], "state": r["state"], "role": r["role"],
                    "generation": r["generation"], "ctx_used": r["ctx_used"],
                    "ctx_limit": r["ctx_limit"], "tokens_sent": r["tokens_sent"],
@@ -659,6 +679,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_doctor(args: argparse.Namespace) -> int:
     """Health check: suspected failures, wait-for cycles, stuck collectives."""
     rt, _ = make_runtime(args)
+    classification = rt.refresh_failures()
     cycle = rt.detect_deadlock()
     waiting = rt.device.query(
         "SELECT owner, kind, src, tag, posted_at FROM request WHERE job_id=? AND state='posted' "
@@ -692,6 +713,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     return emit({
         "deadlock_cycle": cycle,
         "suspected": rt.suspected(),
+        "never_joined": classification["never_joined"],
         "failed": sorted(rt.failed_ranks()),
         "blocked_receives": waiting,
         "open_collectives": stuck,
@@ -766,6 +788,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = add("new", cmd_new, "Create a new AgentMPI job")
     p.add_argument("-n", type=int, required=True, help="world size")
     p.add_argument("--ctx-limit", type=int, default=DEFAULT_CTX_LIMIT)
+    p.add_argument("--roll-call-timeout", type=float, default=DEFAULT_ROLL_CALL_TIMEOUT)
     p.add_argument("--meta")
 
     p = add("init", cmd_init, "AMPI_Init: join the job as a rank")

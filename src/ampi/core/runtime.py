@@ -41,6 +41,7 @@ from ..constants import (
     DEFAULT_CTX_LIMIT,
     DEFAULT_FAILURE_TIMEOUT,
     DEFAULT_POLL_INTERVAL,
+    DEFAULT_ROLL_CALL_TIMEOUT,
     LIVE_RANK_STATES,
     LOCK_EXCLUSIVE,
     LOCK_SHARED,
@@ -63,6 +64,7 @@ from ..errors import (
     AmpiProcFailed,
     AmpiRevoked,
     AmpiTimeout,
+    AmpiStaleRun,
 )
 from .collectives import allreduce_structural, barrier
 from .comm import CommRegistry, Communicator
@@ -98,6 +100,8 @@ class Runtime:
         # The incarnation this handle is operating under, captured at Init.
         # None means we have not claimed the rank in this process.
         self.incarnation: int | None = None
+        job = device.query_one("SELECT run_id FROM job WHERE job_id=?", (job_id,))
+        self.run_id = str(job["run_id"]) if job and job.get("run_id") else ""
         self.comms = CommRegistry(device, job_id)
         self.ctx = ContextAccount(device, job_id)
         self.tracer = Tracer(device, job_id, rank)
@@ -114,28 +118,53 @@ class Runtime:
         world_size: int,
         *,
         ctx_limit: int = DEFAULT_CTX_LIMIT,
+        roll_call_timeout: float = DEFAULT_ROLL_CALL_TIMEOUT,
         meta: dict[str, Any] | None = None,
     ) -> Runtime:
         with device.write_tx():
             existing = device.query_one("SELECT * FROM job WHERE job_id=?", (job_id,))
-            if existing is None:
-                device.execute(
-                    "INSERT INTO job (job_id, world_size, spec_version, created_at, meta) "
-                    "VALUES (?,?,?,?,?)",
-                    (job_id, world_size, SPEC_VERSION, util.now(), util.dumps(meta or {})),
+            if existing is not None:
+                raise AmpiArgError(
+                    f"job {job_id!r} already exists and belongs to run "
+                    f"{existing.get('run_id') or '<legacy>'}; use a fresh job directory",
+                    job_id=job_id,
+                    run_id=existing.get("run_id"),
                 )
-                for r in range(world_size):
-                    device.execute(
-                        "INSERT INTO rank (job_id, rank, generation, state, ctx_limit) "
-                        "VALUES (?,?,?,?,?)",
-                        (job_id, r, 0, RANK_INIT, ctx_limit),
-                    )
+            created_at = util.now()
+            run_id = util.new_id("run")
+            device.execute(
+                "INSERT INTO job (job_id, run_id, world_size, spec_version, created_at, "
+                "roll_call_timeout, meta) VALUES (?,?,?,?,?,?,?)",
+                (
+                    job_id,
+                    run_id,
+                    world_size,
+                    SPEC_VERSION,
+                    created_at,
+                    float(roll_call_timeout),
+                    util.dumps(meta or {}),
+                ),
+            )
+            for r in range(world_size):
+                device.execute(
+                    "INSERT INTO rank (job_id, rank, generation, state, ctx_limit, "
+                    "join_deadline) VALUES (?,?,?,?,?,?)",
+                    (
+                        job_id,
+                        r,
+                        0,
+                        RANK_INIT,
+                        ctx_limit,
+                        created_at + float(roll_call_timeout),
+                    ),
+                )
             rt = cls(device, job_id, None)
             rt.comms.create(AMPI_COMM_WORLD, list(range(world_size)))
             rt.tracer.emit("AMPI_Job_create", "exit", world_size=world_size)
         return cls(device, job_id, None)
 
     def job(self) -> dict[str, Any]:
+        self._check_run_identity()
         row = self.device.query_one("SELECT * FROM job WHERE job_id=?", (self.job_id,))
         if row is None:
             raise AmpiArgError(f"no such job {self.job_id!r}")
@@ -150,8 +179,29 @@ class Runtime:
         meta: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """AMPI_Init.  Idempotent, so a restarted agent process can re-enter."""
+        self._check_run_identity()
         self.rank = rank
         self.tracer.rank = rank
+        candidate = self.device.query_one(
+            "SELECT * FROM rank WHERE job_id=? AND rank=?", (self.job_id, rank)
+        )
+        if candidate is None:
+            raise AmpiArgError(f"rank {rank} is not part of job {self.job_id}")
+        if (
+            candidate["started_at"] is None
+            and candidate.get("join_deadline") is not None
+            and util.now() > float(candidate["join_deadline"])
+        ):
+            self.declare_failed(
+                rank,
+                "rank never joined before the roll-call deadline",
+                confirmed=True,
+            )
+            raise AmpiProcFailed(
+                f"rank {rank} missed this run's roll-call deadline; respawn it before joining",
+                rank=rank,
+                run_id=self.run_id,
+            )
         with self.device.write_tx():
             row = self.device.query_one(
                 "SELECT * FROM rank WHERE job_id=? AND rank=?", (self.job_id, rank)
@@ -185,6 +235,7 @@ class Runtime:
 
     def finalize(self, note: str | None = None) -> dict[str, Any]:
         """AMPI_Finalize: an orderly exit, distinguishable from a crash."""
+        self._check_run_identity()
         with self.device.write_tx():
             self.device.execute(
                 "UPDATE rank SET state=?, finished_at=?, exit_note=? WHERE job_id=? AND rank=?",
@@ -195,6 +246,7 @@ class Runtime:
 
     def heartbeat(self, expect_idle: float | None = None) -> dict[str, Any]:
         """AMPI_Heartbeat, optionally declaring an expected quiet period."""
+        self._check_run_identity()
         now_ts = util.now()
         deadline = now_ts + float(expect_idle) if expect_idle else None
         with self.device.write_tx():
@@ -215,6 +267,7 @@ class Runtime:
         latency is heavy tailed enough that false suspicion is routine --- and
         the retraction rate is itself a number worth reporting.
         """
+        self._check_incarnation()
         row = self.device.query_one(
             "SELECT state, generation, failure_confirmed FROM rank WHERE job_id=? AND rank=?",
             (self.job_id, self.rank),
@@ -258,9 +311,11 @@ class Runtime:
         from an action taken with no rank identity at all. We found it while
         reading a trace that said a communicator had been revoked by nobody.
         """
+        self._check_run_identity()
         return -1 if self.rank is None else self.rank
 
     def rank_row(self, rank: int | None = None) -> dict[str, Any]:
+        self._check_run_identity()
         rank = self.rank if rank is None else rank
         row = self.device.query_one(
             "SELECT * FROM rank WHERE job_id=? AND rank=?", (self.job_id, rank)
@@ -270,6 +325,7 @@ class Runtime:
         return row
 
     def all_ranks(self) -> list[dict[str, Any]]:
+        self._check_run_identity()
         return self.device.query(
             "SELECT * FROM rank WHERE job_id=? ORDER BY rank", (self.job_id,)
         )
@@ -317,6 +373,30 @@ class Runtime:
             if now_ts > deadline:
                 out.append(int(row["rank"]))
         return out
+
+    def expired_unjoined(self) -> list[int]:
+        """Ranks that never joined before this run's roll-call deadline."""
+        now_ts = util.now()
+        rows = self.device.query(
+            "SELECT rank FROM rank WHERE job_id=? AND state=? AND started_at IS NULL "
+            "AND join_deadline IS NOT NULL AND join_deadline < ? ORDER BY rank",
+            (self.job_id, RANK_INIT, now_ts),
+        )
+        return [int(row["rank"]) for row in rows]
+
+    def refresh_failures(self) -> dict[str, list[int]]:
+        """Classify never-joined ranks separately from quiet live ranks."""
+        never_joined = self.expired_unjoined()
+        for rank in never_joined:
+            self.declare_failed(
+                rank,
+                "rank never joined before the roll-call deadline",
+                confirmed=True,
+            )
+        suspected = self.suspected()
+        for rank in suspected:
+            self.declare_failed(rank, "heartbeat lease expired")
+        return {"never_joined": never_joined, "suspected": suspected}
 
     def failed_ranks(self) -> set[int]:
         """Ranks that are dead, including any that later exited cleanly.
@@ -417,6 +497,7 @@ class Runtime:
         return {"handle": handle, "tokens": tokens, "sha256": util.sha256_text(content)}
 
     def get_object(self, handle: str) -> dict[str, Any]:
+        self._check_run_identity()
         row = self.device.query_one("SELECT * FROM object WHERE handle=?", (handle,))
         if row is None:
             raise AmpiArgError(f"no such object handle {handle!r}")
@@ -494,10 +575,12 @@ class Runtime:
 
                 seq = self.device.counter_next(self.job_id, f"seq:{comm.comm_id}:{src_rank}:{dst}")
                 cur = self.device.execute(
-                    "INSERT INTO message (job_id, comm_id, src, dst, tag, seq, mode, body, "
-                    "handle, digest, tokens, sent_at, meta) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    "INSERT INTO message (job_id, run_id, comm_id, src, dst, tag, seq, mode, "
+                    "body, handle, digest, tokens, sent_at, meta) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                     (
                         self.job_id,
+                        self.run_id,
                         comm.comm_id,
                         src_rank,
                         dst,
@@ -544,9 +627,15 @@ class Runtime:
         self, comm_name: str, src: int = AMPI_ANY_SOURCE, tag: int = AMPI_ANY_TAG
     ) -> dict[str, Any] | None:
         """AMPI_Iprobe: inspect the envelope without consuming the message."""
+        self._check_run_identity()
         comm = self.comms.get(comm_name)
         me = comm.rank_of(self.rank)
-        predicate: dict[str, Any] = {"comm_id": comm.comm_id, "dst": me, "state": "posted"}
+        predicate: dict[str, Any] = {
+            "run_id": self.run_id,
+            "comm_id": comm.comm_id,
+            "dst": me,
+            "state": "posted",
+        }
         if src != AMPI_ANY_SOURCE:
             predicate["src"] = src
         if tag != AMPI_ANY_TAG:
@@ -631,7 +720,12 @@ class Runtime:
         max_tokens: int | None,
         charge_context: bool,
     ) -> dict[str, Any] | None:
-        predicate: dict[str, Any] = {"comm_id": comm.comm_id, "dst": me, "state": "posted"}
+        predicate: dict[str, Any] = {
+            "run_id": self.run_id,
+            "comm_id": comm.comm_id,
+            "dst": me,
+            "state": "posted",
+        }
         if src != AMPI_ANY_SOURCE:
             predicate["src"] = src
         if tag != AMPI_ANY_TAG:
@@ -741,6 +835,7 @@ class Runtime:
         attempt's receive sits in the store and matches the next attempt's
         messages, silently mixing two generations of ranks into one result.
         """
+        self._check_run_identity()
         if self.incarnation is None or self.rank is None:
             return
         row = self.device.query_one(
@@ -752,6 +847,21 @@ class Runtime:
                 f"{self.incarnation}); abandoning so the newer process owns the rank",
                 rank=self.rank, started_under=self.incarnation,
                 current=int(row["incarnation"]),
+            )
+
+    def _check_run_identity(self) -> None:
+        """Fence a handle if its job path has been rebound to another run."""
+        if not self.run_id:
+            return
+        row = self.device.query_one("SELECT run_id FROM job WHERE job_id=?", (self.job_id,))
+        current = str(row["run_id"]) if row and row.get("run_id") else ""
+        if current != self.run_id:
+            raise AmpiStaleRun(
+                f"job {self.job_id!r} now belongs to run {current or '<missing>'}, "
+                f"but this handle was created for {self.run_id}",
+                job_id=self.job_id,
+                started_under=self.run_id,
+                current=current or None,
             )
 
     def _check_blocked_health(self, comm: Communicator, src: int) -> None:
@@ -769,8 +879,7 @@ class Runtime:
         if now_ts - self._last_health_check < self.health_check_period:
             return
         self._last_health_check = now_ts
-        for suspect in self.suspected():
-            self.declare_failed(suspect, "heartbeat lease expired")
+        self.refresh_failures()
         if self.comms.get(comm.name).revoked:
             raise AmpiRevoked(f"communicator {comm.name!r} was revoked while blocked",
                               comm=comm.name)
@@ -907,6 +1016,7 @@ class Runtime:
         return {"ok": ok, "version": version, "current": current if not ok else value}
 
     def win_get(self, win_name: str, key: str, *, charge_context: bool = False) -> dict[str, Any]:
+        self._check_run_identity()
         win = self._win(win_name)
         row = self.device.query_one(
             "SELECT * FROM win_cell WHERE win_id=? AND key=?", (win["win_id"], key)
@@ -928,6 +1038,7 @@ class Runtime:
         }
 
     def win_list(self, win_name: str, prefix: str = "") -> list[dict[str, Any]]:
+        self._check_run_identity()
         win = self._win(win_name)
         rows = self.device.query(
             "SELECT key, version, updated_by, updated_at, tokens FROM win_cell "
@@ -1223,13 +1334,15 @@ class Runtime:
             generation = int(row["generation"]) + 1
             self.device.execute(
                 "UPDATE rank SET generation=?, state=?, ctx_used=0, last_heartbeat=?, "
-                "hb_deadline=NULL, finished_at=NULL, exit_note=NULL, ctx_limit=? "
+                "hb_deadline=NULL, finished_at=NULL, exit_note=NULL, ctx_limit=?, "
+                "failure_confirmed=0, join_deadline=? "
                 "WHERE job_id=? AND rank=?",
                 (
                     generation,
                     RANK_INIT,
                     util.now(),
                     int(ctx_limit or row["ctx_limit"]),
+                    util.now() + float(self.job()["roll_call_timeout"]),
                     self.job_id,
                     rank,
                 ),

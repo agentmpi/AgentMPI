@@ -36,9 +36,11 @@ PRAGMA foreign_keys=OFF;
 
 CREATE TABLE IF NOT EXISTS job (
     job_id       TEXT PRIMARY KEY,
+    run_id       TEXT NOT NULL,
     world_size   INTEGER NOT NULL,
     spec_version TEXT NOT NULL,
     created_at   REAL NOT NULL,
+    roll_call_timeout REAL NOT NULL,
     state        TEXT NOT NULL DEFAULT 'running',
     meta         TEXT NOT NULL DEFAULT '{}'
 );
@@ -54,6 +56,7 @@ CREATE TABLE IF NOT EXISTS rank (
     state          TEXT NOT NULL,
     role           TEXT,
     started_at     REAL,
+    join_deadline  REAL,
     finished_at    REAL,
     last_heartbeat REAL,
     -- Application-declared liveness deadline.  A rank about to spend four
@@ -108,6 +111,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS comm_name_uq ON comm(job_id, name);
 CREATE TABLE IF NOT EXISTS message (
     msg_id     INTEGER PRIMARY KEY AUTOINCREMENT,
     job_id     TEXT NOT NULL,
+    run_id     TEXT NOT NULL,
     comm_id    TEXT NOT NULL,
     src        INTEGER NOT NULL,
     dst        INTEGER NOT NULL,
@@ -342,7 +346,26 @@ class SqliteDevice(Device):
         Jobs outlive releases here: a run that is halfway through must not be
         invalidated because the runtime grew a field.
         """
-        have = {r["name"] for r in self.query("PRAGMA table_info(rank)")}
+        job_columns = {r["name"] for r in self.query("PRAGMA table_info(job)")}
+        for column, ddl in (
+            ("run_id", "ALTER TABLE job ADD COLUMN run_id TEXT NOT NULL DEFAULT ''"),
+            (
+                "roll_call_timeout",
+                "ALTER TABLE job ADD COLUMN roll_call_timeout REAL NOT NULL DEFAULT 3600",
+            ),
+        ):
+            if column not in job_columns:
+                try:
+                    self.conn.execute(ddl)
+                except sqlite3.OperationalError:
+                    pass
+        for row in self.query("SELECT job_id FROM job WHERE run_id=''"):
+            self.conn.execute(
+                "UPDATE job SET run_id=? WHERE job_id=?",
+                (util.new_id("run"), row["job_id"]),
+            )
+
+        rank_columns = {r["name"] for r in self.query("PRAGMA table_info(rank)")}
         for column, ddl in (
             ("suspicions", "ALTER TABLE rank ADD COLUMN suspicions INTEGER NOT NULL DEFAULT 0"),
             ("retractions", "ALTER TABLE rank ADD COLUMN retractions INTEGER NOT NULL DEFAULT 0"),
@@ -350,12 +373,27 @@ class SqliteDevice(Device):
              "ALTER TABLE rank ADD COLUMN failure_confirmed INTEGER NOT NULL DEFAULT 0"),
             ("incarnation",
              "ALTER TABLE rank ADD COLUMN incarnation INTEGER NOT NULL DEFAULT 0"),
+            ("join_deadline", "ALTER TABLE rank ADD COLUMN join_deadline REAL"),
         ):
-            if column not in have:
+            if column not in rank_columns:
                 try:
                     self.conn.execute(ddl)
                 except sqlite3.OperationalError:
                     pass
+
+        message_columns = {r["name"] for r in self.query("PRAGMA table_info(message)")}
+        if "run_id" not in message_columns:
+            try:
+                self.conn.execute(
+                    "ALTER TABLE message ADD COLUMN run_id TEXT NOT NULL DEFAULT ''"
+                )
+            except sqlite3.OperationalError:
+                pass
+        self.conn.execute(
+            "UPDATE message SET run_id=("
+            "SELECT job.run_id FROM job WHERE job.job_id=message.job_id"
+            ") WHERE run_id=''"
+        )
 
     def close(self) -> None:
         if self._conn is not None:

@@ -21,6 +21,7 @@ from .constants import (
     AMPI_ANY_TAG,
     AMPI_COMM_WORLD,
     DEFAULT_CTX_LIMIT,
+    DEFAULT_ROLL_CALL_TIMEOUT,
     LOCK_EXCLUSIVE,
 )
 from .core import collectives as _coll
@@ -41,11 +42,12 @@ class Ampi:
     # -- lifecycle ---------------------------------------------------------
     @classmethod
     def create(cls, job_dir: str, world_size: int, *, ctx_limit: int = DEFAULT_CTX_LIMIT,
+               roll_call_timeout: float = DEFAULT_ROLL_CALL_TIMEOUT,
                meta: dict[str, Any] | None = None) -> Ampi:
         os.makedirs(job_dir, exist_ok=True)
         device = open_device(os.path.join(job_dir, "job.db"))
         Runtime.create_job(device, os.path.basename(os.path.abspath(job_dir)), world_size,
-                           ctx_limit=ctx_limit, meta=meta)
+                           ctx_limit=ctx_limit, roll_call_timeout=roll_call_timeout, meta=meta)
         return cls(job_dir)
 
     def init(self, rank: int, **kw: Any) -> dict[str, Any]:

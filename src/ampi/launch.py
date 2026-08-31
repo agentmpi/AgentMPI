@@ -31,7 +31,7 @@ import sys
 import time
 from typing import Any
 
-from .constants import DEFAULT_CTX_LIMIT
+from .constants import DEFAULT_CTX_LIMIT, DEFAULT_ROLL_CALL_TIMEOUT
 from .core.runtime import Runtime
 from .device import open_device
 
@@ -134,17 +134,31 @@ ampi finalize --note "..."                  # leave cleanly. Do this last.
 
 
 def create_job(job_dir: str, world_size: int, *, ctx_limit: int = DEFAULT_CTX_LIMIT,
+               roll_call_timeout: float = DEFAULT_ROLL_CALL_TIMEOUT,
                meta: dict[str, Any] | None = None) -> dict[str, Any]:
     job_dir = os.path.abspath(job_dir)
     os.makedirs(job_dir, exist_ok=True)
     device = open_device(os.path.join(job_dir, "job.db"))
     job_id = os.path.basename(job_dir.rstrip("/"))
-    Runtime.create_job(device, job_id, world_size, ctx_limit=ctx_limit, meta=meta or {})
+    runtime = Runtime.create_job(
+        device,
+        job_id,
+        world_size,
+        ctx_limit=ctx_limit,
+        roll_call_timeout=roll_call_timeout,
+        meta=meta or {},
+    )
     for rank in range(world_size):
         os.makedirs(os.path.join(job_dir, "ranks", str(rank)), exist_ok=True)
     device.close()
-    return {"job_id": job_id, "job_dir": job_dir, "world_size": world_size,
-            "ctx_limit": ctx_limit}
+    return {
+        "job_id": job_id,
+        "run_id": runtime.run_id,
+        "job_dir": job_dir,
+        "world_size": world_size,
+        "ctx_limit": ctx_limit,
+        "roll_call_timeout": roll_call_timeout,
+    }
 
 
 def default_bindir() -> str:
@@ -237,6 +251,7 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--job", required=True)
     p.add_argument("-n", type=int, required=True)
     p.add_argument("--ctx-limit", type=int, default=DEFAULT_CTX_LIMIT)
+    p.add_argument("--roll-call-timeout", type=float, default=DEFAULT_ROLL_CALL_TIMEOUT)
     p.add_argument("--meta")
 
     p = sub.add_parser("cards", help="write rank cards from a JSON task map")
@@ -259,8 +274,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "new":
-        info = create_job(args.job, args.n, ctx_limit=args.ctx_limit,
-                          meta=json.loads(args.meta) if args.meta else None)
+        info = create_job(
+            args.job,
+            args.n,
+            ctx_limit=args.ctx_limit,
+            roll_call_timeout=args.roll_call_timeout,
+            meta=json.loads(args.meta) if args.meta else None,
+        )
         print(json.dumps(info, indent=2))
         return 0
 
