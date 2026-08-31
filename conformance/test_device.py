@@ -371,3 +371,21 @@ def test_stats_names_the_device(dev):
     st = dev.stats()
     assert st["device"] == dev.name
     assert "durable" in st
+
+
+def test_indexed_integer_fields_round_trip_as_integers(dev):
+    """A device must not silently change a value's type.
+
+    SQLite applies type affinity, so an integer written to a column declared TEXT
+    is returned as a string.  Every predicate above the waist is written against
+    Python values, so a device that coerces produces failures that look like
+    protocol bugs and are not.  This is the assertion that keeps the three devices
+    interchangeable.
+    """
+    dev.append("recvq", {"comm": "c", "dst": 3, "src_want": -1, "tag_want": -1,
+                         "state": "open", "run": "r", "reqid": "abc"})
+    (rec,) = dev.scan("recvq", {"reqid": "abc"})
+    for field in ("dst", "src_want", "tag_want"):
+        assert isinstance(rec[field], int), f"{field} came back as {type(rec[field]).__name__}"
+    assert rec["src_want"] == -1
+    assert dev.scan("recvq", {"src_want": -1}), "an integer predicate must match"

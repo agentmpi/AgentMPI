@@ -538,4 +538,13 @@ class SqliteDevice(Device):
         return out
 
 
-_INT_FIELDS = {"rank", "src", "dst", "tag", "epoch", "gen", "step", "assignee"}
+# Indexed fields that carry integers.  SQLite applies type affinity, so an integer
+# written to a TEXT column comes back as a string -- which the memory and journal
+# devices do not do.  Getting this list wrong produces a device-specific semantic
+# divergence: a wildcard receive posted as src_want=-1 reads back as "-1" and
+# stops matching.  The conformance suite caught exactly that, which is the whole
+# reason it is parametrised over every device rather than run against one.
+_INT_FIELDS = {
+    "rank", "src", "dst", "tag", "epoch", "gen", "step", "assignee",
+    "src_want", "tag_want", "provider", "verifier",
+}

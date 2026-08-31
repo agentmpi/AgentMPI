@@ -114,6 +114,11 @@ class IfaceMixin:
         cells = self.device.keys(space)
         items = []
         for c in cells:
+            # Verification records live in the same space under a "verify/" prefix,
+            # so that a consumer's check is durable and discoverable alongside the
+            # thing it checked.  They are not declarations.
+            if c.key.startswith("verify/"):
+                continue
             if name and not c.key.endswith(f"/{name}"):
                 continue
             provider, _, iname = c.key.partition("/")

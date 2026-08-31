@@ -219,7 +219,10 @@ class P2PMixin:
                 timeout=timeout,
                 what=f"synchronous send to rank {dst} to be matched",
             )
-        return {"ok": True, "seq": seq, "delivery": chosen, **env.to_dict()}
+        return {
+            "ok": True, "seq": seq, "delivery": chosen,
+            **{**env.to_dict(), "source": self.rank, "tag": tag, "comm": comm},
+        }
 
     def isend(self, dst: int, payload: Any, **kw: Any) -> dict[str, Any]:
         """Nonblocking send.  Returns a request handle."""
@@ -401,14 +404,24 @@ class P2PMixin:
                     hint="Run 'ampi failed' for detail, then 'ampi ack' and re-issue, or shrink.",
                     src=pred["src"],
                 )
-            if failures and "src" not in pred:
-                unacked = [f.rank for f in failures]
-                raise err(
-                    "AMPI_ERR_PROC_FAILED_PENDING",
-                    f"rank(s) {unacked} failed while a wildcard receive was posted",
-                    hint="Run 'ampi ack' to re-enable wildcard receives, then re-issue.",
-                    failed=unacked,
-                )
+            if "src" not in pred:
+                # Only failures the caller has not yet acknowledged may mask a
+                # wildcard receive.  Without the acknowledgement step the error is
+                # permanent, because there is always some failure the caller has
+                # not been told about, and the receive can never return a timeout.
+                unacked = sorted({
+                    rec["rank"]
+                    for rec in self.device.scan(
+                        "fail", {"state": "unacked", "run": self.manifest.job_id}
+                    )
+                })
+                if unacked:
+                    raise err(
+                        "AMPI_ERR_PROC_FAILED_PENDING",
+                        f"rank(s) {unacked} failed while a wildcard receive was posted",
+                        hint="Run 'ampi ack' to re-enable wildcard receives, then re-issue.",
+                        failed=unacked,
+                    )
             if time.time() >= deadline:
                 waiting_on = "any peer" if "src" not in pred else f"rank {pred['src']}"
                 raise err(
