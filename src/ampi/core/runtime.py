@@ -319,8 +319,18 @@ class Runtime:
         return out
 
     def failed_ranks(self) -> set[int]:
+        """Ranks that are dead, including any that later exited cleanly.
+
+        Keying this on the current state alone made the answer transient: a
+        killed rank that went on to call AMPI_Finalize moved to FINALIZED and
+        silently dropped out of the failed set, so two survivors calling
+        AMPI_Comm_shrink moments apart computed different survivor sets and one
+        of them got a name collision. A confirmed death is a fact about the
+        run, not a state a later call can overwrite.
+        """
         rows = self.device.query(
-            "SELECT rank FROM rank WHERE job_id=? AND state=?", (self.job_id, RANK_FAILED)
+            "SELECT rank FROM rank WHERE job_id=? AND (state=? OR failure_confirmed=1)",
+            (self.job_id, RANK_FAILED),
         )
         return {int(r["rank"]) for r in rows}
 

@@ -114,13 +114,23 @@ did.
 | Software build (real agents) | 8 x 2 | Both delivered working software. The collective run: 68 collectives, 5 communicators, 10 claim grants for 6 modules, 2 implementers left as spares. The window run: **0 collectives**, 6 clean claims, 6 non-overlapping leases, and cross-module tests that found a real defect two reviewers confirmed. |
 | Fault tolerance (real agents) | 6 | Two agents killed. Survivors revoked, shrank to a single communicator, and **adopted both dead agents' sections from the window rather than rewriting them**. Zero work lost. |
 
-The runs broke the runtime in eight distinct ways, each fixed with a regression
-test: detector oscillation (1091 condemnations in 20 minutes), a declared idle
-period that overrode its own heartbeats, a suspicion that could fail a peer's
-send, a poisoned collective slot with no recovery, a stale process consuming a
-later run's messages, rank 0 logged as the sentinel −1 because it is falsy, a
-killed rank resurrecting itself, and a `shrink` whose default naming fragmented
-the survivors it was meant to regroup.
+The runs broke the runtime in ten distinct ways, each fixed with a regression
+test:
+
+1. the failure detector oscillated, condemning healthy agents 1091 times in 20 minutes;
+2. a declared idle period overrode the rank's own heartbeats, so declaring a short one was worse than declaring none;
+3. a mere suspicion could fail a peer's send, costing a whole job;
+4. a poisoned collective slot had no recovery short of abandoning the job (`AMPI_Comm_resync`);
+5. a stale process from an abandoned run consumed a later run's messages (incarnation fencing);
+6. rank 0 was logged as the sentinel −1, because 0 is falsy in Python;
+7. a killed rank resurrected itself on its next call;
+8. a terminated rank could still reshape the communicator the survivors were repairing;
+9. `shrink`'s default naming fragmented the survivors it was meant to regroup;
+10. a confirmed failure was forgotten once the killed rank finalized, so concurrent shrinks disagreed on who survived.
+
+Plus one interface trap: `win-get` returned a cell only under `payload`, so
+agents polling a counter wrote loops against `value`, read nothing, and never
+took their early exit.
 
 ## Paper and dashboard
 
