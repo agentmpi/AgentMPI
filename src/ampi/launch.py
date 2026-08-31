@@ -26,6 +26,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
+import site
 import subprocess
 import sys
 import time
@@ -163,9 +165,13 @@ def create_job(job_dir: str, world_size: int, *, ctx_limit: int = DEFAULT_CTX_LI
 
 def default_bindir() -> str:
     """Directory holding the ``ampi`` executable this installation provides."""
-    candidate = os.path.join(sys.prefix, "bin")
-    return candidate if os.path.exists(os.path.join(candidate, "ampi")) else os.path.dirname(
-        os.path.abspath(sys.executable))
+    on_path = shutil.which("ampi")
+    if on_path:
+        return os.path.dirname(os.path.abspath(on_path))
+    for candidate in (os.path.join(sys.prefix, "bin"), os.path.join(site.USER_BASE, "bin")):
+        if os.path.isfile(os.path.join(candidate, "ampi")):
+            return candidate
+    return os.path.dirname(os.path.abspath(sys.executable))
 
 
 def rank_card(job_dir: str, rank: int, world_size: int, task: str, role: str = "worker",
