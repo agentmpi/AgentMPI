@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 import threading
 from collections.abc import Callable
+from itertools import count
 from typing import Any
 
 import pytest
@@ -82,13 +83,15 @@ class Job:
 
 @pytest.fixture
 def make_job(tmp_path):
+    sequence = count()
+
     def _make(
         world_size: int,
         ctx_limit: int = 200_000,
         roll_call_timeout: float = 3600.0,
     ) -> Job:
         return Job(
-            str(tmp_path / f"job{world_size}"),
+            str(tmp_path / f"job{world_size}-{next(sequence)}"),
             world_size,
             ctx_limit,
             roll_call_timeout,
