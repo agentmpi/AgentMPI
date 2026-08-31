@@ -6,13 +6,13 @@
 
 ## How to read this dossier
 
-Every system below is assessed against two questions, because those are the two the paper turns on.
+Every system below is assessed against two questions.
 
-1. **Is it a protocol you write a coordination layer *with*, or a framework/product that makes the coordination decisions *for* you?** MPI is the former: it standardises `MPI_Send`, `MPI_Barrier` and `MPI_Allreduce` and says nothing about what your application computes. A framework is the latter: it decides that your agents talk in a group chat, or traverse a graph, or hand off to one another, and your job is to fill in the nodes.
+1. **Is it a protocol you write a coordination layer *with*, or a framework that makes the coordination decisions *for* you?** MPI is the former: it standardises `MPI_Send`, `MPI_Barrier` and `MPI_Allreduce` and says nothing about what your application computes. A framework is the latter: it decides that your agents talk in a group chat, traverse a graph, or hand off to one another, and your job is to fill in the nodes.
 
-2. **What does it provide, concretely, for the five failure modes AgentMPI targets?** Abbreviated throughout as **F1** information sharing between executors; **F2** robustness to executor death; **F3** synchronisation and mutual exclusion; **F4** executor lifecycle; **F5** context-window exhaustion.
+2. **What does it provide, concretely, for the five failure modes AgentMPI targets?** Abbreviated throughout: **F1** information sharing between executors; **F2** robustness to executor death; **F3** synchronisation and mutual exclusion; **F4** executor lifecycle; **F5** context-window exhaustion.
 
-**Verification conventions.** Claims traceable to a primary source (specification text, paper, official documentation, vendor announcement) are stated plainly. Claims established only from secondary reporting are attributed to that reporting. Claims I could not establish are marked `[UNVERIFIED]`. Section F is my own analysis and is marked as such.
+**Conventions.** Primary-source claims (specification text, paper, official documentation, vendor announcement) are stated plainly; claims resting on secondary reporting are attributed to it; claims I could not establish are marked `[UNVERIFIED]`. Section F is my own analysis.
 
 ---
 
@@ -20,13 +20,13 @@ Every system below is assessed against two questions, because those are the two 
 
 Four strata that do not compose, and none of them is the stratum AgentMPI proposes.
 
-**Interoperability protocols (§A)** — MCP, A2A, and what remains of ACP/AGNTCY/ANP — standardise *reachability*: how an agent finds a tool or another agent, authenticates, invokes, and reads a result. By mid-2026 they have consolidated under one governance umbrella, which makes the ecosystem tidier without making it more expressive. None has a communicator, a group, a collective, a barrier, a reduction, shared state with atomics, a failure detector, or flow control. That is their scope, not an oversight.
+**Interoperability protocols (§A)** — MCP, A2A, and what remains of ACP/AGNTCY/ANP — standardise *reachability*: how an agent finds a tool or another agent, authenticates, invokes, and reads a result. By mid-2026 they have consolidated under one governance umbrella, which makes the ecosystem tidier without making it more expressive. None has a communicator, a collective, a barrier, a reduction, shared state with atomics, a failure detector, or flow control. That is their scope, not an oversight.
 
-**Classical ACLs (§B)** — KQML and FIPA-ACL — did try to standardise *meaning*, and failed in a well-documented way: their mentalistic semantics are unverifiable by an external observer, which is the property a standard most needs. AgentMPI's thesis is the MPI inversion of this, and the critique literature is its strongest historical argument.
+**Classical ACLs (§B)** did try to standardise *meaning*, and failed in a well-documented way: KQML's and FIPA-ACL's mentalistic semantics are unverifiable by an external observer, the property a standard most needs. AgentMPI is the MPI inversion of that choice, and the critique literature is its strongest historical argument.
 
 **Multi-agent LLM frameworks (§C)** each embed one coordination model in their runtime, and in most a substantial part of the coordination logic lives *in the prompt*: whether an agent delegates, when it terminates, whether it reports back, is a model decision rather than an enforced mechanism. The empirical failure literature, MAST above all, shows this is where the failures are.
 
-**Distributed computing models (§D)** supply the mechanisms AgentMPI wants, for a different cost model. Ray needs the most careful treatment, because "why not just Ray?" is the reviewer question with the highest cost of a sloppy answer. **Context systems (§E)** supply the evidence that context is scarce and that more of it is not simply better — the grounding for putting flow control in the protocol at all.
+**Distributed computing models (§D)** supply the mechanisms AgentMPI wants, at a different cost model; Ray needs the most care, because "why not just Ray?" is the reviewer question with the highest cost of a sloppy answer. **Context systems (§E)** supply the evidence that context is scarce and that more of it is not simply better — the grounding for putting flow control in the protocol at all.
 
 ---
 
