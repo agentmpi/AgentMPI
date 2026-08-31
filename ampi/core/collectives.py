@@ -46,6 +46,7 @@ from .ops import (
     finalise_vote,
     fold,
     get_op,
+    identity_like,
     serial_fold,
 )
 from .payload import Contract, apply_view, canonical, check_contract
@@ -658,7 +659,7 @@ class CollectiveMixin:
             for w in members[: me + (0 if exclusive else 1)]
             if w in by_rank and by_rank[w].get("handle")
         ]
-        value = serial_fold(operator, prefix) if prefix else operator.identity
+        value = serial_fold(operator, prefix) if prefix else identity_like(operator, payload)
         charged, _ = self.charge(count_tokens(canonical(value)), what=kind)
         self.trace(kind, rank=self.rank, label=label, op=op, prefix=len(prefix))
         return {

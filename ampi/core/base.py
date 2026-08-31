@@ -391,8 +391,22 @@ class RuntimeBase:
         return ok
 
     def _fence_check(self, view: RankView | None = None) -> RankView:
-        """Refuse to act for an executor that has been replaced."""
+        """Refuse to act for an executor that has been replaced or killed.
+
+        A confirmed kill is a decision the rank may not overrule.  If the victim's
+        next heartbeat could retract it, fault injection would be unobservable and
+        an experiment measuring recovery would be measuring nothing.  A rank that
+        merely lost its lease is different: it may re-initialise and continue, and
+        the whole two-phase detector exists so that being slow is survivable.
+        """
         view = view or self._rankview()
+        if view.state == STATE_FAILED and view.failure_kind in ("killed", "abort"):
+            raise err(
+                "AMPI_ERR_FENCED",
+                f"rank {view.rank} was {view.failure_kind}; this executor may no longer act",
+                hint="Stop. This was an administrative decision. Report and exit.",
+                rank=view.rank, kind=view.failure_kind,
+            )
         if view.state == STATE_FENCED:
             raise err(
                 "AMPI_ERR_FENCED",

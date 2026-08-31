@@ -577,6 +577,25 @@ register_op(
 # --------------------------------------------------------------------------
 
 
+def identity_like(op: Op, sample: Any) -> Any:
+    """The identity element, matching the shape of what is being folded.
+
+    ``concat`` is polymorphic over strings and lists, so a single declared
+    identity is wrong for one of them: an exclusive scan at rank 0 would hand back
+    ``""`` where the harness sent lists, and the next operation would fail on a
+    type it never produced.  The identity has to follow the operand.
+    """
+    if op.identity is not None and type(op.identity) is type(sample):
+        return op.identity
+    if isinstance(sample, list):
+        return []
+    if isinstance(sample, str):
+        return ""
+    if isinstance(sample, dict):
+        return {}
+    return op.identity
+
+
 def serial_fold(op: Op, values: list[Any]) -> Any:
     """The reference semantics.  Every EXACT algorithm must reproduce this.
 
