@@ -24,16 +24,55 @@ import agentmpi as ampi  # noqa: E402
 
 RUNS = Path("runs")
 
-#: Events the timeline draws. Everything else is available through /api/events but
-#: is not laid out, because a timeline that draws every event is unreadable.
+#: Events the timeline draws, grouped by what the reader is looking for. Everything else is
+#: available through /api/events but is not laid out, because a timeline that draws every
+#: event is unreadable.
+#:
+#: The omissions are deliberate and narrow: ``coll.*`` appears in its own panel, ``job.*``
+#: has no rank to draw on, and ``comm.create`` / ``topo.*_create`` / ``win.create`` /
+#: ``broker.enqueue`` are setup bookkeeping that says nothing about how the run unfolded.
+#:
+#: Everything else is drawn, including every failure and recovery event. Those are rare --- a
+#: few dozen in fifty thousand --- so they cost nothing in clutter, and they are the reason
+#: someone opens a trace at all. Leaving them out made the fault-injection runs render as
+#: blank lanes: the runs that exist specifically to show the failure model showed nothing.
+WORK_KINDS = ("agent.call",)
+MESSAGE_KINDS = ("msg.send", "msg.recv", "msg.fetch")
+RMA_KINDS = ("win.put", "win.get", "win.accumulate", "win.cas", "win.lock", "win.unlock", "win.sync", "win.flush")
+LIFECYCLE_KINDS = ("rank.init", "rank.finalize", "rank.compact", "proc.spawn", "sup.restart")
+#: A rank is in trouble: stalled, timed out, evicted, or contractually wrong.
+TROUBLE_KINDS = (
+    "rank.error",
+    "rank.stuck",
+    "rank.version_mismatch",
+    "barrier.timeout",
+    "win.lock_timeout",
+    "broker.expire",
+    "broker.fail",
+    "broker.reclaim",
+    "agent.contract_violation",
+    "transport.credit_stall",
+    "harness.degraded",
+    "ft.declare_failed",
+    "ft.agree_timeout",
+)
+#: The harness responding to trouble.
+RECOVERY_KINDS = (
+    "ft.agree",
+    "ft.revoke",
+    "ft.shrink",
+    "ft.shrink_in_place",
+    "ft.failure_ack",
+    "sup.escalate",
+    "transport.credit_granted",
+)
 LANE_KINDS = (
-    "agent.call",
-    "msg.send",
-    "msg.recv",
-    "win.put",
-    "win.get",
-    "win.lock",
-    "win.accumulate",
+    *WORK_KINDS,
+    *MESSAGE_KINDS,
+    *RMA_KINDS,
+    *LIFECYCLE_KINDS,
+    *TROUBLE_KINDS,
+    *RECOVERY_KINDS,
     "broker.claim",
     "broker.complete",
 )
@@ -64,6 +103,56 @@ def _candidate_dirs() -> list[Path]:
 
 def _name_of(path: Path) -> str:
     return str(path.relative_to(RUNS)).replace("/", NEST)
+
+
+#: Payload keys worth showing in a tooltip, in the order they read best. Failure events keep
+#: their substance in kind-specific keys --- which rank died, who failed to vote, what the
+#: contract rejected --- so a diamond with only a colour is close to useless at the moment a
+#: reader has found the thing they were looking for.
+DETAIL_KEYS = (
+    "kind",  # failure class on ft.declare_failed
+    "error_class",
+    "failed",
+    "excluded",
+    "missing",
+    "absent",
+    "policy",
+    "result",
+    "state",
+    "problems",
+    "contract",
+    "detail",
+    "waited_s",
+    "mode",
+    "contended",
+    "win",
+    "version",
+    "executor",
+)
+
+
+def _detail(payload: dict[str, Any], limit: int = 4) -> str:
+    """A compact ``key=value`` summary of the salient parts of an event payload."""
+    parts: list[str] = []
+    for key in DETAIL_KEYS:
+        if key not in payload:
+            continue
+        value = payload[key]
+        if value is None or value == "" or value == [] or value is False:
+            continue
+        if isinstance(value, list):
+            shown = ", ".join(str(v) for v in value[:4])
+            if len(value) > 4:
+                shown += f", +{len(value) - 4}"
+            value = f"[{shown}]"
+        elif isinstance(value, bool):
+            value = "true"  # falsey values are filtered above, so this is always True
+        elif isinstance(value, float):
+            value = f"{value:g}"
+        parts.append(f"{key}={value}")
+        if len(parts) >= limit:
+            break
+    return " · ".join(parts)
 
 
 def list_runs() -> list[dict[str, Any]]:
@@ -123,6 +212,7 @@ def run_detail(name: str) -> dict[str, Any]:
                         "start": claim["start"],
                         "end": rel,
                         "label": claim["label"],
+                        "detail": _detail(p),
                         "tokens": p.get("result_tokens", 0),
                         "aid": aid,
                     }
@@ -136,6 +226,7 @@ def run_detail(name: str) -> dict[str, Any]:
                 "start": rel,
                 "end": rel,
                 "label": p.get("label") or p.get("kind_label") or p.get("tag") or p.get("slot") or "",
+                "detail": _detail(p),
                 "tokens": p.get("tokens") or p.get("output_tokens") or 0,
                 "peer": p.get("dst") if kind == "msg.send" else p.get("src"),
                 "mode": p.get("mode"),

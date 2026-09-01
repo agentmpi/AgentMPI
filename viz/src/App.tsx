@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { RunDetail, RunListItem, Span } from "./types";
-import { styleFor } from "./types";
+import type { Role, RunDetail, RunListItem, Span } from "./types";
+import { ROLE_COLOR, ROLE_LABEL, styleFor } from "./types";
 
 const LANE_H = 26;
 const LANE_GAP = 4;
@@ -17,6 +17,18 @@ const LEFT = 68;
  * agent ranks than for CPU cores because the spread between the fastest and slowest
  * participant is an order of magnitude rather than a few percent.
  */
+/** Separator `scripts/export_traces.py` uses to flatten `runs/<campaign>/<run>` into a name. */
+const NEST = "__";
+/** Sentinel group for runs with no campaign prefix, rendered without a header. */
+const UNGROUPED = "\u0000top";
+
+type Group = { key: string; runs: RunListItem[] };
+
+const shortName = (name: string) => {
+  const i = name.indexOf(NEST);
+  return i === -1 ? name : name.slice(i + NEST.length);
+};
+
 export function App() {
   const [runs, setRuns] = useState<RunListItem[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
@@ -28,6 +40,8 @@ export function App() {
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const [live, setLive] = useState<boolean | null>(null);
+  const [query, setQuery] = useState("");
+  const [open, setOpen] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     let cancelled = false;
@@ -49,7 +63,14 @@ export function App() {
           setLive(isLive);
           setRuns(data);
           setLoading(false);
-          const best = [...data].sort((a, b) => (b.n_events ?? 0) - (a.n_events ?? 0))[0];
+          // Land on the most substantial *real* run. Ranking by event count alone puts a
+          // synthetic collective sweep on top -- those have the most events and the least to
+          // look at (no agent calls, no failures, sub-second spans), which is a poor first
+          // impression of what the viewer is for.
+          const rank = (r: RunListItem) => (r.experiment ? 1 : 0);
+          const best = [...data].sort(
+            (a, b) => rank(b) - rank(a) || (b.n_events ?? 0) - (a.n_events ?? 0),
+          )[0];
           if (best) setSelected(best.name);
           return;
         } catch {
@@ -78,6 +99,46 @@ export function App() {
       .then((d) => (d.error ? setError(d.error) : setDetail(d)))
       .catch((e) => setError(String(e)));
   }, [selected, live]);
+
+  // With every run committed, the list is ~500 entries, most of them one-line entries in a
+  // parameter sweep. A flat list of that length is not browsable, so runs are grouped by the
+  // campaign that produced them -- the exporter already encodes that as `campaign__run` --
+  // and sweeps stay collapsed until asked for. Headline runs have no campaign prefix and so
+  // sit at the top level, which is where someone opening this for the first time should land.
+  const groups = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const match = (r: RunListItem) =>
+      !q || r.name.toLowerCase().includes(q) || (r.experiment ?? "").toLowerCase().includes(q);
+    const byKey = new Map<string, RunListItem[]>();
+    for (const r of runs) {
+      if (!match(r)) continue;
+      const i = r.name.indexOf(NEST);
+      const key = i === -1 ? UNGROUPED : r.name.slice(0, i);
+      const bucket = byKey.get(key);
+      if (bucket) bucket.push(r);
+      else byKey.set(key, [r]);
+    }
+    const weight = (rs: RunListItem[]) => Math.max(...rs.map((r) => r.n_events ?? 0));
+    return [...byKey.entries()]
+      .map(([key, rs]) => ({
+        key,
+        runs: [...rs].sort((a, b) => (b.n_events ?? 0) - (a.n_events ?? 0)),
+      }))
+      // Ungrouped headline runs first, then campaigns by their most substantial run.
+      .sort((a, b) =>
+        a.key === UNGROUPED ? -1 : b.key === UNGROUPED ? 1 : weight(b.runs) - weight(a.runs),
+      );
+  }, [runs, query]);
+
+  // Collapsed by default, except the group holding the current selection and, while a filter
+  // is active, every group -- a search that returns hidden results looks like no results.
+  const collapsed = (g: Group) => {
+    if (g.key === UNGROUPED || query.trim()) return false;
+    const explicit = open[g.key];
+    if (explicit !== undefined) return !explicit;
+    return !g.runs.some((r) => r.name === selected);
+  };
+  const toggle = (g: Group) => setOpen((o) => ({ ...o, [g.key]: collapsed(g) }));
 
   const ranks = useMemo(() => (detail ? Object.keys(detail.lanes).sort((a, b) => +a - +b) : []), [detail]);
   const width = Math.max(900, 900 * zoom);
@@ -131,19 +192,48 @@ export function App() {
   return (
     <Shell>
       <aside className="sidebar">
-        <h2>Runs</h2>
-        <ul>
-          {runs.map((r) => (
-            <li key={r.name}>
-              <button className={r.name === selected ? "run active" : "run"} onClick={() => setSelected(r.name)}>
-                <span className="run-name">{r.name}</span>
-                <span className="run-meta">
-                  {r.experiment || "—"} · {r.n_ranks ?? 0} ranks · {(r.n_events ?? 0).toLocaleString()} events
-                </span>
-              </button>
-            </li>
-          ))}
-        </ul>
+        <h2>
+          Runs <span className="count">{runs.length}</span>
+        </h2>
+        <input
+          className="search"
+          value={query}
+          placeholder="Filter by name or experiment…"
+          onChange={(e) => setQuery(e.target.value)}
+        />
+        {groups.length === 0 ? (
+          <p className="no-match">Nothing matches “{query}”.</p>
+        ) : (
+          groups.map((g) => (
+            <section className="group" key={g.key}>
+              {g.key !== UNGROUPED && (
+                <button className="group-head" onClick={() => toggle(g)} aria-expanded={!collapsed(g)}>
+                  <span className="caret">{collapsed(g) ? "▸" : "▾"}</span>
+                  <span className="group-name">{g.key}</span>
+                  <span className="count">{g.runs.length}</span>
+                </button>
+              )}
+              {!collapsed(g) && (
+                <ul>
+                  {g.runs.map((r) => (
+                    <li key={r.name}>
+                      <button
+                        className={r.name === selected ? "run active" : "run"}
+                        onClick={() => setSelected(r.name)}
+                      >
+                        <span className="run-name">{shortName(r.name)}</span>
+                        <span className="run-meta">
+                          {r.experiment || "—"} · {r.n_ranks ?? 0} ranks ·{" "}
+                          {(r.n_events ?? 0).toLocaleString()} events
+                        </span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </section>
+          ))
+        )}
       </aside>
 
       <main className="main">
@@ -269,7 +359,7 @@ export function App() {
               </svg>
             </div>
 
-            <Legend />
+            <Legend lanes={detail.lanes} />
             <Collectives events={detail.collectives} />
             <Health rows={detail.health} />
           </>
@@ -282,6 +372,7 @@ export function App() {
           <div className="mono">
             rank {hover.rank} · {hover.span.kind}
           </div>
+          {hover.span.detail ? <div className="mono detail">{hover.span.detail}</div> : null}
           <div className="mono">
             {hover.span.start.toFixed(2)}s
             {hover.span.end > hover.span.start ? ` → ${hover.span.end.toFixed(2)}s (${(hover.span.end - hover.span.start).toFixed(2)}s)` : ""}
@@ -342,22 +433,38 @@ function niceStep(span: number): number {
   return 10 * mag;
 }
 
-function Legend() {
-  const items: Array<[string, string]> = [
-    ["agent invocation", "#3b82f6"],
-    ["message sent", "#10b981"],
-    ["message received", "#34d399"],
-    ["window put", "#f59e0b"],
-    ["window get", "#fbbf24"],
-    ["lock acquired", "#ef4444"],
-    ["accumulate", "#a78bfa"],
-    ["stale write", "#dc2626"],
-  ];
+/**
+ * A legend of what this run actually contains, not of everything the protocol can emit.
+ *
+ * Most runs use a handful of the forty-odd event kinds, so a fixed legend is mostly noise and
+ * -- worse -- implies the absent kinds were looked for and not found. Deriving it from the
+ * lanes also means it cannot fall out of date when the runtime gains an event.
+ */
+function Legend({ lanes }: { lanes: RunDetail["lanes"] }) {
+  const items = useMemo(() => {
+    const seen = new Map<Role, number>();
+    let stale = false;
+    for (const spans of Object.values(lanes)) {
+      for (const s of spans) {
+        const { role } = styleFor(s.kind);
+        seen.set(role, (seen.get(role) ?? 0) + 1);
+        if (s.stale) stale = true;
+      }
+    }
+    const order: Role[] = ["work", "message", "rma", "lifecycle", "trouble", "recovery"];
+    const out = order
+      .filter((r) => seen.has(r))
+      .map((r) => ({ label: ROLE_LABEL[r], color: ROLE_COLOR[r], n: seen.get(r) ?? 0 }));
+    if (stale) out.push({ label: "stale write — lost-update risk", color: "#dc2626", n: 0 });
+    return out;
+  }, [lanes]);
+
   return (
     <div className="legend">
-      {items.map(([label, color]) => (
+      {items.map(({ label, color, n }) => (
         <span key={label}>
           <i style={{ background: color }} /> {label}
+          {n > 0 && <em> {n.toLocaleString()}</em>}
         </span>
       ))}
     </div>
