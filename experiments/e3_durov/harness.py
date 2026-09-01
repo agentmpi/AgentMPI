@@ -281,12 +281,16 @@ def _invoke_with_policy(
     *,
     policy: str,
     max_restarts: int,
+    lease_extend_s: float,
     validate: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
     attempts = max_restarts + 1 if policy == "retry-then-fail" else 1
     for attempt in range(attempts):
         try:
-            amp.heartbeat(note=f"{task.label} attempt {attempt + 1}")
+            amp.heartbeat(
+                extend=lease_extend_s,
+                note=f"{task.label} attempt {attempt + 1}",
+            )
             value = executor.invoke(task)
             violations = check_contract(value, task.contract, subs={"rank": task.rank})
             if violations:
@@ -566,6 +570,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             research_task,
             policy=args.failure_policy,
             max_restarts=args.max_restarts,
+            lease_extend_s=args.task_timeout,
             validate=_validate_research,
         )
         amp.memo("research", {"digest": _digest(research)})
@@ -621,6 +626,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     arbitration_task,
                     policy=args.failure_policy,
                     max_restarts=args.max_restarts,
+                    lease_extend_s=args.task_timeout,
                     validate=validate_arbitration,
                 )
                 glossary = amp.op_arbitrate(
@@ -679,6 +685,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 translation_task,
                 policy=args.failure_policy,
                 max_restarts=args.max_restarts,
+                lease_extend_s=args.task_timeout,
                 validate=lambda value, expected=page_assignment: _validate_translation(
                     value,
                     expected,
@@ -739,6 +746,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 review_task,
                 policy=args.failure_policy,
                 max_restarts=args.max_restarts,
+                lease_extend_s=args.task_timeout,
                 validate=partial(
                     _validate_review,
                     target_rank=target_rank,
