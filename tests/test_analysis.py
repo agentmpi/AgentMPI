@@ -262,3 +262,59 @@ def test_as_dict_is_json_serialisable(analyses: list[an.Analysis]) -> None:
     """The documents read metrics.json, so anything unserialisable is a silent data loss."""
     for a in analyses[:40]:
         json.dumps(a.as_dict())
+
+
+# -- cost-model consistency (no archive needed) ----------------------------------------
+
+
+@pytest.mark.parametrize("p", [4, 8, 16, 32])
+def test_reduce_time_charges_one_operator_application_per_fold_level(p: int) -> None:
+    """Time and price must agree about how many folds a reduction performs.
+
+    `predict` clamped operator applications to the round count, so flat reduce paid for one
+    application where its root performs p-1 back to back -- flat's sends land in a single
+    communication round but the fold that follows is left-deep, which is why its measured
+    `fold_depth` is p-1. The clamp also contradicted the price term, which charges p-1, and it made
+    `best_algorithm(objective="time")` recommend flat: at p=8 the agent-executed runs measured root
+    blocking of 51.8 s for k-ary against 251.6 s for flat.
+    """
+    from agentmpi import cost
+
+    params = cost.CostParams()
+    flat = cost.predict("reduce", "flat", p, 1000, params, op_cost_tokens=500)
+    binomial = cost.predict("reduce", "binomial", p, 1000, params, op_cost_tokens=500)
+
+    # Flat folds p-1 deep and binomial ceil(log2 p) deep, so flat must cost more time.
+    assert flat.fold_depth == p - 1, flat.fold_depth
+    assert binomial.fold_depth < flat.fold_depth
+    assert flat.time_s > binomial.time_s, (
+        f"p={p}: flat predicted {flat.time_s:.3f}s, binomial {binomial.time_s:.3f}s"
+    )
+    # Time must scale with the fold depth it claims.
+    per_fold = params.message_time(500)
+    assert flat.time_s >= (p - 1) * per_fold
+
+
+@pytest.mark.parametrize("p,k", [(8, 4), (16, 4), (32, 8), (64, 8)])
+def test_kary_price_charges_the_folds_it_actually_performs(p: int, k: int) -> None:
+    """A k-ary fold retires k-1 inputs per application, so it performs ceil((p-1)/(k-1)) of them.
+
+    Pricing p-1 charged a wide tree as if it folded pairwise, erasing from the price axis the whole
+    advantage a variadic operator exists to provide.
+    """
+    from agentmpi import cost
+
+    params = cost.CostParams()
+    wide = cost.predict_kary(p, 1000, k, params, op_cost_tokens=500)
+    pairwise = cost.predict_kary(p, 1000, 2, params, op_cost_tokens=500)
+
+    expected = -(-(p - 1) // (k - 1))
+    assert wide.fold_depth < pairwise.fold_depth, "a wider tree must be shallower"
+    assert wide.price_usd < pairwise.price_usd, (
+        f"p={p} k={k}: wide costs {wide.price_usd:.6f}, pairwise {pairwise.price_usd:.6f}"
+    )
+    # Message count is invariant in k: every non-root rank sends exactly once.
+    assert wide.messages == pairwise.messages == p - 1
+    # The price difference must reflect the application count, not the message count.
+    delta = pairwise.price_usd - wide.price_usd
+    assert delta == pytest.approx(params.message_price(0, (p - 1 - expected) * 500), rel=1e-6)

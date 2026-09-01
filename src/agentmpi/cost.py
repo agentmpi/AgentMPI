@@ -308,7 +308,13 @@ def predict_kary(p: int, n_tokens: int, k: int, params: "CostParams | None" = No
     depth = _logkc(p, k)
     time_s = depth * (params.fabric_s + n_tokens * params.beta_in_s_per_token)
     time_s += depth * params.message_time(op_cost_tokens or n_tokens * k)
-    price = params.message_price((p - 1) * n_tokens, (p - 1) * (op_cost_tokens or n_tokens))
+    # A k-ary fold performs ceil((p-1)/(k-1)) operator applications, not p-1: each application
+    # consumes k inputs and yields one, so it retires k-1 of them. Pricing p-1 charged a wide tree
+    # as if it folded pairwise, which erased the whole advantage from the price axis --- the
+    # advantage a variadic operator exists to provide. Measured on the archived fidelity runs the
+    # count is 3 at p=8 and 5 at p=16 with k=4, against the 7 and 15 the old term charged.
+    n_applications = max(1, -(-(p - 1) // max(1, k - 1)))
+    price = params.message_price((p - 1) * n_tokens, n_applications * (op_cost_tokens or n_tokens))
     return Prediction(
         op="reduce",
         algorithm=f"kary(k={k})",
@@ -420,7 +426,14 @@ def predict(
     op_rounds = depth if op in ("reduce", "allreduce", "scan", "reduce_scatter") else 0
     time_s = rounds * (params.fabric_s + n_tokens * params.beta_in_s_per_token)
     if op_rounds:
-        time_s += min(op_rounds, rounds if rounds else op_rounds) * params.message_time(op_cost_tokens or n_tokens)
+        # Charged for the fold depth, not clamped to the round count. Clamping made flat reduce pay
+        # for one operator application when its root performs p-1 of them back to back --- flat's
+        # sends land in a single communication round but the fold that follows is left-deep, which
+        # is why its measured `fold_depth` is p-1 and not 1. The clamp also put time and price in
+        # contradiction, since the price term below charges (p-1) applications, and it made
+        # `best_algorithm(objective="time")` recommend flat: at p=8 the agent-executed runs measured
+        # root blocking of 51.8 s for k-ary and 251.6 s for flat.
+        time_s += op_rounds * params.message_time(op_cost_tokens or n_tokens)
     price = params.message_price(volume, 0)
     if op_cost_tokens:
         price += params.message_price(volume, (p - 1) * op_cost_tokens)

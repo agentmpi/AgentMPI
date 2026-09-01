@@ -249,6 +249,13 @@ def barrier(
     else:
         raise AmpiUsageError("unknown barrier algorithm", algorithm=algorithm)
 
+    # The round count was computed and returned in `BarrierResult` but never written to the stats
+    # the trace records, so every `coll.barrier` event in the archive reports zero rounds --- 42
+    # sweep runs and every barrier in the agent runs. Barrier is the one collective whose payload
+    # is a single token and whose entire cost is latency, so rounds is the only number about it
+    # worth having; it is also the only collective in this module that omitted the assignment,
+    # against twenty that make it.
+    tr.stats.rounds = rounds
     stats = tr.finish(label=label, absent=list(absent))
     _record(comm, stats)
     arrived = tuple(x for x in range(p) if x not in set(absent))
@@ -852,12 +859,19 @@ def reduce(
     # order coincides with communicator rank order only when the root is 0.  For
     # any other root a non-commutative operator would be evaluated in rotated
     # order, so the tree is refused rather than silently reordering.
-    if algorithm == "binomial" and not op.commutative and root != 0:
+    # `kary` needs the same refusal for the same reason, and lacked it. Both algorithms number
+    # ranks relative to the root, so at a non-zero root a non-commutative operator is folded in
+    # rotated order --- but where binomial raised, kary returned the rotated answer silently. A
+    # four-rank probe with a string-concatenation operator at root=1 yielded '[1][2][3][0]' where
+    # rank order requires '[0][1][2][3]'. A silent wrong answer in exactly the case a guard exists
+    # to catch is worse than the missing guard.
+    if algorithm in ("binomial", "kary") and not op.commutative and root != 0:
         raise AmpiUsageError(
-            "binomial reduce cannot preserve rank order for a non-commutative operator "
+            f"{algorithm} reduce cannot preserve rank order for a non-commutative operator "
             "with a non-zero root; use algorithm='chain' or 'flat'",
             op=op.name,
             root=root,
+            algorithm=algorithm,
         )
     epoch = comm._next_epoch("reduce")
     tr = _Tracker(comm, "reduce", algorithm, root=root)

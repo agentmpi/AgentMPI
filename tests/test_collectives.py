@@ -672,3 +672,56 @@ def test_contract_max_tokens_is_what_makes_a_budget_real(tmp_path):
         timeout=60,
     )
     assert job2.ok and len(attempts) == 1
+
+
+@pytest.mark.parametrize("algorithm,size", [("dissemination", 8), ("dissemination", 5), ("linear", 8), ("central", 6)])
+def test_barrier_records_its_round_count(tmp_path, algorithm, size):
+    """Barrier must write its rounds to the trace, not only return them.
+
+    It computed `rounds` into a local, returned it in `BarrierResult`, and never assigned
+    `tr.stats.rounds` -- the only collective in the module to omit that, against twenty that make
+    it. So every `coll.barrier` event in the archive reports zero: 42 sweep runs and every barrier
+    in the agent runs. Barrier is the one collective whose payload is a single token and whose
+    entire cost is latency, so the round count is the only number about it worth having.
+    """
+    def rank_main(comm):
+        return comm.barrier(algorithm=algorithm, policy="wait").rounds
+
+    root = tmp_path / f"bar-{algorithm}-{size}"
+    job = ampi.launch(rank_main, size=size, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+    returned = {o.value for o in job.outcomes}
+    assert returned and 0 not in returned, f"barrier returned {returned}"
+
+    events = [e for e in ampi.Fabric(root).events() if e["kind"] == "coll.barrier"]
+    assert events, "no barrier event recorded"
+    recorded = {int(e["payload"].get("rounds") or 0) for e in events}
+    assert recorded == returned, f"trace records {recorded}, barrier returned {returned}"
+
+
+@pytest.mark.parametrize("algorithm", ["binomial", "kary"])
+def test_root_relative_reduce_refuses_a_non_commutative_operator(tmp_path, algorithm):
+    """Both root-relative trees must refuse, not silently rotate.
+
+    `binomial` and `kary` both number ranks relative to the root, so at a non-zero root a
+    non-commutative operator folds in rotated order. `binomial` raised; `kary` returned the rotated
+    answer. A four-rank probe at root=1 gave '[1][2][3][0]' where rank order requires
+    '[0][1][2][3]' -- a silent wrong answer in exactly the case the guard exists to catch.
+    """
+    concat = ampi.Op(
+        "CONCAT", lambda a, b, _ctx: f"{a}{b}", commutative=False
+    )
+
+    def rank_main(comm, algorithm=algorithm):
+        try:
+            comm.reduce(f"[{comm.rank}]", concat, root=1, algorithm=algorithm)
+        except ampi.AmpiUsageError:
+            return "refused"
+        return "accepted"
+
+    job = ampi.launch(rank_main, size=4, root=tmp_path / f"nc-{algorithm}")
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    assert {o.value for o in job.outcomes} == {"refused"}, (
+        f"{algorithm} reduce accepted a non-commutative operator at a non-zero root"
+    )
