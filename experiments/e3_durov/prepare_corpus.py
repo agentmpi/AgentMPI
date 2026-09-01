@@ -8,6 +8,7 @@ import json
 import subprocess
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 PAGE_COUNT = 99
 RESEARCH_FILES = (
@@ -32,6 +33,17 @@ def _git(checkout: Path, *args: str) -> str:
 
 def _sha256(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def _public_repo_url(url: str) -> str:
+    """Strip credentials from an HTTP(S) git remote before recording provenance."""
+    parsed = urlsplit(url)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname is None:
+        return url
+    host = parsed.hostname
+    if parsed.port is not None:
+        host = f"{host}:{parsed.port}"
+    return urlunsplit((parsed.scheme, host, parsed.path, parsed.query, parsed.fragment))
 
 
 def prepare_corpus(
@@ -65,6 +77,7 @@ def prepare_corpus(
             url = _git(checkout, "remote", "get-url", "origin")
         except subprocess.CalledProcessError as exc:
             raise ValueError("source repository URL is required when origin is unavailable") from exc
+    url = _public_repo_url(url)
 
     pages = []
     for page in range(1, PAGE_COUNT + 1):

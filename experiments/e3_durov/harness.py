@@ -7,6 +7,7 @@ import hashlib
 import json
 import time
 from collections.abc import Callable
+from functools import partial
 from pathlib import Path
 from typing import Any
 
@@ -28,14 +29,22 @@ RESEARCH_CONTRACT = {
     "max_tokens": 2400,
     "semantics": "Cultural and terminology proposals, each supported by a URL and evidence.",
 }
+ARBITRATION_CONTRACT = {
+    "kind": "json",
+    "name": "durov-terminology-arbitration",
+    "required": ["rank", "rulings", "reasons"],
+    "expect": {"rank": "{rank}"},
+    "max_tokens": 5000,
+    "semantics": "One evidence-grounded ruling for every lifted terminology conflict.",
+}
 TRANSLATION_CONTRACT = {
     "kind": "json",
     "name": "durov-translation",
     "required": ["rank", "pages"],
     "nonempty": ["pages"],
     "expect": {"rank": "{rank}"},
-    "max_tokens": 24000,
-    "semantics": "Complete literary English, Simplified Chinese, and Japanese translations.",
+    "max_tokens": 12000,
+    "semantics": "One complete literary English, Simplified Chinese, and Japanese page.",
 }
 REVIEW_CONTRACT = {
     "kind": "json",
@@ -43,8 +52,8 @@ REVIEW_CONTRACT = {
     "required": ["rank", "target_rank", "critique", "revised_translation"],
     "nonempty": ["critique", "revised_translation"],
     "expect": {"rank": "{rank}"},
-    "max_tokens": 26000,
-    "semantics": "A substantive peer review and a corrected complete translation.",
+    "max_tokens": 14000,
+    "semantics": "A substantive peer review and corrected translation of one page.",
 }
 
 
@@ -96,7 +105,7 @@ Do not translate the pages in this phase.
 
 
 def translation_prompt(
-    assignment: dict[str, Any],
+    page: dict[str, Any],
     glossary: dict[str, Any],
     rank: int,
     max_chars: int,
@@ -111,16 +120,46 @@ Do not summarize or omit text. Use the binding terminology when applicable.
 Binding population glossary:
 {_dump(glossary)}
 
-Assigned pages:
-{_dump(assignment["pages"])}
+Assigned page:
+{_dump(page)}
 
 Return only JSON:
 {{"rank":{rank},"pages":[{{"page":1,"source_sha256":"...","segments":[
 {{"id":1,"ru":"exact source segment","en":"...","zh":"...","ja":"..."}}]}}]}}
 
-Every page must occur exactly once, source_sha256 must match its assignment, every
-source segment must be represented in order, and all four language fields must be
-nonempty. Translator notes, if indispensable, may be added at page level.
+The assigned page must occur exactly once and source_sha256 must match. Represent
+every source segment in order and make all four language fields nonempty. For a
+blank front-matter page, return an empty segments list and explain it in
+translator_notes. Translator notes, if indispensable, may be added at page level.
+"""
+    return _bounded_prompt(prompt, max_chars)
+
+
+def arbitration_prompt(
+    conflicts: dict[str, list[Any]],
+    proposals: list[dict[str, Any]],
+    rank: int,
+    max_chars: int,
+) -> str:
+    prompt = f"""# Binding terminology arbitration — rank {rank}
+
+The population researching Nikolai Kononov's *Код Дурова* proposed conflicting
+English, Simplified Chinese, and Japanese renderings. Resolve every lifted
+conflict exactly once. Select one of the supplied candidate values for each key;
+do not invent a third rendering. Use the URL-backed research evidence where it
+is relevant, and prefer literary naturalness over word-for-word equivalence.
+
+Lifted conflicts:
+{_dump(conflicts)}
+
+Population research proposals:
+{_dump(proposals)}
+
+Return only JSON:
+{{"rank":{rank},"rulings":{{"<conflict key>":<one supplied candidate>}},
+"reasons":{{"<conflict key>":"brief evidence-grounded reason"}}}}
+
+The rulings object must contain exactly the conflict keys.
 """
     return _bounded_prompt(prompt, max_chars)
 
@@ -181,26 +220,41 @@ def stub_executor(corpus: dict[str, Any]) -> FunctionExecutor:
                     }
                 ],
             }
-        if task.label == "translate":
+        if task.label == "arbitrate":
+            conflicts = task.meta["conflicts"]
             return {
                 "rank": task.rank,
                 "stub": True,
-                "pages": [
+                "rulings": {key: candidates[0] for key, candidates in conflicts.items()},
+                "reasons": {key: "Deterministic first-candidate fixture." for key in conflicts},
+            }
+        if task.label.startswith("translate-page-"):
+            translated_pages = []
+            for page in page_ids:
+                source = by_page[page]
+                segments = []
+                if source["text"]:
+                    segments.append(
+                        {
+                            "id": 1,
+                            "ru": source["text"],
+                            "en": f"[TEST en page {page}]",
+                            "zh": f"[测试 zh page {page}]",
+                            "ja": f"[テスト ja page {page}]",
+                        }
+                    )
+                translated_pages.append(
                     {
                         "page": page,
-                        "source_sha256": by_page[page]["sha256"],
-                        "segments": [
-                            {
-                                "id": 1,
-                                "ru": by_page[page]["text"],
-                                "en": f"[TEST en page {page}]",
-                                "zh": f"[测试 zh page {page}]",
-                                "ja": f"[テスト ja page {page}]",
-                            }
-                        ],
+                        "source_sha256": source["sha256"],
+                        "segments": segments,
+                        "translator_notes": ["Blank front matter."] if not source["text"] else [],
                     }
-                    for page in page_ids
-                ],
+                )
+            return {
+                "rank": task.rank,
+                "stub": True,
+                "pages": translated_pages,
             }
         target = task.meta["target"]
         return {
@@ -279,11 +333,27 @@ def _validate_translation(
         if page.get("source_sha256") != expected[page["page"]]:
             raise ValueError(f"page {page['page']} has the wrong source hash")
         segments = page.get("segments")
-        if not isinstance(segments, list) or not segments:
+        source_page = next(item for item in assignment["pages"] if item["page"] == page["page"])
+        if not isinstance(segments, list) or (source_page["text"] and not segments):
             raise ValueError(f"page {page['page']} has no translated segments")
         for index, segment in enumerate(segments, 1):
             if segment.get("id") != index or any(not segment.get(lang) for lang in ("ru", *LANGUAGES)):
                 raise ValueError(f"page {page['page']} has an invalid segment at position {index}")
+
+
+def _validate_review(
+    value: dict[str, Any],
+    *,
+    target_rank: int,
+    reviewer_rank: int,
+    assignment: dict[str, Any],
+) -> None:
+    if value.get("target_rank") != target_rank:
+        raise ValueError(f"rank {reviewer_rank} reviewed the wrong target")
+    revised = value.get("revised_translation")
+    if not isinstance(revised, dict):
+        raise ValueError("review must contain a revised translation object")
+    _validate_translation(revised, assignment, expected_rank=target_rank)
 
 
 def _assignments(corpus: dict[str, Any], size: int) -> list[dict[str, Any]]:
@@ -388,6 +458,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     brief = _research_brief(corpus, args.research_chars)
     contracts = {
         "research": {**RESEARCH_CONTRACT},
+        "arbitration": {**ARBITRATION_CONTRACT},
         "translation": {**TRANSLATION_CONTRACT},
         "review": {**REVIEW_CONTRACT},
     }
@@ -506,12 +577,58 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             quorum=args.quorum,
             timeout=args.phase_timeout,
         )
+        evidence = amp.gather(
+            "research-evidence",
+            payload=research["proposals"],
+            root=0,
+            quorum=args.quorum,
+            timeout=args.phase_timeout,
+            materialize=rank == 0,
+        )
         if rank == 0:
-            glossary = (
-                amp.op_arbitrate("terminology")["value"]
-                if reduced.get("conflicts")
-                else reduced["value"]
-            )
+            conflicts = reduced.get("conflicts", {})
+            if conflicts:
+                proposals = [
+                    proposal
+                    for contribution in evidence.get("bodies", [])
+                    for proposal in contribution["body"]
+                ]
+                arbitration_task = Task(
+                    aid=new_aid(),
+                    rank=rank,
+                    label="arbitrate",
+                    prompt=arbitration_prompt(
+                        conflicts,
+                        proposals,
+                        rank,
+                        args.max_prompt_chars,
+                    ),
+                    contract=Contract.parse(contracts["arbitration"]),
+                    meta={"conflicts": conflicts},
+                )
+
+                def validate_arbitration(value: dict[str, Any]) -> None:
+                    rulings = value.get("rulings")
+                    if not isinstance(rulings, dict) or set(rulings) != set(conflicts):
+                        raise ValueError("arbitration must rule on exactly every lifted conflict")
+                    for key, ruling in rulings.items():
+                        if ruling not in conflicts[key]:
+                            raise ValueError(f"ruling for {key!r} is not a supplied candidate")
+
+                arbitration = _invoke_with_policy(
+                    amp,
+                    executor,
+                    arbitration_task,
+                    policy=args.failure_policy,
+                    max_restarts=args.max_restarts,
+                    validate=validate_arbitration,
+                )
+                glossary = amp.op_arbitrate(
+                    "terminology",
+                    rulings=arbitration["rulings"],
+                )["value"]
+            else:
+                glossary = reduced["value"]
             amp.bcast(
                 "binding-glossary",
                 payload=glossary,
@@ -544,27 +661,33 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             quorum=args.quorum,
         )
 
-        translation_task = Task(
-            aid=new_aid(),
-            rank=rank,
-            label="translate",
-            prompt=translation_prompt(assignment, glossary, rank, args.max_prompt_chars),
-            contract=Contract.parse(contracts["translation"]),
-            meta={"pages": [page["page"] for page in assignment["pages"]]},
-        )
-        draft = _invoke_with_policy(
-            amp,
-            executor,
-            translation_task,
-            policy=args.failure_policy,
-            max_restarts=args.max_restarts,
-            validate=lambda value: _validate_translation(
-                value,
-                assignment,
-                expected_rank=rank,
-            ),
-        )
-        amp.put("editorial", f"draft/{rank:03d}", draft)
+        translated_pages: list[dict[str, Any]] = []
+        for page in assignment["pages"]:
+            page_assignment = {"rank": rank, "pages": [page]}
+            page_number = page["page"]
+            translation_task = Task(
+                aid=new_aid(),
+                rank=rank,
+                label=f"translate-page-{page_number:03d}",
+                prompt=translation_prompt(page, glossary, rank, args.max_prompt_chars),
+                contract=Contract.parse(contracts["translation"]),
+                meta={"pages": [page_number]},
+            )
+            translated = _invoke_with_policy(
+                amp,
+                executor,
+                translation_task,
+                policy=args.failure_policy,
+                max_restarts=args.max_restarts,
+                validate=lambda value, expected=page_assignment: _validate_translation(
+                    value,
+                    expected,
+                    expected_rank=rank,
+                ),
+            )
+            translated_pages.extend(translated["pages"])
+            amp.put("editorial", f"draft-page/{page_number:03d}", translated["pages"][0])
+        draft = {"rank": rank, "pages": translated_pages}
         amp.memo("translation", {"digest": _digest(draft)})
         amp.win_fence(
             "editorial",
@@ -585,57 +708,77 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if not claim["swapped"]:
             raise ValueError(f"rank {rank} could not claim review target {target_rank}")
-        target = amp.get("editorial", f"draft/{target_rank:03d}")["value"]
-        review_task = Task(
-            aid=new_aid(),
-            rank=rank,
-            label="review",
-            prompt=review_prompt(
-                target,
-                rank,
-                target_rank,
-                glossary,
-                args.max_prompt_chars,
-            ),
-            contract=Contract.parse(contracts["review"]),
-            meta={"target": target},
-        )
-        def validate_review(value: dict[str, Any]) -> None:
-            if value.get("target_rank") != target_rank:
-                raise ValueError(f"rank {rank} reviewed the wrong target")
-            revised = value.get("revised_translation")
-            if not isinstance(revised, dict):
-                raise ValueError("review must contain a revised translation object")
-            _validate_translation(
-                revised,
-                assignments[target_rank],
-                expected_rank=target_rank,
+        critiques: list[dict[str, Any]] = []
+        revised_pages: list[dict[str, Any]] = []
+        for target_page in assignments[target_rank]["pages"]:
+            page_number = target_page["page"]
+            target = {
+                "rank": target_rank,
+                "pages": [
+                    amp.get("editorial", f"draft-page/{page_number:03d}")["value"]
+                ],
+            }
+            review_task = Task(
+                aid=new_aid(),
+                rank=rank,
+                label=f"review-page-{page_number:03d}",
+                prompt=review_prompt(
+                    target,
+                    rank,
+                    target_rank,
+                    glossary,
+                    args.max_prompt_chars,
+                ),
+                contract=Contract.parse(contracts["review"]),
+                meta={"target": target},
             )
 
-        review = _invoke_with_policy(
-            amp,
-            executor,
-            review_task,
-            policy=args.failure_policy,
-            max_restarts=args.max_restarts,
-            validate=validate_review,
-        )
-        lock = amp.win_lock(
-            "editorial",
-            f"final/{target_rank:03d}",
-            mode="exclusive",
-            ttl=args.claim_ttl,
-            timeout=args.phase_timeout,
-        )
-        try:
-            amp.put(
-                "editorial",
-                f"final/{target_rank:03d}",
-                review,
-                lock_token=lock["token"],
+            page_review = _invoke_with_policy(
+                amp,
+                executor,
+                review_task,
+                policy=args.failure_policy,
+                max_restarts=args.max_restarts,
+                validate=partial(
+                    _validate_review,
+                    target_rank=target_rank,
+                    reviewer_rank=rank,
+                    assignment={"rank": target_rank, "pages": [target_page]},
+                ),
             )
-        finally:
-            amp.win_unlock(lock["lock_id"])
+            critiques.extend(page_review["critique"])
+            revised_pages.extend(page_review["revised_translation"]["pages"])
+
+            # Editors touching pages in the same ten-page section serialize this
+            # short index update. The leased lock protects actual shared state,
+            # so contention and stale fencing tokens are observable in the trace.
+            chapter_key = f"chapter-index/{(page_number - 1) // 10:02d}"
+            lock = amp.win_lock(
+                "editorial",
+                chapter_key,
+                mode="exclusive",
+                ttl=args.claim_ttl,
+                timeout=args.phase_timeout,
+            )
+            try:
+                current = amp.get("editorial", chapter_key)
+                entries = current.get("value", []) if current["present"] else []
+                amp.put(
+                    "editorial",
+                    chapter_key,
+                    [*entries, {"page": page_number, "reviewer": rank}],
+                    lock_token=lock["token"],
+                )
+            finally:
+                amp.win_unlock(lock["lock_id"])
+
+        review = {
+            "rank": rank,
+            "target_rank": target_rank,
+            "critique": critiques,
+            "revised_translation": {"rank": target_rank, "pages": revised_pages},
+        }
+        amp.put("editorial", f"final/{target_rank:03d}", review)
         amp.memo("review", {"target_rank": target_rank, "digest": _digest(review)})
         amp.win_fence(
             "editorial",
