@@ -120,7 +120,12 @@ class CostParams:
         }
 
 
-def calibrate(fabric: Fabric, *, price_in_per_mtok: float = 3.0, price_out_per_mtok: float = 15.0) -> CostParams:
+def calibrate(
+    source: "Fabric | list[dict[str, Any]]",
+    *,
+    price_in_per_mtok: float = 3.0,
+    price_out_per_mtok: float = 15.0,
+) -> CostParams:
     """Fit α and β from an executed run's ``agent.call`` events.
 
     Least squares on ``latency = α + n_out·β`` over observed invocations.  The
@@ -128,8 +133,14 @@ def calibrate(fabric: Fabric, *, price_in_per_mtok: float = 3.0, price_out_per_m
     *spread* of α — not its mean — governs how long a barrier waits, and a model
     that reported only the mean would predict collective latencies that are
     systematically too optimistic.
+
+    Accepts a ``Fabric`` or an already-materialised event list, so an exported
+    ``traces/events/*.jsonl`` log calibrates through this same code path.
     """
-    events = fabric.events(kinds=["agent.call"])
+    if isinstance(source, Fabric):
+        events = source.events(kinds=["agent.call"])
+    else:
+        events = [e for e in source if e.get("kind") == "agent.call"]
     xs: list[float] = []
     ys: list[float] = []
     for e in events:
