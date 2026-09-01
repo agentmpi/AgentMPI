@@ -28,9 +28,11 @@ but adaptation --- \texttt{engine.py} routes 47 attribute-name guesses through o
 accessor rather than calling a published interface. The single most important reading is that
 withholding a shared interface does not show up as a broken build; it shows up as code that
 introspects its collaborators at runtime, as a 1.98 $\rightarrow$ 3.24 jump in the
-straggler-to-mean ratio at the integration barrier, and as \$0.23 of extra completion tokens
-that buy nothing. The run also carries four harness defects and one genuine AgentMPI
-accounting bug, all documented below.
+straggler-to-mean ratio at the integration barrier that lifts coordination from 41.7\% of the
+pool's rank-seconds to 56.4\%, and as \$0.23 of extra completion tokens that buy nothing.
+Cleanest of all, the interface-publication phase still ran with the window closed: eight agent
+calls and 8{,}735 completion tokens spent on interfaces that only their own authors could read.
+The run also carries four harness defects and one AgentMPI accounting bug, all documented below.
 \end{abstract}
 
 \input{generated}
@@ -123,8 +125,18 @@ by an ordinary \texttt{barrier}, which changes the barrier count from 32 to 24 a
 algorithm mix from sixteen \texttt{dissemination} plus sixteen \texttt{central} to
 twenty-four \texttt{central}. That substitution accounts for the entire message-count
 difference: the baseline's two dissemination fences logged 24 messages each, 48 in total, and
-$129-81=48$ exactly. Both runs ran the fixed two rounds and neither agreed green. And the
-interface publication phase was billed in full for information that only its author could read.
+$129-81=48$ exactly. Both runs ran the fixed two rounds and neither agreed green.
+
+The fourth deserves its own sentence, because it is the cleanest single statement of what the
+ablation costs. Closing the window did not switch off the phase that fills it: all eight ranks
+still published an interface, on prompts identical to the baseline's down to the token
+(13{,}746 in both), returning 8{,}735 completion tokens over 276.6\,s of summed agent latency ---
+and with no window to put them in, each interface reached exactly one reader, its own author,
+through the ``interface you published'' block of that rank's implementation prompt. Eight agent
+calls were paid for at full price to tell eight agents something each of them already knew. That
+is not a subtle statistical effect that needs a baseline to see; it is a whole phase of the
+protocol running with its output disconnected, and it is visible in the trace as eight
+\texttt{agent.call} events with no \texttt{win.put} anywhere after them.
 
 \subsection{What emerged}
 
@@ -248,25 +260,42 @@ the extra one being a window fence that does not exist here.
 \subsection{Defects}
 \label{sec:defects}
 
-\paragraph{An AgentMPI accounting bug.} \texttt{tokens\_deferred} is incremented on two different
-axes and summed into one field. In \texttt{src/agentmpi/comm.py} the send path adds
-\texttt{blob.tokens} when the chosen transport is \texttt{RENDEZVOUS}, and the receive path adds
-\texttt{row["tokens"]} whenever \texttt{admit} is false. This harness passes
-\texttt{admit=False} on every receive, so every rendezvous message is counted twice. The
+\paragraph{An AgentMPI accounting bug, since fixed.} \texttt{tokens\_deferred} used to be
+incremented on two different axes and summed into one field. In \texttt{src/agentmpi/comm.py} the
+send path added \texttt{blob.tokens} when the chosen transport was \texttt{RENDEZVOUS}, and the
+receive path added \texttt{row["tokens"]} whenever \texttt{admit} was false. This harness passes
+\texttt{admit=False} on every receive, so every rendezvous message was counted twice. The
 arithmetic is exact: the 20 rendezvous sends carry 97{,}526 tokens, all 81 arrivals carry
 155{,}792, and $97{,}526+155{,}792=253{,}318$, which is the \texttt{tokens\_deferred} value in
-this run's \texttt{job.finish} event and result file. The baseline reproduces it:
-$79{,}354+133{,}090=212{,}444$. \texttt{rank.py} documents the field with a single definition
-(``tokens that a rendezvous transfer avoided moving into context''), which the two increment sites
-do not both implement --- the receive-side one measures what an \emph{admission} decision avoided,
-a different quantity. \texttt{analysis.py} computes it correctly from the log, counting only
-rendezvous sends, which is why \texttt{metrics.json} reports 97{,}526 and the headline table above
-is right. The consequence is that the runtime's own \texttt{job.totals()} inflates the number
-2.6$\times$, and that inflated value is what reaches
-\texttt{results/software/real-sw-p8-noshared-locks-review.json} and thence
-\texttt{scripts/make\_tables.py:371}. This is a defect in AgentMPI, not in the harness, and it is
-the most consequential thing this analysis found: the field is described in
-\texttt{rank.py} as ``the headline number for the transport-mode experiment.''
+this run's \texttt{job.finish} event and archived result file. The baseline reproduces it:
+$79{,}354+133{,}090=212{,}444$. The tell is visible without any arithmetic: the archived result
+reports more tokens deferred (253{,}318) than sent (155{,}792), which a subset of sent traffic
+cannot be. \texttt{rank.py} documented the field with a single definition (``tokens that a
+rendezvous transfer avoided moving into context'') that the two increment sites did not both
+implement --- the receive-side one measures what an \emph{admission} decision avoided, a different
+quantity that is worth having under its own name.
+
+Both quantities now have one. \texttt{cost.summarise} derives \texttt{tokens\_deferred}
+(send-side, rendezvous only, a subset of \texttt{tokens\_sent} by construction) and
+\texttt{tokens\_unadmitted} (receive-side, any transport, arrived and never admitted into context)
+from the log, and \texttt{job.totals()} reports both; for this run they are 97{,}526 and
+155{,}792. The log-derived path in \texttt{analysis.py} was always right, which is why the 97{,}526
+in the headline table above needed no correction. The reason the conflation survived is instructive:
+the old test asserted that the \emph{receiver} had \texttt{tokens\_deferred > 4000}, encoding the
+conflation as expected behaviour. \texttt{tests/test\_analysis.py} now asserts across all 500
+archived runs that deferred tokens never exceed sent tokens, which is a property of the definition
+rather than of any one run.
+
+The blast radius was narrower than I first claimed and the correction sharpens the finding rather
+than weakening it. I wrote that the inflated value reached the transport table built at
+\texttt{scripts/make\_tables.py:371}; it did not. That table is built from
+\texttt{results/microbench/free-transport.json}, and the transport microbench admits its receives
+--- which is why its eager rows correctly read zero deferred tokens at every message size. No
+published number was affected. What was affected is every archived agent-experiment result:
+\texttt{results/software/*.json} and \texttt{results/translation/*.json} still carry the runtime's
+figure, 2.6$\times$ high in this run's case, and none of them carries
+\texttt{tokens\_unadmitted} because they predate the split. Anyone reading those files directly,
+rather than re-deriving from the traces, is reading an inflated number.
 
 \paragraph{The oracle the population saw was a phantom.} The executed \texttt{run\_acceptance}
 parsed the suite's report with \texttt{json.loads(out[out.rfind("\{"):])}, which slices from the
@@ -381,13 +410,17 @@ That is why the eight discarded interface calls were not wholly wasted and why \
 out byte-identical to the baseline's. What this run ablates is the cross-rank half of the channel,
 not the channel.
 
-\paragraph{Two headline metrics do not mean what they look like.} \texttt{coordination\_share} at
-87.9\% invites the reading that the protocol spent seven-eighths of the run coordinating; it did
-not. The barriers that dominate it sent zero messages, and the figure is the wall-clock envelope of
-collectives that were waiting for one agent call. Likewise the per-rank context column reads 0.0\%
-for all eight ranks not because context was ample but because \texttt{admit=False} is passed
-everywhere, so \texttt{context\_high\_water} and \texttt{context\_rejections} are structurally zero
-and the run says nothing about admission pressure.
+\paragraph{Coordination share is not protocol overhead, and the context column is not health.}
+At 56.4\% the coordination share now is a proportion --- rank-seconds blocked in completed
+collectives over the $8\times528.6=4{,}228.7$ available --- but it still invites the wrong reading.
+The barriers that dominate it sent zero messages. It measures schedule skew, not the cost of the
+protocol, and on this run 84.2\% of it is a single barrier waiting on a single agent call. The
+companion \texttt{coordination\_span\_share} of 89.3\% answers a different question again --- how
+much of the wall clock had coordination in flight anywhere --- and the two should not be swapped
+for one another. Separately, the per-rank context column reads 0.0\% for all eight ranks not
+because context was ample but because \texttt{admit=False} is passed everywhere, so
+\texttt{context\_high\_water} and \texttt{context\_rejections} are structurally zero and the run
+says nothing about admission pressure.
 
 \paragraph{The repair loop was never exercised, so this run says nothing about convergence.} Because
 the oracle's report never parsed, neither round was a repair round in any meaningful sense: the

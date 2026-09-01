@@ -128,6 +128,20 @@ do, present both explanations rather than picking one. Compare `runs/<RUN>/outpu
 baseline's, and check `runs/<RUN>/spool/` for which stages actually ran. Shared *input* artefacts
 (scatter units, glossary, term sheets) are identical by design and are not evidence of anything.
 
+Do not jump to contamination. On the run above the evidence favours convergence, and the test
+that discriminates is worth reusing: the overlap in the content-addressed stores is entirely in
+inputs, with **zero shared `gather` digests**, which is not what wholesale output reuse looks
+like. More decisively, for one unit the baseline's *on-disk output* is the revised text while the
+ablation produced the *unrevised* text, which exists nowhere except inside the baseline's spool
+prompt — a worker copying the previous run's outputs would have copied the revised one. Where the
+constraints are tight enough (a binding 206-term glossary, a pinned paragraph count and register,
+a canonical source text) and the revision moved under 1% of characters, byte-identity is a short
+step rather than a leap.
+
+So: look for shared *output* digests specifically, check which stage each shared artefact
+corresponds to, and quantify how much the baseline's revision actually changed. Then say which
+explanation the evidence favours and which you cannot exclude.
+
 ### The quality bar
 
 - **Every claim traces to a number or to the figure.** Cite the value. If you cannot support it,

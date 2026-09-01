@@ -23,7 +23,10 @@ integration. That first-round success is the reason this cell has the fewest eve
 in the $2\times2$ --- 311 against 473--686 --- because the harness breaks out of its repair loop
 on a green build, so the run simply stopped after one round while its siblings each ran two. The
 run is therefore not a story of ranks doing less work; it is a story of not having to do the
-second half. Against its matched sibling \texttt{vague-sw-p8-vague-noshared}, which differs only
+second half --- though only one of the three siblings ran its second round for an honest reason,
+because the two \texttt{real-sw} cells were produced before the oracle's report parser was fixed
+and were told that trees which in fact score 60/60 and 59/60 had failed to import. Against its
+matched sibling \texttt{vague-sw-p8-vague-noshared}, which differs only
 in that the window is withheld, it used half the agent calls (16 against 32), 36\% of the output
 tokens (32{,}304 against 88{,}989) and 39\% of the money (\$0.65 against \$1.64) to reach the
 same 60/60. The single most important caveat is that ``interface agreement'' here means
@@ -230,49 +233,90 @@ prediction is trivial, and only the 24-message dissemination barrier is a real c
 also reports \texttt{n\_misreported\_collectives: 0} where all three siblings report 2, but that
 is because it never invoked the neighbourhood collectives at all, not because it is cleaner.
 
-\paragraph{Two defects in AgentMPI itself.} First, \texttt{tokens\_deferred} is reported with two
-different definitions and the two disagree by 2.4$\times$ in this run.
-\texttt{cost.summarise()} counts only the tokens of \texttt{msg.send} events in rendezvous mode
-and yields 31{,}415, which is what \texttt{metrics.json}, the headline table above and the trace
-viewer's stats row all display. \texttt{Job.totals()} sums the per-rank counter, which
-\texttt{comm.py} increments both on a rendezvous send and again on \emph{every} receive taken with
-\texttt{admit=False}, and yields 74{,}494, which is what the \texttt{job.finish} event and the
-results file record. The identity is exact and holds in all four software runs: $31{,}415$
+\paragraph{Two accounting defects, one since fixed and one still live.} The first was that
+\texttt{tokens\_deferred} was reported with two different definitions that disagreed by
+2.4$\times$ in this run. \texttt{cost.summarise()} counted only the tokens of \texttt{msg.send}
+events in rendezvous mode and yielded 31{,}415, which is what \texttt{metrics.json} and the trace
+viewer's stats row displayed. \texttt{Job.totals()} summed a per-rank counter that \texttt{comm.py}
+incremented both on a rendezvous send and again on \emph{every} receive taken with
+\texttt{admit=False}, and yielded 74{,}494, which is what the \texttt{job.finish} event and the
+results file recorded. The identity was exact and held in all four software runs: $31{,}415$
 rendezvous-send tokens plus $43{,}079$ non-admitted-receive tokens equals $74{,}494$, and since
-every receive in this harness is non-admitted, the second term is simply every token sent, counted
-a second time. The docstring on \texttt{summarise} promises that its numbers are ``not an artefact
-of two different summarisers''; here they are. A reader taking the headline number from the
-results file gets a figure 2.4$\times$ the one on the same run's dashboard.
+every receive in this harness is non-admitted, the second term was simply every token sent,
+counted a second time --- so a reader taking the figure from the results file got 2.4$\times$ the
+figure on the same run's dashboard, against a \texttt{summarise} docstring promising that its
+numbers were ``not an artefact of two different summarisers''.
 
-Second, a reattaching worker silently overwrites the rank's configured context budget. The job was
-launched with \texttt{context\_budget=120\_000}, and the eight incarnation-1 \texttt{rank.init}
-events say \texttt{budget: 120000}; every one of the 23 later \texttt{rank.init} events says
+That is now fixed, and fixed in the way that keeps both quantities rather than discarding one.
+\texttt{tokens\_deferred} is send-side and rendezvous-only, a subset of \texttt{tokens\_sent} by
+construction, and measures transport mode; \texttt{tokens\_unadmitted} is receive-side and
+transport-agnostic, and measures context admission. \texttt{cost.summarise} derives both from the
+log and \texttt{Job.totals()} reports both, so the collision is gone. This run's regenerated
+summary reads \texttt{tokens\_deferred: 31415} and \texttt{tokens\_unadmitted: 43079}, and the
+second number is now meaningful in its own right: 43{,}079 is every token the run sent, and every
+one of them was received without being admitted to a context, because the harness passes
+\texttt{admit=False} on every collective. The old conflated 74{,}494 was not a quantity anybody
+wanted.
+
+The second defect is still live at HEAD, and I checked rather than assumed. A reattaching worker
+silently overwrites the rank's configured context budget. In this run the job was launched with
+\texttt{context\_budget=120\_000}, the eight incarnation-1 \texttt{rank.init} events say
+\texttt{budget: 120000}, every one of the 23 later \texttt{rank.init} events says
 \texttt{budget: 128000}, and the \texttt{ranks} table in the fabric ends the run holding
 \texttt{context\_budget = 128000} for all eight ranks. The cause is that \texttt{cmd\_worker}
 constructs its \texttt{RankRuntime} without passing \texttt{context\_budget}, so it takes
-\texttt{DEFAULT\_CONTEXT\_BUDGET = 128\_000}, and \texttt{register()} writes that value back over
-the persisted one; the sibling code path \texttt{\_comm()} reads the persisted budget from the
-\texttt{ranks} row first and does not have the bug, so the fix is one argument. The same pattern
-appears in all four software runs. Nothing in this run depended on it, because nothing was ever
-admitted, but a run that relied on admission pressure would find its budget raised by 6.7\% at the
-first reattachment, and the generated finding's claim that reattachment preserves the rank's
-context account is false of the budget half of that account.
+\texttt{DEFAULT\_CONTEXT\_BUDGET = 128\_000}, and the \texttt{UPDATE} branch of
+\texttt{register()} writes that value back over the persisted one; the sibling code path
+\texttt{\_comm()} reads the persisted budget from the \texttt{ranks} row first and does not have
+the bug, so the fix is one argument. Reproducing it against a scratch fabric at HEAD --- create a
+job, register rank 0 with a budget of 120{,}000, then re-register it exactly as
+\texttt{cmd\_worker} does --- the persisted budget still goes 120{,}000 to 128{,}000 and the two
+\texttt{rank.init} events still disagree. A related but distinct hardening has landed in the
+meantime: \texttt{register()} now refuses a rank index outside the job's world size, where it
+previously accepted any index unconditionally. That closes a different hole --- a shared worker
+pool leaking rank rows into the wrong fabric --- and does not touch the budget path, which runs
+after the range check and is unchanged. Nothing in this run depended on the budget, because
+nothing was ever admitted, but a run that relied on admission pressure would find its budget
+raised by 6.7\% at the first reattachment, and the generated finding's claim that reattachment
+preserves the rank's context account remains false of the budget half of that account.
 
 \section{Threats to this reading}
 
-\emph{The precise-spec half of the $2\times2$ cannot be compared with on outcome.} Both
-\texttt{real-sw-p8-full} and \texttt{real-sw-p8-noshared} report \texttt{importable: false} and
-\texttt{n\_total: 0} for both of their rounds and 0/0 final acceptance. That is not a failure of
-those populations. Their results files record commit \texttt{26ae006}, which predates
+\emph{Half of the $2\times2$ was driven by a false failure signal, and the rows are not
+commensurable on outcome.} Both \texttt{real-sw-p8-full} and \texttt{real-sw-p8-noshared} report
+\texttt{importable: false}, \texttt{n\_total: 0} and 0/0 final acceptance for both of their
+rounds. That is not a failure of those populations; it is a failure of the harness's report
+parser. Their results files record commit \texttt{26ae006}, which predates
 \texttt{parse\_report}; at that commit \texttt{run\_acceptance} parsed the oracle's stdout with
 \texttt{json.loads(out[out.rfind("\{"):])}, which lands inside a nested per-case object and never
 parses, and the stored \texttt{import\_error} for \texttt{real-sw-p8-full} is visibly a truncated
-JSON report full of \texttt{"passed": true} cases. Both of those runs therefore spent their second
-round repairing a phantom, which is exactly the pathology the current
-\texttt{parse\_report} docstring describes. This does not touch my run, which is at commit
-\texttt{90ca469} and post-fix, but it means the framing ``this cell has fewer events than the
-easier cells'' is partly an artefact: two of the three comparators were forced into a second round
-by a plumbing bug rather than by their code.
+JSON report full of \texttt{"passed": true} cases.
+
+The trees those runs left on disk settle it. Replaying the unmodified oracle
+(\texttt{experiments/minidb/acceptance.py}) against copies of them, \texttt{real-sw-p8-full}
+scores \texttt{importable: true} and 60/60 in both round 1 and round 2, and
+\texttt{real-sw-p8-noshared} scores \texttt{importable: true} and 59/60 in both, failing only
+\texttt{empty\_table\_select}. Two other analysts obtained the same figures independently. So the
+precise-spec population composed a working SQL engine at first integration and was told it had
+not compiled. Worse than wasted, the repair round was misdirected: because an unparseable report
+is treated as an import failure, the harness broadcasts a synthetic \texttt{IMPORT} case to every
+rank instead of scattering real blame, so the \texttt{noshared} population never saw its one
+genuine failure --- and \texttt{empty\_table\_select} is still failing at the end of round 2.
+
+The consequence for the $2\times2$ has to be stated plainly, and this document is the place to
+state it, because this cell is the one whose \emph{event count} the comparison leans on.
+Comparisons between the \texttt{real-sw} row and the \texttt{vague-sw} row can legitimately use
+token counts, code size, message counts and window traffic, because those measure what the
+populations did and are unaffected by how the oracle's output was parsed. They cannot use round
+count, and they cannot use ``did it pass''. Two of the four cells ran their second round because
+of a parsing bug rather than because of anything in their code, and both of those cells report a
+pass rate of zero for a tree that passes at least 59 of 60. The headline of my own run --- that it
+has the fewest events of the four because it needed one round rather than two --- is therefore
+sound as a statement about this cell and about its matched sibling
+\texttt{vague-sw-p8-vague-noshared}, which was run at the same post-fix commit, and is not sound
+as a statement about the \texttt{real-sw} pair, whose round count was set by the bug. Nothing here
+touches this run, which is at commit \texttt{90ca469}, after the fix, and whose 60/60 was parsed
+correctly and confirmed by the agreement vote.
 
 \emph{Wall time is the least reliable of the comparisons.} The six interface responses that are
 byte-identical between this run and the no-window run took very different times to produce:

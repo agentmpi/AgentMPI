@@ -31,10 +31,13 @@ protocol detected the condition, named it with the right error class, bounded ev
 and refused to report success. The one genuine defect is a composition defect --- the
 broker's 5{,}400\,s expiry is three times the collectives' 1{,}800\,s receive timeout, so
 the harness's degrade-and-stay-in-the-group discipline fires 3{,}600\,s after the peers
-it was meant to rescue have already given up. The single most consequential thing a
-reader should take away is external to the run: this failed run was a row in the paper's
-strong-scaling table, and the p=16 point is not safe to use --- for two independent
-reasons, only one of which has been fixed.
+it was meant to rescue have already given up. Because those two constants are
+independently authored defaults in different modules and no line of the harness is wrong,
+\S\ref{sec:whose} argues that AgentMPI should own that ordering --- reporting it, not
+forbidding it --- while the mitigation stays the harness author's responsibility. The
+single most consequential thing a reader should take away is nonetheless external to the
+run: this failed run was a row in the paper's strong-scaling table, and the p=16 point is
+not safe to use, for two independent reasons.
 \end{abstract}
 
 \input{generated}
@@ -252,6 +255,11 @@ and the \texttt{PROCEED} barrier's \texttt{absent} list. A degraded book is what
 harness was designed to produce under exactly these conditions, and the only thing
 standing between the design and the outcome was the ordering of two timeout constants.
 
+This defect and the ``observed through, not of'' reading above are in tension --- the
+shortage was not the protocol's fault, yet the protocol's own recovery path was made
+unreachable by the configuration around it --- and \S\ref{sec:whose} resolves which of the
+two owns the ordering.
+
 \subsection{What the harness should have done, and why it did not}
 \label{sec:shrink}
 
@@ -286,6 +294,83 @@ over those ten is what a correct supervisor would have produced. Whether the res
 would have been fast is an inference rather than a measurement, but a bounded one:
 \texttt{real-tr-p8-full} completed all three agent phases over eight units in 166.8\,s,
 so a ten-rank continuation was minutes of work, not hours.
+
+\subsection{Whose defect is the ordering? A recommendation}
+\label{sec:whose}
+
+Two of the readings above sit in apparent tension and are worth reconciling explicitly,
+because this run is the only evidence there is for the question. The capacity shortage was
+not AgentMPI's fault --- six rank roles had no executor, and no protocol can conjure one.
+Yet the protocol's own recovery affordances were made unreachable by a timeout ordering
+that came from the configuration surrounding it. If the second is a real defect, whose is
+it?
+
+The tension dissolves once you ask not who chose the numbers but who was in a position to
+check them. Nobody chose the pair. The 5{,}400\,s comes from a default argument in
+\texttt{common.make\_executor\_factory}; the 1{,}800\,s comes from a module-level default
+in \texttt{algorithms.py}; and \texttt{translation.py} passes neither, mentions neither,
+and contains no line that is wrong. The hazard was produced by two independently authored
+defaults composing across a module boundary, and there is no single site at which a
+careful author would have seen both. A rule that can be violated without anyone writing an
+incorrect line is not a rule an author can be held responsible for, and it is precisely
+the class of hazard this protocol already takes on itself elsewhere: rendezvous transport
+refuses to admit tokens that would overflow a context rather than trusting harness authors
+to count them, and \texttt{UNION} is offered over a semantic merge so that exactness is a
+property of the operator rather than of discipline. My recommendation is that AgentMPI
+should own this one too.
+
+It should not, however, \emph{forbid} the ordering, for three reasons the trace and the
+API make plain. First, the relation is often not knowable at \texttt{init}: both timeouts
+are per-call keyword arguments, a harness may legitimately vary either by phase, and a
+static check can only ever see the defaults. Second, the ordering is not always a defect
+--- a harness that makes an agent call and then enters no collective has no peer waiting
+on it, and a long agent timeout is correct there, so refusal would break correct programs.
+Third, converting a latent quality problem into a startup failure is worst for exactly the
+runs that most need to make partial progress.
+
+What I would recommend instead, in ascending order of value:
+
+\emph{Warn on the defaults at \texttt{init}.} The runtime already holds the executor's
+\texttt{default\_timeout} and can see the collective defaults; when the former exceeds the
+latter it can emit one trace event naming both values. It is a comparison of two constants
+and it is cheap, and its worth is that it lands \emph{in the log}, so a sweep over the
+archive could find every run carrying the hazard latently rather than only the one where
+it fired.
+
+\emph{Report the ordering at the moment it becomes provable.} This is stronger, needs no
+static reasoning about configuration, and I would rank it the highest-value addition of
+the three. A send that lands in the mailbox of a rank already in state \texttt{failed} is
+proof that a degrade-and-rejoin arrived too late, and the fabric can see that locally and
+mechanically at delivery time. A distinct event --- \texttt{msg.orphaned}, say --- would
+have promoted this run's single most diagnostic fact to a first-class observation instead
+of something an analyst had to recover by differencing 27 \texttt{msg.send} against 24
+\texttt{msg.recv} and then reconstructing the reduce tree by hand. It generalises past
+timeouts, too: \emph{any} degraded contribution can arrive after its group has moved on,
+whatever the constants, and only the fabric is positioned to notice.
+
+\emph{Make the correct ordering the default rather than something to remember.} The deeper
+reason the harness could not protect itself is that there is no way to ask the question
+``how long may I wait here before my peers give up on me?'' Threading the enclosing
+collective's receive timeout through as \texttt{comm.agent}'s default timeout, or exposing
+it as an accessor, would make the discipline that \texttt{safe\_agent}'s docstring preaches
+into something the API supplies. Notably, \texttt{safe\_agent} itself would need no edit:
+it is already correct, and was already correct in this run.
+
+What should remain the harness author's responsibility is the mitigation, not the trigger.
+Whether a ten-of-sixteen book is worth producing is a domain judgement the protocol cannot
+make, so calling \texttt{revoke}, \texttt{agree} and \texttt{shrink} is properly the
+author's job --- and \S\ref{sec:shrink} is a criticism of this harness, not of the
+protocol. But the author has to be \emph{able} to make that judgement, and in this run
+nobody ever was: the \texttt{failures} table has zero rows, no rank was declared failed,
+and by the time the degrade path fired the group had been gone for 3{,}412\,s. The
+mitigation primitives exist and the paper's fault table shows them working; what is
+missing is the trigger, and the trigger is the part only the runtime can see. That is the
+line I would draw.
+
+One thing I would explicitly \emph{not} recommend: lengthening the collective timeout to
+match the broker's. It repairs the ordering and is exactly backwards --- it would have
+turned a two-hour failure into a four-hour one, and it inverts the design intent, which is
+that a collective should fail fast and leave the decision to a supervisor.
 
 \subsection{The incomplete reduce is not a cost-model disagreement}
 \label{sec:notamodelfailure}
