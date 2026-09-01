@@ -58,6 +58,8 @@ experiments/           E0 microbenchmarks, E1 translation, corpus, scoring
 runs/                  committed run artifacts: prompts, per-rank output, traces
 research/              four scholarly dossiers and their bibliographies
 paper/                 the paper; every number is a macro generated from run data
+runs/*/analysis/       generated per-run metrics and static trace figures
+viz/                   read-only Jumpshot-style interactive trace explorer
 ```
 
 ## Quick start
@@ -127,6 +129,23 @@ make bench         # E0 microbenchmarks; fits alpha and beta per device
 make paper         # regenerate macros from run data, then build the PDF
 make check         # lint, plus verify the PDF matches its sources
 ```
+
+Analyze any completed run directly from its append-only event log:
+
+```bash
+.venv/bin/pip install -e '.[plots]'
+.venv/bin/python scripts/analyze_run.py runs/e1-real-p32
+make viz-install && make viz-build
+make viz-api       # then run `make viz-dev` in another terminal
+```
+
+The production Durov experiment is documented in
+[`experiments/e3_durov/`](experiments/e3_durov/README.md). Its importer binds the
+authorized 99-page source checkout to a git commit and per-page hashes without
+copying legacy translations. The harness runs at 16, 32, or 64 durable ranks and
+uses bounded per-page agent calls, evidence-grounded terminology reduction,
+peer review, RMA epochs, compare-and-swap claims, leased locks, barriers,
+broadcasts, and manifest gathers.
 
 The agent experiments need agents. `experiments/launch.py` renders one worker
 prompt per rank and writes a launch plan naming every rank *requested*, before any
