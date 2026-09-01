@@ -8,6 +8,7 @@ import pytest
 
 import agentmpi as ampi
 from agentmpi.constants import BarrierPolicy, FailureClass, RestartPolicy
+from agentmpi.ft import shrink_in_place
 
 
 def test_barrier_proceed_names_the_absentees(tmp_path):
@@ -381,3 +382,50 @@ def test_ordinary_traffic_is_never_marked_orphaned(tmp_path):
     job = ampi.launch(rank_main, size=2, root=root)
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
     assert [e for e in ampi.Fabric(root).events() if e["kind"] == "msg.orphaned"] == []
+
+
+def test_in_place_shrink_reaches_one_generation_across_all_survivors(tmp_path):
+    """Every survivor calls shrink_in_place, so it must converge on one generation.
+
+    The generation was incremented per call. Because each rank runs it independently, seven
+    survivors drove a communicator from generation 0 to 7 and each cached a different value --- and
+    since a collective is keyed on (ctx, generation, epoch, op), the `agree` that followed split
+    into six collectives of one or two voters, none reached quorum, and every rank blocked to the
+    timeout. That was the whole observed cost of the shrink barrier policy.
+    """
+    size = 6
+    dead = 5
+
+    def rank_main(comm):
+        if comm.rank == dead:
+            return "gone"
+        ampi.declare_failed(comm, dead, kind=FailureClass.FAIL_STOP)
+        shrink_in_place(comm, [dead])
+        return comm.generation
+
+    root = tmp_path / "shrink-gen"
+    job = ampi.launch(rank_main, size=size, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+    generations = {o.value for o in job.outcomes if o.rank != dead}
+    assert generations == {1}, f"survivors disagree on the generation: {sorted(generations)}"
+
+    fabric = ampi.Fabric(root)
+    row = fabric.query_one("SELECT generation FROM comms WHERE ctx=0")
+    assert int(row["generation"]) == 1, f"communicator generation is {row['generation']}, not 1"
+
+
+def test_in_place_shrink_is_idempotent(tmp_path):
+    """Calling it twice for the same departure must not advance the generation again."""
+    def rank_main(comm):
+        if comm.rank == 3:
+            return "gone"
+        ampi.declare_failed(comm, 3, kind=FailureClass.FAIL_STOP)
+        shrink_in_place(comm, [3])
+        shrink_in_place(comm, [3])
+        return comm.generation
+
+    root = tmp_path / "shrink-idem"
+    job = ampi.launch(rank_main, size=4, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    assert {o.value for o in job.outcomes if o.rank != 3} == {1}

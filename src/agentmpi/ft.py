@@ -291,6 +291,21 @@ def shrink_in_place(comm: Communicator, absent: Sequence[int]) -> None:
     In-place shrink keeps ``members`` stable and only excludes the dead from
     future collectives, at the cost of leaving holes in the rank space — the
     ``BLANK`` mode of FT-MPI rather than its ``SHRINK`` mode.
+
+    Every survivor calls this, so it must be idempotent.  The generation is therefore *derived*
+    from membership --- the number of members excluded so far --- rather than incremented.  An
+    increment is not idempotent, and because each rank runs it independently, seven survivors drove
+    one communicator's generation from 0 to 7 and each cached a different value.  That is not a
+    cosmetic inconsistency: ``_record_collective`` keys a collective on
+    ``(ctx, generation, epoch, op)``, so the ``agree`` that followed split into six separate
+    collectives of one or two voters each, none reached quorum, and all seven ranks blocked until
+    the timeout --- the shrink policy's entire 60-second cost, plus seven spurious failure
+    declarations naming healthy ranks.  ``_itag`` also embeds the generation in every internal
+    message tag, so any message-passing collective after an in-place shrink would have broken the
+    same way and less legibly.
+
+    Membership updates were already idempotent; only the version was not.  Deriving it makes every
+    survivor compute the same number in any order, and makes a repeated call a no-op.
     """
     wranks = [comm.wrank(a) for a in absent]
     with comm.fabric.write() as cur:
@@ -300,8 +315,21 @@ def shrink_in_place(comm: Communicator, absent: Sequence[int]) -> None:
                 "UPDATE ranks SET state=? WHERE rank=? AND state!=?",
                 (RankState.EXCLUDED.value, w, RankState.FINALIZED.value),
             )
-        cur.execute("UPDATE comms SET generation = generation + 1 WHERE ctx=?", (comm.ctx,))
-        comm.fabric.emit("ft.shrink_in_place", rank=comm.rt.wrank, ctx=comm.ctx, cur=cur, excluded=list(absent))
+        n_excluded = cur.execute(
+            "SELECT COUNT(*) AS n FROM comm_members WHERE ctx=? AND state='failed'", (comm.ctx,)
+        ).fetchone()["n"]
+        cur.execute(
+            "UPDATE comms SET generation=? WHERE ctx=? AND generation<?",
+            (int(n_excluded), comm.ctx, int(n_excluded)),
+        )
+        comm.fabric.emit(
+            "ft.shrink_in_place",
+            rank=comm.rt.wrank,
+            ctx=comm.ctx,
+            cur=cur,
+            excluded=list(absent),
+            generation=int(n_excluded),
+        )
     comm.refresh()
 
 

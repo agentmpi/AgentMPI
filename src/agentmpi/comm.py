@@ -642,6 +642,22 @@ class Communicator:
         row = self.fabric.query_one("SELECT unexpected_limit FROM ranks WHERE rank=?", (wdst,))
         limit = int(row["unexpected_limit"]) if row else self.rt.unexpected_limit
         if n_tokens > limit:
+            # Recorded before raising. The branch below this one emits both `transport.credit_stall`
+            # and `transport.credit_granted`, so a *stall* was traceable while an outright refusal
+            # was not --- and a refusal is the harder failure. Two transport-sweep runs in which all
+            # eight ranks raised this were recorded as `ok: true` with no failed ranks, and rendered
+            # in the viewer as FAILURES 0 with every rank finalized: the only evidence they had
+            # failed lived outside the trace entirely. A harness can catch the exception and decline
+            # to report it, but it cannot log what the library never emitted.
+            self.fabric.emit(
+                "transport.credit_refused",
+                rank=self.rt.wrank,
+                ctx=self.ctx,
+                dst=dest,
+                wdst=wdst,
+                tokens=n_tokens,
+                limit=limit,
+            )
             raise AmpiContextOverflow(
                 "single eager payload exceeds destination unexpected-message budget; use mode=rendezvous",
                 tokens=n_tokens,

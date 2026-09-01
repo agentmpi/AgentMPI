@@ -53,6 +53,7 @@ TROUBLE_KINDS = (
     "agent.contract_violation",
     "transport.credit_stall",
     "msg.orphaned",
+    "transport.credit_refused",
     "harness.degraded",
     "ft.declare_failed",
     "ft.agree_timeout",

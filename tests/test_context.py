@@ -282,3 +282,39 @@ def test_deferred_never_exceeds_sent_when_nothing_is_admitted(tmp_path):
 
     totals = job.totals()
     assert totals["tokens_deferred"] <= totals["tokens_sent"], totals
+
+
+def test_a_refused_eager_payload_is_recorded_in_the_trace(tmp_path):
+    """An outright refusal must be traceable, not only a stall.
+
+    The credit-polling branch emitted `transport.credit_stall` and `transport.credit_granted`, so a
+    stall was visible while a refusal --- the harder failure --- was not. Two transport-sweep runs in
+    which all eight ranks raised `ERR_CONTEXT_OVERFLOW` were recorded as `ok: true` with no failed
+    ranks and rendered as FAILURES 0 in the viewer; the only evidence they had failed lived outside
+    the trace. A harness can catch the exception and decline to report it, but it cannot log what
+    the library never emitted.
+    """
+    payload = _big(4000)
+
+    def rank_main(comm):
+        if comm.rank == 0:
+            try:
+                comm.send(payload, 1, "toobig", mode=Mode.EAGER, timeout=5.0)
+            except ampi.AmpiContextOverflow:
+                return "refused"
+            return "delivered"
+        return "idle"
+
+    root = tmp_path / "refused"
+    job = ampi.launch(rank_main, size=2, root=root, unexpected_limit=256)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    assert job.value(0) == "refused", "the payload should have exceeded the unexpected budget"
+
+    events = ampi.Fabric(root).events()
+    refusals = [e for e in events if e["kind"] == "transport.credit_refused"]
+    assert len(refusals) == 1, [e["kind"] for e in events]
+    p = refusals[0]["payload"]
+    assert p["tokens"] > p["limit"], p
+    assert p["wdst"] == 1
+    # The refusal must not have created a message.
+    assert [e for e in events if e["kind"] == "msg.send"] == []
