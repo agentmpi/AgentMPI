@@ -56,7 +56,10 @@ prompts capped at 180,000 characters. Relevant controls are:
   a fresh task identity up to `--max-restarts`; `fail-rank` makes the first
   failure terminal. Exhausted work explicitly kills that rank, allowing
   quorum-aware collectives and the surviving-rank review ring to continue.
-- `--ctx-budget`, `--research-chars`, and `--max-prompt-chars` for hard bounds.
+- `--ctx-budget`, `--research-chars`, `--arbitration-evidence-chars`, and
+  `--max-prompt-chars` for hard bounds. Arbitration receives only compact
+  research excerpts that mention an actually lifted conflict; the full
+  population dossier is never inlined at the root.
 
 `stub` is a deterministic protocol fixture, not a translation or quality model.
 It is locked behind both `--executor stub` and `--test-stub` and should only be

@@ -165,6 +165,33 @@ The rulings object must contain exactly the conflict keys.
     return _bounded_prompt(prompt, max_chars)
 
 
+def _select_arbitration_evidence(
+    conflicts: dict[str, list[Any]],
+    proposals: list[dict[str, Any]],
+    budget_chars: int,
+) -> list[dict[str, Any]]:
+    """Keep only compact evidence mentioning a lifted conflict key."""
+    keys = [key.casefold() for key in conflicts]
+    selected: list[dict[str, Any]] = []
+    used = 0
+    for proposal in proposals:
+        searchable = _dump(proposal).casefold()
+        if not any(key in searchable for key in keys):
+            continue
+        compact = {
+            "topic": str(proposal.get("topic", ""))[:240],
+            "recommendation": str(proposal.get("recommendation", ""))[:600],
+            "url": str(proposal.get("url", ""))[:500],
+            "evidence": str(proposal.get("evidence", ""))[:1000],
+        }
+        encoded = _dump(compact)
+        if used + len(encoded) > budget_chars:
+            continue
+        selected.append(compact)
+        used += len(encoded)
+    return selected
+
+
 def review_prompt(
     target: dict[str, Any],
     reviewer_rank: int,
@@ -467,6 +494,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--ctx-budget", type=int, default=100_000)
     parser.add_argument("--research-chars", type=int, default=12_000)
+    parser.add_argument("--arbitration-evidence-chars", type=int, default=60_000)
     parser.add_argument("--max-prompt-chars", type=int, default=180_000)
     parser.add_argument("--task-timeout", type=float, default=3600.0)
     parser.add_argument("--phase-timeout", type=float, default=5400.0)
@@ -491,6 +519,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         raise ValueError("--executor stub is test-only and requires --test-stub")
     if not 1 <= args.executors <= args.size:
         raise ValueError("--executors must be between 1 and --size")
+    if args.arbitration_evidence_chars <= 0:
+        raise ValueError("--arbitration-evidence-chars must be positive")
     corpus_path = args.source_dir / args.corpus
     corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
     if corpus.get("schema") != "ampi.durov-corpus/v1" or len(corpus.get("pages", [])) != 99:
@@ -561,6 +591,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "bounds": {
             "context_tokens_per_rank": args.ctx_budget,
             "research_chars": args.research_chars,
+            "arbitration_evidence_chars": args.arbitration_evidence_chars,
             "max_prompt_chars": args.max_prompt_chars,
             "contracts": contracts,
         },
@@ -638,6 +669,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     for contribution in evidence.get("bodies", [])
                     for proposal in contribution["body"]
                 ]
+                proposals = _select_arbitration_evidence(
+                    conflicts,
+                    proposals,
+                    args.arbitration_evidence_chars,
+                )
                 arbitration_task = Task(
                     aid=new_aid(),
                     rank=rank,

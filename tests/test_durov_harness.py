@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 
 from ampi.analysis import analyse_path
-from experiments.e3_durov.harness import SUPPORTED_RANKS, build_parser, main
+from experiments.e3_durov.harness import (
+    SUPPORTED_RANKS,
+    _select_arbitration_evidence,
+    build_parser,
+    main,
+)
 from experiments.e3_durov.prepare_corpus import RESEARCH_FILES, _public_repo_url, prepare_corpus
 from experiments.e3_durov.summarize import summarize
 
@@ -108,6 +113,30 @@ def test_provenance_strips_credentials_from_https_remotes() -> None:
     assert _public_repo_url("git@github.com:example/project.git") == (
         "git@github.com:example/project.git"
     )
+
+
+def test_arbitration_evidence_is_relevant_and_hard_bounded() -> None:
+    conflicts = {"ботаник": [{"en": "nerd"}, {"en": "geek"}]}
+    proposals = [
+        {
+            "topic": "ботаник",
+            "recommendation": "Use geek in this school context.",
+            "url": "https://example.com/relevant",
+            "evidence": "x" * 5000,
+        },
+        {
+            "topic": "unrelated",
+            "recommendation": "Ignore",
+            "url": "https://example.com/unrelated",
+            "evidence": "not about the conflict",
+        },
+    ]
+
+    selected = _select_arbitration_evidence(conflicts, proposals, 2000)
+
+    assert len(selected) == 1
+    assert selected[0]["url"].endswith("/relevant")
+    assert len(json.dumps(selected, ensure_ascii=False)) <= 2000
 
 
 def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Path) -> None:
