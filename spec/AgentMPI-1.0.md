@@ -1282,7 +1282,9 @@ A conforming binding for LLM executors SHOULD:
 * be idempotent by default: labelled collectives, idempotency on sends, resumable
   blocking calls;
 * provide the protocol manual as a command, so an executor can re-read it;
-* **print only commands that exist.**
+* **print only commands that exist**, and accept the command a caller will
+  actually write. Identity flags SHOULD be accepted both before and after a
+  subcommand.
 * offer a way to move a payload to disk *without* charging context, on every
   operation that hands back a payload.
 
@@ -1292,6 +1294,22 @@ A conforming binding for LLM executors SHOULD:
 > blocked behind them. A binding that prints a command an agent cannot copy-paste
 > is worse than one that prints nothing. An implementation SHOULD test this
 > mechanically by walking every emitted command string through its own parser.
+>
+> The rule has two corollaries we learned the second time round, at greater cost.
+> First, *the bootstrap prompt is a command the binding prints*: ours placed the
+> identity flags before the subcommand, where a reader expects a global option and
+> where our parser did not accept them, and roughly thirty executors each lost
+> their first call to `invalid choice`. The mechanical check must cover the prompt,
+> not only the runtime's own output. Second, a binding whose flags are
+> positional-by-subparser will be got wrong by everyone; accepting both orders
+> costs four lines.
+>
+> A third, sharper one. **Any guard the binding leaves out of a printed command is
+> a guard that is only present when the agent thinks of it.** Our emitted `submit`
+> command omitted `--expect-rank`; the executors who noticed added it by hand and
+> the ones who did not, did not have it. Handing over the exact command is
+> supposed to require recognition rather than recall, and a command missing its
+> own safety check does not.
 
 ### S14.2 The conformance suite
 

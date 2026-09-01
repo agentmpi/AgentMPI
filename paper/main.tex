@@ -729,35 +729,63 @@ it, a rank whose executor never starts has no lease to expire, so it is neither
 alive nor failed and every peer waits for it forever. With it, a launcher that can
 start six of twenty-two ranks produces sixteen detectable no-shows.
 
-\subsection{Two identities, one of them checked}
+\subsection{Two identities, and the one we thought was checked}
 \label{sec:identity}
 
-Two identities travel with every task in these experiments, and the difference
-between them is the cleanest result the hundred-rank run produced.
+Two identities travel with every task in these experiments. The \emph{protocol
+identity} is the rank an operation acts as, which the binding lets a caller assert
+with \code{--expect-rank}. The \emph{provenance label} is an environment variable
+we added so that a scale claim would have per-executor evidence; it is outside the
+protocol and nothing checks it.
 
-The \emph{protocol identity} is the rank an operation acts as. It is ambient, and
-every command asserts it: \code{--rank N --expect-rank N}, refused before taking
-effect if the ambient rank disagrees, and re-checked by the broker on submit. The
-\emph{provenance label} is an environment variable we added for this evaluation so
-that a scale claim would have per-executor evidence. It is outside the protocol.
-Nothing checks it.
+On a host where shell sessions are shared between concurrently running agents,
+both drifted. Across \provTasks\ tasks and \provExecutors\ executors the
+provenance label was wrong on \provDrift\ of them (\provDriftPct\%). In every run
+with one executor per rank, and in the $p=\eLargeP$ runs at oversubscription
+four, it drifted \provSmallDrift\ times.
 
-On a host where shell sessions are shared between concurrently running agents, one
-drifted and the other did not. In a hundred-rank run that did not finish (see
-below), across \provTasks\ tasks and \provExecutors\ executors the provenance
-label was wrong on \provDrift\ of them (\provDriftPct\%); the protocol identity
-was refused exactly \provRefused\ time, and on that occasion the executor
-abandoned the task with an accurate reason --- ``claimed via shared-shell env
-clobber; rank 90 is not served by executor rank 9'' --- instead of submitting
-another rank's work as its own. In every run with one executor per rank, and in
-the $p=\eLargeP$ runs at oversubscription four, the label drifted
-\provSmallDrift\ times.
+We first reported that the protocol identity held because it was asserted. That
+was wrong, and two executors told us so. One wrote: ``the \code{next} call carried
+\code{--expect-rank 3} and still returned rank 2's identity.'' Another diagnosed
+it exactly: ``the guard didn't fire because the clobber replaced \code{--rank} and
+\code{--expect-rank} \emph{together}.'' Both are right, for two independent
+reasons, and the reasons are more useful than the claim we had made.
 
-Every task that completed did so under a correct protocol identity, and that is
-true \emph{because} of the submit check rather than in spite of the drift. This is
-the argument of \S\ref{sec:design} for making ambient identity assertable, stated
-as a measurement: what the protocol checks stayed correct, and what it does not
-check did not.
+\paragraph{The implementation defect.} The assertion was wired into the library
+API and into the ordinary CLI operations, and \emph{not} into the \code{worker}
+subcommand --- the only surface any executor in these experiments ever touched.
+The conformance suite covered the paths we had thought about. What actually caught
+the one misroute that was caught was a different and weaker mechanism: the
+broker's check that a submitted task belongs to a rank the caller serves. That
+check is a serve-set membership test, not an identity assertion, and it fires only
+at submit, after the work is done.
+
+\paragraph{The design defect, which is the interesting one.} An assertion compares
+two values the caller supplies. A corruption that rewrites \emph{both} the acting
+rank and the assertion leaves them consistent, so the check passes and the
+operation acts as somebody else. No amount of asserting fixes this, because the
+assertion is made of the same material as the thing it asserts about.
+
+The mechanism that does fix it was already in the specification and already
+implemented: a per-rank \emph{launch token}, issued by the launcher and recorded
+in the job, which cannot be made self-consistent by an accident of the
+environment. We had the mechanism and not the property, because the path that
+needed it did not call it.
+
+\paragraph{What the executors did instead.} Both misrouted claims were handled
+correctly, by agent judgement rather than by the protocol. One executor abandoned
+its task with an accurate reason. The other declined even to abandon it,
+reasoning that \code{give-up} would also have acted as the wrong rank and would
+have discarded another executor's work, and let the claim lease-expire instead ---
+which the broker requeued, and its rightful server completed. That is a better
+decision than the protocol was in a position to enforce, and we would rather not
+have to rely on it.
+
+All four defects are fixed and regression-tested: identity is asserted on the
+worker path, the emitted \code{submit} and \code{give-up} commands carry
+\code{--expect-rank} rather than leaving it to the agent to remember, and the
+identity flags are accepted on either side of the subcommand. The last of those
+is its own lesson (\S\ref{sec:lessons}).
 
 \section{What only real agents exposed}
 \label{sec:lessons}
@@ -786,7 +814,15 @@ because its consumer is a reader; an operand may not, because its consumer is a
 function. Agents handed JSON clipped mid-string invented recovery hacks, one
 prefix-matching the content-addressed store by hand.
 
-\item \textbf{Print only commands that exist.}
+\item \textbf{Print only commands that exist} --- including the bootstrap
+prompt, which is also a command the binding prints. Ours placed the identity flags
+before the subcommand, where a reader expects a global option and where our parser
+rejected them, and roughly thirty executors each lost their first call to
+\code{invalid choice}. Our mechanical check walked the strings the runtime emits
+and not the prompt every executor reads first. And any guard left out of a printed
+command is a guard that is present only when the agent thinks of it: the emitted
+\code{submit} omitted \code{--expect-rank}, and exactly the executors who noticed
+had it.
 
 \item \textbf{Give every payload a free path to disk.} Agents that lacked one
 reached into the object store directly rather than pay to see what was already a

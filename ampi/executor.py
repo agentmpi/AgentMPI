@@ -300,13 +300,20 @@ class BrokerExecutor:
                     "prompt_file": rec["prompt_file"],
                     "result_file": rec["result_file"],
                     "contract": rec.get("contract"),
+                    # --expect-rank is in the printed command, not left to the
+                    # agent to remember.  Every executor that noticed its absence
+                    # added it by hand; the ones that did not, did not have it.  A
+                    # guard an agent must think of is a guard that is sometimes
+                    # absent, and the whole argument for handing over the exact
+                    # command is that it should require recognition, not recall.
                     "submit": (
                         f"ampi worker --campaign {campaign} --rank {rank} "
-                        f"--job-root {root} submit --aid {rec['aid']}"
+                        f"--expect-rank {rank} --job-root {root} submit --aid {rec['aid']}"
                     ),
                     "give_up": (
                         f"ampi worker --campaign {campaign} --rank {rank} "
-                        f"--job-root {root} give-up --aid {rec['aid']} --reason 'WHY'"
+                        f"--expect-rank {rank} --job-root {root} "
+                        f"give-up --aid {rec['aid']} --reason 'WHY'"
                     ),
                     "check_size": (
                         f"ampi tokens --file {rec['result_file']} --limit "

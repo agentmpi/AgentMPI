@@ -137,11 +137,17 @@ WHEN SOMETHING IS WRONG
 
 
 def _common(p: argparse.ArgumentParser) -> None:
-    p.add_argument("--rank", type=int, default=None, help="acting rank (default: $AMPI_RANK)")
-    p.add_argument("--job-root", default=None, help="job directory (default: $AMPI_ROOT)")
-    p.add_argument("--expect-rank", type=int, default=None,
+    # SUPPRESS, not None: argparse applies a subparser's defaults *after* parsing
+    # the top-level options, so a concrete default here would silently overwrite a
+    # --rank given before the subcommand and reintroduce the bug this fixes.
+    p.add_argument("--rank", type=int, default=argparse.SUPPRESS,
+                   help="acting rank (default: $AMPI_RANK)")
+    p.add_argument("--job-root", default=argparse.SUPPRESS,
+                   help="job directory (default: $AMPI_ROOT)")
+    p.add_argument("--expect-rank", type=int, default=argparse.SUPPRESS,
                    help="fail before acting if the ambient rank differs")
-    p.add_argument("--expect-job", default=None, help="fail before acting if the job id differs")
+    p.add_argument("--expect-job", default=argparse.SUPPRESS,
+                   help="fail before acting if the job id differs")
     p.add_argument("--comm", default="world", help="communicator name")
     p.add_argument("--compact", action="store_true", help="single-line JSON")
 
@@ -167,6 +173,21 @@ def _take(p: argparse.ArgumentParser) -> None:
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser("ampi", description="AgentMPI command binding")
     ap.add_argument("--version", action="version", version=f"AgentMPI {PROTOCOL_VERSION}")
+    # The identity flags are accepted *before* the subcommand as well as after it.
+    # Every executor in the hundred-rank run wrote them before, because that is
+    # where a reader expects a global option, and every one of them lost its first
+    # call to "invalid choice: /workspace/runs/.../job".  The specification says a
+    # binding must print only commands that exist; the corollary, learned here, is
+    # that a binding whose identity flags are positional will be got wrong by
+    # everyone.  Defaults are SUPPRESS so that a value given after the subcommand
+    # is not silently overwritten by the global default.
+    for flag, kw in (
+        ("--rank", {"type": int}),
+        ("--job-root", {}),
+        ("--expect-rank", {"type": int}),
+        ("--expect-job", {}),
+    ):
+        ap.add_argument(flag, default=argparse.SUPPRESS, **kw)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     # -- job and lifecycle -------------------------------------------------
@@ -825,6 +846,12 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
     if cmd == "worker":
         from .executor import BrokerExecutor
 
+        # The worker subcommand is the only surface the agents in our experiments
+        # ever touch, and it skipped this call.  Two executors reported that
+        # --expect-rank did not protect them and they were right: the assertion
+        # was wired into the library API and the ordinary CLI operations, and not
+        # into the one path that mattered.
+        amp.assert_identity()
         serve = [int(x) for x in a.serve.split(",") if x.strip()] if a.serve else []
         if a.workercmd == "next":
             return (BrokerExecutor.next_task(amp, a.campaign, amp.rank, timeout=a.timeout,
