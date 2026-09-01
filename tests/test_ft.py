@@ -128,16 +128,42 @@ def test_agree_reaches_a_consistent_decision(tmp_path):
 
 
 def test_agree_excludes_failed_ranks(tmp_path):
+    """``agree`` must reach a decision over the survivors once a rank is known failed.
+
+    Ranks 1 and 2 wait for the declaration to become visible before voting. Without that they
+    race rank 0: whichever of them enters ``agree`` first may still see rank 3 as live, wait for
+    a vote that never comes, and return False on timeout --- so the test failed intermittently for
+    a reason that had nothing to do with what it was checking. The wait makes the precondition
+    explicit rather than assumed, which is the difference between testing ``agree`` and testing
+    the scheduler.
+
+    The wait is on the ``failures`` table via ``get_failed``, not on the rank's state, because
+    ``declare_failed`` will not overwrite a ``finalized`` state --- and rank 3 here returns
+    immediately, so it usually *has* finalized by then. Polling the state would therefore hang on
+    a condition that never becomes true even though the declaration succeeded, which is a neat
+    illustration of why the two are recorded separately: the failure record is the communicator's
+    view of a peer, and the rank state is that peer's own lifecycle.
+    """
+    failed_rank = 3
+
     def rank_main(comm):
-        if comm.rank == 3:
+        if comm.rank == failed_rank:
             return "gone"
         if comm.rank == 0:
-            ampi.declare_failed(comm, 3, kind=FailureClass.FAIL_STOP)
+            ampi.declare_failed(comm, failed_rank, kind=FailureClass.FAIL_STOP)
+        else:
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                if failed_rank in ampi.get_failed(comm):
+                    break
+                time.sleep(0.02)
+            else:
+                raise AssertionError("the failure declaration never became visible")
         return ampi.agree(comm, True, timeout=15.0)
 
     job = ampi.launch(rank_main, size=4, root=tmp_path / "ag2")
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
-    assert all(o.value is True for o in job.outcomes if o.rank != 3)
+    assert all(o.value is True for o in job.outcomes if o.rank != failed_rank)
 
 
 def test_health_detects_lease_expiry(tmp_path):
@@ -297,3 +323,61 @@ def test_registration_inside_the_world_still_reattaches(tmp_path):
     again.register(executor_name="worker")
     row = fabric.query_one("SELECT incarnation FROM ranks WHERE rank=1")
     assert int(row["incarnation"]) > 1, "reattaching must bump the incarnation"
+
+
+def test_a_send_to_a_dead_rank_is_recorded_as_orphaned(tmp_path):
+    """A message nobody will ever read must be visible as such in the trace.
+
+    This is the p=16 translation failure in miniature. Three ranks whose agents never arrived
+    eventually produced degraded contributions and sent them into the mailboxes of peers that had
+    abandoned the collective 3412 s earlier. The sends succeeded, the messages were never received,
+    and nothing in the log said so -- the fact had to be recovered by differencing 27 sends against
+    24 receives and rebuilding the reduction tree by hand.
+
+    The condition is cheap and entirely local: at delivery time the fabric knows the destination's
+    state. It needs no reasoning about timeouts or configuration, and it generalises past this
+    cause, because any degraded contribution can arrive after its group has moved on.
+    """
+    def rank_main(comm):
+        if comm.rank == 1:
+            return "left early"
+        # Wait until rank 1 has finalised, then send to it anyway.
+        deadline = time.time() + 15.0
+        while time.time() < deadline:
+            row = comm.fabric.query_one("SELECT state FROM ranks WHERE rank=1")
+            if row is not None and row["state"] == "finalized":
+                break
+            time.sleep(0.02)
+        else:
+            raise AssertionError("rank 1 never finalised")
+        comm.send("too late", 1, "late")
+        return "sent"
+
+    root = tmp_path / "orphan"
+    job = ampi.launch(rank_main, size=2, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+    events = ampi.Fabric(root).events()
+    orphans = [e for e in events if e["kind"] == "msg.orphaned"]
+    assert len(orphans) == 1, [e["kind"] for e in events]
+    payload = orphans[0]["payload"]
+    assert payload["wdst"] == 1
+    assert payload["dst_state"] == "finalized"
+    assert payload["tag"] == "late"
+    assert payload["tokens"] > 0
+
+
+def test_ordinary_traffic_is_never_marked_orphaned(tmp_path):
+    """The detector must not fire on a healthy run, or it is noise rather than a signal."""
+    def rank_main(comm):
+        if comm.rank == 0:
+            comm.send("hello", 1, "greet")
+        else:
+            assert comm.recv(source=0, tag="greet", timeout=15.0).payload == "hello"
+        comm.barrier(policy="wait")
+        return True
+
+    root = tmp_path / "healthy"
+    job = ampi.launch(rank_main, size=2, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    assert [e for e in ampi.Fabric(root).events() if e["kind"] == "msg.orphaned"] == []

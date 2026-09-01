@@ -94,6 +94,16 @@ class CostParams:
     n_samples: int = 0
     alpha_p50: float = 0.0
     alpha_p99: float = 0.0
+    #: How ``alpha_s`` and ``beta_s_per_token`` were obtained.  ``least_squares`` is a real fit;
+    #: ``median_fallback`` means the regression produced a negative slope or intercept and robust
+    #: medians were substituted; ``median_only`` means there were too few distinct output sizes to
+    #: fit at all; ``default`` means no invocations were observed.  Reported because a fit and a
+    #: fallback are not interchangeable, and a run with broker contention silently produces the
+    #: latter --- the queue wait enters the latency but not the token count, so the relationship the
+    #: regression is looking for is not in the data.
+    fit_method: str = "default"
+    #: The slope the regression produced when it was rejected, for diagnosis.
+    fit_rejected_beta: float | None = None
 
     def message_time(self, n_tokens: int) -> float:
         return self.alpha_s + n_tokens * self.beta_s_per_token
@@ -117,6 +127,10 @@ class CostParams:
             "n_samples": self.n_samples,
             "alpha_p50": round(self.alpha_p50, 3),
             "alpha_p99": round(self.alpha_p99, 3),
+            "fit_method": self.fit_method,
+            "fit_rejected_beta": (
+                round(self.fit_rejected_beta, 6) if self.fit_rejected_beta is not None else None
+            ),
         }
 
 
@@ -161,14 +175,26 @@ def calibrate(
         # A negative slope or intercept is a fit artefact of a narrow token
         # range; fall back to the robust decomposition rather than emit a
         # nonsensical model.
+        #
+        # Which branch was taken is recorded, because the two are not
+        # interchangeable and nothing previously distinguished them.  On the
+        # semantic-glossary run the regression returned β = −0.108 s/token --- the
+        # longest broker queue waits landed on the smallest-output calls --- so the
+        # published α and β were the median fallback rather than a fit at all, and
+        # a reader had no way to tell.  The guard prevented a nonsensical model; it
+        # did not make the reported numbers a regression.
         if beta > 0 and alpha > 0:
             params.beta_s_per_token = beta
             params.alpha_s = alpha
+            params.fit_method = "least_squares"
         else:
             params.alpha_s = statistics.median(ys)
             params.beta_s_per_token = max(1e-6, (statistics.median(ys) / max(1.0, statistics.median(xs))) / 2)
+            params.fit_method = "median_fallback"
+            params.fit_rejected_beta = beta
     elif ys:
         params.alpha_s = statistics.median(ys)
+        params.fit_method = "median_only"
     if ys:
         params.alpha_p50 = statistics.median(ys)
         params.alpha_p99 = sorted(ys)[max(0, int(0.99 * (len(ys) - 1)))]

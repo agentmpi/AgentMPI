@@ -52,6 +52,7 @@ TROUBLE_KINDS = (
     "broker.reclaim",
     "agent.contract_violation",
     "transport.credit_stall",
+    "msg.orphaned",
     "harness.degraded",
     "ft.declare_failed",
     "ft.agree_timeout",

@@ -14,25 +14,134 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the extreme corner of a ten-cell transport sweep and its single strongest
+result. Eight agent-free ranks ring-exchange a 32{,}768-word payload under
+\texttt{Mode.RENDEZVOUS} --- 43{,}116 estimated tokens, which is $1.32\times$ the
+entire 32{,}768-token context budget of the rank receiving it. The run completed: 34
+events, 0.08\,s, all eight messages delivered, zero admissions, a context high water
+of zero and 0\% occupancy on every rank, with 344{,}928 tokens deferred. A payload
+larger than a receiver's whole context window crossed the ring without occupying any
+of it. The eager cell at the same size produced 18 events, no messages and
+\texttt{ERR\_CONTEXT\_OVERFLOW} on all eight ranks, and it is over both limits at
+once: $10.5\times$ the 4{,}096-token unexpected-message credit that actually refused
+it, and $1.32\times$ the context budget, so it could not have succeeded under any
+credit setting. That asymmetry is the whole of AgentMPI's context-safety claim in one
+pair of runs, and this is the half that works.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} shows eight lanes with two grey lifecycle diamonds and two
+green message ticks each and no bars, which is a property of an agent-free benchmark:
+the executor is \texttt{none} on all eight ranks, there were zero agent calls, and no
+\texttt{task.*} event was emitted, so ``idle fraction 100.0\%'' and ``achieved
+parallelism 0.00$\times$'' say that no rank held a task rather than that ranks
+waited. This is the longest-spanning run in the sweep at 75\,ms, with a 55\,ms rank
+start-up window and receive latencies of 37\,ms median and 53\,ms maximum, an order
+of magnitude above the 2.5\,ms median at 128 words. None of that is the payload
+arriving: a rendezvous receive transfers nothing, and it is the ring's own ordering
+that inflates the figure. Every rank sends before it receives, and
+\texttt{Communicator.send} calls \texttt{fabric.blobs.put} before it does anything
+else, so each rank writes 163{,}840 bytes to the content store before it looks in its
+mailbox --- and that write sits inside the latency of the message already waiting
+there. The eager cell at this size, which sent nothing at all, spans 70\,ms for the
+same reason: its blob was written and only then was the send refused. Wall time in
+this sweep tracks bytes into the content store, not transport mode.
+
+Figure~\ref{fig:comm} shows the ring as one off-diagonal band of 43{,}116 tokens per
+edge, rank $r$ to rank $(r{+}1) \bmod 8$. The eager cell at this size has no such
+figure, because there is no traffic to plot. The row that carries the result is in
+the rank health table: 0\% context occupancy on all eight ranks, with every
+\texttt{msg.recv} recording \texttt{admitted: false} and \texttt{admitted\_tokens: 0}
+against \texttt{tokens: 43116}, and every \texttt{rank.finalize} recording
+\texttt{admissions: 0}, \texttt{n\_items: 0}, \texttt{high\_water: 0}, \texttt{used:
+0}. The stats row reads \texttt{TOKENS DEFERRED 344.9k}. Set against the eager
+column, where occupancy climbs 1\%, 2\%, 8\% across 128, 512 and 2{,}048 words and
+then stops because the runs stop, the rendezvous column is a flat zero from 128 words
+to 32{,}768 --- a factor of 256 in payload with no change in the receiver's context
+at all.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+By construction: the ring, eight ranks, one send and one receive each, and the mode.
+Note that the mode here is what AgentMPI would have chosen unprompted. Every
+\texttt{rank.init} records \texttt{eager\_limit: 1000000000}, disabling
+\texttt{\_choose\_mode}'s threshold, but the shipped default is
+\texttt{DEFAULT\_EAGER\_LIMIT} = 2048 tokens and this payload is 43{,}116, so the
+library's own policy is rendezvous by a factor of twenty-one. The eager cell at this
+size is the harness overriding that policy, and the override does not merely
+under-perform --- it cannot work.
+
+The reason it cannot work is the point of this cell, and it is a stronger statement
+than the one available one size down. At 8{,}192 words the eager payload is 10{,}779
+tokens: over the 4{,}096-token unexpected-message credit but comfortably inside the
+32{,}768-token context budget, so that pair isolates a flow-control ceiling and shows
+AgentMPI refusing a message the receiver could actually have held. Here the payload
+is 43{,}116 tokens, which exceeds the receiver's entire context window. Even with
+unlimited eager credit the exchange is impossible: the message would have arrived,
+\texttt{\_deliver} would have called \texttt{rt.admit}, and
+\texttt{ContextAccount.admit} would have found \texttt{would\_fit} false against a
+budget of 32{,}768 with \texttt{strict\_context} true, failing with
+\texttt{ERR\_TRUNCATE} instead of \texttt{ERR\_CONTEXT\_OVERFLOW}. There is no
+configuration of the eager path that delivers this payload, because eager's contract
+is that the payload enters the receiver's context and the payload does not fit. And
+yet the artefact moved: all eight envelopes were delivered, the blob
+\texttt{04af1d57ed51} sits in the fabric at its full 163{,}840 bytes, byte-identical
+to the one the failed eager run wrote, and any receiver could have called
+\texttt{fetch} with a \texttt{View} to take a projection of it that did fit. This is
+what \texttt{comm.py} means when it says MPI hides the eager/rendezvous choice because
+both modes deliver the same bytes while AgentMPI exposes it because they do not have
+the same effect on the receiving agent's context. The bytes were the same in both runs.
+The effect was total.
+
+The deferred figure needs a correction, and this cell shows it at its largest.
+\texttt{metrics.json} reports 344{,}928, which is $8 \times 43{,}116$: one rendezvous
+send per rank, exactly equal to \texttt{tokens sent}, as it must be when every message
+is rendezvous, and $4.00\times$ the 8{,}192-word cell for $4\times$ the payload. The
+results file records 689{,}856, and the per-rank events say why ---
+\texttt{tokens\_deferred: 86232} against \texttt{tokens\_sent: 43116}, a rank
+deferring twice what it sent, which is impossible for a quantity documented as a
+subset of transmitted traffic. Until commit \texttt{0fea51d2},
+\texttt{RankCost.tokens\_deferred} accumulated on rendezvous sends and on every
+non-admitted receive alike, so each rank charged its own send and its predecessor's
+arrival to one counter. The fix separated \texttt{tokens\_deferred} (send-side,
+rendezvous only) from \texttt{tokens\_unadmitted} (receive-side, transport-agnostic),
+under which this run reports 344{,}928 of each. \texttt{cost.summarise} reconstructs
+from the log and was always correct, so the viewer and \texttt{metrics.json} already
+show the right number; only the archived results carry the doubled one. The fix's
+summary reasons that the paper's transport table is unaffected because the microbench
+admits its receives --- correct for the eager rows, which read zero, and incorrect for
+the rendezvous rows, because \texttt{bench\_transport} passes no \texttt{admit}
+argument and \texttt{\_deliver} defaults it to \texttt{False} for rendezvous. All five
+rendezvous entries in that table are exactly $2\times$ the send-side deferral.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The headline --- 43{,}116 tokens moved into a 32{,}768-token receiver at zero cost ---
+is true and incomplete, and the incompleteness is the main threat. Nothing in this
+sweep calls \texttt{fetch}. The receivers finished holding a digest, a token count, a
+kind and a one-line synopsis of a document none of them read, so what is demonstrated
+is that a large artefact can be \emph{addressed} without consuming context, not that
+it can be \emph{used} without consuming context. A rank that needed the whole thing
+would find it does not fit and would have to project it through a \texttt{View} or
+release something first, and no cell in this sweep exercises either. The claim that
+eager could not have worked at any credit setting is a code-path argument from
+\texttt{rank.py}, not a measurement --- it was not run --- although the arithmetic
+behind it, 43{,}116 against 32{,}768, is not in question. Token counts are estimates:
+provenance records \texttt{tokenizer\_exact: false}, and 43{,}116 is
+$\lceil 163840/3.8 \rfloor$ from a character heuristic applied to one repeated word.
+A real BPE tokeniser would price this text near 32{,}768 tokens, which would put it
+essentially \emph{at} the context budget rather than 32\% above it, weakening the
+second-ceiling argument to a marginal case while leaving the first ceiling --- an
+order of magnitude above the credit either way --- untouched. Both budgets are
+benchmark parameters rather than library defaults (\texttt{unexpected\_limit} 4{,}096
+against a shipped $8\times$ eager limit; \texttt{context\_budget} 32{,}768 against
+128{,}000), so the ratio between payload and window is one the benchmark chose. And
+the executor is \texttt{none} with zero agent calls, so the 0\% occupancy is an entry
+in \texttt{ContextAccount} rather than an observation about a model, while the 75\,ms
+wall time is one sample of eight SQLite-backed rank start-ups and eight 160\,KiB blob
+writes.
 
 \end{document}

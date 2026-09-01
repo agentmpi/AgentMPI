@@ -97,6 +97,18 @@ class RankState(str, enum.Enum):
     EXCLUDED = "excluded"
 
 
+#: States from which a rank will never read its mailbox again.  A message queued for a rank in
+#: one of these is an orphan: the send succeeded and nothing will ever receive it.
+#:
+#: ``IDLE`` is deliberately absent.  An idle rank has released its lease but may be
+#: re-incarnated, and its mailbox survives the gap --- that persistence is the point of a rank
+#: being a durable role rather than a process, and treating a message to an idle rank as lost
+#: would contradict it.
+TERMINAL_RANK_STATES: frozenset[str] = frozenset(
+    {RankState.FINALIZED.value, RankState.FAILED.value, RankState.EXCLUDED.value}
+)
+
+
 class FailureClass(str, enum.Enum):
     """AgentMPI's failure taxonomy (spec section 8).
 

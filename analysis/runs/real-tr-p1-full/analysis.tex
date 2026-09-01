@@ -6,6 +6,9 @@
 \documentclass[11pt]{article}
 \input{../../preamble}
 
+%% Long \texttt{} identifiers in running prose leave little room for the line breaker.
+\emergencystretch=2.5em
+
 \title{\textbf{real-tr-p1-full}\\[2pt]\large An AgentMPI run analysis}
 \author{}
 \date{}
@@ -14,25 +17,401 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the sequential baseline of the parallel book-translation strong-scaling series, and it
+exists to be a denominator. One rank translated all eight sections of the book in 576.74\,s
+using sixteen agent calls. Because the communicator has one member, every collective in the
+harness degenerates: \texttt{scatterv}, both glossary \texttt{allreduce}s, the pre-gather
+\texttt{barrier} and the \texttt{gather} return without sending a message, and the harness's own
+phase timers record 0.000\,s for all four. That makes this the one run in the campaign that
+measures the task without the protocol, and it lets AgentMPI's fixed overhead be measured
+directly rather than inferred. It is 58.585\,s, 10.16\% of the wall clock, and it decomposes
+sharply: 54.473\,s is the broker waiting for a worker process to claim a published task
+(3.405\,s per call), 4.071\,s is the 0.5\,s completion poll aliasing, and everything the
+protocol itself does --- five collective invocations, sixteen content-addressed store writes,
+106 logged events, sixteen contract validations --- accounts for 40.3\,ms, or 0.0070\% of the
+run. The single most important thing to take from this document is that those two numbers should
+never be added together: AgentMPI's coordination machinery costs about 2.5\,ms per agent call,
+and its task-dispatch mechanism costs 3.4\,s per agent call, a ratio of 1{,}360 to one. The
+second most important is a caveat on the curve this run anchors. At $p=1$ the harness skips the
+seam-reconciliation phase entirely, so the baseline performs 16 agent calls where $p=8$ performs
+24 and reconciles none of the book's seven section boundaries where $p=8$ reconciles all seven.
+The denominator is cheaper than the numerators because it is doing less.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is one lane with sixteen blue bars in it and nothing else, and the
+viewer screenshot shows the same picture with seven empty lanes underneath. There is no
+communication to draw: the run logged zero messages, so there are no green ticks anywhere, and
+the collectives panel in the dashboard prints \emph{0} in every numeric column of all four of its
+rows. Figure~\ref{fig:concurrency} is consequently a square wave between one and zero, and
+Figure~\ref{fig:collectives} has no bars at all, because a collective that sends no messages has
+nothing to compare against its closed form.
+
+The interesting structure is therefore not in the bars but in the gaps between them, and they are
+remarkably regular. Each of the sixteen calls follows the same four-event cycle:
+\texttt{broker.enqueue}, \texttt{broker.claim}, \texttt{broker.complete}, \texttt{agent.call}.
+Measuring each interval across all sixteen cycles partitions the wall clock exactly:
+
+\begin{center}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+  interval & seconds & \% of wall & what it is \\
+\midrule
+  \texttt{claim} $\to$ \texttt{complete} & 518.156 & 89.844 & the model working \\
+  \texttt{enqueue} $\to$ \texttt{claim} & 54.473 & 9.445 & waiting for a worker to take the task \\
+  \texttt{complete} $\to$ \texttt{agent.call} & 4.071 & 0.706 & the broker's 0.5\,s completion poll \\
+  everything else & 0.040 & 0.007 & collectives, fabric writes, prompt construction \\
+\midrule
+  wall & 576.741 & 100.000 & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The four rows sum to 576.740 of 576.741\,s; the missing millisecond is the interval between the
+last \texttt{rank.finalize} and \texttt{job.finish}. The 518.156\,s in the first row is exactly
+the \texttt{busy\_s} the headline table reports, and the 89.844\% is its 89.8\% occupancy figure.
+
+Two features of that partition are worth reading off the picture rather than the table. The first
+is that the gaps are all the same size. Fifteen of the sixteen dispatch intervals lie between
+3.086 and 3.923\,s, with a median of 3.465\,s; the sixteenth, the very first, is 1.945\,s, and it
+is short because six worker processes had already registered against the job in the first two
+seconds before any task existed to claim. Every subsequent claim is preceded by a
+\texttt{rank.init} at the same millisecond, at incarnation $n+1$ --- the trace records a fresh
+process attaching to the rank and immediately taking the waiting task. Rank 0 reaches
+incarnation 17. So the uniform gap is not a queue and it is not contention; it is the cost of
+starting a new agent process for every invocation, and at $p=1$ the whole of it lands on the
+critical path because there is nothing else to overlap it with.
+
+The second is that the bars come in two clearly separated sizes, and Figure~\ref{fig:timeline}
+shows the boundary: the first eight bars average 19.60\,s and the last eight average 45.17\,s.
+Those are the terminology-extraction and translation phases, and the transition happens at
+$t=185.082$\,s, where the harness records \texttt{extract} at 185.081\,s and \texttt{glossary} at
+0.000\,s in the same breath. This bimodality is why the headline ``agent latency p50 42.02\,s''
+should not be read as a typical call. The sixteen latencies are eight values between 20.0 and
+25.5\,s and eight between 42.0 and 57.0\,s, so the median falls in the empty gap between the two
+modes and describes no call in the run. It is also reported inconsistently: the headline table
+says 42.02\,s and the per-rank profile and the calibration both say 33.764\,s, from the same
+sixteen numbers. \texttt{cost.summarise} takes \texttt{lat[len(lat)//2]}, the ninth of sixteen,
+where \texttt{cost.calibrate} takes \texttt{statistics.median}, the mean of the eighth and ninth.
+On an even-sized bimodal sample the two conventions differ by 8.25\,s, and this run is the
+starkest case in the campaign because its sample is exactly eight short calls and eight long ones.
+
+Figure~\ref{fig:ranks} has an empty right-hand panel: context occupancy is 0.0\% against a
+120{,}000-token budget, and \texttt{rank.finalize} reports \texttt{used: 0},
+\texttt{high\_water: 0}, \texttt{admissions: 0}. Nothing this run did touched an agent's context
+account, which is by construction --- there is nothing to receive.
+
+The last thing the picture shows is what the plot omits. Figure~\ref{fig:timeline} draws one lane;
+the viewer draws eight, because ranks 1 through 7 registered against a world of size 1 and are
+each represented by a short row of grey lifecycle ticks scattered across the run. That is the
+subject of a later section.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{The collectives really did degenerate}
+
+This is the premise the whole document rests on, so it is worth establishing from the trace rather
+than asserting from the world size. Three independent lines of evidence agree.
+
+From the event log: the run contains five \texttt{coll.*} events and no \texttt{msg.send} or
+\texttt{msg.recv} at all. Every one of the five carries \texttt{messages\_sent: 0},
+\texttt{tokens\_sent: 0}, \texttt{rounds: 0} and \texttt{wall\_s: 0.0}. Notably the log contains
+\emph{no} \texttt{coll.reduce} and \emph{no} \texttt{coll.bcast}, where every $p>1$ sibling
+contains two of each per \texttt{allreduce}. The \texttt{reduce\_bcast} algorithm did not merely
+send zero messages, it never delegated.
+
+From the source: \texttt{algorithms.allreduce} tests \texttt{if p == 1} at line 1052 and returns
+its payload before reaching the \texttt{reduce\_bcast} branch on the next line. The same guard
+appears in \texttt{bcast}, \texttt{scatter}, \texttt{gather}, \texttt{allgather}, \texttt{reduce}
+and \texttt{scan}, and \texttt{barrier} tests \texttt{p <= 1}. In every case the body of the guard
+is three statements: finish the timer, call \texttt{\_record}, return. \texttt{\_record} is the
+fabric write and the event emit, and it is the entirety of what a single-rank collective does.
+
+From the harness's own instrumentation: \texttt{per\_rank\_stats} for rank 0 reports
+\texttt{decompose: 0.0}, \texttt{glossary: 0.0}, \texttt{halo: 0.0} and \texttt{collect: 0.0}
+seconds, against \texttt{extract: 185.081} and \texttt{translate: 391.656}. Those timers round to
+three decimals, so each of the four coordination phases took under half a millisecond. The
+\texttt{halo} zero has a different cause from the other three --- \texttt{cfg.halo and comm.size
+> 1} is false, so the phase was skipped rather than degenerated --- and that distinction matters
+enough to have its own section below.
+
+\subsection*{The residual: what AgentMPI costs when it has nothing to coordinate}
+
+The four-row partition in the previous section is the measurement, and the interesting row is the
+last one. Forty milliseconds, of a 576.741\,s run, is everything AgentMPI did that was not waiting
+for a worker or waiting for a model. Broken down by where the intervals fall:
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+  host-side interval & occurrences & total (ms) \\
+\midrule
+  \texttt{agent.call} $\to$ next \texttt{broker.enqueue} & 14 & 33.6 \\
+  \texttt{agent.call} $\to$ \texttt{broker.enqueue} across the glossary phase & 1 & 4.4 \\
+  \texttt{job.create} $\to$ \texttt{coll.scatter} $\to$ first \texttt{broker.enqueue} & 1 & 2.7 \\
+  last \texttt{agent.call} $\to$ \texttt{barrier} $\to$ \texttt{gather} $\to$ \texttt{finalize} $\to$ \texttt{job.finish} & 1 & 0.6 \\
+\midrule
+  total & & 40.3 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The dominant row is the enqueue path, and it is 2.40\,ms on average over the fourteen clean
+samples. That interval contains: parsing and contract-checking the previous result, building the
+next prompt, writing it to the content-addressed blob store, an \texttt{INSERT} into
+\texttt{agent\_calls} inside a SQLite write transaction, and the \texttt{broker.enqueue} emit
+inside the same transaction. Sixteen of those is 38.4\,ms, which is essentially the whole 40.3.
+
+The collectives are visible in this table only as the difference between 4.4\,ms and the 2.40\,ms
+that an ordinary enqueue costs, because the two glossary \texttt{allreduce}s and the glossary
+blob write both fall inside that one interval. Individually, the successive event timestamps
+bound each collective's own cost: 0.138\,ms between the last \texttt{terms} \texttt{agent.call}
+and the first \texttt{coll.allreduce}, 0.078\,ms between the two \texttt{allreduce}s, 0.126\,ms
+between the last \texttt{agent.call} and \texttt{coll.barrier}, 0.051\,ms between
+\texttt{coll.barrier} and \texttt{coll.gather}, and 0.113\,ms from there to
+\texttt{rank.finalize}. A degenerate collective costs between 0.05 and 0.14\,ms, and all five
+together cost under a millisecond. Against 106 logged events the whole residual works out at
+0.38\,ms per event, which is the right order for one SQLite row insert with the fabric's default
+synchronous settings.
+
+The completion-poll row, 4.071\,s, is a different kind of cost and is worth separating from the
+other two. \texttt{BrokerExecutor.poll\_s} is 0.5, so a task that finishes is noticed on average
+0.25\,s later. The sixteen observed lags average 0.2545\,s and none exceeds 0.471\,s, which is
+what pure aliasing against a 0.5\,s grid predicts; the 4.5\,ms of excess over the expected
+0.250\,s upper-bounds the cost of reading the result blob, validating it against the contract and
+emitting \texttt{agent.call}. Sixteen samples is too few to defend 4.5\,ms as an estimate, but it
+is a sound bound, and it is consistent with the 2.40\,ms measured on the enqueue side. The same
+aliasing is visible in the reported latencies themselves: all sixteen \texttt{latency\_s} values
+lie within 21\,ms of a multiple of 0.5\,s.
+
+So the honest statement of AgentMPI's fixed overhead at $p=1$ is two numbers, not one. The
+\emph{protocol} --- collectives, fabric persistence, event logging, contract validation --- costs
+about 2.5\,ms per agent call and 0.007\% of this run. The \emph{dispatch mechanism} costs 3.405\,s
+per agent call and 9.45\% of this run. Only the first is a property of AgentMPI's design; the
+second is a property of running one ephemeral worker process per invocation, and the trace shows
+it plainly, because every \texttt{broker.claim} in the run is preceded at the same millisecond by
+a \texttt{rank.init} at a new incarnation. It is also not constant across the series. Dispatch
+per call is 3.405\,s at $p=1$, 3.412\,s at $p=2$, 2.633\,s at $p=4$ and 1.632\,s at $p=8$, and
+because at $p>1$ it overlaps across ranks, the amount of it that lands on the critical path falls
+roughly as $54.5$, $30.7$, $14.5$, $4.9$\,s. Some of the measured speedup in the paper's table is
+this fixed per-call cost amortising, and I quantify that below.
+
+\subsection*{What this run contributes to the scaling curve}
+
+Wall times across the four completing points are 576.74, 410.11, 308.44 and 166.78\,s, giving
+
+\begin{center}
+\begin{tabular}{@{}rrrrrrrr@{}}
+\toprule
+  $p$ & wall (s) & speedup & efficiency & Karp--Flatt & calls & model rank-s & achieved par.\ eff. \\
+\midrule
+  1 & 576.74 & 1.000 & 1.000 & --- & 16 & 518.16 & 0.898 \\
+  2 & 410.11 & 1.406 & 0.703 & 0.422 & 18 & 670.53 & 0.818 \\
+  4 & 308.44 & 1.870 & 0.467 & 0.380 & 22 & 906.20 & 0.735 \\
+  8 & 166.78 & 3.458 & 0.432 & 0.188 & 24 & 1{,}033.19 & 0.774 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The efficiency column falls from 1.00 to 0.43, and the last two columns say where it went. Write
+$W(p)$ for the model rank-seconds --- the sum of \texttt{claim}-to-\texttt{complete} intervals ---
+and $E_{\mathrm{par}}(p) = W(p)/(p\,T_p)$ for the achieved parallel efficiency in the last column.
+Then end-to-end efficiency factorises exactly:
+\[
+  E(p) \;=\; \frac{T_1}{p\,T_p} \;=\; \underbrace{\frac{T_1}{W(1)}}_{1.1131}
+  \;\times\; \underbrace{\frac{W(1)}{W(p)}}_{1/A(p)} \;\times\; E_{\mathrm{par}}(p),
+\]
+and it closes to three decimals at every point: $1.1131\times0.7728\times0.8175=0.7031$ at $p=2$,
+$1.1131\times0.5718\times0.7345=0.4675$ at $p=4$, and $1.1131\times0.5015\times0.7743=0.4322$ at
+$p=8$.
+
+Three things follow. First, the leading constant is this run's own overhead: because the baseline
+spends 11.31\% more wall clock than model time, every speedup in the table is inflated by a factor
+of 1.1131 relative to the model work actually done. Second, the work-amplification term $1/A(p)$
+is the largest single contributor to the loss at $p=8$: the parallel run performs $A(8)=1.994$
+times the model rank-seconds of the baseline. Third, once that is divided out, what remains ---
+$E_{\mathrm{par}}$, which is genuinely about waiting --- is 0.818, 0.735 and 0.774, and it is
+\emph{not} monotone in $p$.
+
+Doing the same division on the speedup gives $S_w(p) = S(p)\,A(p) = 1.000$, 1.820, 3.270, 6.895,
+and fitting the USL to those four points instead of the wall-clock ones gives $\sigma=0.025$,
+$\kappa=0.0000$, $R^2=0.989$, against the paper's $\sigma=0.220$, $\kappa=0.0000$, $R^2=0.873$.
+I computed both with the repository's own \texttt{agentmpi.cost.fit\_usl} and the second reproduces
+the paper's macro exactly. The reading is that roughly nine tenths of the $\sigma=0.220$ serial
+fraction the paper reports is not coordination at all: it is the parallel runs doing more work
+than the baseline they are divided by.
+
+\subsection*{Does the Karp--Flatt column support the paper's claim?}
+
+Not as stated, and the column is the right place to see why. Karp--Flatt is constructed so that a
+\emph{constant} value across $p$ is the signature of a fixed serial section, and an
+\emph{increasing} value the signature of a coordination cost that grows with $p$ --- the
+docstring in \texttt{agentmpi.cost.karp\_flatt} says exactly this. The measured column is 0.422,
+0.380, 0.188: monotone decreasing, and down by 55\% from $p=2$ to $p=8$.
+
+That rules out the ceiling. A coherency term would push the metric up, and the USL's
+$\kappa=0.0000$ agrees; nothing in $p\le8$ shows a retrograde region. But it equally rules out the
+constant serial fraction that $\sigma=0.220$ asserts. The empirical serial fraction is 0.422 at
+$p=2$ and 0.188 at $p=8$, and 0.220 lies between them without matching either. The residuals of
+the fit confirm this is systematic rather than noise: the USL over-predicts speedup at $p=2$ and
+$p=4$ by $0.233$ and $0.540$ and under-predicts at $p=8$ by $0.308$, a sign pattern of
+$-,-,+$ rather than a scatter. An $R^2$ of 0.873 from a two-parameter monotone curve fitted to
+four monotone points is weak evidence for the functional form, and it is worth saying that the
+fit was only reportable at all after the $p=16$ attempt was dropped; with it, the same grid search
+returns $\sigma=0.020$, $\kappa=0.0465$, $R^2=0.404$, which \texttt{make\_tables.py} suppresses
+because it falls below its $R^2\ge0.5$ threshold.
+
+Decreasing Karp--Flatt is the signature of a fixed cost being amortised, and this run supplies two
+candidates for it. The work amplification above is one: dividing it out drops the Karp--Flatt
+column to 0.099, 0.074, 0.023 and lifts $R^2$ to 0.989. Broker dispatch is the other: the baseline
+pays 54.5\,s of it on the critical path and $p=8$ pays about 4.9\,s, and subtracting the
+critical-path estimate at each point gives speedups of 1.000, 1.377, 1.777 and 3.226 --- lower
+than the reported ones, confirming that the dispatch cost inflates the curve rather than
+depressing it. Both are fixed per-call costs, both amortise as $p$ grows, and neither is a serial
+fraction of the algorithm.
+
+\subsection*{This baseline is not running the same experiment}
+
+The harness guards the seam-reconciliation phase with \texttt{if cfg.halo and comm.size > 1}, so
+at $p=1$ there is no \texttt{cart\_create}, no \texttt{halo\_exchange} and no \texttt{revise:*}
+call. The trace confirms it: 16 agent calls, eight \texttt{terms} and eight \texttt{translate},
+and \texttt{n\_boundary\_changes: 0}.
+
+The consequence is structural, not incidental. The book is cut into eight units, so it has seven
+internal seams, and the halo exchange reconciles exactly those seams that fall on a rank boundary.
+At $p=1$ that is none of them; at $p=2$, one; at $p=4$, three; at $p=8$, all seven. The number of
+revision agent calls follows: 0, 2, 6, 8, which is $2(p-1)$ while a rank holds more than one unit
+and $p$ once each rank holds exactly one. That accounts for the whole of the call-count column in
+the scaling table.
+
+I checked whether the extra calls changed anything, by pulling every \texttt{translate:u\emph{n}}
+and \texttt{revise:u\emph{n}} result out of each run's blob store and diffing the
+\texttt{translation} strings. At $p=2$ both revisions returned text byte-identical to the
+pre-revision translation: 0 of 2{,}437 characters moved. At $p=4$, three of six revisions changed
+the text, 23 of 6{,}959 characters. At $p=8$, all eight did, 70 of 9{,}527 characters. So the
+mechanism the baseline omits is close to inert at $p=2$ and does progressively more as $p$ grows,
+which is what one would expect when the fraction of seams it can see rises from $1/7$ to $7/7$.
+
+None of this is visible in the quality metrics. Coverage, consistency, rendering verification and
+paragraph fidelity all read 1.000 at every $p$ including this one, and
+\texttt{n\_divergent\_entities} is 0 everywhere. Whether the extra 1.994$\times$ of model work at
+$p=8$ bought anything is therefore a question this instrument cannot answer, and the two
+defensible speedup numbers --- 3.46$\times$ on wall clock, 6.90$\times$ on work --- bracket the
+two possible answers. A reader who believes the seam revision is worth doing should quote the
+second; a reader who does not should quote the first and note that $p=1$ is the only configuration
+that gets the cheaper artefact for free.
+
+\subsection*{Seven stray ranks in a world of one}
+
+The generated findings flag ranks 1 through 7 as appearing without participating. They are the
+worst instance of this leak in the campaign, in ratio terms: the fabric's \texttt{ranks} table
+ends the run with eight rows for a declared \texttt{world\_size} of 1, so 87.5\% of the recorded
+population is spurious, against 20\% at $p=8$.
+
+The mechanism is the one the sibling analyses describe and the evidence here is consistent with
+it. \texttt{create\_job} writes \texttt{world\_size} into \texttt{meta} and populates
+\texttt{comm\_members} with exactly one row; \texttt{RankRuntime.register} consults neither and
+performs an unconditional \texttt{INSERT} for whatever \texttt{wrank} the process was started
+with. Seven worker processes from the shared pool did so, in the first 4.6\,s of the run, and
+seven more re-registered later --- ranks 4, 5, 6 and 7 reach incarnation 2 within the first 23\,s,
+ranks 1, 2 and 3 reach incarnation 3 as late as $t=496.5$\,s. Ten of the run's 26 reported
+reattachments are these; the other sixteen are rank 0's genuine one-per-call turnover.
+
+What makes this run's version of the leak informative is the index set. The strays are exactly
+$1\ldots7$, which is the complement of a one-rank world inside an eight-rank one, and the $p=8$
+run of the same campaign finished 25 minutes earlier. The pool that leaked into this job is the
+pool that had just served \texttt{real-tr-p8-full}. The same reading holds across the series:
+\texttt{real-tr-p2-full} carries strays $2\ldots8$ and 14, \texttt{real-tr-p4-full} carries
+$4\ldots7$, 8 and 14, and \texttt{real-tr-p8-full} carries 8 and 14. One pool, indices 0--8 and
+14, attaching to whichever job was live.
+
+Containment held here as it did at $p=8$: collectives resolve membership through
+\texttt{comm\_members}, which has one row, so no tree ever addressed a stray and no \texttt{absent}
+list ever mentioned one. The residue is in the fabric --- seven rows left in state
+\texttt{running}, with leases renewed to thirty minutes past a job that has already emitted
+\texttt{job.finish}. I count this as a genuine defect in \texttt{RankRuntime.register} rather than
+as untidiness, for the reason the $p=8$ analysis gives: registration is an upsert keyed on rank
+index, so the only thing that kept these seven processes from taking rank 0's lease and mailbox is
+that their indices happened to be out of range. A bounds check against the \texttt{world\_size}
+meta key would refuse all seven.
+
+\subsection*{The glossary, and a code path that never ran}
+
+Rank 0's \texttt{allreduce} contributed 208 local terms and received 208, which is the identity
+it must be. Worth noting is that this is not a smaller glossary than the distributed runs
+produce: $p=2$ agreed 207 terms, $p=4$ agreed 208 and $p=8$ agreed 206. The union of eight term
+sheets is the union of eight term sheets whether one agent or eight produce them, and the two-term
+spread is agent nondeterminism in what each sheet proposed, not a protocol effect. The
+\texttt{UNION} operator's claim to exactness is not tested by this run; it is tested by the
+sibling runs, and it holds there.
+
+One consequence is that the harness's conflict-resolution rule --- \texttt{sorted(v)[0]} over a
+term with multiple proposed renderings, the thing that guarantees every rank resolves identically
+--- is dead code here. \texttt{n\_conflicting\_terms} is 0 at $p=1$, and it is also 0 at $p=2$ and
+$p=4$; only at $p=8$, where eight independent extractors each see one section, does it reach 4.
+The determinism argument the harness's docstring makes for choosing an exact operator is sound,
+but this run cannot support it and neither can two of its three siblings.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The 3.405\,s dispatch figure measures the driver, not AgentMPI, and I cannot fully
+separate them.} What the trace shows is the interval between an \texttt{agent\_calls} row reaching
+state \texttt{pending} and a worker claiming it. Whether that 3.4\,s is Cursor subagent spawn
+latency, an external scheduler's own poll, or something in \texttt{ampi worker next} is not
+visible in the log, and the fact that it falls to 1.632\,s per call at $p=8$ --- where eight
+workers are being spawned concurrently --- suggests it is dominated by something with fixed
+start-up cost and spare capacity, which is an inference. What is measurement is that it is
+9.45\% of this run and that the protocol residual it is often lumped with is three orders of
+magnitude smaller.
+
+\textbf{The 40.3\,ms residual is a lower bound on the protocol's cost, not the whole of it.} It
+counts only work that happens on the broker thread between two of its own events. Fabric writes
+performed inside the claim and complete transactions are attributed to dispatch and to model work
+respectively, because the trace cannot see inside those intervals. The 33 worker registrations
+each write a \texttt{ranks} row and emit an event, and those writes are invisible here. A
+microbenchmark of the fabric would settle this; the trace cannot.
+
+\textbf{Sixteen samples, one draw, and the interesting quantities are means of them.} The
+2.40\,ms enqueue cost, the 0.2545\,s poll lag, the 3.405\,s dispatch and the 45.17\,s mean
+translate latency are all means over eight or sixteen observations from a single run. The
+dispatch figure in particular has a range of 1.945 to 3.923\,s. Nothing in this document should be
+read to more precision than the sample supports, and the three-decimal figures are reported for
+reproducibility against the log, not as claims of accuracy.
+
+\textbf{The executor is a broker fronting real workers, but the log cannot see what ran inside
+one.} \texttt{metrics.json} reports \texttt{executors: \{broker: 1, worker: 33\}}, so this is not
+a \texttt{simulated} or \texttt{function} run, and the outputs are real Chinese prose whose
+per-unit content varies in ways the deterministic \texttt{synthetic\_agent} could not produce. But
+the quantisation of every latency to a 0.5\,s grid is exactly what a scripted executor would also
+produce, and the only reason I read it as the broker's poll interval rather than as evidence of
+one is that \texttt{poll\_s} is 0.5 in the source and no observed lag exceeds it.
+
+\textbf{This run ran last in the series and shares outputs with its predecessors.} The campaign
+executed in descending order of $p$: $p=8$ at 06:54, $p=4$ at 07:03, $p=2$ at 07:10, $p=1$ at
+07:19, all against one persistent worker pool. Four of this run's eight output sections are
+byte-identical to \texttt{real-tr-p2-full}'s, and two are identical to \texttt{real-tr-p4-full}'s
+as well. The contract asks that both explanations be presented, so: the evidence here favours
+convergence rather than memory, on two grounds. Diffing the actual prompts shows that this run's
+\texttt{translate:u0} prompt differs from $p=2$'s in five lines out of 302 --- one glossary term
+present in one and not the other, one term whose key differs only by a typographic apostrophe,
+and the agreed register sentence --- while it differs from $p=8$'s in fourteen lines including
+five extra glossary entries and a register string that is in English rather than Chinese. The
+runs whose prompts were near-identical produced identical text and the run whose prompt differed
+materially did not, which is what a near-deterministic decoder does and is not what selective
+recall looks like. And the coincidences follow position rather than recency: the shared units are
+$u_0$ and $u_1$ with $p=4$ and $u_0$ through $u_3$ with $p=2$, which are precisely the units that
+sat on rank 0 in the same sequence position in both runs. I cannot exclude memory --- the trace
+cannot --- but a worker reproducing a previous run's work would not track prompt similarity this
+closely.
+
+\textbf{This point is the denominator, and it is the least representative run in the series.} It
+is the only one whose collectives are all degenerate, the only one with no messages, the only one
+with no seam reconciliation, and the only one where the entire dispatch cost is serialised onto
+the critical path. Every one of those makes it a good instrument for measuring fixed overhead and
+a questionable instrument for measuring what a one-rank version of the parallel program would
+cost. The speedups computed against it inherit all four properties.
 
 \end{document}

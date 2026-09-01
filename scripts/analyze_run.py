@@ -126,6 +126,16 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
             f"fabric logged {num(c.logged_messages)}: the collective's own accounting disagrees with "
             f"the traffic it produced.",
         ))
+    orphans = [e for e in a.trouble if e["kind"] == "msg.orphaned"]
+    if orphans:
+        states = sorted({str(e["payload"].get("dst_state")) for e in orphans})
+        out.append((
+            "critical",
+            f"{len(orphans)} message(s) were delivered to ranks that had already reached a terminal "
+            f"state ({', '.join(states)}), so nothing will ever read them. This is the signature of a "
+            f"contribution arriving after its group moved on --- usually a recovery path given a "
+            f"deadline longer than the operation it was meant to rescue.",
+        ))
     stray = a.stray_ranks
     if stray:
         out.append((
@@ -157,6 +167,25 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
             "note",
             f"Collectives account for {num(a.coordination_share * 100, 1)}\\% of the run's rank-seconds, "
             f"so more of the pool's time went to coordination than to work.",
+        ))
+    fit = getattr(a.calibration, "fit_method", "default")
+    if fit == "median_fallback":
+        rejected = getattr(a.calibration, "fit_rejected_beta", None)
+        out.append((
+            "warning",
+            "The cost model's $\\alpha$ and $\\beta$ here are a median fallback, not a fit: the "
+            "regression returned a negative slope"
+            + (f" ($\\beta={num(rejected, 4)}$\\,s/token)" if rejected is not None else "")
+            + " and was rejected. That happens when queueing dominates latency, because the wait "
+            "enters the measured time but not the token count, so the relationship the fit looks "
+            "for is not in the data. Any latency prediction from this run's calibration is a "
+            "median, not a model.",
+        ))
+    elif fit == "median_only":
+        out.append((
+            "note",
+            "Too few distinct output sizes to fit $\\beta$, so the reported latency parameters are "
+            "medians rather than a regression.",
         ))
     if a.imbalance > 1.5:
         out.append(("note", f"Load imbalance is {num(a.imbalance)}$\\times$: the slowest rank was busy far longer than the mean."))

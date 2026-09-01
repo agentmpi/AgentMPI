@@ -14,25 +14,281 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+Despite the name, this is not a smoke test of the software harness in general: it is the
+verification run for one specific bug fix, and the commit that fixed the bug is the commit
+that added this result file to the repository. In \texttt{real-sw-p8-full} the cross-review
+phase returned every critique over the \emph{forward} review graph, so all sixteen reviews
+were delivered to ranks whose code the sender had not read and the phase was a silent no-op.
+This run, six ranks under the deterministic surrogate executor, drives the corrected code, and
+the trace settles the question: the twelve outgoing code messages travel on edges
+$r \rightarrow \{r{+}1, r{+}2\}$ and the twelve returning review messages on
+$r \rightarrow \{r{-}1, r{-}2\}$, an exact transpose, so \textbf{every review reached the rank
+that wrote the code it is about}. That is the answer to the routing question, and it is the
+opposite of the $p=8$ finding. The run's second lesson is about instrumentation. Both
+neighbourhood exchanges report \texttt{messages\_sent: 0} --- the payload of a
+\texttt{coll.neighbor\_allgather} event of this vintage carries only \texttt{indegree},
+\texttt{outdegree}, \texttt{label} and a wall time --- so the trace viewer's collectives panel
+shows \textsc{messages} 0 for the twelve invocations that in fact carried 24 of the run's 95
+messages. The whole justification of a neighbourhood collective is that it costs $\Theta(\text{degree})$
+rather than $\Theta(p)$: at $p=6$ it sent 12 messages where a ring allgather would have sent
+30. The one collective in the library whose case rests entirely on its message count was the
+one collective not reporting it. Both facts have to be read through the executor: this run is
+\texttt{function}, not \texttt{broker}, so it says nothing whatever about agent behaviour.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} looks nothing like the four-band bulk-synchronous picture the
+real-agent software runs give, and the reason is the executor. With \texttt{--executor
+function} every \texttt{agent.call} has \texttt{latency\_s: 0.0}, so there are no work bars at
+all: the run's 30 agent calls are instants, the entire 0.324\,s is protocol, and all six lanes
+are a dense stipple of message ticks, amber window diamonds and violet agreement marks. The
+concurrency and rank-profile figures are absent from the generated set for the same reason ---
+with zero busy seconds there is nothing to plot --- and the headline table's achieved
+parallelism of $0.00\times$, parallel efficiency of 0.0\,\% and idle fraction of 100.0\,\% are
+all statements that no rank was ever measurably busy, not statements about scheduling. The
+\finding{note} that collectives account for 72.5\,\% of rank-seconds is arithmetically true
+and interpretively empty: when work time is zero, coordination is the only thing there is to
+measure.
+
+What is legible in the timeline is phase structure. Reading the log in order, the six lanes
+move together through \texttt{spec} broadcast and \texttt{win.create} at $t \approx 0.01$\,s;
+eight \texttt{iface} calls and eight \texttt{win.put}s to $t = 0.031$\,s; the
+\texttt{interfaces-published} fence at $t \approx 0.045$\,s, immediately followed on every
+lane by two \texttt{win.sync} events and a burst of \texttt{win.get}s; eight
+\texttt{impl:*:r1} calls; the \texttt{integrate-r1} barrier and the gather to rank~0; the
+report broadcast and blame scatter; the review exchange between $t = 0.139$ and $t = 0.184$\,s;
+renegotiation under the lock; and then the whole second round to \texttt{ft.agree} at
+$t \approx 0.31$\,s. The bulk-synchronous shape is there, compressed into a third of a second.
+
+The one visual detail worth pausing on is in the \textsc{collectives} panel of the dashboard
+rather than in the timeline. Five operations are listed. Four of them ---
+\texttt{barrier}, \texttt{bcast}, \texttt{gather}, \texttt{scatter} --- carry an algorithm name
+and a message count. The fifth reads \texttt{neighbor\_allgather}, 12 invocations, algorithm
+``--'', max rounds 0, \textsc{messages} 0. A reader deciding whether the neighbourhood
+collective earned its place would consult that row, and that row says it moved nothing.
+Figure~\ref{fig:comm} disagrees: the review traffic is plainly there as an off-diagonal band,
+with $0 \rightarrow 1$, $0 \rightarrow 2$, $2 \rightarrow 3$ and $4 \rightarrow 5$ each
+carrying eight messages. The two panels are drawn from different sources --- the collective's
+self-report and the fabric's tagged traffic --- and only one of them is right.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{What is true by construction}
+
+The configuration is \texttt{--ranks 6 --rounds 2 --executor function}, with shared interfaces,
+locks and review all enabled, the precise specification, and smoke-scale guards:
+\texttt{barrier\_timeout 25\,s} and \texttt{job\_timeout 90\,s} against 2{,}400\,s and
+14{,}400\,s in the real runs. Everything below follows from that.
+
+Module assignment is $i \bmod p$ over the eight-entry table, so with $p = 6$ two ranks own two
+modules and four own one: rank~0 has \texttt{errors} and \texttt{engine}, rank~1
+\texttt{tokens} and \texttt{api}, and ranks~2--5 have \texttt{nodes}, \texttt{functions},
+\texttt{parser} and \texttt{planner} respectively. The per-rank agent-call counts in the
+generated table --- 7, 7, 4, 4, 4, 4 --- are exactly this: one interface call and one
+implementation call per module per round, plus one review call per rank. This is the only run
+in the archive with a non-integral modules-per-rank ratio; $p = 1$, $p = 4$ and $p = 8$ all
+divide evenly.
+
+The build fails in both rounds and that is intended. \texttt{synthetic\_agent} returns
+\texttt{def stub\_<name>(): return None} for every implementation, so the eight-file tree is 24
+lines long and \texttt{minidb/\_\_init\_\_.py} cannot import \texttt{query} from
+\texttt{minidb.api}. The oracle reports \texttt{importable: false}, the harness broadcasts the
+synthetic \texttt{IMPORT} record to all six ranks --- hence \texttt{n\_my\_failures: 1} for
+every rank in every round --- and \texttt{agree} returns \texttt{false} twice. A smoke test
+that went green would exit the loop after round~1 and never reach review or renegotiation at
+all. Failing is how this run gets to the code it was written to exercise, which is why it has
+442 events, more than \texttt{real-sw-p8-noshared}'s 473-event sibling class would suggest for
+a run named ``smoke''.
+
+The RMA traffic follows the same construction: 6 \texttt{win.create}, 16 \texttt{win.put}
+(eight slots published, eight renegotiated), 44 \texttt{win.get} (14 dependency reads per
+round, plus a value read and a version read inside each of the eight critical sections), 24
+\texttt{win.sync} and 8 \texttt{win.lock}/\texttt{win.unlock} pairs. The contention report
+records zero contended locks, zero lock wait, zero stale writes and zero staleness violations,
+which is expected rather than reassuring: the window is slot-partitioned by ownership and no
+two ranks ever address the same slot, so the locking path cannot be contended by construction
+in any configuration of this harness.
+
+\subsection*{The review routing is correct, and this run is why we know}
+
+This is the run's purpose. The mechanism is subtle enough to restate: \texttt{review\_edges}
+yields \texttt{(author, reviewer)} pairs, so under \texttt{dist\_graph\_create} a rank's
+\emph{sources} are the authors whose code it reviews and its \emph{destinations} are the
+reviewers of its own code. Code flows along the edges; a critique has to flow back along them,
+which requires the transpose. Sending the critique over the forward graph delivers it to the
+ranks a reviewer sends code to --- a set disjoint from the ranks it reviewed.
+
+The trace contains both graphs. Twelve \texttt{topo.graph\_create} events appear, two per rank,
+and they are exact transposes of each other. Rank~0 records \texttt{sources: [4, 5],
+destinations: [1, 2]} for the first and \texttt{sources: [1, 2], destinations: [4, 5]} for the
+second; the other five ranks are the corresponding rotations of a degree-2 circulant on six
+vertices, which is what \texttt{review\_edges(6, fanout=2)} produces.
+
+The decisive evidence is the traffic, because a topology can be built and then not used. The
+95 \texttt{msg.send} events carry internal tags, and the two neighbourhood exchanges are
+\texttt{\_ampi:nbr\_ag:0:8} (the outgoing code, 12 messages, 560 tokens) and
+\texttt{\_ampi:nbr\_ag:0:9} (the returning reviews, 12 messages, 156 tokens). Grouping each by
+sender:
+
+\begin{center}
+\begin{tabular}{@{}rll@{}}
+\toprule
+sender & code out (\texttt{review-r1}) & review back (\texttt{reviewback-r1}) \\
+\midrule
+0 & 1, 2 & 4, 5 \\
+1 & 2, 3 & 0, 5 \\
+2 & 3, 4 & 0, 1 \\
+3 & 4, 5 & 1, 2 \\
+4 & 0, 5 & 2, 3 \\
+5 & 0, 1 & 3, 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Rank~0's sources are 4 and 5, so rank~0 reviewed the code written by ranks~4 and~5, and
+rank~0's reviews went to ranks~4 and~5. The same holds for all six rows: the right column is
+the left column's transpose, edge for edge, and every one of the twelve return messages was
+addressed to a rank whose code its sender had actually received. \textbf{This run routed its
+reviews correctly.} For contrast, the same check on \texttt{real-sw-p8-full} finds all sixteen
+reviewback messages delivered to ranks the sender had never reviewed.
+
+The dating is worth stating because the provenance field misleads. This result was written at
+08:29:57 and stamps commit \texttt{a803ffd}, which is the \emph{pre-fix} commit, because
+\texttt{provenance()} calls \texttt{git rev-parse HEAD} when the result is written rather than
+reading the working tree. Taken at face value that would say the run executed the buggy code
+--- and the trace plainly shows it did not. The resolution is in the repository: commit
+\texttt{3012e0f}, ``Fix review misrouting: a directed collective needs the graph AND its
+transpose'', landed at 08:31:10, seventy-three seconds after this result was written, and its
+diff \emph{adds} \texttt{results/software/sw-rev-smoke-p6-shared-locks-review-precise-r2.json}
+alongside the change to \texttt{experiments/software.py}. The run was executed against an
+uncommitted working tree and committed as the fix's evidence. That is also the only reason
+there is a run named \texttt{sw-rev-smoke} at all.
+
+One half of the fix is \emph{not} verified here, and the distinction matters. The same commit
+added an ownership filter, so that a reviewer's cross-module remarks are recorded rather than
+acted on by the wrong rank. \texttt{synthetic\_agent} returns \texttt{\{"target": "peer",
+"findings": []\}} for every review call, so the per-rank stats record
+\texttt{review\_findings\_mine: 0} and \texttt{review\_findings\_foreign: 0} for all six ranks.
+With no findings, the filter has nothing to classify. This run establishes that the
+\emph{addressing} is right; that the \emph{content} reaching an author is about that author's
+file is covered by the two unit tests the same commit added to
+\texttt{tests/test\_topology.py}, not by this trace.
+
+\subsection*{The collective that could not report its own saving}
+
+Both \finding{warning} findings are the same defect seen twice, one per invocation, and the
+generated list is right to raise them. In this log a \texttt{coll.neighbor\_allgather} payload
+is \texttt{\{"indegree": 2, "outdegree": 2, "label": ..., "wall\_s": ...\}} and nothing else.
+There is no \texttt{messages\_sent} field to read, no \texttt{tokens\_sent}, no
+\texttt{algorithm} and no \texttt{rounds}, so \texttt{metrics.json} records \texttt{messages:
+0}, \texttt{tokens: 0}, \texttt{algorithm: "?"}, \texttt{rounds: 0} for each of the twelve
+invocations, and the model column is \texttt{\modelna} because there is no closed form for an
+unnamed algorithm.
+
+The traffic is entirely recoverable, and the analysis tool recovers it: the \texttt{msgs}
+column of the collectives table reads 12 for both rows, derived from the
+\texttt{\_ampi:nbr\_ag:} tags rather than from the self-report, which is precisely what makes
+that table a check. What it under-recovers is tokens. \texttt{metrics.json} holds
+\texttt{logged\_tokens: 560} and \texttt{156} for the two invocations, but the LaTeX table's
+token column prints the self-reported \texttt{tokens} field and therefore reads 0 for both.
+Messages come from the log and tokens come from the collective in the same row; that
+inconsistency is a small reporting defect in the generator, worth fixing because the caption
+explains the provenance of the message column and says nothing about the token column.
+
+The scale of the omission: 24 of the run's 95 messages, 25.3\,\%, and 716 of its 12{,}720
+sent tokens, come from the two exchanges that report zero. And the point is sharper than a
+missing field, because of which collective it is. A neighbourhood allgather exists for exactly
+one reason, stated in its own docstring: it costs $\Theta(\text{degree})$ instead of
+$\Theta(p)$. Here that is 12 messages against the 30 a ring allgather would send at $p=6$
+($p(p-1)$) or the 18 recursive doubling would send ($p\lceil \log_2 p \rceil$) --- a factor of
+2.5 or 1.5 at this size, growing without bound in the first case. A trace that records the
+degree but not the message count leaves the collective's entire justification unverifiable
+from the log, which is the situation this archive was built to avoid.
+
+It is fixed at HEAD, and after this trace. \texttt{src/agentmpi/topology.py} at commit
+\texttt{ee21d79} now emits \texttt{algorithm="neighbor"}, \texttt{messages\_sent},
+\texttt{tokens\_sent} and \texttt{rounds} from both \texttt{neighbor\_allgather} and
+\texttt{neighbor\_alltoall}, with a comment giving the reason above. So this is an expected
+property of an archived trace of this vintage rather than a live bug, and the correct reading
+of the two warnings is that the analysis is refusing to trust a self-report --- doing its job
+--- not that the collective misbehaved. Note in passing that no \texttt{coll.neighbor\_alltoall}
+event appears in this trace at all: the corrected harness uses \texttt{neighbor\_allgather} in
+both directions, and \texttt{neighbor\_alltoall} was what the pre-fix version used for the
+return path.
+
+\subsection*{Everything else agrees with the cost model}
+
+Eleven of the thirteen invocations are checkable and all eleven sent exactly the predicted
+number of messages: the binomial broadcasts 5 each, the binomial gathers and scatters 5 each,
+and the dissemination fences 18 each. At $p=6$ the harness takes the binomial path for gather
+and scatter, unlike the $p=4$ smokes, which fall on the \texttt{linear} side of the
+\texttt{p <= 4} rule. The \texttt{central} barriers report 0 messages and are predicted to send
+0, which is correct: that algorithm signals through the fabric's barrier table rather than by
+message.
+
+\subsection*{What this run contributes}
+
+It is the only archived software run at $p=6$, the only one with uneven module ownership, and
+the only one with correct review routing that also has a review phase --- the vague-specification
+pair ran after the fix but \texttt{vague-sw-p8-vague-shared} went green in round~1 and skipped
+review entirely. It is therefore the archive's only positive evidence that the review topology
+works as designed, and it exists because someone wrote it to be that evidence. What it cannot
+contribute is anything about the experiment's actual question. The tree it builds is 24 lines
+of stubs, the acceptance score is 0/60 by construction, and the \$0.1492 and 45{,}501 prompt
+tokens in the headline table are prices for prompts that were assembled and then answered by a
+dictionary lookup.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The executor is a surrogate, so nothing here is about a model.} \texttt{executors:
+function $\times$ 6}. Every conclusion above is about the protocol and the harness. The 0.324\,s
+wall time is SQLite writes and event logging; the agent latencies of 0.00\,s are not fast
+inference, they are the absence of inference. The cost and token figures are notional: the
+prompts were really built, and their 45{,}501 tokens were really counted, but no model ever
+saw them, so \$0.1492 is what this run \emph{would} have cost and 0.1764\,\$/kTok out is an
+artefact of dividing a real prompt bill by 846 stub completion tokens.
+
+\textbf{Routing is verified at the level of addresses, not meaning.} The check above is that
+message $m$ went from rank $a$ to rank $b$ where $b$ had earlier sent $a$ its code. It does not
+show that a critique of \texttt{parser.py} reached the owner of \texttt{parser.py}, because
+under the surrogate every critique is the empty list. The stronger property is what the two
+tests added in \texttt{3012e0f} assert, and a real-agent run with review enabled and a build
+that fails on the first round would be the trace that demonstrates it end to end. No such run
+is in the archive.
+
+\textbf{$p=6$ is small enough to hide an off-by-one.} A degree-2 circulant on six vertices has
+the property that $\{r{+}1, r{+}2\}$ and $\{r{-}1, r{-}2\}$ are disjoint, which is what makes
+the transpose check clean here. It is not obviously robust: at $p = 3$ with fanout~2 the
+forward and reverse neighbour sets coincide, and the same trace evidence would be consistent
+with either routing. Any regression test of this property should not be run at $p = 3$ or
+$p = 4$.
+
+\textbf{Two derived quantities are degenerate rather than informative.} The coordination share
+of 72.5\,\% and span share of 91.9\,\% divide by rank-seconds and wall clock in a run where
+work time is identically zero, so they cannot be compared with the same metrics on the
+real-agent runs; \texttt{real-sw-p8-full}'s 41.7\,\% is a fraction of a pool that was really
+doing something. Likewise the load imbalance of $0.00\times$ means the denominator was zero,
+not that the six ranks were perfectly balanced --- and with two ranks owning two modules each,
+they were not.
+
+\textbf{The twelve \texttt{ft.agree} events are counted as recovery.} \texttt{role\_counts}
+reports 12 recovery events against zero trouble events, and the viewer's legend shows ``fault
+recovery 12'' beside \textsc{failures} 0. Nothing was recovered from: both \texttt{agree}
+invocations record \texttt{voters: [0..5]} and \texttt{excluded: []}. The harness uses
+\texttt{agree} as its decision primitive on the happy path, and the visual vocabulary maps
+every \texttt{ft.*} event to the fault-tolerance palette. This is a taxonomy artefact shared
+with every software run.
+
+\textbf{One run, and its purpose biases what it shows.} A verification run is executed until it
+demonstrates the thing it was written to demonstrate. That this one shows correct routing is
+strong evidence about the code path; it is weak evidence about how often the harness gets
+directed topologies right in general, and the bug it verifies was found by an agent reading its
+own prompts rather than by any test or metric in this system. Message counts, degrees and round
+counts were all correct while every review went to the wrong rank, which is the most
+transferable lesson available here: a directed collective can be perfectly well-formed and
+completely wrong, and no quantity in this trace would have caught it.
 
 \end{document}

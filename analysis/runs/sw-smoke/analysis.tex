@@ -14,25 +14,169 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the first software-experiment run in the archive, recorded at 07:02:01 against commit
+\texttt{b0b652d}, before any of the real-agent runs existed. Four ranks under the deterministic
+surrogate executor take two modules each through one round of the \texttt{minidb} pipeline in
+0.119\,s: broadcast the specification, publish eight interfaces into the RMA window, fence,
+read the fourteen dependency slots the module graph requires, implement, barrier, gather to
+rank~0, run the acceptance oracle, broadcast the report, scatter the blame, and agree. All six
+checkable collectives sent exactly the number of messages their closed forms predict, no
+contract was violated, and no rank failed. That is the entire result: the pipeline runs
+end to end at $p = 4$. It is not a measurement of anything. The executor is \texttt{function},
+so the sixteen agent calls are dictionary lookups, the tree they produce is 24 lines of stubs
+and scores 0/60 by construction, and the \$0.094 in the headline table prices prompts no model
+ever read. Its one incidental contribution is coverage: at $p = 4$ the harness takes the
+\texttt{linear} gather and scatter path rather than the binomial one every larger software run
+uses, and this run and its twin \texttt{sw-vague-smoke} are the only places in the experiment
+where that path is exercised.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} has no work bars, and the absence is the first thing to explain.
+Under \texttt{--executor function} every \texttt{agent.call} carries \texttt{latency\_s: 0.0},
+so all sixteen calls are instants and the four lanes contain nothing but message ticks, amber
+window diamonds and the four violet \texttt{ft.agree} marks at the right-hand edge. The whole
+figure spans 0.119\,s. Everything the headline table says about occupancy follows from this
+and none of it is about scheduling: achieved parallelism $0.00\times$, parallel efficiency
+0.0\,\%, load imbalance $0.00\times$ and idle fraction 100.0\,\% all report that no rank was
+ever measurably busy. The \finding{note} that collectives account for 61.7\,\% of rank-seconds
+is true and vacuous for the same reason --- with zero work seconds, coordination is the only
+quantity in the ratio.
+
+The phase structure is nevertheless legible, and it is the structure the experiment intends.
+Reading the log in order: four \texttt{rank.init}s and the \texttt{spec} broadcast in the first
+0.016\,s; eight \texttt{iface} calls, each immediately followed by its \texttt{win.put}, to
+$t = 0.022$\,s; the \texttt{interfaces-published} fence at $t \approx 0.029$--$0.035$\,s, and
+then on each lane a \texttt{win.sync} followed by that rank's dependency reads --- rank~3, which
+owns \texttt{functions} and \texttt{api}, issues five of them, and rank~0, which owns
+\texttt{errors} and \texttt{parser}, issues three; eight \texttt{impl:*:r1} calls; the
+\texttt{integrate-r1} barrier and the gather at $t \approx 0.06$\,s; the report broadcast and
+blame scatter at $t \approx 0.09$--$0.12$\,s; \texttt{ft.agree} and finalisation. That
+sequencing is the harness's, one lane at a time, and seeing it complete without a stall or a
+timeout is what a smoke test is for.
+
+Figure~\ref{fig:comm} shows a two-level binomial tree and a flat fan-in. Rank~0 sends 1{,}816
+tokens to each of ranks~1 and~2 in four messages apiece --- the specification at 1{,}526 tokens
+plus the round-1 report and blame --- and rank~2 forwards 1{,}669 tokens to rank~3, which is
+the second level of the binomial broadcast. The return traffic is negligible: 63 to 64 tokens
+from each of ranks~1, 2 and~3 to rank~0, because the stub modules the surrogate produces are a
+few dozen bytes each. The asymmetry between the bright top-left cells and the near-empty
+returns is the correct shape for this harness and would be the same with real agents, only
+with a far heavier fan-in.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{What it establishes, and what it does not touch}
+
+The configuration is \texttt{--ranks 4 --rounds 1 --executor function} with shared interfaces,
+locks and review nominally enabled. Module assignment is $i \bmod p$, so the eight modules
+divide evenly two per rank: rank~0 owns \texttt{errors} and \texttt{parser}, rank~1
+\texttt{tokens} and \texttt{planner}, rank~2 \texttt{nodes} and \texttt{engine}, rank~3
+\texttt{functions} and \texttt{api}. The \texttt{broker.enqueue} labels confirm it.
+
+\texttt{--rounds 1} is the important part of that configuration and it is easy to miss. Both
+the review phase and the interface renegotiation are guarded by
+\texttt{round\_no < cfg.rounds}, which is false in a single-round run, so neither executes. The
+trace bears this out precisely: there is no \texttt{topo.graph\_create} event, no
+\texttt{coll.neighbor\_allgather}, and no \texttt{win.lock} or \texttt{win.unlock} at all. The
+sixteen \texttt{win.put}--\texttt{win.get} operations are the publish-and-read half of the RMA
+protocol only; every slot ends at version~1. So although the \texttt{review} and \texttt{locks}
+flags are both true in the config, this run covers neither mechanism, and the two coordination
+mechanisms most specific to this experiment --- cross-review over a distributed graph, and
+exclusive-locked renegotiation --- are untested by it. \texttt{sw-rev-smoke}, at $p = 6$ with
+two rounds, is the run that covers them.
+
+What it does cover, it covers cleanly. Six collective invocations, all complete, all with the
+predicted message count: the \texttt{spec} and \texttt{report-r1} binomial broadcasts at 3
+messages each, the \texttt{interfaces-published} dissemination fence at 8, the
+\texttt{integrate-r1} central barrier at 0, and the \texttt{collect-r1} gather and
+\texttt{blame-r1} scatter at 3 each. Twenty messages in total, seventeen eager and three
+rendezvous, and zero contract violations across sixteen contract-checked agent calls covering
+all three contracts the experiment defines --- \texttt{Interface}, \texttt{Implementation} and,
+through the report path, the acceptance plumbing.
+
+\subsection*{The linear gather and scatter path}
+
+The one thing this run exercises that no larger software run does is the small-$p$ algorithm
+choice. \texttt{algorithms.gather} selects \texttt{"linear" if p <= 4 else "binomial"}, and
+\texttt{scatter} follows the same rule, so at $p = 4$ ranks~1, 2 and~3 each send straight to
+the root instead of folding through a tree. The message count is 3 either way at this size, so
+the check in the collectives table is not discriminating, but the path is different code and
+this is where it runs: \texttt{sw-rev-smoke} at $p = 6$ and every real-agent run at $p = 8$
+take the binomial branch.
+
+Reading that table, note that the \texttt{rounds} and \texttt{pred.} columns disagree for both
+linear invocations --- the implementation reports 1 round, the closed form predicts 3 --- while
+the \texttt{msgs} and its prediction agree at 3. This is not a defect. A linear gather issues
+all $p-1$ transfers without waiting, so the implementation counts one round; the cost model
+counts $p-1$ because they serialise at the root. The two are answering different questions and
+the model check, which compares messages, is unaffected: \texttt{model\_checks\_agree} is 6 of
+6. The same mismatch appears on the dissemination barrier, which reports 0 rounds against a
+prediction of 2.
+
+\subsection*{Against \texttt{sw-vague-smoke}}
+
+The two runs are the same configuration under the two specification regimes, and their traces
+are the same trace to a remarkable degree: 128 events each, identical \texttt{kind\_counts},
+identical \texttt{role\_counts}, the same six collectives with the same algorithms and the same
+20 messages, the same 16 agent calls, and byte-identical completion token totals of 496. Under
+a deterministic executor, control flow does not depend on what the prompts say, and identical
+event counts are the confirmation of that rather than a coincidence worth wondering at. It is
+also the property a smoke test should have: if changing the specification had changed the
+number of window operations or collectives, something would be wrong with the harness.
+
+The differences are entirely in token volume and they reconcile exactly.
+\texttt{apply\_vague\_layout} substitutes a module table that names responsibilities without
+signatures, and the substitution makes the specification 54 characters and 15 tokens longer:
+1{,}526 tokens against 1{,}541. The specification is embedded in all sixteen prompts, and
+\texttt{tokens\_in} differs by 228 --- 28{,}965 against 29{,}193 --- which is 14.25 tokens per
+prompt. The \texttt{spec} broadcast carries $3 \times 1{,}526 = 4{,}578$ tokens here and
+$3 \times 1{,}541 = 4{,}623$ there.
+
+One difference is not about the specification at all. This run's oracle reports
+\texttt{n\_total: 59} and its import traceback points at line 174 of \texttt{acceptance.py};
+\texttt{sw-vague-smoke}'s reports 60 and line 181. The suite grew a case in the 65 minutes
+between them. That is a useful reminder that the two smokes are not a controlled pair: they
+differ in specification regime \emph{and} in oracle version, and the archived offline
+re-scoring, which uses a single suite at \texttt{0eaa6b695b83}, reports 60 cases for both.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{This is not a measurement and should not be quoted as one.} \texttt{executors: function
+$\times$ 4}. The sixteen agent calls are \texttt{synthetic\_agent} returning canned
+dictionaries keyed on the call label; the 0.119\,s wall time is SQLite writes and event
+logging; the \$0.0943 and 28{,}965 prompt tokens price prompts that were genuinely assembled
+and genuinely counted but never sent anywhere. No statement about agent behaviour, model
+latency, code quality or the value of shared interfaces can be drawn from this run, and the
+0.19019 \$/kTok-out figure in \texttt{metrics.json} is an artefact of dividing a real prompt
+bill by 496 stub completion tokens.
+
+\textbf{The acceptance result is a construction, not a failure.} The oracle reports 0 of 59
+with \texttt{ImportError: cannot import name 'query' from 'minidb.api'}, because the surrogate
+writes \texttt{def stub\_api(): return None}. Reading it as the harness failing would be wrong;
+so would reading the subsequent \texttt{agree(false)} as a negative result. The verdict is
+correct --- the tree really does not import --- and it is what makes the blame scatter and the
+agreement carry non-trivial payloads.
+
+\textbf{One round means most of the experiment is unexercised.} Restating it because it is the
+most likely misreading of a run whose findings list is clean: no review, no renegotiation, no
+lock, no second implementation pass, no repair on scattered blame. A green light here says the
+publish-and-read half works, not that the pipeline does.
+
+\textbf{Four \texttt{ft.agree} events are counted as recovery.} \texttt{role\_counts} shows 4
+recovery events against 0 trouble events, and the dashboard's legend reads ``fault recovery 4''
+beside \textsc{failures} 0. Nothing was recovered from: the agreement records
+\texttt{voters: [0, 1, 2, 3]}, \texttt{excluded: []}. The visual vocabulary maps every
+\texttt{ft.*} event to the fault-tolerance palette and the harness uses \texttt{agree} as its
+ordinary decision step, so this appears in every software run.
+
+\textbf{$p = 4$ divides the module count evenly, which hides a case.} Eight modules over four
+ranks gives every rank exactly two, so this run never exercises the uneven ownership that
+$p = 6$ produces, and it says nothing about how the integration barrier behaves when one rank
+owns twice as much as another. Combined with the surrogate's zero-cost calls, the run is blind
+to load imbalance by two independent mechanisms.
 
 \end{document}

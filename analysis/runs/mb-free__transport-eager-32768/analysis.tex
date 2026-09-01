@@ -14,25 +14,129 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the far end of the eager column in a ten-cell transport sweep, and like the
+cell below it, it did not complete.
+\texttt{results/microbench/free-transport.json} records \texttt{completed: false},
+\texttt{n\_failed: 8} and \texttt{ERR\_CONTEXT\_OVERFLOW} for eight agent-free ranks
+asked to ring-exchange a 32{,}768-word payload under \texttt{Mode.EAGER}. The trace
+has 18 events instead of 34 --- eight \texttt{rank.init}, eight
+\texttt{rank.finalize}, and the two job markers --- with no \texttt{msg.send} and no
+\texttt{msg.recv}, an empty \texttt{messages} table and no communication matrix to
+draw. What distinguishes this cell from its 8{,}192-word neighbour is that it is over
+\emph{both} limits at once. Its 43{,}116 estimated tokens exceed the 4{,}096-token
+unexpected-message credit by $10.5\times$, which is what actually refused it, and
+they also exceed the receiver's entire 32{,}768-token context budget by $1.32\times$,
+so no amount of credit would have saved it: with an unlimited budget the receive
+would have raised \texttt{ERR\_TRUNCATE} instead. This is the size at which eager is
+not merely over-provisioned but incoherent --- the message does not fit in the
+receiver. The rendezvous cell at the same size moved the identical blob and finished
+with zero context consumed.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} shows eight lanes with two grey lifecycle diamonds each and
+nothing between them. The viewer's legend lists only ``rank lifecycle 16''; the green
+messages swatch that appears in every completed cell of this sweep is absent, because
+there is no message event of any kind. \texttt{MESSAGES 0}, \texttt{TOKENS DEFERRED
+0.0k}, 0\% context occupancy on every rank, and every rank's state
+\texttt{finalized}. There is no \texttt{figures/comm.pdf} for this run and no
+\texttt{fig:comm} reference in the generated section, because a matrix of zero
+messages is not a picture.
+
+The span deserves attention: 0.07\,s, the longest of any eager cell in the sweep,
+including the three that actually delivered messages --- 0.019\,s, 0.032\,s and
+0.035\,s at 128, 512 and 2{,}048 words. A run that sent nothing took twice as long as
+the largest run that sent everything. The cause is in the order of operations inside
+\texttt{Communicator.send}: \texttt{fabric.blobs.put(payload)} runs first, before
+\texttt{\_choose\_mode} and before the credit check, so each rank serialised, hashed
+and wrote its 163{,}840-byte payload to the content store and only then had the send
+refused. The blob is on disk, at
+\texttt{runs/mb-free/transport-eager-32768/blobs/04/af1d57\ldots}, 163{,}840 bytes,
+and it carries the same digest as the blob written by the rendezvous cell at this
+size --- the two runs put byte-identical content into their fabrics. Nearly all of
+this run's 70\,ms is that write, spread over a 38\,ms rank start-up window. The lanes
+in Figure~\ref{fig:timeline} are wider apart than in any other eager cell for that
+reason and for no protocol reason at all.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+The failure path is the same as the 8{,}192-word cell's and can be pinned down the
+same way. \texttt{ERR\_CONTEXT\_OVERFLOW} is \texttt{AmpiContextOverflow}, which in a
+run with no agent calls can only come from
+\texttt{Communicator.\_await\_eager\_credit}. That function has two raising branches:
+an immediate precondition when a single payload exceeds the destination's
+\texttt{unexpected\_limit}, and a deadline expiry inside the credit-polling loop. The
+benchmark's timeout is \texttt{stall\_timeout} = 12\,s, and the entire job spans
+0.07\,s with the per-rank figure in the results file at 0.01\,s, so the loop was never
+entered; there is also no \texttt{transport.credit\_stall} event, which the loop emits
+the first time it waits. It was the precondition: 43{,}116 tokens against a limit of
+4{,}096. The empty \texttt{messages} and \texttt{seqs} tables show the raise preceded
+the row insert and even the sequence-number increment, so the ring did not form one
+edge.
+
+What this cell adds beyond its neighbour is the second ceiling. At 8{,}192 words the
+payload was 10{,}779 tokens: over the 4{,}096-token credit, but comfortably inside the
+32{,}768-token context budget, so that cell isolates the flow-control limit and shows
+AgentMPI refusing a message the receiver could have held. Here the payload is 43{,}116
+tokens, which is $1.32\times$ the receiver's whole context window. Even with infinite
+eager credit this exchange is impossible: the message would have arrived,
+\texttt{\_deliver} would have called \texttt{rt.admit}, \texttt{ContextAccount.admit}
+would have found \texttt{would\_fit} false against a budget of 32{,}768 with
+\texttt{strict\_context} true, and the run would have failed with
+\texttt{ERR\_TRUNCATE} rather than \texttt{ERR\_CONTEXT\_OVERFLOW}. The two failed
+cells therefore say different things. The 8{,}192-word one says eager has a
+flow-control ceiling below the capacity ceiling; this one says that above the capacity
+ceiling eager is not a transport choice at all, because there is nowhere for the
+payload to go. That is the sharpest statement of the sweep's premise --- an agent's
+context is a bounded, exhaustible resource --- and the sharpest possible contrast with
+its rendezvous twin, \texttt{mb-free\_\_transport-rendezvous-32768}, which moved this
+same 43{,}116-token artefact through eight envelopes in 34 events with zero
+admissions, zero context high water and every rank at 0\% occupancy. A payload
+larger than the receiver's entire context window crossed the ring without consuming
+any of it.
+
+One defect is worth recording, and it belongs to AgentMPI rather than to the
+benchmark. \texttt{\_await\_eager\_credit}'s precondition branch raises without
+emitting anything, while the branch below it emits
+\texttt{transport.credit\_stall} on entry and \texttt{transport.credit\_granted} on
+release. The result is that a run in which every one of eight ranks failed is
+recorded as \texttt{ok: true} with \texttt{failed\_ranks: []} in
+\texttt{job.finish}, as \texttt{degraded: false} with zero findings in
+\texttt{metrics.json}, and as \texttt{FAILURES 0} in the viewer, with all eight ranks
+\texttt{finalized}. The benchmark contributes to this --- its \texttt{rank\_main}
+catches \texttt{AmpiError} and returns a dictionary, so the runtime never sees a
+failure --- but the harness cannot log an event the library does not emit, and the
+asymmetry between the two rejection paths is the library's. It is not a correctness
+bug: the refusal is right and its message names the remedy. It is an observability
+bug, and it is the reason this analysis has to reach outside the trace for the one
+fact that matters most about the run.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The failure is not in the trace. Everything asserting that this run failed ---
+\texttt{completed: false}, \texttt{n\_failed: 8}, the error class --- comes from
+\texttt{results/microbench/free-transport.json}, and the trace supports it only
+negatively, through 18 events instead of 34 and two empty fabric tables. The claim
+that the precondition branch fired rather than the stalling branch is likewise an
+inference from a 0.07\,s span against a 12\,s timeout and from an absent event. The
+counterfactual in the second paragraph --- that with unlimited credit this cell would
+have failed with \texttt{ERR\_TRUNCATE} at admission --- is read off the code path in
+\texttt{rank.py} and was not run; it is the most speculative claim in this document,
+though the arithmetic behind it, 43{,}116 against 32{,}768, is not in doubt. Token
+counts are estimates: provenance records \texttt{tokenizer\_exact: false}, and 43{,}116
+is $\lceil 163840/3.8 \rfloor$ from a character heuristic applied to one repeated
+word. A real tokeniser would price this text nearer 32{,}768 tokens, which would put
+it essentially at the context budget rather than 32\% above it and would make the
+second-ceiling argument marginal instead of clear-cut --- the first ceiling, at
+$8\times$ the credit either way, would be untouched. Both budgets are benchmark
+parameters rather than defaults (\texttt{unexpected\_limit} 4{,}096 and
+\texttt{context\_budget} 32{,}768, against shipped defaults of $8\times$ the eager
+limit and 128{,}000), so this run shows where AgentMPI puts a ceiling when told to,
+not where the ceiling is in practice. Finally, the executor is \texttt{none} with
+zero agent calls, so nothing here concerns agent behaviour, and the wall time is
+dominated by a 160\,KiB blob write and eight SQLite-backed rank start-ups.
 
 \end{document}

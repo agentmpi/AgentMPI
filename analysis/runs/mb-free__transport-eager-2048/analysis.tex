@@ -14,25 +14,117 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the last eager cell that completes. In a ten-cell transport sweep --- two
+modes crossed with five payload sizes, all at $p = 8$ and all agent-free --- eight
+ranks form a ring and each sends one 2{,}048-word payload to its successor with the
+mode pinned to \texttt{Mode.EAGER}. It carried all eight messages in 34 events and
+0.04\,s, and admitted 2{,}695 tokens into every receiver's context: 8.2\% of the
+32{,}768-token budget, but 65.8\% of the 4{,}096-token unexpected-message credit that
+actually gates the eager path. The gap between those two percentages is the whole
+point of the cell. Read against the context budget, eager looks comfortable here;
+read against the credit that governs admission, it has two-thirds of its headroom
+gone and 1{,}401 tokens left. The next size up, 8{,}192 words at 10{,}779 tokens, is
+refused outright. This is the last measurement on the safe side of a cliff whose
+position the run itself gives no warning about.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} shows eight lanes of instantaneous marks and no bars. The
+executor is \texttt{none}, there were zero agent calls and no \texttt{task.*} events,
+so the ``idle fraction 100.0\%'' and ``achieved parallelism 0.00$\times$'' in the
+headline table mean that no rank ever held a task --- they are facts about an
+agent-free benchmark and not about the protocol. Each lane carries a
+\texttt{rank.init} diamond, a \texttt{msg.send} tick, a \texttt{msg.recv} tick and a
+\texttt{rank.finalize} diamond. Ranks arrive over a 23\,ms window inside a 35\,ms
+span, so most of the wall clock is still eight ranks starting up against one SQLite
+writer.
+
+What distinguishes this cell visually from its smaller siblings is the spread between
+send and receive. The median receive latency is 13\,ms and the maximum is 27\,ms,
+against 4\,ms and 10\,ms at 128 words. No rank is waiting on a peer for any of it.
+The interval a latency measures starts when the sender stamps \texttt{sent\_at}, and
+what falls inside it are two payload-sized costs on the receiver's side: its own
+outgoing 10\,KiB blob write, because every rank sends before it receives, and then
+the \texttt{blobs.get} that materialises the arriving payload, which
+\texttt{\_deliver} performs before it emits \texttt{msg.recv}. Both scale with the
+payload, and the run span scales with them, from 19\,ms at 128 words to 35\,ms here.
+Nothing blocks, though. There is no
+\texttt{transport.credit\_stall} event anywhere in the log, because the ring gives
+each destination exactly one inbound sender and \texttt{\_await\_eager\_credit}
+therefore always finds zero outstanding queued tokens. The rank health table reads 8\%
+occupancy across all eight ranks --- the largest context footprint anywhere in this
+sweep, since the two eager cells above this one admitted nothing at all.
+Figure~\ref{fig:comm} shows the ring as a single off-diagonal band of 2{,}695 tokens
+per edge, the last time in the eager column that a communication matrix exists to be
+drawn.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+By construction: eight ranks, a ring, one send and one receive each, mode forced. The
+forcing matters here more than anywhere else in the eager column. Every
+\texttt{rank.init} records \texttt{eager\_limit: 1000000000}, which disables
+\texttt{\_choose\_mode}'s automatic threshold. That threshold defaults to
+\texttt{DEFAULT\_EAGER\_LIMIT} = 2048 \emph{tokens}, and this payload is 2{,}695
+tokens, so under the shipped default the runtime would already have converted this
+send to rendezvous. This cell is thus the first in the sweep where the harness is
+overriding what AgentMPI would have done on its own, and it still succeeds --- the
+default eager limit is conservative relative to the 4{,}096-token credit that
+actually enforces anything.
+
+What emerged is how little warning the successful case gives. The generated finding
+list is empty; the job outcome is ``completed''; every rank finalised with zero
+rejections and 8.2\% occupancy. Nothing in this run's own record indicates that it is
+close to a limit, because the limit is not the context budget it reports occupancy
+against. The binding resource is the destination's \texttt{unexpected\_limit}, fixed
+at 4{,}096 tokens by the benchmark, and \texttt{\_await\_eager\_credit} checks a
+single payload against it before doing anything else: \texttt{if n\_tokens > limit:
+raise AmpiContextOverflow}. At 2{,}695 tokens this cell passes with 1{,}401 to spare,
+34\% of the credit. Its successor at 8{,}192 words prices at 10{,}779 tokens, fails
+that check, and its trace contains no \texttt{msg.send} at all --- 18 events instead
+of 34, an empty \texttt{messages} table in the fabric, and \texttt{completed: false}
+with \texttt{ERR\_CONTEXT\_OVERFLOW} in \texttt{results/microbench/free-transport.json}.
+Since the charge is linear at $5/3.8 = 1.3158$ tokens per word with no intercept
+(168, 674 and 2{,}695 tokens for 128, 512 and 2{,}048 words), the crossing is at
+3{,}113 words. This cell is at 66\% of the way there and reports itself healthy. That
+is the argument for making transport mode explicit: a harness cannot infer from a
+successful eager run how much eager headroom it has left, because the successful run
+reports occupancy against the wrong budget.
+
+Against its rendezvous twin, this cell is the last place in the sweep where the two
+modes are genuinely comparable. \texttt{mb-free\_\_transport-rendezvous-2048} moves
+the identical blob in the identical 34 events and reports zero admissions; this one
+reports 2{,}695 tokens per rank. At 8.2\% of budget the eager charge is affordable
+and the receiver gets the content, whereas the rendezvous run's receivers finish
+holding a handle they never opened. Above this size that comparison stops being
+available, because the eager arm no longer runs. Everything the sweep says about
+rendezvous being necessary rather than merely available rests on the two cells above
+this one, and everything it says about eager being adequate rests on this one and the
+two below.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The context figures are admissions rather than usage: with \texttt{executor: none}
+and no agent calls, 2{,}695 tokens were charged to a budget nothing read, so this run
+measures the protocol's accounting and not any agent's behaviour. The token count is
+an estimate (\texttt{tokenizer\_exact: false}) produced by a character heuristic on a
+payload of one repeated word; a real tokeniser would price this text nearer 2{,}048
+tokens, which would put it at 50\% rather than 66\% of credit and move the sweep's
+ceiling from 3{,}113 words to roughly 4{,}096. The ceiling's existence does not
+depend on that, but its position in this document does, and no cell in the sweep
+brackets it more tightly than the factor of four between 2{,}048 and 8{,}192 words.
+The wall time is one sample --- 35\,ms, of which 23\,ms is rank start-up --- so the
+observation that latencies are larger here than at 128 words is suggestive of blob
+write cost but is not cleanly separable from start-up jitter at this scale. Finally,
+the claim that this cell is ``close to the limit'' is a claim about a per-message
+precondition, not about buffering. The ring hands each receiver exactly one message,
+so the accumulation path that \texttt{\_await\_eager\_credit} spends most of its code
+on --- polling outstanding queued tokens, emitting \texttt{transport.credit\_stall},
+blocking until credit frees --- is never entered in any of these ten runs. A harness
+that fanned two of these 2{,}695-token messages into one rank would exceed the same
+4{,}096-token credit by accumulation and would find out through a stall rather than a
+refusal, and that experiment is absent here.
 
 \end{document}

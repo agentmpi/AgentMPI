@@ -167,6 +167,31 @@ def test_deferred_tokens_are_a_subset_of_sent_tokens(analyses: list[an.Analysis]
         assert a.tokens_deferred <= a.summary.tokens_sent, a.name
 
 
+def test_calibration_declares_whether_it_fitted_or_fell_back(analyses: list[an.Analysis]) -> None:
+    """A fit and a median fallback are different claims and must be distinguishable.
+
+    ``calibrate`` rejects a regression that produces a negative slope or intercept and substitutes
+    robust medians, which is the right behaviour --- but nothing recorded which branch was taken, so
+    a published alpha and beta could be either. That is not a hypothetical: on the
+    semantic-glossary run the regression returned beta = -0.108 s/token, because the longest broker
+    queue waits landed on the smallest-output calls, so the reported parameters were medians and
+    read exactly like a fit.
+    """
+    allowed = {"least_squares", "median_fallback", "median_only", "default"}
+    for a in analyses:
+        method = a.calibration.fit_method
+        assert method in allowed, f"{a.name}: unknown fit_method {method!r}"
+        if a.summary.n_agent_calls == 0:
+            assert method == "default", f"{a.name}: calibrated without any agent call"
+        if method == "median_fallback":
+            assert a.calibration.fit_rejected_beta is not None, (
+                f"{a.name}: fell back without recording the slope it rejected"
+            )
+        # Whatever the branch, the reported parameters must be usable.
+        assert a.calibration.alpha_s > 0, a.name
+        assert a.calibration.beta_s_per_token > 0, a.name
+
+
 def test_participants_never_exceed_communicator_size(analyses: list[an.Analysis]) -> None:
     for a in analyses:
         for c in a.collectives:

@@ -14,25 +14,138 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the first cell of a ten-cell transport sweep at which the mode is not a
+preference. Eight agent-free ranks ring-exchange an 8{,}192-word payload under
+\texttt{Mode.RENDEZVOUS}: 34 events, 0.06\,s, all eight messages delivered, zero
+admissions, a context high water of zero on every rank and 86{,}232 tokens deferred.
+Its eager twin, given the same payload, produced 18 events and no messages at all ---
+\texttt{results/microbench/free-transport.json} records \texttt{completed: false},
+\texttt{n\_failed: 8}, \texttt{ERR\_CONTEXT\_OVERFLOW} --- because the payload's
+10{,}779 estimated tokens exceed the destination's 4{,}096-token unexpected-message
+credit by $2.63\times$ and \texttt{\_await\_eager\_credit} refuses it before writing
+a fabric row. The pair is unusually clean evidence: the two runs put the
+byte-identical blob \texttt{3fbdeea17da4} into their content stores, address the same
+ring, and differ in nothing except what the envelope carries. Eager put the payload
+in it and was refused; rendezvous put a handle in it and was not. This is the cell
+that turns AgentMPI's transport-mode argument from a design preference into a
+requirement.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} shows eight lanes carrying two grey lifecycle diamonds and
+two green message ticks each, and no bars: the executor is \texttt{none} on every
+rank, there were zero agent calls, and no \texttt{task.*} event exists for a bar to
+span. Read ``idle fraction 100.0\%'' and ``achieved parallelism 0.00$\times$'' in the
+headline table as saying that no rank ever held a task. Ranks arrive over a 33\,ms
+window inside a 56\,ms span, and the receive latencies have grown: median 10\,ms and
+maximum 31\,ms, against 5\,ms and 7\,ms at 2{,}048 words. That is not the received
+payload moving --- nothing is transferred on a rendezvous receive, and
+\texttt{sent\_at} is stamped after the sender's own \texttt{fabric.blobs.put} has
+already completed. It is that every rank sends before it receives, so a message's
+measured latency includes the receiver's own time writing its 40\,KiB outgoing blob
+before it ever looks in its mailbox. The same term triples the span against the
+2{,}048-word cell's 20\,ms. Nothing blocked: there is no
+\texttt{transport.credit\_stall} in the log, and none is possible, because the eager
+credit mechanism does not apply to rendezvous traffic at all.
+Figure~\ref{fig:comm} shows the ring as a single off-diagonal band of 10{,}779 tokens
+per edge.
+
+The comparison worth making is with a figure that does not exist. The eager cell at
+this size has no \texttt{figures/comm.pdf} --- \texttt{analyze\_run.py} does not draw
+a matrix for a run with no traffic --- and its timeline has only the grey lifecycle
+marks, with the viewer's legend omitting the messages swatch entirely. Here the rank
+health table reads 0\% occupancy across all eight ranks and the stats row reads
+\texttt{TOKENS DEFERRED 86.2k}; there it reads 0\% occupancy and \texttt{0.0k}
+deferred, and the zeros mean the opposite thing. This is the sweep's sharpest
+illustration of why the trace must be read alongside the results file: two runs whose
+dashboards both show \texttt{FAILURES 0} and all ranks \texttt{finalized}, one of
+which delivered everything and one of which delivered nothing.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+By construction: the world size, the ring mapping, one send and one receive per rank,
+and the mode --- and here the forcing runs the other way from the eager column. Every
+\texttt{rank.init} records \texttt{eager\_limit: 1000000000}, so
+\texttt{\_choose\_mode}'s automatic threshold is off; had it been left at the shipped
+\texttt{DEFAULT\_EAGER\_LIMIT} of 2{,}048 tokens, the runtime would have selected
+rendezvous for this 10{,}779-token payload on its own. This cell is what AgentMPI
+does by default, and its eager twin is what happens when a harness overrides that
+default at a size where the override cannot work. That framing matters for reading
+the sweep: the failure in the eager column is not AgentMPI failing, it is AgentMPI
+refusing an instruction it was given, and refusing it early, locally and with the
+remedy named in the exception message.
+
+The mechanism of the contrast is worth stating precisely, because the two runs are so
+nearly identical that it is easy to assume rendezvous saved something physical. It
+did not. Both runs' \texttt{send} calls reached
+\texttt{fabric.blobs.put(payload)} and wrote all 40{,}960 bytes; the blob is present
+on disk in \emph{both} run directories, under the same digest, because the content is
+the same and the store is content-addressed. Both would have sent eight envelopes.
+The divergence happens at the next line: \texttt{\_choose\_mode} returns
+\texttt{Mode.EAGER} for the twin, which enters \texttt{\_await\_eager\_credit}, which
+compares 10{,}779 against the destination's \texttt{unexpected\_limit} of 4{,}096 and
+raises \texttt{AmpiContextOverflow} on the spot --- before the \texttt{messages} row,
+before the sequence-number increment, which is why that run's fabric has empty
+\texttt{messages} and \texttt{seqs} tables. Here \texttt{\_choose\_mode} returns
+\texttt{Mode.RENDEZVOUS}, the credit check is skipped entirely, and the envelope goes
+out carrying digest, token count, kind and a one-line synopsis. The difference between
+a run that works and a run that does not is one branch on a mode flag. Note also
+which limit did the refusing: 10{,}779 tokens would have fitted inside the receiver's
+32{,}768-token context budget, at 33\% occupancy. The eager path did not fail because
+the message was too big for the receiver; it failed because it was too big for the
+receiver's unexpected-message pool, a flow-control bound set at $\tfrac{1}{8}$ of the
+context budget in this benchmark.
+
+The deferral figure needs one correction. \texttt{metrics.json} reports 86{,}232,
+which is $8 \times 10{,}779$ --- one rendezvous send per rank, exactly equal to
+\texttt{tokens sent} because all the traffic is rendezvous, and consistent with the
+128-, 512- and 2{,}048-word cells at $4.00\times$ the last of them for $4\times$ the
+payload. The results file records 172{,}464, and the per-rank events show
+\texttt{tokens\_deferred: 21558} against \texttt{tokens\_sent: 10779}: twice what the
+rank transmitted. Before commit \texttt{0fea51d2},
+\texttt{RankCost.tokens\_deferred} accumulated on rendezvous sends \emph{and} on every
+non-admitted receive, so each rank counted its own send and its predecessor's
+arrival. The commit split the field into \texttt{tokens\_deferred} (send-side,
+rendezvous only) and \texttt{tokens\_unadmitted} (receive-side, any mode), under which
+this run reports 86{,}232 of each. \texttt{cost.summarise} derives from the log and
+was always right, which is why the viewer and \texttt{metrics.json} already show the
+corrected number. The fix's summary holds that the paper's transport table is
+unaffected because the microbench admits its receives; that is true of the eager
+rows, which correctly read zero, and false of the rendezvous rows, since
+\texttt{bench\_transport} never passes \texttt{admit} and rendezvous defaults it to
+\texttt{False}. Every rendezvous entry in that table is exactly doubled.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The strongest caveat is that this cell's advantage is entirely deferral, and deferral
+is not delivery. No \texttt{fetch} is called anywhere in the transport sweep, so the
+eight receivers finished holding a digest, a token count and a synopsis of a document
+they never read. If the workload genuinely needed the content, a rank would have to
+call \texttt{fetch} with \texttt{admit=True} and would then charge 10{,}779 tokens to
+a 32{,}768-token budget --- affordable once, not four times. The cell therefore shows
+that a large artefact can be \emph{addressed} without cost, not that it can be
+\emph{used} without cost, and the mechanism that would bridge the two, a partial
+materialisation through a \texttt{View}, is exercised nowhere in this sweep. Second,
+the failure of the eager twin --- the comparison this document rests on --- is not
+recorded in that run's trace. Its \texttt{job.finish} says \texttt{ok: true} with
+\texttt{failed\_ranks: []}, its \texttt{metrics.json} says \texttt{degraded: false},
+and the error class comes from the results file; the trace corroborates only by
+absence, through 18 events instead of 34 and empty fabric tables. The inference that
+the immediate precondition fired, rather than the credit loop timing out, rests on
+that run's 0.04\,s span against a 12\,s stall timeout and on the absence of
+\texttt{transport.credit\_stall}. Third, token counts are estimates
+(\texttt{tokenizer\_exact: false}): 10{,}779 is $\lceil 40960/3.8 \rfloor$ from a
+character heuristic on one repeated word, and a real tokeniser would price it near
+8{,}192 --- still $2.0\times$ the credit, so the contrast survives, but every
+deferred figure here scales by about $0.76$. Fourth, both budgets are benchmark
+parameters rather than defaults (\texttt{unexpected\_limit} 4{,}096 against a shipped
+$8\times$ eager limit; \texttt{context\_budget} 32{,}768 against 128{,}000), so this
+pair locates a ceiling the benchmark chose. Finally, the executor is \texttt{none}
+with zero agent calls and the wall time is one sample dominated by a 40\,KiB blob
+write and eight SQLite-backed rank start-ups, so nothing here is a statement about
+agents or about throughput.
 
 \end{document}

@@ -14,25 +14,391 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the serial baseline of the collaborative software-development experiment: one real
+agent, given the whole \texttt{minidb} specification, writing all eight modules itself. It
+passed 59 of 60 acceptance cases at the first attempt and 60 of 60 after one repair round,
+in 1{,}213.0\,s for \$0.4379 --- against 499.4\,s and \$1.1445 for the eight-rank baseline
+\texttt{real-sw-p8-full}, which also reached 60/60. Eight agents therefore bought
+$2.43\times$ the speed for $2.61\times$ the money and $31.1\times$ the prompt tokens. The run's
+real value is as a measurement of what AgentMPI costs when it is doing nothing: of the
+1{,}212.9986\,s of wall clock, 1{,}210.228\,s is time a worker held a claim and 1{,}212.896\,s
+is inside the two \texttt{agent.call} latencies, leaving \textbf{2.768\,s --- 0.228\,\% ---} for
+broker dispatch, contract validation, result handling, two invocations of the acceptance
+oracle, and every fabric write the protocol performed. The protocol proper is thirteen event
+rows and one degenerate broadcast. Two things qualify that figure and both matter: the $p=1$
+path in the harness branches away before the RMA window is ever created, so this is the floor
+of the runtime rather than the fixed cost of the full pipeline; and 47 of the run's 60 events
+are not this job's at all, but a shared worker pool registering ranks 0--7 into a world of size
+1 on a 244.7\,s cycle, which the viewer then reports as seven ranks suspected of
+\texttt{fail\_stop} in a run with zero failures. The structural result the run is uniquely
+placed to give is about verification, not overhead: every one of the 60 acceptance cases enters
+through \texttt{minidb.query}, so no case can run until all eight modules exist. At $p=1$ that
+gate opens after every agent call; at $p=8$ it opens once per round, at rank~0, after the
+integration barrier, and never for an individual rank at all.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is the simplest picture in the archive and almost all of it is
+somebody else's run. Rank~0's lane holds two blue work bars that between them cover
+1{,}210.23\,s of the 1{,}213.00\,s span, and the seam between them --- at $t=563.7$\,s --- is
+so narrow that the viewer draws the pair as one continuous bar. The other seven lanes contain
+no work at all: only evenly spaced grey lifecycle ticks, five to nine per lane, marching
+across the full width of the plot. Those lanes should not exist. The declared world size is
+1, the job created exactly one rank, and ranks~1 through~7 have \texttt{busy\_s} of 0.0 and
+\texttt{n\_agent\_calls} of 0. They are the subject of the run's one \finding{warning} finding
+and of Section~\ref{sec:strays}.
+
+Figure~\ref{fig:concurrency} is the corresponding flat line: one rank busy for 99.77\,\% of
+the run, zero for the remaining 0.23\,\%, with a single faint vertical mark at $t\approx0$ for
+the only collective the run performed. Figure~\ref{fig:ranks} shows rank~0 at 99.8\,\%
+occupancy and a right-hand context panel that is empty at 0\,\%; the latter is not a finding
+about context pressure but a consequence of the harness never admitting anything into a
+context account, exactly as in the $p=8$ runs. Figure~\ref{fig:collectives} has one point on
+it, and it sits on the line: a flat broadcast at $p=1$ is predicted to send zero messages and
+sent zero.
+
+The interesting reading is of the seam rather than the bars. Laying the thirteen events that
+belong to this job end to end, with time relative to \texttt{job.create}:
+
+\begin{center}
+\begin{tabular}{@{}rll@{}}
+\toprule
+$t$ (s) & event & what it covers \\
+\midrule
+0.0000 & \texttt{job.create} & fabric schema, blob store, spool \\
+0.0012 & \texttt{rank.init} & rank~0 registers, executor \texttt{broker} \\
+0.0013 & \texttt{coll.bcast} & the specification, $p=1$: 0 rounds, 0 messages \\
+0.0055 & \texttt{broker.enqueue} & prompt \texttt{single:r1}, 1{,}706 tokens \\
+1.3962 & \texttt{broker.claim} & a pool worker takes the task \\
+563.5329 & \texttt{broker.complete} & 14{,}066 result tokens \\
+563.6854 & \texttt{agent.call} & contract \texttt{Bundle} validated, latency 563.682\,s \\
+563.7367 & \texttt{broker.enqueue} & prompt \texttt{single:r2}, 1{,}737 tokens \\
+564.3652 & \texttt{broker.claim} & \\
+1212.4560 & \texttt{broker.complete} & 14{,}436 result tokens \\
+1212.9493 & \texttt{agent.call} & latency 649.214\,s \\
+1212.9983 & \texttt{rank.finalize} & \\
+1212.9986 & \texttt{job.finish} & \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Everything AgentMPI did in this run is in that table. The two gaps that are not agent time
+are 0.0055\,s before the first prompt and 0.0513\,s and 0.0490\,s after each completion; the
+latter two are where the harness wrote eight files, copied the oracle in, ran it out of
+process, and built the next prompt. Running the archived round-1 tree against
+\texttt{experiments/minidb/acceptance.py} in a scratch directory takes 0.040--0.050\,s per
+invocation over three trials, which accounts for essentially the whole of each gap. That is
+the measurement behind the abstract's claim: at $p=1$ the fabric's own contribution to wall
+clock is not merely small, it is smaller than the cost of starting a Python interpreter.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{What is true by construction}
+
+The run has one rank because \texttt{--ranks 1} was passed, and at $p=1$
+\texttt{build\_harness} broadcasts the specification and then returns into
+\texttt{\_single\_rank}, which is a different code path from the one every other software run
+takes. That branch happens before \texttt{ampi.win\_create}, so this run performs no window
+operation of any kind: the \texttt{kind\_counts} contain no \texttt{win.*} event, no
+\texttt{coll.barrier}, no \texttt{coll.gather}, no \texttt{coll.scatter} and no
+\texttt{ft.agree}. The \texttt{shared\_interfaces}, \texttt{locks} and \texttt{review} flags
+are all true in the config and all inert. \texttt{agreed\_green} is \texttt{null} for both
+rounds for the same reason: \texttt{agree} is never called, so the loop terminates on the
+oracle's verdict directly rather than on a collective decision. The two rounds are the
+configured maximum, and the run used both.
+
+Three headline numbers are therefore trivially true and should not be read as results. The
+imbalance of $1.00\times$ and the coordination share of 0.0\,\% are what a one-rank world
+must report. The achieved parallelism of $1.00\times$ is a statement that one rank was busy
+almost all the time, not that anything ran in parallel.
+
+\subsection*{The fixed overhead, stated three ways}
+
+The question this run is here to answer is what the protocol costs when there is nothing for
+it to coordinate. There are three defensible boundaries and they give three numbers.
+
+The narrowest is wall clock outside the agent calls: $1{,}212.9986 - 1{,}212.8960 =
+\mathbf{0.1026\,s}$, or 0.00846\,\% of the run. Most of that is the oracle, which is the
+experiment rather than the protocol.
+
+The widest useful boundary is wall clock outside the interval a worker actually held the
+task. Summing \texttt{broker.claim} to \texttt{broker.complete} over the two calls gives
+1{,}210.228\,s, which matches the independently computed \texttt{busy\_s} of 1{,}210.227\,s
+for rank~0 to a millisecond. The complement is $\mathbf{2.768\,s}$, \textbf{0.228\,\%} of the
+run, and it decomposes cleanly: 2.019\,s of dispatch wait, from \texttt{broker.enqueue} to
+\texttt{broker.claim} (1.391\,s and 0.629\,s); 0.646\,s of result handling, from
+\texttt{broker.complete} to the \texttt{agent.call} event that follows it (0.153\,s and
+0.493\,s), which is where the JSON is decoded and the \texttt{Bundle} contract is checked; and
+the 0.103\,s above. Zero contract violations and zero retries were recorded, so the validation
+cost is the cost of a passing check.
+
+The third boundary is the one the paper cares about and it is a count rather than a duration:
+thirteen event rows and a 159{,}744-byte SQLite fabric for a twenty-minute run. The only
+collective is a broadcast to nobody, correctly logged as \texttt{rounds: 0, messages\_sent: 0,
+wall\_s: 0.0}.
+
+The honest caveat is the one already stated: because \texttt{\_single\_rank} bypasses the RMA
+window, this is the floor of the runtime and not the fixed cost of the pipeline the $p=8$ runs
+execute. A $p=1$ run of the \emph{full} pipeline would additionally create a window, publish
+eight interfaces into it, fence against itself, and read fourteen dependency slots that it had
+itself written; the archive contains no such run. What can be said from the $p=8$ traces is
+that those operations are individually sub-millisecond --- in \texttt{sw-rev-smoke}, 100 RMA
+events occur inside a 0.324\,s run --- so the extrapolated floor would still be well under a
+second. The two-decimal-order claim survives; the exact figure is for the branch this run
+took.
+
+\subsection*{Continuous verification is available at $p=1$ and unavailable at $p=8$}
+\label{sec:verify}
+
+This is the asymmetry the project asserts and the only run in the archive that isolates it.
+The assertion is usually made loosely --- a single agent can test as it goes --- and the
+harness lets it be made exactly.
+
+The oracle's entry point is \texttt{minidb.query}, and every one of the 60 cases in
+\texttt{CASES} calls it. \texttt{query} lives in \texttt{api.py}, which the module table
+declares dependent on \texttt{parser}, \texttt{planner}, \texttt{engine} and \texttt{errors};
+those in turn require \texttt{tokens}, \texttt{nodes} and \texttt{functions}. Six of the eight
+modules have declared dependencies, and \texttt{run\_all} returns \texttt{importable: false}
+with zero cases attempted if \texttt{import minidb} raises. The consequence is not that
+testing a single module in isolation is inconvenient at $p=8$; it is that the acceptance suite
+contains \textbf{no case that any individual rank could run}, at any point before the
+integration barrier, no matter how complete its own module was. The three smoke runs in this
+family demonstrate the same thing from the other side: their surrogate modules are
+syntactically valid stubs and the suite still reports zero of sixty, because
+\texttt{minidb.api} exposes no \texttt{query}.
+
+At $p=1$ that gate is open after every agent call, and the trace shows the loop closing in
+0.05\,s. Round~1 scored 59/60; the single failure, \texttt{empty\_table\_select}, was
+attributed to \texttt{planner}; round~2 scored 60/60. At $p=8$ the same feedback arrives
+through \texttt{barrier} $\rightarrow$ \texttt{gather} $\rightarrow$ oracle at rank~0
+$\rightarrow$ \texttt{bcast} $\rightarrow$ \texttt{scatter}, once per round, and the latency of
+that loop is set by the slowest rank: in \texttt{real-sw-p8-full}, rank~0 finished its module
+at $t=85.0$\,s and did not learn anything about it until the barrier released at $t=300.6$\,s,
+a 215.56\,s wait. The gap between 0.05\,s and 215.56\,s is not a protocol inefficiency to be
+optimised away. It is what "the module's tests cannot run until its dependencies exist" costs,
+and AgentMPI's contribution is to make the barrier the place where that cost is paid visibly
+rather than the place where a build silently diverges.
+
+The repair itself shows the second half of the asymmetry, which is granularity. One failing
+case out of sixty produced a rewrite of all eight files: \texttt{planner} grew from 341 to 530
+lines, \texttt{parser} from 365 to 391, \texttt{tokens} from 95 to 148, while \texttt{api} fell
+from 47 to 26 and \texttt{errors} from 17 to 8; not one of the eight round-1 digests survives
+into round~2. A single agent holding the whole system revises the whole system. At $p=8$ the
+harness scatters blame per module precisely so that it need not, and only the blamed owners
+rewrite --- although \texttt{real-sw-p8-full} cannot be used to demonstrate that, because its
+oracle report failed to parse and every rank was handed the same synthetic \texttt{IMPORT}
+failure.
+
+\subsection*{The code one agent writes is the most internally consistent in the experiment}
+
+The offline re-scoring stored with the result computes two structural measures over the
+delivered tree, and on both of them this run is the extreme of the five real-agent software
+runs.
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+run & lines & defensive constructs & per kloc & mixed-convention files \\
+\midrule
+\texttt{real-sw-p1-full} (r2) & 1{,}752 & 1 & \textbf{0.57} & \textbf{0} \\
+\texttt{vague-sw-p8-vague-shared} & 2{,}203 & 2 & 0.91 & 3 \\
+\texttt{real-sw-p8-full} & 1{,}954 & 7 & 3.58 & 1 \\
+\texttt{vague-sw-p8-vague-noshared} & 3{,}564 & 15 & 4.21 & 5 \\
+\texttt{real-sw-p8-noshared} & 2{,}693 & 33 & 12.25 & 2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Defensive constructs are \texttt{getattr} with a default, \texttt{hasattr}, and
+\texttt{except} clauses that adapt to a peer's shape --- the syntax of an author who is not
+sure what the other side exposes. The $p=1$ tree contains exactly one, in \texttt{engine.py},
+against 33 in the windowless eight-rank run. The naming audit is starker: zero files in which
+the same concept is spelled two ways, against two to five everywhere else. This is the
+mechanical version of "one agent writes both sides of every call", and it is worth being
+precise about what it does and does not show. It does not show that $p=1$ produces better
+code: the acceptance outcome is 60/60 in three of the five runs above, and the oracle cannot
+tell them apart. It shows that the artefacts of \emph{coordination failure} --- runtime
+introspection of a collaborator, two names for one idea --- are absent when there is no
+collaborator, which locates them as coordination costs rather than as properties of the model
+or the task. Note also that the $p=1$ run's own round~1 tree scored 2.62 defensive constructs
+per kloc and mixed two conventions; the repair round removed both. Even a single author
+accumulates inconsistency across a 1{,}500-line generation and cleans it up on a second pass.
+
+\subsection*{What the run contributes to the sweep}
+
+\begin{center}
+\begin{tabular}{@{}lrrrrrl@{}}
+\toprule
+run & $p$ & wall (s) & calls & tokens in & tokens out & USD \\
+\midrule
+\texttt{real-sw-p1-full} & 1 & 1{,}213.0 & 2 & 3{,}443 & 28{,}502 & 0.4379 \\
+\texttt{real-sw-p8-full} & 8 & 499.4 & 32 & 107{,}118 & 54{,}871 & 1.1445 \\
+\texttt{real-sw-p8-noshared} & 8 & 528.6 & 32 & 94{,}239 & 72{,}935 & 1.3768 \\
+\texttt{vague-sw-p8-vague-shared} & 8 & 401.9 & 16 & 54{,}169 & 32{,}304 & 0.6471 \\
+\texttt{vague-sw-p8-vague-noshared} & 8 & 847.5 & 32 & 102{,}613 & 88{,}989 & 1.6427 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Every one of these reached 60/60 on re-scoring except \texttt{real-sw-p8-noshared} at 59/60.
+The baseline is therefore not beaten on quality by anything; it is beaten on latency by three
+of the four and on price by none of them. The cheapest eight-rank cell,
+\texttt{vague-sw-p8-vague-shared}, is $3.0\times$ faster and $1.48\times$ dearer, which is the
+most favourable trade in the archive and is favourable partly because it happened to go green
+in one round.
+
+The prompt-token column is where the parallel decomposition is most expensive, and the ratio
+is not $8\times$ but $31.1\times$. The specification is 1{,}526 tokens and it is embedded in
+every prompt: two prompts at $p=1$, thirty-two at $p=8$, each additionally carrying published
+dependency interfaces, scattered failures and returned reviews. Completion tokens scale far
+more gently --- 28{,}502 against 54{,}871, a factor of 1.93 for a tree only 1.12 times longer
+--- because the system being written is the same system either way. Parallelising this task
+costs prompt tokens roughly in proportion to $p$ and completion tokens hardly at all, and
+since prompt tokens are the cheap ones the bill only doubles. That decomposition of the cost
+is the baseline's main quantitative contribution.
+
+\subsection*{The flagged findings}
+
+Of the three findings above, the two \finding{ok} marks are correct but one is misleading and
+the \finding{warning} is a real defect. All one checkable collective agreed with its closed
+form, which at $p=1$ is a statement that zero equals zero. The 40 rank reattachments up to
+incarnation~9 are described as normal broker behaviour; six of them are rank~0 and 34 are
+ranks that do not exist in this job, so the number is not a property of this run at all. The
+warning about stray ranks is the subject of the next section.
+
+\subsection*{Forty-seven registrations that belong to another job}
+\label{sec:strays}
+
+Forty-seven of the run's 60 events are \texttt{rank.init} with \texttt{executor: worker}, and
+they arrive on a metronome: taking every inter-registration interval longer than 50\,s across
+all eight rank slots gives 35 samples with a median of 244.7\,s, a minimum of 82.2\,s and a
+maximum of 247.1\,s. A one-rank job that makes two agent calls does not re-register a rank
+every four minutes. The pool did.
+
+The pool was busy elsewhere. \texttt{real-tr-p16-full} was live from 06:47:39 to 08:47:39 and
+therefore spanned this entire run; inside this run's window it logged six
+\texttt{broker.expire} events with \texttt{waited\_s: 5400.0} and six matching
+\texttt{harness.degraded} \texttt{ERR\_TIMEOUT} records for \texttt{terms:u9} through
+\texttt{terms:u15}. A sixteen-rank job was starving for workers at the same moment that a
+one-rank job was accumulating eight rank rows. I cannot show from the trace that these are the
+same workers --- registration in one fabric leaves no trace in another, and none of the 48
+\texttt{rank.init} timestamps here falls within a second of a \texttt{rank.init} there --- but
+the coincidence is worth recording for anyone reading either trace.
+
+The defect itself is understood and half-fixed. \texttt{RankRuntime.register} accepted any
+rank index unconditionally; commit \texttt{6728d91} now refuses an index outside the world,
+and its docstring lists the three translation runs where the leak was first seen (worlds of 2,
+4 and 8). This run is a fourth instance and the most extreme: seven of the eight rank rows in
+a world of size~1 are foreign, and ranks~1--7 carry lifetimes of 968--1{,}209\,s in
+\texttt{metrics.json} despite never doing anything.
+
+What this run adds is evidence for the case that commit says it cannot close. Registration is
+an upsert keyed on rank index, so a worker landing on an index \emph{inside} the world would
+silently take over the incumbent's lease and mailbox. Rank~0 received six worker registrations
+beyond its own broker registration. Two of them are legitimate and identifiable: the one at
+$t=1.396$\,s immediately precedes the first \texttt{broker.claim}, and the one at
+$t=568.53$\,s follows the second claim by 4.2\,s. The other four --- at $t=241.90$, $486.33$,
+$812.41$ and $1{,}058.66$\,s --- sit on the same 244.7\,s cadence as the seven out-of-world
+lanes and arrived while a claim was outstanding. If they are pool strays, then the dangerous
+case did happen here, at least four times, and did no damage only because nothing was waiting
+in rank~0's mailbox. If they are the claiming worker renewing, they are benign. \emph{The
+trace cannot distinguish these}, which is exactly the property that makes the case
+uncloseable: a worker holding the right index is indistinguishable from the rank it claims to
+be. Anyone tempted to consider the registration issue closed by \texttt{6728d91} should read
+these six events first.
+
+The consequence for the viewer is worth seeing rather than describing. The dashboard's stats
+row reports \textsc{failures} 0. Its rank table reports rank~0 as \texttt{finalized} and every
+other rank as \texttt{running}, \texttt{alive: no}, with \texttt{fail\_stop} in the
+\textsc{suspected} column. Seven ranks are flagged as suspected failures in a run that had
+none, because the failure detector is doing its job on rows that should never have been
+created.
+
+\subsection*{Two numbers in the artefacts that do not mean what they say}
+
+The headline table and the dashboard both report agent latency as
+\texttt{p50 / p95 = 649.21 / 563.68\,s}, a p95 below the p50 and a p50 equal to the maximum.
+With two samples, \texttt{RunSummary.as\_dict} computes the median as
+\texttt{lat[len(lat) // 2]}, which is the upper of the two, and the p95 as
+\texttt{lat[int(0.95 * (len(lat) - 1))]}, which floors to index~0 and returns the smaller.
+Both indices are wrong in the same direction for small samples, and for $n = 2$ the reported
+p95 is the minimum. The same pattern appears in \texttt{cost.calibrate}, where
+\texttt{alpha\_p99} is 563.682 against an \texttt{alpha\_p50} of 606.448. This is cosmetic here
+--- the two latencies are printed in full in the log --- but it is on the dashboard, and on
+any run with fewer than about twenty calls the percentile pair should be ignored.
+
+The second is the calibration block, which reports \texttt{tokens\_per\_s: 45.0} and an
+$\alpha/\beta$ crossover at 27{,}290 tokens. Neither is fitted from this run.
+\texttt{calibrate} requires at least three samples with distinct token counts before it runs
+its least squares; with $n = 2$ it takes the \texttt{elif} branch, sets $\alpha$ to the median
+latency and leaves $\beta$ at the \texttt{CostParams} class default of 1/45\,s per token. The
+run's own throughput is 14{,}066/563.682 = 24.95 and 14{,}436/649.214 = 22.24 tokens per
+second, an aggregate of 23.50 --- about half the figure the archived calibration reports. The
+guard is visible (\texttt{n\_samples: 2} is recorded alongside), but the defaulted values are
+not marked as defaults, and a reader comparing calibrations across runs would not see that
+this one contains no measurement.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{One shared output digest, and the pool was shared.} \texttt{real-sw-p8-full} finished
+at 07:55:25 and this run started at 08:04:14 against the same worker pool, so the contract's
+contamination test applies. Comparing content hashes across all four archived trees, exactly
+one agent-authored file coincides: \texttt{errors.py} in this run's round~1 is byte-identical
+to \texttt{errors.py} in both rounds of \texttt{real-sw-p8-full} (17 lines,
+\texttt{a22b8a49e1c7}). The harness-written \texttt{\_\_init\_\_.py} matches everywhere and is
+not evidence. Nothing else matches: \texttt{engine.py} is 340 lines here against 429 there,
+\texttt{planner.py} 341 against 505, \texttt{tokens.py} 95 against 170.
+
+The evidence favours convergence, for three reasons, and I cannot exclude reproduction. First,
+the shape is wrong for reuse: a worker replaying its previous output would not replay one file
+of eight, and at $p=1$ all eight came back in a single JSON object from a single call. Second,
+\texttt{errors.py} is the most constrained artefact in the system --- the specification's
+module table pins it to ``\texttt{QueryError(Exception)} and nothing else'', it has no logic,
+and there is essentially one way to write it. Third, and most usefully, the identical text did
+not survive: round~2 replaced it with a different 8-line file, so the tree that scores 60/60
+contains no byte in common with the $p=8$ run. The uncomfortable part is that the matching 17
+lines are mostly a docstring whose error taxonomy --- ``malformed SQL, unknown tables or
+columns, ambiguous column references, mixed-type comparisons, negative LIMIT/OFFSET values and
+type errors'' --- is assembled from four separate places in the specification and matches
+including its line wrapping. That is a stronger coincidence than a bare class statement would
+be, and the trace records no worker identity, so it cannot be resolved here.
+
+\textbf{$n = 2$, and the two calls disagree about the model.} Every timing statement about the
+agent rests on two samples whose latencies differ by 15\,\% and whose throughputs differ by
+12\,\%. The claim that the baseline took 1{,}213\,s is exact; the claim that a single agent
+writing \texttt{minidb} takes about twenty minutes is a sample of one, drawn on a pool that was
+concurrently oversubscribed by a sixteen-rank job, which is a plausible source of the dispatch
+waits and possibly of latency inside them.
+
+\textbf{The overhead figure is a floor, not the pipeline's fixed cost.} Restating the caveat
+because it is the most likely thing to be misquoted: 0.228\,\% is the overhead of the code path
+\texttt{--ranks 1} actually executes, which contains no window, no barrier, no gather, no
+scatter and no agreement. It bounds what AgentMPI costs when idle. It does not bound what the
+eight-rank pipeline's coordination machinery would cost if run against a single rank, and no
+run in the archive measures that.
+
+\textbf{The oracle changed after this run.} The suite re-scored offline carries
+\texttt{suite\_sha 0eaa6b695b83} and 60 cases; \texttt{sw-smoke}, recorded at 07:02, ran a
+59-case version. This run's in-flight and offline scores agree at 60/60, so nothing here
+depends on the difference, but the 59/60 of round~1 and the 60/60 of round~2 are scores against
+a suite that was itself under revision during the campaign, and one case in it was later found
+to contradict the specification.
+
+\textbf{The provenance commit is not the code that ran.} The result names \texttt{a803ffd},
+which was committed at 08:10:32, six minutes after the run began at 08:04:14.
+\texttt{provenance()} records \texttt{git rev-parse HEAD} when the result is written, not when
+the run starts, so the field dates the write and nothing else. This matters for the sibling
+comparisons above, which span at least three harness commits.
+
+\textbf{A single-rank run cannot falsify a claim about coordination.} The most quotable
+sentence available here --- that AgentMPI's overhead is a fifth of a percent --- is measured on
+the configuration that uses none of AgentMPI. It is the right baseline for exactly one
+question, whether the framework's bookkeeping is a material tax on an agent workload, and the
+answer is no by two orders of magnitude. It is the wrong evidence for any question about
+whether the coordination mechanisms are worth their cost, and the four eight-rank cells are
+where that is decided.
 
 \end{document}

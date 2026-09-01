@@ -100,6 +100,7 @@ STYLE: dict[str, Style] = {
     "broker.reclaim": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
     "agent.contract_violation": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
     "transport.credit_stall": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
+    "msg.orphaned": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
     "harness.degraded": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
     "ft.declare_failed": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),
     "ft.agree_timeout": Style(ROLE_COLOR["trouble"], "diamond", "trouble"),

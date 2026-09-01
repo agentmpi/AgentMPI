@@ -40,6 +40,7 @@ export type EventKind =
   | "broker.reclaim"
   | "agent.contract_violation"
   | "transport.credit_stall"
+  | "msg.orphaned"
   | "harness.degraded"
   | "ft.declare_failed"
   | "ft.agree_timeout"
@@ -213,6 +214,7 @@ export const STYLE: Record<EventKind, { color: string; glyph: Glyph; role: Role 
   "broker.reclaim": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
   "agent.contract_violation": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
   "transport.credit_stall": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
+  "msg.orphaned": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
   "harness.degraded": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
   "ft.declare_failed": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },
   "ft.agree_timeout": { color: ROLE_COLOR.trouble, glyph: "diamond", role: "trouble" },

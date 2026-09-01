@@ -67,6 +67,7 @@ from .constants import (
     INTERNAL_TAG_PREFIX,
     UNDEFINED,
     WORLD_CTX,
+    TERMINAL_RANK_STATES,
     BarrierPolicy,
     MessageState,
     Mode,
@@ -577,6 +578,31 @@ class Communicator:
                 digest=blob.digest[:12],
                 contract=contract.name if contract else None,
             )
+            # A message queued for a rank that has already reached a terminal state will never
+            # be read. Recording it here is the cheapest possible detection of a whole class of
+            # coordination bug: a degraded contribution that arrives after its group has moved
+            # on. The p=16 translation run's single most diagnostic fact was three such sends,
+            # arriving 3412 s after their destinations had abandoned the collective, and it was
+            # recoverable only by differencing send and receive counts and rebuilding the
+            # reduction tree by hand. It required no configuration reasoning to see -- only a
+            # look at the destination's state at delivery time.
+            dst_row = cur.execute(
+                "SELECT state FROM ranks WHERE rank=?", (wdst,)
+            ).fetchone()
+            dst_state = str(dst_row["state"]) if dst_row is not None else None
+            if dst_state in TERMINAL_RANK_STATES:
+                self.fabric.emit(
+                    "msg.orphaned",
+                    rank=wsrc,
+                    ctx=self.ctx,
+                    cur=cur,
+                    mid=mid,
+                    dst=dest,
+                    wdst=wdst,
+                    tag=tag,
+                    tokens=blob.tokens,
+                    dst_state=dst_state,
+                )
         self.rt.cost.n_messages_sent += 1
         self.rt.cost.tokens_sent += blob.tokens
         if chosen is Mode.RENDEZVOUS:

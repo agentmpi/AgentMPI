@@ -14,25 +14,345 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the \texttt{PROCEED} point of the four-policy barrier-failure sweep in
+\texttt{bench\_faults} (\texttt{experiments/microbench.py}): eight ranks, rank~3 returns
+immediately to simulate a crashed agent session, and the seven survivors enter a barrier
+with a 15\,s deadline. \texttt{PROCEED} is the \emph{partial barrier} --- continue with
+whoever arrived, report the absentees, leave the communicator alone --- and this run is
+the cleanest of the four by a wide margin. Thirty-nine events, 15.217\,s, one repeated
+three-event sequence (\texttt{barrier.timeout}, \texttt{ft.declare\_failed},
+\texttt{coll.barrier}) executed independently by each of the seven survivors, and then
+the job ends. All seven agree on \texttt{absent:\ [3]} within 18.8\,ms of one another,
+which is why the benchmark records \texttt{detected\_correctly:\ true} and
+\texttt{all\_completed:\ true} with a median detection latency of 15.195\,s. Nothing
+unexpected happens, and that is the result: of the four policies, \texttt{PROCEED} is the
+only one that correctly names the dead rank without invoking any machinery that can then
+misbehave. Its sibling \texttt{SHRINK} detects identically and then spends a further
+60.2\,s in a broken agreement; \texttt{RAISE} and \texttt{WAIT} record no failure at all
+and blame the wrong rank. The single thing to take away is the division of labour that
+makes this work: \texttt{PROCEED} buys \emph{knowledge} --- a named absentee and a durable
+failure record --- and deliberately defers the \emph{repair} to the harness. The
+communicator ends the run at generation~0 with all eight members still marked
+\texttt{active}, so a second collective would wait for rank~3 all over again. That is a
+liability, but it is a bounded, honest and repeatable one, which is more than the other
+three policies can claim.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is a single vertical column of red at the right-hand edge and
+nothing else. Seven of the eight lanes carry one mark at $t\approx15.2$\,s; rank~3's lane
+carries only its lifecycle ticks at $t\approx0$. There are no bars anywhere, because there
+is no work anywhere: \texttt{metrics.json} records \texttt{executors:\ \{none: 8\}}, zero
+agent calls, zero tokens and \$0.0000. The headline table's \emph{achieved parallelism
+$0.00\times$} and \emph{idle fraction 100.0\%} are consequences of the benchmark's design
+and not findings about the protocol --- \texttt{bench\_faults}'s \texttt{rank\_main} calls
+\texttt{comm.barrier} and nothing else, so a rank has nothing to be busy with. Read those
+two rows as ``not applicable''.
+
+The same caution applies to the wall clock. 15.217\,s is
+\texttt{--detect-timeout} (15.0\,s, recorded in
+\texttt{results/microbench/free-faults.json}) plus 217\,ms of poll granularity and SQLite
+write latency. The run measures a constant, and the residual measures the fabric.
+
+Rank~3's empty lane is the injected fault in its entirety. It initialised at $t=0.006$\,s
+and finalised at the same millisecond, because \texttt{rank\_main} returns
+\texttt{\{"role":\ "victim"\}} before touching the communicator. From the survivors' point
+of view this is indistinguishable from an agent session that died before its first call,
+which is the point.
+
+The interesting structure is inside the 18.8\,ms width of that single column, and the
+viewer resolves it better than the figure does. The seven \texttt{barrier.timeout} events
+run from 15.198\,s (rank~0) to 15.216\,s (rank~4), and each rank then runs
+\texttt{ft.declare\_failed}, \texttt{coll.barrier} and \texttt{rank.finalize} as one
+contiguous group in the log. Two things are visible in the millisecond timings. First,
+detection order is not completion order: rank~7 timed out at 15.199\,s, third earliest,
+but did not get its declaration written until 15.203\,s, behind ranks 2 and 5 --- a 4\,ms
+gap where every other rank's was under 1\,ms. The declaration is an \texttt{INSERT} plus
+an \texttt{UPDATE} inside one \texttt{fabric.write()} transaction, so what that gap shows
+is the write lock queue. Second, the collective table records the arrival spread as
+\emph{skew 0.02\,s}, which is small absolutely but is 7$\times$ the 2.7\,ms spread in the
+\texttt{SHRINK} sibling. The likeliest reading is entry skew propagated forward rather
+than detection jitter: a central barrier measures its deadline from each rank's own entry,
+and rank~4 both entered last (\texttt{rank.init} at $t=0.022$\,s, against 0.001\,s for
+rank~0) and timed out last, 18\,ms behind.
+
+The viewer's stats row reads \textsc{failures 7}, \textsc{messages 0}, and its legend
+counts \emph{rank lifecycle 16, failure / timeout 14} with no third entry. The absence of
+the violet recovery colour is the visual signature of this policy: seven detections, zero
+recovery actions. Its \textsc{collectives} panel lists \texttt{barrier}, 7 invocations,
+algorithm \texttt{central}, 0 messages --- a collective that coordinated eight ranks
+without sending anything, because the central algorithm coordinates through
+\texttt{coll\_parts} rows rather than through the message layer. Reproducing the barrier's
+20\,ms-to-250\,ms poll back-off arithmetically gives about 70 polls per rank over 15\,s,
+so roughly 490 \texttt{SELECT} statements crossed the fabric during the stretch of
+Figure~\ref{fig:timeline} that looks entirely empty. That, and not any protocol cost, is
+what the wall clock's residual is made of.
+
+The rank health table shows all eight ranks \texttt{finalized}, \texttt{alive: no},
+\texttt{suspected: --}. The empty \texttt{suspected} column for rank~3 is worth noticing
+rather than glossing: it reflects \texttt{ft.health}'s lease-based detector, which this
+run never calls, not the \texttt{failures} table, which does hold rank~3.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection{What is true by construction}
+
+Almost the whole shape of this run was fixed before it started, and separating that from
+what emerged is most of the interpretive work.
+
+The victim, the population size and the deadline are configuration:
+\texttt{victims: "3"}, \texttt{ranks: 8}, \texttt{detect\_timeout: 15.0}. The algorithm is
+forced rather than chosen --- \texttt{algorithms.barrier} overrides the caller's
+\texttt{dissemination} default with \texttt{central} whenever the policy is
+\texttt{PROCEED}, \texttt{SHRINK} or \texttt{REVOKE}, because only the arrival-counting
+algorithm can name who did not arrive. Everything downstream follows: no messages, no
+communication matrix figure, \texttt{eager\_messages: 0}, and coordination conducted
+entirely through fabric rows. The barrier's \texttt{rounds: 0} against
+\texttt{predicted 2} in the collective table is a logging gap and not a disagreement:
+\texttt{algorithms.barrier} sets \texttt{rounds = 2} locally for the central path and
+returns it in \texttt{BarrierResult}, but never writes it onto the \texttt{\_Tracker}'s
+\texttt{CollStats}, so the emitted \texttt{coll.barrier} always carries zero. The tooling
+declines to score it (\modelna{}), which is right.
+
+What emerged is narrower and worth stating precisely, because it is the run's actual
+content: seven independently polling processes, with no leader and no communication
+between them, converged on the same absentee set within 18.8\,ms and each recorded it.
+The consistency is not enforced anywhere. Each rank computes
+\texttt{absent = set(range(comm.size)) - arrived} from its own \texttt{SELECT}, and they
+agree because the fabric is a single serialising point of truth about arrivals. That is
+the design's central bet --- route the hard part through a reliable shared service ---
+and this run is a small, clean confirmation of it.
+
+\subsection{The mechanism: detection with a deliberately empty mitigation}
+
+\texttt{\_central\_barrier}'s deadline branch is common to \texttt{PROCEED},
+\texttt{SHRINK} and \texttt{REVOKE}: emit \texttt{barrier.timeout}, then call
+\texttt{ft.declare\_failed} for each absentee. The three policies then diverge, and
+\texttt{PROCEED} is the branch that does nothing further --- it falls past the
+\texttt{REVOKE} and \texttt{SHRINK} tests and returns the absentee tuple. The barrier
+therefore returns \emph{normally}, with a \texttt{BarrierResult} whose \texttt{absent} is
+\texttt{(3,)} and whose \texttt{complete} property is \texttt{False}, and the caller
+decides what that means. This is why the benchmark records \texttt{all\_completed: true}
+and an empty \texttt{example\_error} for this row: no rank raised.
+
+The seven \texttt{ft.declare\_failed} events reduce to one row in the fabric. The
+\texttt{INSERT} into \texttt{failures} carries
+\texttt{ON CONFLICT(ctx, rank, kind) DO NOTHING}, and querying
+\texttt{runs/mb-free/faults-proceed/fabric.sqlite} shows exactly one row: \texttt{rank 3},
+\texttt{fail\_stop}, \texttt{detail: "barrier phase"}. The \texttt{fabric.emit} call sits
+outside the conflict clause and fires unconditionally, so the event count is the number of
+\emph{observers} and the row count is the number of \emph{failures}. Seven observers, one
+failure. That is defensible for an event log, but it means the viewer's
+\textsc{failures} tile of 7 and \texttt{metrics.json}'s \texttt{summary.failures: 7} both
+read as seven dead ranks when one rank died, and neither artefact says which it means.
+The \texttt{SHRINK} sibling makes the same arithmetic considerably worse, reaching 14
+declarations for the same single failure.
+
+\subsection{What the policy costs: a repair that was never attempted}
+
+The fabric's end state is the most informative thing in this run, and it is invisible in
+every generated artefact. After the barrier, \texttt{comms.generation} is still
+\texttt{0}, \texttt{comms.revoked} is still \texttt{0}, and all eight \texttt{comm\_members}
+rows --- rank~3 included --- are still \texttt{state = 'active'}. The communicator is
+bit-for-bit what it was before the failure, apart from one row in a side table.
+
+That is exactly what the \texttt{BarrierPolicy.PROCEED} docstring promises: ``continue
+with whatever contributions arrived, leaving the communicator intact and reporting the
+absentees.'' The liability is the direct consequence. \texttt{\_central\_barrier}'s
+completion test is \texttt{len(arrived) >= comm.size}, and \texttt{comm.size} is
+\texttt{len(self.\_members)}, which counts rank~3. A second barrier on this communicator
+would therefore wait the full timeout again and declare rank~3 failed again, and a
+message-passing collective --- a \texttt{reduce}, say, whose default timeout is 1{,}800\,s
+--- would block on rank~3 for half an hour. A harness that calls a \texttt{PROCEED}
+barrier in a loop and never acts on the returned \texttt{absent} list pays 15\,s per
+iteration forever.
+
+I do not read this as a defect. It is a division of labour, and I think it is the right
+one: naming the absentee is something only the runtime can do, and deciding whether a
+seven-of-eight glossary is worth having is a domain judgement the protocol cannot make.
+The failure record is durable and machine-readable, so \texttt{ft.get\_failed} will return
+\texttt{(3,)} to any later call and \texttt{ft.shrink}'s agreement step has the input it
+needs. What \texttt{PROCEED} guarantees is that the harness is \emph{able} to decide;
+whether it does is not the barrier's problem.
+
+It is worth contrasting this with what \texttt{SHRINK} does with the same information,
+because the comparison is the sweep's main product. \texttt{SHRINK} takes the extra step
+of calling \texttt{ft.shrink\_in\_place}, and in that trace the extra step is where
+everything breaks: seven concurrent \texttt{UPDATE comms SET generation = generation + 1}
+statements drive the generation from 0 to 7, the seven survivors cache six different
+values, and the \texttt{agree} that follows splits across six separate collectives and
+never reaches quorum. \texttt{PROCEED} pays 15.2\,s and gets a correct answer;
+\texttt{SHRINK} pays 75.4\,s and gets a correct answer plus seven false failure
+declarations and an inconsistent agreement. The extra 60\,s buys nothing.
+
+\subsection{The flagged findings}
+
+Three findings are generated and all three are expected for this configuration.
+
+\emph{``\texttt{barrier/central} (label \texttt{phase}) was reached by 7 of 8 ranks, so it
+never completed.''} This is the experiment, not a defect. \texttt{bench\_faults} kills
+rank~3 on purpose precisely so that the barrier cannot complete; the policy under test is
+defined entirely by what happens at that moment, and a run of this benchmark in which the
+barrier \emph{did} complete would be the broken one. The finding is also why the collective
+table shows \modelna{} and \texttt{model\_checks\_total} is 0:
+\texttt{analysis.py} gates its cost-model comparison on \texttt{n\_participants >= size}
+and correctly refuses to score a closed form against an invocation that did not happen.
+
+\emph{``The coordination figures count time inside \emph{completed} collectives only\ldots
+the reported share is a floor.''} Expected, and unusually tight here. The numerator behind
+\emph{coordination share 87.4\%} is 106.365 rank-seconds, which is $7 \times 15.195$\,s
+--- the seven survivors' barrier waits and nothing else. The only blocking the metric
+misses is rank~3's, which is zero, so on this run the floor is nearly the true value.
+That is a useful calibration point for the flag itself: it fires whenever a run has an
+incomplete collective, regardless of how much is actually being missed, and here it is
+formally correct but practically almost tight. In the \texttt{SHRINK} sibling the same
+flag hides four times the recorded blocking, and in \texttt{real-tr-p16-full} it hides a
+factor of about 4{,}500. The flag says ``this is a floor''; it does not say how loose, and
+the three runs together show the range is enormous.
+
+\emph{``Collectives account for 87.4\% of the run's rank-seconds, so more of the pool's
+time went to coordination than to work.''} Arithmetically correct and semantically empty.
+There was no work: zero agent calls, zero tokens. Any nonzero coordination figure would
+have exceeded the work figure. The 87.4\% is worth citing only as a check that the run is
+what it claims to be --- essentially all of it was one barrier, and
+\emph{coordination in flight} of 99.98\% says the same thing about wall clock. Read as a
+harness-efficiency finding it would be badly wrong, and it is the one flagged item here
+that a careless reader could misuse.
+
+\subsection{Against its siblings, and what a harness author should do}
+
+The four policies are the same program with one enum changed, so the differences between
+their traces are attributable to the policy and to nothing else. Set out that way the
+ordering is stark:
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}llrrrl@{}}
+\toprule
+policy & barrier algorithm & events & wall (s) & \texttt{ft.declare\_failed} & absentee correctly named \\
+\midrule
+\texttt{wait}    & dissemination & 45 & 15.26 & 0  & no \\
+\texttt{raise}   & dissemination & 45 & 15.27 & 0  & no \\
+\texttt{proceed} & central       & 39 & 15.22 & 7  & yes \\
+\texttt{shrink}  & central       & 60 & 75.43 & 14 & yes, then seven false ones \\
+\bottomrule
+\end{tabular}\normalsize
+\end{center}
+
+\texttt{WAIT} and \texttt{RAISE} are indistinguishable from each other and diagnostically
+dead. Neither is in the list that switches the algorithm to \texttt{central}, so both run
+the \texttt{dissemination} barrier, which cannot name absentees. Their traces contain no
+\texttt{barrier.timeout}, no \texttt{ft.*} and no \texttt{coll.*} events; their fabrics'
+\texttt{failures} tables are empty; and both fail with
+\texttt{ERR\_TIMEOUT: receive timed out [\ldots source=4 \ldots]}, naming a live rank
+rather than the dead one, because in a dissemination barrier at $p=8$ the rank that
+notices is three rounds removed from the rank that died. The benchmark scores both
+\texttt{detected\_correctly: false}.
+
+\textbf{The recommendation is \texttt{PROCEED} wherever a phase's input can legitimately
+be partial, and \texttt{REVOKE} plus an explicit out-of-place \texttt{ft.shrink} wherever
+it cannot --- and not the \texttt{SHRINK} barrier policy, until the generation increment
+in \texttt{shrink\_in\_place} is fixed.} This run is the direct evidence for the first
+half. It is the cheapest correct outcome in the sweep on every axis: fewest events,
+shortest wall clock, one failure row, no side effects the harness did not ask for, and an
+\texttt{absent} list handed back through a normal return. \texttt{REVOKE} is untested
+here, which is a genuine gap in the evidence, but it is the only escalating policy that
+does not route through \texttt{shrink\_in\_place}: it writes an absolute
+\texttt{revoked = 1}, which is idempotent under concurrent execution, and then raises,
+leaving the harness to call \texttt{ft.shrink} --- the sibling that elects a leader and
+publishes one agreed context.
+
+The archive supplies the counterexample that shows why this matters and, awkwardly, also
+shows that \texttt{PROCEED} alone is not sufficient. \texttt{real-tr-p16-full} is the only
+genuine failure among the 500 runs: sixteen ranks, all sixteen in \texttt{failed\_ranks},
+\texttt{ok: false}, 7{,}200\,s of wall clock, \$0.0726 spent and no output. Six rank roles
+were never bound to a worker process; the ten that worked correctly died waiting inside a
+glossary \texttt{allreduce} that could never fold. Its \texttt{failures} table has zero
+rows and its log has zero \texttt{ft.declare\_failed} events --- nothing was ever declared,
+so \texttt{shrink}'s agreement step had no input and the harness had nothing to act on. Its
+own analysis concludes that a shrink at $t\approx190$\,s over the ten ranks that actually
+had executors would have finished the job in minutes. (Ten, not twelve: twelve is the
+number of ranks that emitted a \texttt{coll.reduce} record, which is a different set from
+the set that could do work.) The fifteen seconds in the present run are exactly the
+affordance that harness lacked.
+
+But that harness \emph{did} use \texttt{PROCEED}. It set the policy on a barrier in
+phase~5, downstream of the phase-2 \texttt{allreduce} it never survived to reach, and
+that placement is the whole difference. Reading the signatures in
+\texttt{src/agentmpi/algorithms.py}, \texttt{policy} is a parameter of \texttt{barrier}
+and of nothing else: \texttt{bcast}, \texttt{scatter}, \texttt{gather},
+\texttt{allgather}, \texttt{reduce}, \texttt{allreduce} and \texttt{reduce\_scatter} take
+a \texttt{timeout} and no policy at all. So no choice among these four names would have
+saved that run; the harness would have had to place a policy-bearing barrier
+\emph{before} the allreduce, or the protocol would have to extend the policy to the other
+collectives. The lesson this sweep contributes is therefore not simply ``choose
+\texttt{PROCEED}'' but that a failure policy protects only the operation it is attached
+to, and that in AgentMPI today exactly one operation can carry one.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The injected fault is gentler than a crash in one specific, checkable way.} Rank~3
+returns normally, so it reaches \texttt{rank.finalize} at $t=0.006$\,s and its
+\texttt{ranks} row is \texttt{finalized} for the rest of the run.
+\texttt{ft.declare\_failed}'s state update is guarded by
+\texttt{state NOT IN (FINALIZED, EXCLUDED)}, so when the survivors declared rank~3 dead
+at $t=15.2$\,s the guard skipped it: the fabric's \texttt{ranks} table ends the run with
+rank~3 \texttt{finalized}, not \texttt{failed}. A genuinely crashed agent would have been
+left \texttt{running} and the update would have fired. Nothing in this run's conclusions
+depends on that state --- the \texttt{failures} row was written either way, and it is the
+\texttt{failures} table that \texttt{get\_failed}, \texttt{agree} and
+\texttt{\_agree\_survivors} consult --- but a reader checking the rank table for evidence
+of the failure will not find it, and any harness that keys recovery off
+\texttt{RankState.FAILED} rather than off the failure records would see nothing here.
+
+\textbf{There are no agents in this run and nothing in it bears on agent behaviour.}
+\texttt{executors: \{none: 8\}}, zero agent calls, zero tokens, \$0. The failure modelled
+is a rank that returns instantly, which is \texttt{FAIL\_STOP} and only
+\texttt{FAIL\_STOP}. \texttt{src/agentmpi/ft.py}'s own taxonomy is explicit that the class
+that matters for agent systems is \texttt{FAIL\_PLAUSIBLE} --- a rank that returns a
+well-formed, confident, wrong answer --- and that no amount of deadline tuning detects it.
+A \texttt{PROCEED} barrier would let such a rank through untouched, because it arrives.
+These four runs exercise one row of a six-row table, and a reader taking them as the
+evidence for the project's failure-model claims should scope them accordingly.
+
+\textbf{The detection latency is a restatement of the deadline.}
+\texttt{detect\_p50\_s: 15.195} against a configured 15.0\,s is the timeout plus 195\,ms
+of poll granularity and fabric write latency. It is not a measurement of how quickly
+AgentMPI can notice a failure, because the only detector exercised is the barrier's own
+deadline. The lease-based detector that \texttt{ft.py} presents as \emph{the} failure
+detector, \texttt{ft.health}, is never called in this run at all: the only caller is
+\texttt{\_agree\_survivors}, which \texttt{PROCEED} does not reach. Nothing here supports
+a detection-latency claim, and in particular nothing here says what would happen with a
+detect timeout short enough to race a slow-but-live rank.
+
+\textbf{The claim that a second collective would repeat the wait is read from the source,
+not observed.} \texttt{rank\_main} runs exactly one barrier, so this trace cannot show it.
+The inference is short --- \texttt{comm\_members} still reads all-active,
+\texttt{comm.size} counts all members, and \texttt{\_central\_barrier} compares against
+\texttt{comm.size} --- but it is an inference, and a two-barrier variant of this benchmark
+would settle it in thirty seconds. The same experiment would settle the parallel question
+for \texttt{SHRINK}, where the situation is arguably worse: that policy \emph{does} mark
+rank~3's member row \texttt{failed}, but \texttt{Communicator.\_active}, the tuple that
+records the distinction, is assigned in \texttt{refresh()} and never read anywhere in
+\texttt{src/agentmpi}.
+
+\textbf{The 18.8\,ms skew attribution is plausible rather than proven.} I read it as entry
+skew propagated forward, on the grounds that rank~4 was both the last to initialise
+($t=0.022$\,s) and the last to time out ($t=15.216$\,s), and that a central barrier's
+deadline runs from each rank's own entry. The two orderings agree in six of seven
+positions --- ranks 5 and 6 swap --- which is consistent but is seven samples spanning
+18.8\,ms, and contention on the fabric's write lock is an equally good explanation for
+part of the spread, as rank~7's 4\,ms detection-to-declaration gap shows directly. The
+distinction does not affect anything else in this reading.
+
+\textbf{$n=1$, but the parts that matter are structural rather than statistical.} A rerun
+would shuffle the millisecond ordering of the seven detections and move the skew. It would
+not change the event vocabulary, the one-row-seven-events asymmetry, the untouched
+communicator state, or the algorithm substitution, all of which are properties of the code
+rather than of this schedule. Where I have relied on a specific number --- 18.8\,ms,
+15.195\,s --- I have tried to say what it is a measurement \emph{of}, and in both cases
+the answer is the fabric and the configured deadline, not the protocol.
 
 \end{document}

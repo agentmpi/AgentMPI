@@ -14,25 +14,112 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the middle of the eager column in a ten-cell transport sweep --- two modes
+crossed with five payload sizes, all at $p = 8$ and all agent-free. Eight ranks form
+a ring, each sending one 512-word payload to its successor and receiving from its
+predecessor, with the mode pinned to \texttt{Mode.EAGER}. It completed in 0.03\,s
+over 34 events and admitted 674 tokens into every receiver's context, 2.1\% of the
+32{,}768-token budget and 16.5\% of the 4{,}096-token unexpected-message credit. Its
+value is as the second point on a line: against the 128-word cell's 168 tokens, the
+context charge is $4.01\times$ for $4\times$ the payload, so eager's cost to the
+receiver is linear in payload with no fixed component. That linearity is what makes
+the eager ceiling predictable, and it is what lets this sweep say where the ceiling
+must fall without having measured every size --- 4{,}096 tokens of credit divided by
+1.316 tokens per word puts it at 3{,}113 words, between this cell and the next
+one up.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is eight lanes of instantaneous marks with no bars in any
+of them. That is a property of the benchmark rather than an observation about it: the
+executor is \texttt{none} on all eight ranks, there were zero agent calls, and no
+\texttt{task.*} event was emitted, so there is no interval for a bar to span. Read
+the headline table's ``idle fraction 100.0\%'' and ``achieved parallelism
+0.00$\times$'' accordingly --- they mean no rank ever held a task, not that ranks
+were stalled. Each lane carries two grey lifecycle diamonds and two green message
+ticks. The ranks arrive over a 21\,ms window against a 32\,ms total span, so
+two-thirds of this run's wall clock is the launcher bringing eight ranks up against
+one SQLite writer, and the ring itself occupies the remainder.
+
+Within that remainder nothing waits on a peer. The median receive latency is 7\,ms
+and the maximum 10\,ms, and neither is protocol delay. Rank 7 accounts for one of the
+three 10\,ms figures directly: it initialised 24\,ms in and claimed rank 6's message
+in the same millisecond it arrived, so its latency is simply how long the message sat
+waiting for a receiver that did not exist yet. The others are contention, not
+waiting --- every send inserts a row and every receive claims one inside an exclusive
+SQLite write transaction, and eight ranks are doing that concurrently against a
+single file. Every rank finalises within a millisecond of its receive. This is what
+an eager exchange looks like when
+it is well inside its budget --- the send returns as soon as the message row is
+committed, and \texttt{\_await\_eager\_credit} finds zero outstanding queued tokens
+at the destination because the ring gives each receiver exactly one inbound sender.
+Figure~\ref{fig:comm} carries the structure the timeline cannot: a single
+off-diagonal band of 674 tokens per edge, rank $r$ to rank $(r{+}1) \bmod 8$, eight
+edges and nothing else. The rank health table reads 2\% context occupancy uniformly,
+which is the sweep's one-glance measure of what eager cost here.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+By construction: the world size, the ring mapping, one send and one receive per rank,
+and the mode. One construction detail is worth stating because it drives the whole
+sweep --- every \texttt{rank.init} records \texttt{eager\_limit: 1000000000}, so the
+runtime's automatic mode selection is disabled. Left to itself,
+\texttt{\_choose\_mode} would send a 674-token payload eager anyway (the default
+limit is 2{,}048 tokens), but at 8{,}192 and 32{,}768 words it would silently convert
+to rendezvous, and the sweep needs it not to. The failures in the eager column are
+consequently deliberate: the harness forced a mode the runtime would have declined
+to choose.
+
+What emerged is the linearity, and it is worth being precise about it because the
+sweep's central claim depends on extrapolating it. The payload is 512 repetitions of
+\texttt{"word "}, 2{,}560 characters, priced by the default estimator at
+$\lceil 2560/3.8 \rfloor = 674$ tokens. Against the 128-word cell's 168 that is
+$4.01\times$ for $4\times$ the words; against the 2{,}048-word cell's 2{,}695 it is
+$0.250\times$ for $0.25\times$ the words. The relation is $1.3158$ tokens per word
+with no intercept, which is just $5/3.8$ --- the estimator's character rule applied
+to a five-character word. So eager's context charge has no per-message overhead, and
+a payload's admissibility is decided entirely by its own size. That is why the
+ceiling is sharp rather than gradual: \texttt{\_await\_eager\_credit} compares
+\texttt{n\_tokens} against the destination's \texttt{unexpected\_limit} of 4{,}096
+and raises \texttt{AmpiContextOverflow} if the single payload exceeds it, and with a
+linear price that condition flips at one specific payload size, 3{,}113 words. This
+cell at 674 tokens sits at 16.5\% of credit; the next cell up, at 2{,}695 tokens,
+sits at 66\%; the one after that, at 10{,}779 tokens, is refused. Two-thirds of the
+distance to the cliff is covered between this cell and its immediate successor.
+
+Set against its rendezvous twin, this cell also shows what the choice actually
+trades. \texttt{mb-free\_\_transport-rendezvous-512} moves the same payload --- the
+same content-addressed blob, the same digest --- in the same 34 events, and reports
+zero admissions and zero context high water. The difference is not bytes on disk and
+not messages on the wire; both runs write one 2.5\,KiB blob and send eight envelopes.
+The difference is that here the receiver has the text and there it has a handle. At
+2\% occupancy that is a bad trade to make reflexively, and the sweep is not arguing
+for rendezvous at this size. The generated finding list is empty, correctly: there is
+no anomaly in this cell.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The context numbers are admissions, not usage. With \texttt{executor: none} and zero
+agent calls, \texttt{ContextAccount} recorded that 674 tokens entered a budget that
+no model ever read, so this run establishes the protocol's accounting and says
+nothing about agent behaviour. The token count itself is an estimate --- provenance
+records \texttt{tokenizer\_exact: false} --- and the $5/3.8$ ratio that makes the
+linearity so clean is an artefact of a character-based heuristic applied to a
+pathological payload of one repeated word; a real BPE tokeniser would price this text
+near 512 tokens, moving the sweep's ceiling in word terms by about 30\% while leaving
+its existence untouched. The wall time is a single sample dominated by SQLite writes
+and by a 21\,ms rank start-up spread that is itself two-thirds of the span, so the
+fact that this cell took 32\,ms and the 2{,}048-word cell took 35\,ms supports no
+claim at all. Finally, the linearity argument extrapolates to the failed cells from
+three points, all of them the same synthetic string at different lengths; it would be
+more convincing on payloads of varied shape, and the sweep does not have those.
+Separately, the ring's one-inbound-message-per-receiver structure means the
+\texttt{transport.credit\_stall} path --- the blocking back-pressure that
+\texttt{\_await\_eager\_credit} exists to provide --- is never entered in any of these
+ten runs, so the ceiling this sweep locates is a per-message precondition and not
+the aggregate buffering limit the benchmark's docstring describes.
 
 \end{document}

@@ -14,25 +14,364 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the \texttt{WAIT} point of the four-policy barrier-failure sweep in
+\texttt{bench\_faults} (\texttt{experiments/microbench.py}): eight ranks, rank~3 returns
+immediately to simulate a crashed agent session, and the seven survivors enter a barrier
+with a 15\,s deadline. \texttt{WAIT} is the sweep's intended control --- MPI semantics,
+block indefinitely --- and \texttt{bench\_faults}'s own docstring says it ``is included
+precisely because it is MPI's only option and it never completes\,---\,which is the
+point.'' The run completed in 15.260\,s. It did not block indefinitely, and the trace
+shows that it could not have: \texttt{BarrierPolicy.WAIT} has no distinct implementation
+anywhere in AgentMPI. \texttt{algorithms.barrier} switches to the arrival-counting
+\texttt{central} algorithm only for \texttt{PROCEED}, \texttt{SHRINK} and \texttt{REVOKE},
+so \texttt{WAIT} runs the \texttt{dissemination} barrier, which never reads the policy at
+all and simply threads the caller's 15\,s timeout into every send and receive; and on the
+one path where the policy \emph{is} read, \texttt{WAIT} shares a branch verbatim with
+\texttt{RAISE}. Grepping \texttt{src/agentmpi} finds \texttt{BarrierPolicy.WAIT} exactly
+once, in that shared condition. The consequence is measurable rather than theoretical:
+this run and \texttt{mb-free\_\_faults-raise} have identical event-kind counts (45 events;
+17 \texttt{msg.send}, 10 \texttt{msg.recv}, 8 \texttt{rank.init}, 8
+\texttt{rank.finalize}), identical per-rank send and receive profiles, a
+character-identical 17-edge communication matrix, an identical error string, and wall
+clocks 11\,ms apart. The single most important thing to take away is that the sweep has
+three arms and not four, and that its control arm is a duplicate of its default arm. Any
+comparison in the paper's fault table between the \texttt{wait} and \texttt{raise} rows is
+reporting scheduler noise.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} has two vertical columns and nothing between them: a green
+cluster hard against $t=0$ and a grey column at $t\approx15.25$\,s. The green marks are
+the barrier's 17 messages, all sent inside the first 20\,ms; the grey marks are
+\texttt{rank.finalize}. There are no bars, because there is no work.
+\texttt{metrics.json} records \texttt{executors: \{none: 8\}}, zero agent calls, zero
+tokens and \$0.0000, so the headline table's \emph{achieved parallelism $0.00\times$} and
+\emph{idle fraction 100.0\%} are properties of the benchmark's design and not findings
+about the protocol: \texttt{bench\_faults}'s \texttt{rank\_main} calls \texttt{comm.barrier}
+and nothing else, and a rank with no task cannot have a busy fraction. Read both rows as
+``not applicable''. The 15.260\,s wall clock is likewise a constant --- 15.0\,s of
+\texttt{--detect-timeout} from \texttt{results/microbench/free-faults.json} plus 260\,ms of
+process start-up and SQLite writes.
+
+Rank~3's lane holds one tick at the far left: \texttt{rank.init} and
+\texttt{rank.finalize} both at $t=0.012$\,s. That is the injected fault in its entirety,
+and it is why the axis stops at 15\,s rather than running to the job timeout.
+
+The structure worth reading is compressed into the first 20\,ms and the per-rank table in
+\texttt{generated.tex} resolves it better than the figure does. The \emph{sent} and
+\emph{recv} columns are not uniform:
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}rrrl@{}}
+\toprule
+rank & sent & recv & where it stopped \\
+\midrule
+3 & 0 & 0 & the victim; never entered the barrier \\
+4 & 1 & 0 & blocked in round 0, waiting on rank~3 \\
+5 & 2 & 1 & blocked in round 1, waiting on rank~3 \\
+6 & 2 & 1 & blocked in round 1, waiting on rank~4 \\
+0, 1, 2, 7 & 3 & 2 & blocked in round 2, waiting on ranks 4, 5, 6 and 3 \\
+\bottomrule
+\end{tabular}\normalsize
+\end{center}
+
+A dissemination barrier at $p=8$ runs $\lceil \log_2 8 \rceil = 3$ rounds; in round $k$
+rank $r$ sends to $(r + 2^k) \bmod 8$ and receives from $(r - 2^k) \bmod 8$. Rank~4's
+round-0 source is the dead rank, so it sends once and stops; rank~5's round-1 source is
+rank~3 and rank~6's is the already-stalled rank~4, so both manage two sends; the other
+four complete two full rounds and stall in round~2. Summing gives $7+6+4 = 17$ sends
+against the 24 a complete barrier needs, and $6+4=10$ receives. The single injected
+failure reaches every survivor in exactly the three rounds the algorithm takes.
+
+Figure~\ref{fig:comm} shows the same fact spatially. Row~3 is empty across its width; row
+lengths elsewhere encode blocking depth (three cells for ranks 0, 1, 2 and 7, two for
+ranks 5 and 6, one for rank~4). Column~3 carries three cells, from ranks 2, 1 and 7 ---
+three messages delivered one per round into a dead rank's mailbox. Seven of the seventeen
+messages were never received: three by rank~3 and four by ranks 4, 5 and 6, which were
+alive but had already stopped reading. Nothing in the run notices either category, and
+neither category appears in any generated artefact; I recovered the count by differencing
+17 sends against 10 receives and then reconstructing the schedule from the internal tags.
+
+The viewer's stats row reads \textsc{messages 17} and \textsc{failures 0}, its legend
+offers only \emph{messages 27} and \emph{rank lifecycle 16}, and there is no
+\textsc{collectives} panel at all, because no \texttt{coll.*} event was emitted. Its rank
+table lists all eight ranks as \texttt{finalized}, \texttt{alive: no},
+\texttt{suspected: --}, with rank~3 indistinguishable from the seven that outlived it by
+fifteen seconds. Placed beside the \texttt{mb-free\_\_faults-raise} dashboard the two are
+not merely similar; without the title bar there is nothing in either screenshot that
+distinguishes them.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection{\texttt{WAIT} is a synonym for \texttt{RAISE}, and the trace shows it twice over}
+
+The control-flow argument is short. \texttt{algorithms.barrier} opens with
+
+\begin{center}
+\texttt{if policy in (BarrierPolicy.PROCEED, BarrierPolicy.SHRINK, BarrierPolicy.REVOKE):}\\
+\texttt{\hspace*{2em}algorithm = "central"}
+\end{center}
+
+\noindent so \texttt{WAIT} keeps the signature's \texttt{"dissemination"} default that
+\texttt{bench\_faults} did not override. The dissemination branch is a loop of
+\texttt{comm.\_csend} and \texttt{comm.\_crecv} calls with \texttt{timeout=timeout}
+threaded through, and it contains no reference to \texttt{policy} whatsoever. The only
+code that reads the policy is \texttt{\_central\_barrier}, which this run never enters ---
+and \emph{that} code disposes of \texttt{WAIT} with
+
+\begin{center}\texttt{if policy is BarrierPolicy.RAISE or policy is BarrierPolicy.WAIT: raise AmpiTimeout(\ldots)}\end{center}
+
+\noindent which is the only occurrence of \texttt{BarrierPolicy.WAIT} in
+\texttt{src/agentmpi}. There is therefore no code path in AgentMPI on which \texttt{WAIT}
+and \texttt{RAISE} differ, on either barrier algorithm.
+
+The empirical confirmation is unusually complete, because the two runs differ in exactly
+one enum value and nothing else. Comparing the two \texttt{metrics.json} files
+programmatically: the \texttt{kind\_counts} dictionaries are equal
+(\texttt{\{job.create: 1, job.finish: 1, msg.recv: 10, msg.send: 17, rank.finalize: 8,
+rank.init: 8\}}), the \texttt{role\_counts} are equal (\texttt{lifecycle 18, message 27}),
+the per-rank \texttt{(sent, recv, tokens\_sent)} triples are equal for all eight ranks, and
+the \texttt{comm} matrices are equal edge for edge --- the same 17 ordered pairs at one
+token each. \texttt{results/microbench/free-faults.json} records the same error string for
+both rows,
+\texttt{ERR\_TIMEOUT: receive timed out [ctx=0 rank=0 source=4 tag='\_ampi:barrier:0:1:2'
+waited\_s=15.0]}, and the same \texttt{detected\_correctly: false}. What separates the two
+runs is 11\,ms of wall clock (15.260 versus 15.271\,s), 1\,ms of detection median (15.250
+versus 15.249\,s), and the interleaving of the 17 sends, which differ in which rank got the
+fabric's write lock first. The fabrics agree too: both end with an empty
+\texttt{failures} table, an empty \texttt{collectives} table,
+\texttt{comms.generation = 0}, \texttt{revoked = 0}, and all eight \texttt{comm\_members}
+rows \texttt{active}.
+
+\subsection{What ``block indefinitely'' would actually have required}
+
+The enum's docstring is not wrong about what \texttt{WAIT} is \emph{for} --- ``block
+indefinitely (MPI semantics; useful only for debugging)'' is a coherent and useful
+semantic. It is wrong about where that semantic lives. Blocking indefinitely is what
+AgentMPI does when \texttt{timeout} is \texttt{None}, not when \texttt{policy} is
+\texttt{WAIT}: \texttt{\_central\_barrier} sets
+\texttt{deadline = None if timeout is None else time.time() + timeout} and its loop then
+has no exit but success, and on the dissemination path \texttt{\_crecv(timeout=None)}
+blocks in \texttt{Communicator.recv} indefinitely. Both are reachable. Neither is reached
+by naming the policy.
+
+So the harness could have built the control it wanted, but not by the parameter it used.
+\texttt{bench\_faults} passes \texttt{timeout=cfg.detect\_timeout} uniformly to all four
+policies, which is the right thing to do for the other three --- comparing detection
+behaviour across policies requires holding the deadline fixed --- and is precisely what
+prevents the fourth from being a control. A genuine \texttt{WAIT} arm would need
+\texttt{timeout=None}, and would then have been terminated not by the barrier but by
+\texttt{ampi.launch}'s job timeout, which \texttt{bench\_faults} sets to
+\texttt{cfg.detect\_timeout + 120} = 135\,s. That is an inference from the harness source
+rather than something this trace shows, but it is the shape the missing arm would have
+had: a 135\,s run ending in a job-level abort rather than a 15\,s run ending in seven
+receive timeouts.
+
+I would call the discrepancy a real defect, though the mildest of the three this sweep
+turns up. It is not a wrong computation; it is a parameter that is silently ignored, a
+docstring that describes behaviour the code does not implement, and a benchmark whose
+published claim about this row (``it never completes'') is contradicted by the row's own
+\texttt{detect\_p50\_s} of 15.25\,s. The cost is not to any running program --- a harness
+asking for \texttt{WAIT} gets \texttt{RAISE}, which is at least bounded --- but to the
+evidence. A four-row fault table with a control that is secretly a duplicate overstates
+what the table establishes.
+
+\subsection{What the run does establish on its own terms}
+
+Set the naming aside and this run is still informative, as the shared measurement of MPI's
+own semantics under a single fail-stop rank.
+
+\emph{One dead rank at $p=8$ costs all seven survivors, and the propagation is
+logarithmic.} Every survivor blocked, none partially recovered, and the failure reached
+the last of them in the third and final round. This is the pathology
+\texttt{algorithms.barrier}'s docstring names --- ``the probability that all $p$ members
+arrive within any fixed window falls off with $p$'' --- observed at the smallest
+population where the recursion has room to develop. It does not get better with scale: the
+round count is $\lceil \log_2 p \rceil$, so a larger population delays the collapse by a
+round or two rather than containing it.
+
+\emph{The wait is bounded and every deadline is honoured.} All seven survivors finalised
+between 15.247 and 15.259\,s. Nothing hung, and there is no interval in this trace whose
+length is not a configured constant. Against real MPI, where a barrier with a dead peer
+hangs forever, that is the substantive difference, and it is worth noting that this run
+demonstrates it \emph{despite} being the arm nominally configured to reproduce the hang.
+
+\emph{But the diagnosis names the wrong rank, and there is no failure record at all.} The
+error reports \texttt{source=4}; rank~0's round-2 source is $(0-4) \bmod 8 = 4$, and
+rank~4 was alive throughout, finalising normally at $t=15.247$\,s. It must name a live
+rank: a dissemination barrier gives each participant visibility of exactly three peers,
+and rank~3 is not one of rank~0's. The benchmark's \texttt{detected\_correctly} field
+encodes the consequence directly --- it compares each survivor's detected list against the
+victim list \texttt{[3]}, and the fallback \texttt{ampi.get\_failed(comm)} returns an empty
+tuple against an empty \texttt{failures} table, so every survivor reports nothing and the
+row scores \texttt{false}.
+
+That empty table also closes off recovery. \texttt{ft.shrink} begins with
+\texttt{\_agree\_survivors}, which builds the survivor set from \texttt{get\_failed}
+unioned with whatever \texttt{ft.health}'s lease detector suspects, and \texttt{ft.agree}
+computes its \texttt{expected} set the same way. With nothing declared, both would
+reconstruct a group still containing rank~3 and block on it again. A harness that catches
+this run's \texttt{AmpiTimeout} and tries to recover has nothing to recover with.
+
+\subsection{The flagged findings}
+
+The generated list reads: \emph{``Nothing anomalous was detected mechanically.''} True as
+defined, and badly wrong as read, and the reason is the same emptiness.
+
+\texttt{Analysis.degraded} is
+\texttt{bool(failed\_ranks) or ok is False or bool(incomplete\_collectives)}. There are no
+incomplete collectives because \texttt{n\_collectives} is 0 --- the collective section of
+\texttt{generated.tex} says ``This run invoked no collectives'' about a run that invoked
+exactly one, since only \texttt{\_central\_barrier} calls
+\texttt{\_record\_collective} and only \texttt{\_Tracker.finish} emits
+\texttt{coll.barrier}, and neither ran. \texttt{failed\_ranks} is copied from
+\texttt{job.finish}, which lists ranks whose \texttt{rank\_main} raised, and
+\texttt{bench\_faults} catches \texttt{ampi.AmpiError} inside \texttt{rank\_main}, so the
+job reported \texttt{ok: true} with an empty list. Even
+\texttt{coordination\_is\_underreported} is \texttt{false} here, which is correct by its
+own definition --- no completed collective is having its time undercounted --- and
+misleading in effect, because $7 \times 15.2 \approx 106$ rank-seconds of blocking inside
+a barrier are absent from every coordination figure and the flag that would have warned a
+reader stays down. The \texttt{PROCEED} and \texttt{SHRINK} siblings, which did record
+their barrier, both raise the flag and both report \texttt{degraded: true}.
+
+The uncomfortable comparison this contributes to the sweep is that the two policies which
+handled the failure well are flagged as degraded and the two that handled it worst pass
+every mechanical check. \texttt{analysis.py} is not at fault --- it can only score what
+the log holds --- but the fix belongs upstream, in having the dissemination barrier record
+its invocation and its timeout the way the central one does.
+
+\subsection{Against its siblings, and what a harness author should do}
+
+The four runs are one program with one enum changed, so every difference is attributable
+to the policy:
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}llrrrrl@{}}
+\toprule
+policy & algorithm & events & wall (s) & msgs & \texttt{ft.declare\_failed} & absentee named \\
+\midrule
+\texttt{wait}    & dissemination & 45 & 15.26 & 17 & 0  & no \\
+\texttt{raise}   & dissemination & 45 & 15.27 & 17 & 0  & no \\
+\texttt{proceed} & central       & 39 & 15.22 & 0  & 7  & yes \\
+\texttt{shrink}  & central       & 60 & 75.43 & 0  & 14 & yes, then seven false ones \\
+\bottomrule
+\end{tabular}\normalsize
+\end{center}
+
+The first two rows are the same run twice. \texttt{PROCEED} detects correctly in
+15.195\,s, writes one durable failure row --- seven \texttt{ft.declare\_failed} events
+deduplicated by \texttt{ON CONFLICT} into a single \texttt{failures} entry for rank~3 ---
+leaves the communicator intact at generation 0, and hands the harness the absentee list
+through a normal return. \texttt{SHRINK} detects identically and then attempts a repair
+that breaks: seven concurrent \texttt{UPDATE comms SET generation = generation + 1}
+statements in \texttt{ft.shrink\_in\_place} drive the generation from 0 to 7, the seven
+survivors cache six different values, and because
+\texttt{Communicator.\_record\_collective} keys a collective on
+\texttt{(ctx, generation, epoch, op)}, the \texttt{ft.agree} that follows splits across
+six separate collectives, blocks for its full 60\,s, and ends with seven false failure
+declarations naming healthy ranks and five ranks returning \texttt{true} over
+\texttt{voters: []}.
+
+\textbf{The recommendation is \texttt{PROCEED} wherever a phase's input can legitimately
+be partial and \texttt{REVOKE} plus an explicit out-of-place \texttt{ft.shrink} wherever
+it cannot; \texttt{RAISE}, which is the default, should be treated as unsuitable for any
+barrier a harness intends to recover from; and \texttt{WAIT} should not be used at all,
+because asking for it gets you \texttt{RAISE} without saying so.} The evidence from this
+run for the last clause is as direct as evidence gets: the two traces are the same trace.
+For the first clause, note that \texttt{PROCEED} costs the same fifteen seconds this run
+costs and buys strictly more --- an absentee list, a durable failure record, and zero
+messages of traffic where this run sent seventeen. \texttt{REVOKE} is untested in the
+sweep, which is a genuine gap, but it is the only escalating policy that does not route
+through \texttt{shrink\_in\_place}: it writes an absolute \texttt{revoked = 1}, which is
+idempotent under concurrent execution, and then raises, leaving the harness to call
+\texttt{ft.shrink} --- the sibling that elects a leader and publishes one agreed context.
+
+The archive's one genuine failure shows what is at stake and, awkwardly, also shows the
+limit of the recommendation. \texttt{real-tr-p16-full} ended with sixteen ranks in
+\texttt{failed\_ranks}, \texttt{ok: false}, 7{,}200\,s of wall clock, \$0.0726 spent and no
+output: six rank roles were never bound to a worker process, and the ten that worked
+correctly died waiting inside a glossary \texttt{allreduce} that could never fold. Its
+\texttt{failures} table has zero rows and its log has zero \texttt{ft.declare\_failed}
+events --- the same empty-record end state this run reaches, reached the same way, by a
+collective that blocks on a timeout and records nothing about who did not arrive. Its own
+analysis concludes that a shrink over the ten ranks that actually had executors would have
+finished the job in minutes. (Ten, not twelve: twelve is the count of ranks that emitted a
+\texttt{coll.reduce} record, which is a different set from the set that could do work.)
+
+But no choice among these four names would have saved it. Reading the signatures in
+\texttt{src/agentmpi/algorithms.py}, \texttt{policy} is a parameter of \texttt{barrier}
+and of nothing else --- \texttt{bcast}, \texttt{scatter}, \texttt{gather},
+\texttt{allgather}, \texttt{reduce}, \texttt{allreduce} and \texttt{reduce\_scatter} take
+a \texttt{timeout} and no policy at all --- and the collective that killed that run was an
+\texttt{allreduce}. An \texttt{allreduce} behaves exactly the way this run behaves: it
+blocks, it times out, and it records nothing. That is the general form of what this run
+demonstrates. The default behaviour of every collective in AgentMPI except the central
+barrier is the behaviour on this page, and a harness gets the good behaviour only by
+placing a policy-bearing barrier ahead of the collective it actually cares about.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The equivalence claim is about recorded behaviour, and recorded behaviour is not
+all behaviour.} What I can show is that these two runs produced identical event-kind
+counts, identical per-rank profiles, identical communication matrices, identical fabric
+end states and identical error strings. What I cannot show from the traces alone is that
+no path exists on which the two differ; for that I am relying on the grep, which finds
+\texttt{BarrierPolicy.WAIT} once in \texttt{src/agentmpi}, in a condition it shares with
+\texttt{RAISE}. That is strong but it is a static reading, and a caller constructing the
+policy from a string, or third-party code branching on the enum, would not appear in it.
+
+\textbf{The round-by-round reconstruction is derived, not logged.} No event records which
+round a message belonged to. I recovered the structure from the internal tags, which
+encode it as \texttt{\_ampi:barrier:\{generation\}:\{epoch\}:\{k\}}, and checked the
+implied send and receive counts against the per-rank table in \texttt{generated.tex},
+which matches exactly. Mapping those counts onto ``rank~5 blocked waiting on rank~3''
+additionally assumes the $(r \pm 2^k) \bmod p$ schedule as implemented, read from the
+source. The arithmetic is over-determined and I am confident in it, but it is an
+inference and no artefact states it.
+
+\textbf{The claim that recovery was foreclosed is a source reading, not an observation.}
+\texttt{rank\_main} catches the \texttt{AmpiTimeout} and returns; it never attempts
+\texttt{ft.shrink} or \texttt{ft.agree}, so nothing here shows what would have happened if
+it had. I rely on \texttt{\_agree\_survivors} computing its survivor set from
+\texttt{get\_failed} plus \texttt{ft.health}, and on the \texttt{failures} table being
+empty. The hole in that reading is \texttt{ft.health} itself: its lease-based detector
+could in principle have suspected rank~3 independently, since rank~3's lease would
+eventually expire. Nothing in this run exercises it, and whether it would fire inside a
+15\,s window depends on the lease length, which this trace does not record.
+
+\textbf{There are no agents here and nothing in this run bears on agent behaviour.}
+\texttt{executors: \{none: 8\}}, zero agent calls, zero tokens, \$0. The 17 messages carry
+one token each and share a single digest, \texttt{6b86b273ff34} --- the same one-byte
+payload seventeen times. The failure modelled is a rank that returns instantly, which is
+\texttt{FAIL\_STOP} and only \texttt{FAIL\_STOP}, and \texttt{src/agentmpi/ft.py}'s own
+taxonomy is explicit that the class that matters for agent systems is
+\texttt{FAIL\_PLAUSIBLE} --- a rank that returns a confident wrong answer, which no
+deadline detects. These four runs exercise one row of a six-row table, and the barrier
+policies address that row alone. It is worth being blunt that a genuine \texttt{WAIT}
+implementation would not have helped with any of the other five either.
+
+\textbf{Two counters named \texttt{tokens\_deferred} disagree across artefacts.}
+\texttt{job.finish} reports 10; \texttt{metrics.json} reports 0 at the top level and
+surfaces the 10 as \texttt{summary.tokens\_unadmitted}. Both are right under their own
+definitions --- \texttt{analysis.py} counts tokens on rendezvous \emph{sends}, of which
+there were none, while the runtime counts received tokens not admitted to a context, which
+is all ten receives at one token each --- but the same name carries different values in
+two files a reader will open together. Nothing here depends on it; the same collision at a
+scale that matters is documented in \texttt{real-tr-p16-full}, at 50{,}544 against
+16{,}082.
+
+\textbf{$n=1$, though almost nothing in this reading is statistical.} A rerun would shuffle
+the ordering of the 17 sends and move the wall clock by tens of milliseconds. It would not
+change the send and receive counts, which follow from the dissemination schedule and the
+victim's identity; not the empty \texttt{failures} and \texttt{collectives} tables, which
+follow from which branch of \texttt{algorithms.barrier} executes; not the rank named in the
+error, which is fixed by $(0-4) \bmod 8$; and not the equivalence with
+\texttt{mb-free\_\_faults-raise}, which follows from the source. The 11\,ms separating the
+two runs is the only quantity here that a second sample would meaningfully change, and it
+is also the only quantity that distinguishes them.
 
 \end{document}
