@@ -255,3 +255,45 @@ def test_runtime_version_mismatch_is_traced(tmp_path, monkeypatch):
     assert len(events) == 1, events
     assert events[0]["payload"]["worker_version"] == "9.9.9+schema99"
     assert events[0]["payload"]["job_version"] == original
+
+
+def test_registration_is_refused_outside_the_world(tmp_path):
+    """A rank index the job never declared must not be able to join.
+
+    Registration previously accepted any index unconditionally, and a shared worker pool leaked
+    ranks into three translation runs: the world-2 run ended with rank rows for 2--8 and 14, two
+    of them still renewing leases half an hour after the job had finished. Collectives were
+    unaffected because they resolve through `comm_members`, so nothing failed loudly and the leak
+    was only visible by counting rows in the fabric.
+    """
+    root = tmp_path / "world"
+    job = ampi.launch(lambda comm: comm.rank, size=2, root=root)
+    assert job.ok
+
+    fabric = ampi.Fabric(root)
+    assert fabric.get_meta("world_size") == "2"
+
+    stray = ampi.RankRuntime(fabric=fabric, wrank=7)
+    with pytest.raises(ampi.AmpiUsageError):
+        stray.register(executor_name="worker")
+
+    rows = fabric.query("SELECT rank FROM ranks ORDER BY rank")
+    assert [int(r["rank"]) for r in rows] == [0, 1], "a refused registration must leave no row"
+
+
+def test_registration_inside_the_world_still_reattaches(tmp_path):
+    """The check must not break the mechanism it sits next to.
+
+    A rank is a durable role and a fresh agent taking it over is the normal case, so an in-range
+    index must still be accepted and must bump the incarnation rather than be rejected as a
+    duplicate.
+    """
+    root = tmp_path / "reattach"
+    job = ampi.launch(lambda comm: comm.rank, size=2, root=root)
+    assert job.ok
+
+    fabric = ampi.Fabric(root)
+    again = ampi.RankRuntime(fabric=fabric, wrank=1)
+    again.register(executor_name="worker")
+    row = fabric.query_one("SELECT incarnation FROM ranks WHERE rank=1")
+    assert int(row["incarnation"]) > 1, "reattaching must bump the incarnation"
