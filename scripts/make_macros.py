@@ -300,6 +300,64 @@ def e2_macros() -> None:
     put("eTwoExpected", s4["published_expected"])
 
 
+def e3_macros() -> None:
+    """The production translation series: one block of macros per scale.
+
+    Reads the series table rather than each run's report, because the quantities
+    the paper cites about E3 are cross-scale by nature --- how coordination,
+    disagreement and achieved parallelism move as ``p`` goes 16, 32, 64 --- and
+    recomputing them per run would let the paper cite a figure the series plot
+    does not agree with.
+    """
+    rows = load(RUNS / "e3-series" / "series.json")
+    scales = (16, 32, 64)
+    if not rows:
+        for p in scales:
+            for key in ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
+                        "Conf", "Imbal", "MaxWait", "Blocked", "Work"):
+                put(f"eThree{key}{p}", None)
+        for key in ("Researched", "Duplicated", "Saved"):
+            put(f"eThree{key}", None)
+        return
+
+    by_p = {row["p"]: row for row in rows}
+    for p in scales:
+        row = by_p.get(p)
+        if not row:
+            for key in ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
+                        "Conf", "Imbal", "MaxWait", "Blocked", "Work"):
+                put(f"eThree{key}{p}", None)
+            continue
+        put(f"eThreeWall{p}", int(round(row["wall_s"])))
+        put(f"eThreeWallH{p}", round(row["wall_s"] / 3600, 2), fmt=".2f")
+        put(f"eThreeTasks{p}", row["tasks"])
+        put(f"eThreeExecs{p}", row["executors"])
+        put(f"eThreeCoord{p}", round(row["coordination_share"] * 100, 1), fmt=".1f")
+        put(f"eThreePar{p}", round(row["achieved_parallelism"], 2), fmt=".2f")
+        put(f"eThreeEff{p}", round(row["parallel_efficiency"] * 100, 1), fmt=".1f")
+        put(f"eThreeConf{p}", row["conflicts"])
+        put(f"eThreeImbal{p}", round(row["imbalance"], 2), fmt=".2f")
+        put(f"eThreeMaxWait{p}", int(round(row["max_single_wait_s"])))
+        put(f"eThreeBlocked{p}", int(round(row["blocked_rank_s"])))
+        put(f"eThreeWork{p}", int(round(row["work_rank_s"])))
+
+    # The research-sharing saving, which is the window's whole justification: the
+    # agenda is bounded and independent of p, so what a run avoids is every rank
+    # researching every contested term.
+    glossary = load(RUNS / "e3-real-p64" / "glossary.json") or load(
+        RUNS / "e3-real-p32" / "glossary.json"
+    ) or load(RUNS / "e3-real-p16" / "glossary.json")
+    if glossary:
+        researched = len(glossary)
+        put("eThreeResearched", researched)
+        biggest = max((row["p"] for row in rows), default=0)
+        put("eThreeDuplicated", researched * biggest)
+        put("eThreeSaved", researched * (biggest - 1))
+    else:
+        for key in ("Researched", "Duplicated", "Saved"):
+            put(f"eThree{key}", None)
+
+
 def suite_macros() -> None:
     d = load(RESULTS / "suite.json")
     if not d:
@@ -315,6 +373,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
+    e3_macros()
     provenance_macros()
     suite_macros()
 

@@ -49,12 +49,13 @@ spec/AgentMPI-1.0.md   the normative specification
 ampi/                  the reference runtime
   device/              the narrow waist: 6 operations, 3 transports
   core/                everything above the waist, transport independent
+  analysis/            event log in; measurements, figures and a report out
   cli.py               the command binding an agent calls
   harness.py           the SPMD driver
   executor.py          function, replay, and broker (pull-queue) executors
   doctor.py            "which rank has not arrived, and what do I do"
 conformance/           one suite, run against every transport
-experiments/           E0 microbenchmarks, E1 translation, corpus, scoring
+experiments/           E0 microbenchmarks, E1 translation, E3 the production run
 runs/                  committed run artifacts: prompts, per-rank output, traces
 research/              four scholarly dossiers and their bibliographies
 paper/                 the paper; every number is a macro generated from run data
@@ -111,6 +112,23 @@ operator's codomain with a conflict set whose join is a semilattice, so the
 conflicts reaching the root are identical for every tree shape and the root
 arbitrates each exactly once. Verified exhaustively over every binary fold order
 to p=6 and randomly to p=32.
+
+**The trace is the evidence.** An agent run is expensive and it is not
+reproducible: nobody will repeat a sixty-four rank job to settle an argument about
+what happened in it. So tracing is unconditional, and `ampi analyze` takes the
+event log as its *only* input and returns measurements, six figures and a report.
+Writing it changed the runtime three times, which is the argument for keeping it
+in the package rather than in a script: a broadcast emitted no event at all and so
+was indistinguishable from a broadcast that never happened; no collective recorded
+how long its caller had been blocked, so coordination cost could not be separated
+from work; and `finalize` dropped the context ledger, which is the scarce resource
+the whole protocol is about. An analysis that cannot be built is a specification of
+what the runtime forgot to say.
+
+It also attributes rather than merely aggregating. A skew figure says a barrier
+cost four minutes; it does not say which rank owed them. Arrival order comes from
+`coll.join`, so the straggler is the rank the others were actually waiting for
+rather than whichever one happened to poll last.
 
 **Context safety.** MPI's advice is to test a program by making every send
 synchronous. Here the buffer a harness implicitly relies on is the receiving
