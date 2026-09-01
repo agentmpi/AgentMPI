@@ -1,5 +1,5 @@
 PY := .venv/bin/python
-.PHONY: test lint bench paper macros bib check suite clean
+.PHONY: test lint bench paper macros bib check suite clean viz-install viz-build viz-api viz-dev
 
 test:
 	$(PY) -m pytest conformance tests -q
@@ -31,3 +31,15 @@ check: lint test
 
 clean:
 	rm -f paper/*.aux paper/*.log paper/*.out paper/*.bbl paper/*.blg
+
+viz-install:
+	cd viz && npm ci
+
+viz-build:
+	cd viz && npm run build
+
+viz-api:
+	$(PY) scripts/trace_server.py --runs runs
+
+viz-dev:
+	cd viz && npm run dev
