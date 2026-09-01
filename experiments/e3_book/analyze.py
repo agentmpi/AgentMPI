@@ -213,12 +213,20 @@ def main(argv: list[str] | None = None) -> None:
     render_series(series, out / "figures" / "scaling.pdf")
     render_series(series, out / "figures" / "scaling.png")
 
-    # Per-run packages beside the series, so a reader can go from the curve to the
-    # run that produced a point without regenerating anything.
+    # Per-run packages go beside their own run, not into the series directory.
+    # Writing them here as well would duplicate every figure and metrics file, and
+    # a reader who then found the two copies disagreeing --- because one was
+    # regenerated and the other was not --- would have no way to tell which was
+    # current. One artifact, one home.
     from ampi.analysis.report import write_all
 
     for an in series:
-        write_all(an, out / an.name, tex_prefix=f"{a.tex_prefix}{an.world_size}", fmt="pdf")
+        write_all(
+            an,
+            RUNS / an.name / "analysis",
+            tex_prefix=f"{a.tex_prefix}{an.world_size}",
+            fmt="pdf",
+        )
 
     lines = [f"% E3 series, generated from {', '.join(n.name for n in series)}"]
     for row in rows:
