@@ -283,6 +283,19 @@ def table_translation() -> None:
             else rf"not supported by single-trial data ($R^2={r2:.3f}$); "
             rf"see \cref{{tab:scalingsim}} for averaged scaling"
         )
+        # Work amplification. The parallel configurations run a seam-reconciliation phase the
+        # serial baseline skips entirely (`if cfg.halo and comm.size > 1`), so p=1 makes 16 agent
+        # calls and p=8 makes 24. Total *text* is identical; total *work* is not, and the
+        # difference matters twice: the reported speedup is conservative, because the parallel run
+        # achieved its time while doing more, and the fitted contention coefficient conflates
+        # coordination overhead with the extra work it is being divided by.
+        base_calls = base["job"]["agent_calls"]
+        if base_calls:
+            top = scal[max(scal)]
+            _MACROS["NScalingBaseCalls"] = str(base_calls)
+            _MACROS["NScalingTopCalls"] = str(top["job"]["agent_calls"])
+            _MACROS["NScalingWorkAmp"] = fmt(top["job"]["agent_calls"] / base_calls, 2)
+
         # Macros so the prose can state the exclusion in the paper's own words rather than
         # leaving the dagger unexplained.
         _MACROS["NScalingMaxP"] = str(max(scal))
