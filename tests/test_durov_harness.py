@@ -166,6 +166,14 @@ def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Pa
     launch = json.loads((run_dir / "launch_plan.json").read_text(encoding="utf-8"))
     assert launch["supported_sizes"] == [16, 32, 64]
     assert launch["bounds"]["contracts"]["translation"]["max_tokens"] == 12000
+    assert len(launch["executors"]) == 10
+    assert sorted(rank for executor in launch["executors"] for rank in executor["serves"]) == (
+        list(range(16))
+    )
+    assert all(
+        command["next_command"].startswith(f"AMPI_WORKER_ID={command['worker_id']} ")
+        for command in launch["executors"]
+    )
 
 
 def test_stub_requires_explicit_test_flag_and_rank_choices() -> None:

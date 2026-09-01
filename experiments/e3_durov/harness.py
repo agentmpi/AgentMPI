@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 import time
 from collections.abc import Callable
 from functools import partial
@@ -367,6 +368,38 @@ def _assignments(corpus: dict[str, Any], size: int) -> list[dict[str, Any]]:
     return [{"rank": rank, "pages": pages} for rank, pages in enumerate(buckets)]
 
 
+def _executor_plan(
+    run_dir: Path,
+    campaign: str,
+    size: int,
+    executors: int,
+) -> list[dict[str, Any]]:
+    groups: list[list[int]] = [[] for _ in range(executors)]
+    for rank in range(size):
+        groups[rank % executors].append(rank)
+    ampi_cli = Path(sys.executable).with_name("ampi")
+    planned = []
+    for executor, ranks in enumerate(groups):
+        primary, *extra = ranks
+        serve = f" --serve {','.join(map(str, extra))}" if extra else ""
+        worker_id = f"{campaign}-e{executor:02d}"
+        command = (
+            f"AMPI_WORKER_ID={worker_id} {ampi_cli} "
+            f"--job-root {run_dir / 'job'} --rank {primary} --expect-rank {primary} "
+            f"worker --campaign {campaign}{serve} next --timeout 240"
+        )
+        planned.append(
+            {
+                "executor": executor,
+                "worker_id": worker_id,
+                "primary_rank": primary,
+                "serves": ranks,
+                "next_command": command,
+            }
+        )
+    return planned
+
+
 def _research_brief(corpus: dict[str, Any], max_chars: int) -> dict[str, Any]:
     documents = []
     remaining = max_chars
@@ -426,6 +459,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="sqlite")
     parser.add_argument("--campaign")
+    parser.add_argument(
+        "--executors",
+        type=int,
+        default=10,
+        help="planned external worker sessions; ranks are round-robin oversubscribed",
+    )
     parser.add_argument("--ctx-budget", type=int, default=100_000)
     parser.add_argument("--research-chars", type=int, default=12_000)
     parser.add_argument("--max-prompt-chars", type=int, default=180_000)
@@ -450,6 +489,8 @@ def build_parser() -> argparse.ArgumentParser:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     if args.executor == "stub" and not args.test_stub:
         raise ValueError("--executor stub is test-only and requires --test-stub")
+    if not 1 <= args.executors <= args.size:
+        raise ValueError("--executors must be between 1 and --size")
     corpus_path = args.source_dir / args.corpus
     corpus = json.loads(corpus_path.read_text(encoding="utf-8"))
     if corpus.get("schema") != "ampi.durov-corpus/v1" or len(corpus.get("pages", [])) != 99:
@@ -473,6 +514,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source": corpus["provenance"],
         "ampi_version": ampi.__version__,
         "executor": args.executor,
+        "planned_executors": args.executors,
         "stub": args.executor == "stub",
         "created_unix": time.time(),
     }
@@ -507,10 +549,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "size": args.size,
         "supported_sizes": list(SUPPORTED_RANKS),
         "executor": args.executor,
-        "worker_command": (
-            f"ampi worker --campaign {campaign} --rank RANK "
-            f"--job-root {run_dir / 'job'} next --timeout 240"
-        ),
+        "executors": _executor_plan(run_dir, campaign, args.size, args.executors),
+        "oversubscription": round(args.size / args.executors, 3),
         "lifecycle": {
             "task_timeout_s": args.task_timeout,
             "claim_ttl_s": args.claim_ttl,

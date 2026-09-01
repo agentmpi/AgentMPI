@@ -31,6 +31,7 @@ python experiments/e3_durov/harness.py \
   --source-dir /secure/source \
   --corpus durov_corpus.json \
   --size 32 \
+  --executors 10 \
   --executor broker
 ```
 
@@ -38,6 +39,12 @@ Supported populations are 16, 32, and 64. `--source-dir` and `--run-dir` keep
 copyrighted source and generated translations outside the repository when
 desired. Start workers using the command template in `launch_plan.json`; workers
 may be tied to any model vendor or agent host.
+
+The launch plan assigns all durable ranks round-robin across `--executors`
+physical sessions. Each emitted command prefixes `AMPI_WORKER_ID` inline rather
+than exporting it in a shared shell, preventing another concurrent worker from
+clobbering provenance. Logical rank count, planned executors, observed executor
+IDs, and oversubscription are reported separately.
 
 The default strict run uses full quorum, leased broker claims, bounded response
 contracts, a 100,000-token per-rank communication ledger, and self-contained
