@@ -225,6 +225,22 @@ def table_translation() -> None:
         c = d["config"]
         if c.get("glossary") and c.get("halo") and c.get("glossary_op") == "union" and c.get("allreduce_alg") == "reduce_bcast":
             scal[c["ranks"]] = d
+
+    # A run that did not finish is not a slow run, and its wall time is not a measurement --- it
+    # is whatever timeout fired. The p=16 point died at the 7200 s job cap with all sixteen ranks
+    # marked failed and six of them starved for 5400 s waiting for an agent to claim a task, and
+    # including it produced a table row reading speedup 0.08, efficiency 0.01, and a Karp--Flatt
+    # of 13.25 --- a serial-fraction estimate that cannot exceed 1 by construction. It also
+    # reported a terminology consistency of 1.000, computed over the handful of units that were
+    # translated before the run collapsed.
+    #
+    # Dropping it silently would be the other error, so failed attempts are reported separately
+    # below the curve, without derived quantities that presuppose completion. The failure is a
+    # real result about the harness's operating limit given the agent pool available; it is not a
+    # point on a speedup curve.
+    failed = {p: d for p, d in scal.items() if not d["job"].get("ok")}
+    scal = {p: d for p, d in scal.items() if d["job"].get("ok")}
+
     if len(scal) >= 2:
         base = scal.get(1) or scal[min(scal)]
         t1 = base["job"]["wall_s"]
@@ -243,6 +259,14 @@ def table_translation() -> None:
                 rf"{d['job']['agent_calls']} & {fmt(d['job']['tokens_in'] + d['job']['tokens_out'])} & "
                 rf"{fmt(d['job']['usd'], 3)} & {fmt(d['quality']['consistency'], 3)} \\"
             )
+        for p in sorted(failed):
+            d = failed[p]
+            lines.append(
+                rf"\midrule" "\n"
+                rf"{p}\rlap{{$^\dagger$}} & {fmt(d['job']['wall_s'], 0)} & \multicolumn{{3}}{{c}}{{\emph{{did not complete}}}} & "
+                rf"{d['job']['agent_calls']} & {fmt(d['job']['tokens_in'] + d['job']['tokens_out'])} & "
+                rf"{fmt(d['job']['usd'], 3)} & -- \\"
+            )
         import sys
 
         sys.path.insert(0, str(REPO / "src"))
@@ -259,11 +283,30 @@ def table_translation() -> None:
             else rf"not supported by single-trial data ($R^2={r2:.3f}$); "
             rf"see \cref{{tab:scalingsim}} for averaged scaling"
         )
+        # Macros so the prose can state the exclusion in the paper's own words rather than
+        # leaving the dagger unexplained.
+        _MACROS["NScalingMaxP"] = str(max(scal))
+        _MACROS["NScalingFailedP"] = ", ".join(str(p) for p in sorted(failed)) or "none"
+        _MACROS["NScalingFailedCount"] = str(len(failed))
+        if failed:
+            worst = failed[max(failed)]
+            _MACROS["NScalingFailedWall"] = fmt(worst["job"]["wall_s"], 0)
+            _MACROS["NScalingFailedRanks"] = str(len(worst["job"].get("failed_ranks") or []))
+
+        note = (
+            r"$^\dagger$ Attempted and did not complete; the wall time is the job timeout rather "
+            r"than a measurement, so no speedup, efficiency, or Karp--Flatt value is derived from "
+            r"it. Reported because the failure bounds the configuration that the available agent "
+            r"pool could sustain."
+            if failed
+            else ""
+        )
         body = (
             "\\begin{tabular}{rrrrrrrrr}\n\\toprule\n"
             "$p$ & wall (s) & speedup & efficiency & Karp--Flatt & calls & tokens & USD & consist. \\\\\n\\midrule\n"
             + "\n".join(lines)
             + "\n\\bottomrule\n\\end{tabular}"
+            + (f"\n\n{{\\footnotesize {note}}}" if note else "")
         )
         emit("tab_translation_scaling.tex", body)
     else:
