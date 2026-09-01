@@ -37,7 +37,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-from ampi import Ampi
 from ampi.errors import AmpiError
 from ampi.harness import Harness
 

@@ -669,12 +669,25 @@ class RuntimeBase:
         agent that receives a truncated message can continue while one that
         receives an error usually cannot.
         """
-        from .context import degrade_spec
+        from .context import MIN_DEGRADE_TOKENS, degrade_allowance, degrade_spec
 
         view = self._rankview()
         ledger = Ledger.from_dict(view.ctx)
         spec = ""
         if ledger.would_exceed(tokens):
+            if ledger.remaining < MIN_DEGRADE_TOKENS:
+                # Degradation is preferred to failure, but it has a floor: below a
+                # few dozen tokens no projection says anything, and charging a
+                # minimum would break the very budget the ledger exists to keep.
+                raise err(
+                    "AMPI_ERR_CTX_EXCEEDED",
+                    f"rank {view.rank} has {ledger.remaining} tokens left and cannot "
+                    f"accept a {tokens}-token delivery, even degraded",
+                    hint="Use --out FILE to save the body to disk without charging "
+                    "context, or start a fresh executor turn with 'ampi ctx-release'.",
+                    tokens=tokens,
+                    **ledger.to_dict(),
+                )
             if not degrade_ok:
                 ledger_error = err(
                     "AMPI_ERR_CTX_EXCEEDED",
@@ -685,7 +698,7 @@ class RuntimeBase:
                 )
                 raise ledger_error
             spec = degrade_spec(tokens, ledger.remaining)
-            tokens = min(tokens, max(64, ledger.remaining // 2))
+            tokens = min(tokens, degrade_allowance(ledger.remaining))
             ledger.degradations += 1
             self.trace("ctx.degrade", rank=view.rank, spec=spec, what=what)
         ledger.used += tokens

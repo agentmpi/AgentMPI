@@ -146,16 +146,33 @@ def choose_delivery(
     return DELIVERY_EAGER
 
 
+#: Below this many tokens a projection cannot say anything useful, so an
+#: implementation must fail rather than pretend to have delivered something.
+MIN_DEGRADE_TOKENS = 64
+
+
+def degrade_allowance(remaining: int) -> int:
+    """How many tokens an over-budget delivery may still be charged.
+
+    Half the remaining budget rather than all of it, because a rank that spends
+    its last token on one message can do nothing with what it read --- but never
+    more than what is actually left.  An earlier version took
+    ``max(64, remaining // 2)``, and that floor is a bug: with two tokens
+    remaining it charges sixty-four, so the mechanism that exists to keep a rank
+    inside its budget takes it outside.  A randomised invariant test found it at
+    4035/4000.
+    """
+    return min(remaining, max(MIN_DEGRADE_TOKENS, remaining // 2))
+
+
 def degrade_spec(tokens: int, remaining: int) -> str:
     """The view an over-budget delivery degrades to.
 
-    Half the remaining budget rather than all of it: a rank that spends its last
-    token on one message can do nothing with what it read.  ``headtail`` rather
-    than ``head`` because the end of an agent artifact is where the conclusions
-    are, and losing them silently is worse than losing the middle visibly.
+    ``headtail`` rather than ``head`` because the end of an agent artifact is
+    where the conclusions are, and losing them silently is worse than losing the
+    middle visibly.
     """
-    allowance = max(64, remaining // 2)
-    return f"headtail:{min(allowance, tokens)}"
+    return f"headtail:{min(degrade_allowance(remaining), tokens)}"
 
 
 @dataclass
