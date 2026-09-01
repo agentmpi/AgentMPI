@@ -45,9 +45,10 @@ prompts capped at 180,000 characters. Relevant controls are:
 
 - `--task-timeout`, `--claim-ttl`, and `--max-restarts` for lifecycle policy.
 - `--quorum` and `--barrier-policy` for missing/failed rank policy.
-- `--failure-policy` records whether orchestration should preserve a degraded
-  artifact or fail a rank. It is included in launch and report provenance; worker
-  supervisors should apply the matching policy when replacing abandoned tasks.
+- `--failure-policy retry-then-fail` republishes failed agent/contract work with
+  a fresh task identity up to `--max-restarts`; `fail-rank` makes the first
+  failure terminal. Exhausted work explicitly kills that rank, allowing
+  quorum-aware collectives and the surviving-rank review ring to continue.
 - `--ctx-budget`, `--research-chars`, and `--max-prompt-chars` for hard bounds.
 
 `stub` is a deterministic protocol fixture, not a translation or quality model.
