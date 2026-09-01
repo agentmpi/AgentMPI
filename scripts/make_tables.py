@@ -292,12 +292,25 @@ def table_translation() -> None:
             worst = failed[max(failed)]
             _MACROS["NScalingFailedWall"] = fmt(worst["job"]["wall_s"], 0)
             _MACROS["NScalingFailedRanks"] = str(len(worst["job"].get("failed_ranks") or []))
+            _MACROS["NScalingFailedTimeout"] = fmt(worst["config"].get("job_timeout"), 0)
+            # The failed row is also not the same experiment. Every completing point translates
+            # `units` of `words_per_unit`; the p=16 attempt was driven with twice the units, so
+            # even its raw wall, token, and cost cells are not commensurable with the curve.
+            base_cfg = (scal.get(1) or scal[min(scal)])["config"]
+            base_work = int(base_cfg.get("units") or 0) * int(base_cfg.get("words_per_unit") or 0)
+            fail_work = int(worst["config"].get("units") or 0) * int(worst["config"].get("words_per_unit") or 0)
+            _MACROS["NScalingBaseWords"] = f"{base_work:,}"
+            _MACROS["NScalingFailedWords"] = f"{fail_work:,}"
+            _MACROS["NScalingWorkRatio"] = fmt(fail_work / base_work, 2) if base_work else "--"
 
         note = (
-            r"$^\dagger$ Attempted and did not complete; the wall time is the job timeout rather "
-            r"than a measurement, so no speedup, efficiency, or Karp--Flatt value is derived from "
-            r"it. Reported because the failure bounds the configuration that the available agent "
-            r"pool could sustain."
+            r"$^\dagger$ Attempted and did not complete, so no speedup, efficiency, or Karp--Flatt "
+            r"value is derived from it. Its wall time is where two composed deadlines fired --- a "
+            r"$5400$\,s broker claim timeout followed by an $1800$\,s collective receive timeout --- "
+            r"not the job budget, which was \NScalingFailedTimeout\,s. It also translated "
+            r"\NScalingFailedWords\ words against \NScalingBaseWords\ at every completing point, "
+            r"so its remaining cells are not commensurable with the curve either. Reported because "
+            r"the failure bounds what the available agent pool could sustain."
             if failed
             else ""
         )
