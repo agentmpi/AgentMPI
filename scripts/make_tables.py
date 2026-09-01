@@ -599,6 +599,7 @@ def table_software() -> None:
         return ", ".join(bits)
 
     lines = []
+    phantom_rows: list[str] = []
     ordered = sorted(
         res,
         key=lambda x: (
@@ -619,20 +620,58 @@ def table_software() -> None:
         a = d.get("acceptance_reeval") or d["acceptance"]
         j, c = d["job"], d["config"]
         rounds = (d.get("acceptance_reeval") or {}).get("per_round") or d.get("per_round") or []
-        traj = " / ".join(str(r.get("n_passed") or 0) for r in rounds)
         dfc = a.get("defensiveness") or {}
+        # A run whose first round actually passed but was *recorded* as unimportable spent its
+        # second round repairing a phantom: the oracle's report failed to parse, the harness read
+        # that as an import failure, and `agree` refused to declare the build green. The quality
+        # columns are unaffected because they come from the offline re-evaluation, but the cost
+        # columns are not --- wall time, calls, tokens, and price all include a round a working
+        # oracle would have skipped. Marking it is the difference between a reader comparing
+        # configurations and a reader comparing two rounds against one.
+        recorded = d.get("per_round") or []
+        phantom = bool(
+            recorded
+            and rounds
+            and recorded[0].get("importable") is False
+            and rounds[0].get("importable") is True
+        )
+        if phantom:
+            phantom_rows.append(label(c))
+        mark = r"\rlap{$^\ddagger$}" if phantom else ""
         lines.append(
             rf"{label(c)} & {c.get('ranks')} & "
             rf"{a.get('n_passed') or 0}/{a.get('n_total') or 0} & "
             rf"{fmt(dfc.get('n_lines'))} & {dfc.get('total', 0)} & {fmt(dfc.get('per_kloc'), 2)} & "
-            rf"{fmt(j['wall_s'], 0)} & {j['agent_calls']} & "
+            rf"{fmt(j['wall_s'], 0)} & {j['agent_calls']}{mark} & "
             rf"{fmt(j['tokens_in'] + j['tokens_out'])} & {fmt(j['usd'], 3)} \\"
         )
+    note = (
+        r"$^\ddagger$ This run's first round already passed the acceptance suite, but the suite's "
+        r"report failed to parse and was recorded as an import failure, so \code{agree} withheld "
+        r"the build and a second round was spent repairing a defect that did not exist. The "
+        r"quality columns come from an offline re-evaluation against one oracle and are unaffected; "
+        r"the wall, call, token, and price columns include that extra round, so they are not "
+        r"comparable with single-round rows."
+        if phantom_rows
+        else ""
+    )
+    _MACROS["NPhantomRounds"] = str(len(phantom_rows))
+    # Derived rather than written into the prose, because the suite grew by a case during the
+    # project and the paper went on describing it as a 59-case suite in three places while the
+    # table beside them printed 60/60.
+    totals = {
+        int((d.get("acceptance_reeval") or d["acceptance"]).get("n_total") or 0)
+        for d in ordered
+    }
+    totals.discard(0)
+    if len(totals) == 1:
+        _MACROS["NAcceptanceCases"] = str(next(iter(totals)))
     body = (
         "\\begin{tabular}{lrcrrrrrrr}\n\\toprule\n"
         "configuration & $p$ & passed & lines & defensive & /kloc & wall (s) & calls & tokens & USD \\\\\n\\midrule\n"
         + "\n".join(lines)
         + "\n\\bottomrule\n\\end{tabular}"
+        + (f"\n\n{{\\footnotesize {note}}}" if note else "")
     )
     emit("tab_software.tex", body)
 
