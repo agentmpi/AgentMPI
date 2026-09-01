@@ -173,10 +173,26 @@ comment.
 
 ## Do not
 
-- Do not commit. The parent agent handles all git operations.
+- **Do not run any git command that changes state.** No `commit`, `add`, `checkout`, `switch`,
+  `branch`, `reset`, `stash`, `restore`, `merge`, or `rebase`. Reading is fine: `git log`,
+  `git show`, `git status`, `git diff`. The parent agent owns all git operations.
+
+  This is the strictest rule here because violating it has already cost real work. Several
+  analyses ran concurrently in one working tree; one created and checked out its own branch, so
+  the parent's subsequent commits landed there instead of on the session branch, and a later
+  `reset` orphaned eight commits — three of the parent's fixes and four completed analyses. The
+  content was recoverable only because a later `git add -A` happened to sweep it back in. You
+  share this checkout with up to nine other agents and with the parent; a branch change is not
+  local to you.
+
+  If you think you need a git operation, say so in your report instead and let the parent do it.
 - Do not modify anything outside `analysis/runs/<RUN>/` (and only `analysis.tex` within it).
-- Do not edit `src/`, `scripts/`, `traces/`, or `runs/`.
+- Do not edit `src/`, `scripts/`, `traces/`, or `runs/`. If you find a bug in the tooling or the
+  runtime, report it with evidence — that is one of the most valuable things you can return — but
+  do not fix it yourself, because a concurrent analyst is reading the same file.
 - Do not re-run experiments. The traces are the record; they are not to be regenerated.
+- Expect the working tree to be dirty from other agents. That is normal and is not yours to clean
+  up. Never `git checkout --` or `git restore` a file you did not write.
 
 ## If you were assigned a collective *family* instead of a run
 
