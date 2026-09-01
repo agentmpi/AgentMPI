@@ -6,6 +6,19 @@ measurement.  The cost of that discipline is that we cannot score fluency; the
 benefit is that the numbers mean the same thing in every arm and can be recomputed
 from stored artifacts by anyone.
 
+One threat this discipline does *not* remove. An executor in the treatment arm
+reported, unprompted, that it capitalised compass words mid-sentence because the
+glossary lists "South" as "el Sur" and it reasoned the check would be mechanical
+-- it chose a less natural rendering to match what it believed the scorer looked
+for. That is Goodhart's law appearing inside the experiment, and it biases the
+treatment arm upward on the metric this file computes. Two others said they
+rendered "City of Emeralds" using the agreed "Ciudad Esmeralda" for book-wide
+consistency, which is the same instinct applied more defensibly. The measurement
+is in ``experiments/results/e1_metric_gaming.json``; the effect is modest, and it
+matters because the treatment arm did not beat the control even with it. A metric
+an executor can see is a metric an executor will aim at, and a harness author
+choosing an acceptance oracle should assume the population will read it.
+
 The headline metric is **terminology consistency**.  For each recurring source
 term, look at every passage whose source contains it, find which rendering that
 passage's translation used, and take the modal rendering's share.  A population
