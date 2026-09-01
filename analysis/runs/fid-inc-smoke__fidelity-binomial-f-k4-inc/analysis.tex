@@ -14,25 +14,112 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is a smoke test: 47 events, 0.062\,s, a \texttt{function} executor on all eight ranks,
+run ten minutes before the broker campaign it was checking. Its job was to confirm that the
+new \texttt{--incompressible} payload generator and the new value-level retention metrics
+plumb through the harness end to end, and it did: the row it produced is the first in the
+repository to carry \texttt{n\_intact}, \texttt{n\_label\_only}, \texttt{n\_dropped},
+\texttt{value\_retention} and \texttt{id\_retention}, at 96, 0, 0, 1.0 and 1.0. The
+structural counts are exact --- \texttt{fold\_depth: 3} $= \lceil\log_2 8\rceil$, 3 rounds,
+7 messages $= p-1$, 7 applications, model check passing --- and the retention figure of
+1.000 must not be read as a fidelity result. Nothing here could have lost anything: the
+surrogate kernel ignores the token budget entirely, so its outputs grow from 386 tokens at
+depth 1 to 3{,}033 at the root against a nominal 450, and there is no budget-bound
+accumulator for incompressible content to overflow. What little the kernel did discard is
+almost comic: the four depth-1 merges all have prompts of exactly 1{,}695 characters, the
+kernel seeds its generator from \texttt{seed + len(prompt)}, and replaying its arithmetic
+shows all four making the same draw and dropping candidate index 0 --- which is not a fact
+but the prompt's own instruction sentence, \texttt{"such as [F-3-2]. Keep every identifier
+\dots"}. The smoke test therefore established that the plumbing works and that a surrogate
+executor cannot exercise erasure at all. The measurement it cleared the way for is
+\texttt{inc-mb-fidelity-inc}, which added \texttt{max\_tokens: 450} to the contract, ran on
+real agents, and returned 0.3854 with ranks 4 through 7 erased whole.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is a binomial tree at millisecond resolution and contains no
+surprises: four ranks act at depth 1 (0, 2, 4, 6), two at depth 2 (0, 4), one at depth 3,
+and the whole run is 0.062\,s with every application an instant. The per-rank call counts
+descend 3, 0, 1, 0, 2, 0, 1, 0, which is the \texttt{stride} loop's signature, and the seven
+messages of the communication matrix, Figure~\ref{fig:comm}, carry 178 tokens on each leaf
+edge and 406 and 1{,}055 on the two accumulated edges into the root, 2{,}579 in total. The
+8.00$\times$ imbalance flagged in the findings is the concentration a tree produces at $p=8$
+and is expected; the occupancy row of the dashboard should be ignored, because these
+executors emit no broker claim events and the generated findings say so directly.
+
+The one thing the widths do show is that the operator is not respecting its budget. The four
+depth-1 calls take 446-token prompts and return 386; the two depth-2 calls take 900 and
+return 1{,}036; the root takes 2{,}198 and returns 3{,}033. Output grows faster than input
+because the kernel copies both of its inputs verbatim into its result --- the stored
+accumulator for the $4\to0$ message is JSON nested inside escaped JSON inside escaped JSON
+--- so the run emits 6{,}649 output tokens for a fold over 96 twelve-token facts, against a
+stated ceiling of 450 per application.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+The structure is by construction and is what a smoke test should verify: depth 3 matching
+$\lceil\log_2 8\rceil$, seven messages against a predicted seven, and the finding that all
+checkable collectives agree with their closed form is the check passing. What the run adds
+to the campaign is a negative result about its own instrument, and it is worth stating
+because it is the reason the campaign was re-run on a broker.
+
+Retention 1.000 here has two independent causes and neither is fidelity. The first is that
+the surrogate has no notion of a budget: \texttt{\_surrogate\_merge} takes a drop rate and a
+seed, never the token ceiling, and the ceiling was in any case advisory in this run --- at
+commit \texttt{90ca469} the harness passed the module-level \texttt{MERGE\_CONTRACT}, which
+has no \texttt{max\_tokens} field, so the 450 tokens existed only as a sentence in the
+prompt and as a \texttt{meta} hint. Whole-rank erasure in this experiment is what happens
+when an accumulator that stands for many ranks fills a binding budget; with no binding
+budget and no budget-aware operator, the mechanism cannot fire, and \texttt{--incompressible}
+--- which removes the operator's ability to re-encode its way out of pressure --- has nothing
+to act on. The second cause is the surrogate's actual loss model, which is not the one its
+docstring describes. It builds candidates from \texttt{prompt.splitlines()} and keeps lines
+matching \texttt{FACT\_ID}, but each input is interpolated as \texttt{json.dumps(\dots)} and
+contains no newlines, so a binary merge prompt offers exactly three candidates: the prompt's
+instruction line containing the example identifier \texttt{[F-3-2]}, and the two inputs
+entire. The unit of loss is a whole input, and the draw is a deterministic function of
+prompt character length. Rebuilding the four depth-1 prompts from
+\texttt{make\_fact\_report} at the run's seed gives 1{,}695 characters for every one of
+them, and the replay keeps candidates 1 and 2 and drops candidate 0 in all four cases ---
+the instruction sentence. The stored blob for the $2\to0$ message confirms it: two findings,
+24 identifiers, ranks 2 and 3 complete, and no \texttt{[F-3-2]}. So the only thing this run
+lost was harness boilerplate, four times, deterministically.
+
+Read against my other fourteen runs, this cell is therefore a plumbing datum and a caution
+rather than evidence. The comparison it makes possible is the important one:
+\texttt{inc-mb-fidelity-inc\_\_fidelity-binomial-f-k4-inc} is the same algorithm at the same
+$p$, the same twelve incompressible items per rank and the same nominal 450 tokens, run ten
+minutes later, differing in exactly two respects --- a real broker executor, and
+\texttt{max\_tokens: 450} in the contract with a semantics clause instructing the operator to
+omit whole items rather than re-encode. It retains 37 of 96: ranks 0, 1 and 2 complete, one
+item of rank 3, and ranks 4 through 7 gone entirely. That is the measurement the experiment
+was built for, and this smoke test is the step that confirmed the new metric block would
+record it.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The executor is a surrogate, so nothing here is agent behaviour, and the cost figure of
+\$0.1171 is a modelled price for tokens produced by string concatenation. The 0.062\,s wall
+time is SQLite writes and event logging.
+
+The replay is a reconstruction rather than a logged fact: a \texttt{function} executor writes
+no rows to \texttt{agent\_calls}, so this run's fabric contains no prompts and no results,
+only the seven message payloads under \texttt{blobs/}. What is directly observed is that
+those payloads contain nested escaped JSON, that their \texttt{findings} arrays have length
+2 or 3 rather than 12 or 24, and that the $2\to0$ payload carries 24 identifiers with the
+phantom absent. The claim that all four depth-1 prompts were 1{,}695 characters and made
+the same draw comes from rebuilding them with the harness's own generator, which reproduces
+the observed output-token counts (386 for all four) and the observed blob contents.
+
+Two defects I would report rather than fix. The prompt's example identifier
+\texttt{[F-3-2]} is a live identifier that \texttt{fact\_retention} will score if the
+operator echoes it; in this run it does no harm, but in
+\texttt{fid-synth\_\_fidelity-binomial-f-k4} it is the sole reason rank 3 is credited with
+0.25 retention after its real report was destroyed. And the line-based item extraction makes
+the surrogate's loss granularity a whole subtree rather than a fact, which means the
+$(1-r)^{\text{depth}}$ curve its docstring promises is not what any of these runs exhibit.
 
 \end{document}

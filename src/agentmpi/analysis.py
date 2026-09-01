@@ -201,6 +201,10 @@ class CollectiveInvocation:
     #: defect worth surfacing rather than a number to average away.
     logged_messages: int | None = None
     logged_tokens: int = 0
+    #: Fan-in for k-ary reductions, read from the event. Without it the prediction falls back to
+    #: ``cost.DEFAULT_FANIN``, which is 8, and a run using k=4 is then compared against a depth
+    #: derived for k=8 --- reporting a round-count disagreement that is entirely the tooling's.
+    fanin: int | None = None
 
     @property
     def accounting_agrees(self) -> bool | None:
@@ -544,9 +548,25 @@ class Analysis:
 
     @property
     def model_checks(self) -> tuple[int, int]:
-        """``(agreeing, checked)`` over collectives whose prediction is meaningful to check."""
+        """``(agreeing, checked)`` on *message counts*, over collectives worth checking."""
         checked = [c for c in self.collectives if c.messages_agree is not None]
         return sum(1 for c in checked if c.messages_agree), len(checked)
+
+    @property
+    def round_checks(self) -> tuple[int, int]:
+        """``(agreeing, checked)`` on *round counts*, reported separately from messages.
+
+        Aggregating only message agreement let a document announce that every checkable collective
+        matched its cost expression while its round counts did not --- true of 132 archived runs, a
+        quarter of the archive. Rounds are the critical-path term, so for a collective whose payload
+        is small they are the number that decides anything.
+        """
+        checked = [
+            c
+            for c in self.collectives
+            if c.rounds_agree is not None and c.complete and c.predicted_rounds is not None
+        ]
+        return sum(1 for c in checked if c.rounds_agree), len(checked)
 
     @property
     def incomplete_collectives(self) -> list[CollectiveInvocation]:
@@ -593,12 +613,30 @@ class Analysis:
         Its own metric because it separates two failures that look identical in a summary: a run
         that was slow, and a run where no agent ever showed up. The second is a pool-sizing
         problem outside the protocol, and reading it as the first would blame the harness.
+
+        Computed from enqueue-to-claim intervals as well as from ``broker.expire``. Reading only
+        the expiries made a *successful but starved* run report zero: one fidelity run showed 0.0
+        here while containing a 908-second wait, with 79.9% of its wall clock spent in broker
+        starvation rather than generation --- which also explains its rejected calibration fit, since
+        a queue wait enters the measured latency but not the token count. A wait that eventually
+        succeeds distorts a cross-algorithm wall-time comparison just as much as one that does not.
         """
         waits = [
             float(e["payload"].get("waited_s") or 0.0)
             for e in self.trouble
             if e["kind"] == "broker.expire"
         ]
+        enqueued: dict[int, float] = {}
+        for e in self.events:
+            aid = e["payload"].get("aid")
+            if aid is None:
+                continue
+            if e["kind"] == "broker.enqueue":
+                enqueued[int(aid)] = e["ts"]
+            elif e["kind"] == "broker.claim":
+                start = enqueued.pop(int(aid), None)
+                if start is not None:
+                    waits.append(e["ts"] - start)
         return max(waits) if waits else 0.0
 
     @property
@@ -877,10 +915,17 @@ def _build_invocation(op: str, label: str, group: list[Event], t0: float) -> Col
         divergence_risk=any(bool(p.get("divergence_risk")) for p in payloads),
     )
 
+    fanins = {int(p["fanin"]) for p in payloads if p.get("fanin")}
+    inv.fanin = sorted(fanins)[0] if fanins else None
+
     formula = cost.FORMULAS.get((op, algorithm))
     if formula is not None and size > 0:
         try:
             rounds, messages, _volume, _depth = formula(size, 1000)
+            # A k-ary reduction's depth depends on its fan-in, and the tabulated entry fixes one
+            # value. Predict from the fan-in the run actually used, which the event records.
+            if inv.fanin and algorithm == "kary":
+                rounds = cost.predict_kary(size, 1000, inv.fanin).rounds
             inv.predicted_rounds = int(rounds)
             inv.predicted_messages = int(messages)
         except Exception:

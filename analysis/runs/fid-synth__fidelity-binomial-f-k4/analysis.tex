@@ -14,25 +14,159 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the surrogate-executor companion to the real binomial fidelity run, taken at $p=16$
+six minutes after the commit that introduced the $k$-ary algorithm, and it is a plumbing
+check rather than evidence about operators: \texttt{executors} records
+\texttt{function}~$\times$~16, so the merge kernel is \texttt{\_surrogate\_merge(0.08, 0)},
+a Python function whose docstring says outright that it reproduces the paper's loss model
+rather than testing it. The structural measurements it does establish are exact ---
+\texttt{fold\_depth: 4} $= \lceil\log_2 16\rceil$, 4 rounds, 15 messages $= p-1$, 15
+operator applications, model check passing --- and the retention figure of 0.7031 should be
+read only as a statement about the surrogate. It is worth reading, because the surrogate
+does not behave as documented. Reconstructing the fold from the message blobs shows that
+what it drops is not a fact but an entire input: \texttt{json.dumps} renders each report as
+one line, the kernel splits the prompt by lines, and so the ``items'' it draws over are the
+whole left input, the whole right input, and one line of the prompt's own instructions ---
+\texttt{"such as [F-3-2]. Keep every identifier that appears in either input, exactly as"}
+--- which is present verbatim in the stored accumulators. Two consequences follow and both
+matter for the campaign. The phantom \texttt{[F-3-2]} is scored as a retained item, which
+is exactly why rank 3 reads 0.25 here while its real report was destroyed at the first
+merge. And because the kernel reseeds from \texttt{seed + len(prompt)}, five structurally
+identical depth-1 merges with byte-identical prompt lengths made byte-identical draws and
+all five dropped their odd-numbered partner: ranks 1, 3, 5, 7 and 9, exactly the observed
+zeros. Loss here is a deterministic function of prompt length, not an independent
+per-item event, so this run cannot support the $(1-r)^d$ curve it was built to exhibit.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is a binomial tree drawn at millisecond resolution: the whole run
+is 0.103\,s, all fifteen merges are instants, and the visual structure is the collapsing
+pattern of active lanes rather than any duration. Eight ranks call the operator at depth 1
+(the even ranks), four at depth 2 (0, 4, 8, 12), two at depth 3 (0, 8) and one at depth 4,
+which is the $\sum 2^{-i}$ staircase the algorithm's \texttt{stride} loop produces, and the
+per-rank table shows it as the descending call counts 4, 0, 1, 0, 2, 0, 1, 0, 3, \dots. The
+event ordering confirms the levels interleave rather than synchronising: rank 0's
+\texttt{merge:d2} fires before rank 14's \texttt{merge:d1}, because a binomial reduce
+imposes no barrier between strides and a rank proceeds as soon as its own partner has
+arrived.
+
+The occupancy row of the dashboard should be ignored, and the generated findings say why:
+these executors emit no \texttt{broker.claim} events, so achieved parallelism of
+0.04$\times$, the 99.8\% idle fraction and the 12.00$\times$ imbalance are artefacts of
+reconstructing busy time from an event stream that has none. What the timeline does show
+honestly is the token growth on the critical path, and it is the run's most visible defect.
+The root's four merges return 177, 439, 1{,}210 and 4{,}645 output tokens on prompts of
+442, 514, 1{,}004 and 3{,}200, so each application roughly doubles the accumulator even
+though the underlying item count grows by at most a factor of two and the operator is
+nominally capped at 900 tokens. It doubles because the kernel copies its inputs verbatim
+into its output: the stored accumulator for the $8\to0$ message is a JSON string containing
+an escaped JSON string containing an escaped JSON string, three levels deep, at
+1{,}884~tokens for 28 real identifiers. Total output across the run is 11{,}833 tokens for
+a fold over 64 four-token facts.
+
+The communication matrix, Figure~\ref{fig:comm}, is the tree's signature: fifteen edges,
+153 tokens on each leaf-to-parent link and 458 and 1{,}884 on the two edges into the root
+that carry accumulated subtrees, for 5{,}416 tokens in total. That is the cheapest traffic
+of the four cells at this $p$ apart from \texttt{flat}, and the tree's characteristic
+property --- traffic per rank is constant while the accumulator carried on the last edge
+grows with $p$ --- is legible in the single 1{,}884-token edge from rank 8.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+Everything structural is by construction and checks out, which is what a plumbing run is
+for. \texttt{fold\_depth: 4} matches $\lceil\log_2 16\rceil$ and is the shallowest of the
+three classical algorithms here, against \texttt{chain} and \texttt{flat} at 15; rounds are
+4 against a predicted 4; messages are 15 against a predicted 15, and the finding that all
+checkable collectives agree with their closed form is the check passing. This cell is
+therefore the depth-4 reference point in the $p=16$ series, and the series exists mainly to
+give the newly written \texttt{kary} branch something to be compared against at a process
+count where its geometry is clean.
+
+What emerged, and what this document exists to record, is that the surrogate implements a
+different loss model from the one its docstring describes. The docstring claims each
+application independently drops each item with probability \texttt{drop\_rate}, giving
+retention $(1-r)^d$. The implementation collects candidate items by iterating
+\texttt{prompt.splitlines()} and keeping lines that match \texttt{FACT\_ID}; but the merge
+prompt interpolates each input as \texttt{json.dumps(\dots)}, which emits no newlines, so a
+binary merge prompt yields exactly three matching lines: the instruction sentence
+containing the example identifier \texttt{[F-3-2]}, the entire left report, and the entire
+right report. The unit of loss is an accumulator, not a fact. Every stored accumulator in
+this run confirms it: \texttt{findings} has length 2 or 3, never 4 or more, and its first
+element is always the instruction sentence.
+
+That has two measurable effects here. The first is a small upward bias in the metric.
+\texttt{fact\_retention} counts identifiers appearing in the root's result, and
+\texttt{[F-3-2]} appears in every accumulator in the run because the operator copies the
+prompt's own example into its output; so rank 3 is credited with 0.25 retention --- one of
+its four facts --- while the blob for the $2\to0$ message shows its real report was
+discarded at rank 2's first merge, leaving only rank 2's four items and the phantom. The
+reported \texttt{n\_retained: 45} therefore overstates transported facts by exactly one, and
+\texttt{n\_hallucinated\_ids: 0} is wrong in spirit if not in letter: the identifier was not
+invented by a model, it was copied from the harness's own prompt, and the harness then
+counted it as evidence of retention. The second effect is more serious. The kernel seeds its
+generator with \texttt{seed + len(prompt)}, so two applications whose prompts have the same
+character length make identical draws. The eight depth-1 merges here divide into five with
+1{,}681-character prompts (ranks 0--9, single-digit rank labels) and three with 1{,}701
+(ranks 10--15, two-digit labels). Replaying the kernel's arithmetic on those prompts
+reproduces the run exactly: the five short prompts keep items 0 and 1 and drop item 2 --- the
+right-hand input, which is always the odd-numbered partner --- and the three long prompts
+keep all three. So ranks 1, 3, 5, 7, 9 lose everything and ranks 11, 13, 15 lose nothing,
+which is precisely the reported \texttt{per\_rank\_retention}, and
+$64 - 5\times4 + 1 = 45$ is precisely the reported retention. The positive
+\texttt{rank\_position\_correlation} of 0.3475 is not recency bias in a reducer; it is the
+fact that ranks above 9 have two-digit numerals.
+
+The consequence for the campaign is that this cell's retention number carries no weight in
+the depth argument, in either direction. Its siblings at this $p$ score 0.875
+(\texttt{flat}, depth 15), 0.6875 (\texttt{chain}, depth 15) and 0.6875 (\texttt{kary},
+depth 2), so the ordering is not monotone in depth and the deepest algorithm wins; but
+that ordering is produced by how many applications happened to draw a repeated prompt
+length, not by any property of reduction. The real evidence about the depth hypothesis is in
+the broker campaigns, where all four algorithms agree exactly --- at 1.000 under an
+advisory budget in \texttt{sat-mb-fidelity} and at 0.3854 under an enforced one in
+\texttt{inc-mb-fidelity-inc} --- and it is the enforced budget, not the fold shape, that
+governs the outcome. The enforcement question does not arise in this run at all: at commit
+\texttt{c5e8e9e} the harness passed the module-level \texttt{MERGE\_CONTRACT}, which has no
+\texttt{max\_tokens} field, so the 900-token budget existed only as a sentence in the
+prompt. That is the advisory regime, and it is why a 4{,}645-token output at the root
+records \texttt{attempt: 1} and \texttt{contract\_violations: 0}. Under a null bound, zero
+violations is uninformative rather than reassuring.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The executor is a surrogate, so nothing here is agent behaviour, and the reading above is
+about a Python function. That is the dominant threat and it applies to every sentence
+containing the word retention. It also means the run's timing, cost and occupancy numbers
+describe the fabric: 0.103\,s of wall time is SQLite writes and event logging, and the
+\$0.2128 is what the modelled price list would have charged for 11{,}833 tokens the
+surrogate produced by string concatenation.
+
+The mechanism claims are stronger than the retention claims, and I should be explicit about
+which is which. That the parsed items are three per prompt, that the first is the
+instruction sentence, and that accumulators nest verbatim are direct observations from the
+stored blobs. That the five depth-1 drops follow from equal prompt lengths is a replay of
+the kernel's own arithmetic on prompts I rebuilt from \texttt{make\_fact\_report} with the
+run's seed, and it predicts the observed \texttt{per\_rank\_retention} vector exactly, which
+is strong but is still a reconstruction rather than a logged fact --- the
+\texttt{function} executor writes no rows to \texttt{agent\_calls}, so this run's fabric
+contains no prompts or results, only message payloads. The regime claim rests on reading
+\texttt{experiments/microbench.py} at the provenance commit rather than on a contract stored
+in the fabric, for the same reason; the behavioural corroboration is that outputs exceed
+900 tokens fivefold with zero violations, which requires \texttt{max\_tokens} to have been
+\texttt{None}.
+
+The prompt-length coincidence is specific to this configuration and should not be
+generalised. It bites here because a binomial tree at $p=16$ contains eight structurally
+identical depth-1 merges; \texttt{flat} and \texttt{chain} at the same $p$ have prompts of
+fifteen distinct lengths, which is why they lost two and five ranks respectively by
+apparently unrelated draws. Nor should the defect be read as affecting the broker runs: they
+never call \texttt{\_surrogate\_merge}. The two defects I would report for fixing are the
+phantom identifier (the prompt's example \texttt{[F-3-2]} should not be an identifier that
+\texttt{fact\_retention} can score) and the line-based item extraction, which makes the
+surrogate's loss granularity a whole subtree; a third, milder one is the seeding, which
+should mix in the call index if the draws are meant to be independent.
 
 \end{document}

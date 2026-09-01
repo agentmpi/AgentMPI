@@ -259,6 +259,27 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
         out.append(("ok", f"All {checked} checkable collective(s) sent exactly the number of messages their closed-form cost expression predicts."))
     elif checked:
         out.append(("critical", f"{checked - agree} of {checked} collectives disagree with the cost model on message count."))
+
+    # Reported separately from messages. Aggregating only message agreement let a document announce
+    # full agreement with the cost model while the round counts disagreed, which was true of a
+    # quarter of the archive. Rounds are the critical-path term, so for a small-payload collective
+    # they are the number that decides anything.
+    r_agree, r_checked = a.round_checks
+    if r_checked and r_agree == r_checked:
+        out.append(("ok", f"All {r_checked} checkable collective(s) also matched the predicted round count."))
+    elif r_checked:
+        mismatched = [c for c in a.collectives if c.rounds_agree is False and c.complete]
+        detail = ", ".join(
+            f"{mono(c.op + '/' + c.algorithm)} recorded {c.rounds} against {c.predicted_rounds}"
+            for c in mismatched[:4]
+        )
+        out.append((
+            "warning",
+            f"{r_checked - r_agree} of {r_checked} collective(s) disagree with the cost model on "
+            f"\\emph{{round}} count while agreeing on messages: {detail}. Rounds are the "
+            f"critical-path term, so a disagreement here changes predicted latency without changing "
+            f"predicted traffic.",
+        ))
     return out
 
 

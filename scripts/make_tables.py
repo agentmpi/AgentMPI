@@ -514,7 +514,11 @@ def table_fidelity() -> None:
         block = groups[key]
         executor, p, facts, budget, incompressible = key
         lost = any((r.get("retention") or 0) < 1.0 for r in block)
-        kind = "agent-executed" if executor == "broker" else f"surrogate operator ({executor})"
+        kind = (
+            "agent-executed"
+            if executor == "broker"
+            else rf"surrogate operator ({executor})$^\S$"
+        )
         if incompressible:
             kind += ", incompressible payload, budget enforced by contract"
         state = "capacity-bound" if lost else "not capacity-bound"
@@ -532,11 +536,29 @@ def table_fidelity() -> None:
             )
         lines.append(r"\addlinespace")
 
+    # The surrogate rows measure the stand-in operator, not a reduction, and a per-run audit showed
+    # their retention and rank-correlation columns cannot be read as properties of the algorithms.
+    # `_surrogate_merge` splits its prompt on newlines to find "items", but each input is
+    # interpolated as JSON and contains none, so a binary merge sees three items --- the instruction
+    # line and the two whole inputs. The unit of loss is therefore an accumulator, not a fact, and
+    # one draw can erase an entire subtree. It also seeds from `seed + len(prompt)`, so structurally
+    # identical applications make identical draws and retention becomes a function of how many
+    # digits are in a rank number. The variation across algorithms in those rows is that artefact.
+    surrogate_note = (
+        r"$^\S$ Surrogate rows characterise the stand-in operator, not a semantic reduction. Its "
+        r"unit of loss is a whole accumulator rather than an individual item, and its draw is seeded "
+        r"from the prompt length, so retention there varies with incidental prompt width --- including "
+        r"the number of digits in a rank label --- rather than with tree shape. Read those rows for "
+        r"cost and structure only; the fidelity claims rest on the agent-executed blocks."
+        if any(b[0]["_executor"] != "broker" for b in groups.values())
+        else ""
+    )
     body = (
         "\\begin{tabular}{lrrrrrrrr}\n\\toprule\n"
         "algorithm & depth & rounds & retention & sd & rank corr. & halluc. & wall (s) & out tok \\\\\n\\midrule\n"
         + "\n".join(lines)
         + "\n\\bottomrule\n\\end{tabular}"
+        + (f"\n\n{{\\footnotesize {surrogate_note}}}" if surrogate_note else "")
     )
     emit("tab_fidelity.tex", body)
 

@@ -14,25 +14,161 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the manager-summarises-everything cell of the enforced, incompressible reduction,
+and it is the run in which whole-rank erasure can be watched happening. Eight ranks send
+twelve high-entropy items each to rank 0, which folds them one at a time under a 450-token
+contract. The reported retention is 0.385, identical to its three siblings. What only this
+cell shows is the moment of failure: the root's accumulator reaches the budget after
+folding in rank 3, and the four merges that follow --- \texttt{merge:d4} through
+\texttt{merge:d7}, the applications whose entire purpose is to bring in ranks 4, 5, 6 and
+7 --- each return the byte-identical blob \texttt{9f300f3a45bf}, 437 tokens, the same 37
+identifiers. Four consecutive applications of the reduction operator were the identity
+function. They cost 89\,s of wall clock and 2{,}888 prompt tokens, each satisfied its
+contract, each reported success, and together they produced nothing. Note also that
+\texttt{flat} is not a one-shot $p$-way fold: \texttt{algorithms.py} applies the binary
+operator $p-1$ times in sequence at the root, so this run's \texttt{fold\_depth} is 7 with
+\texttt{rounds: 1}, and it is a depth-7 cell. This run also carries the campaign's only
+contract violation, and the retry is instructive in its own right: attempt 1 of
+\texttt{merge:d3} returned 472 tokens with 40 identifiers, was rejected for overrunning
+450, and attempt 2 returned 437 with 37 --- enforcement bought budget compliance by
+deleting three more items.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is one occupied lane and seven empty ones. Rank 0 carries eight
+contiguous bars spanning the whole 251.64\,s; ranks 1 through 7 carry two or three
+instantaneous ticks each inside the first 20\,ms and nothing after. That is the flat
+reduction drawn literally: every non-root rank sends its report and returns, all seven
+inside 158 tokens apiece, and the root does all the work. Peak ranks busy is 1 of 8, the
+serial fraction of active time is 100\%, load imbalance is 8.00$\times$ --- the worst
+attainable at $p=8$, and correctly reported --- and rank 0's 209.91\,s is the only
+non-zero entry in the per-rank table. The eighth bar is the retry: the dashboard marks it
+with a red failure glyph, the one item in the \texttt{failure / timeout} legend, and the
+stats row shows \texttt{CONTRACT VIOLATIONS 1}.
+
+The bar widths are what to read, and they say the opposite of what a growing-prompt story
+would predict. The eight calls took 16.51, 20.95, 55.54, 27.65, 28.06, 20.68, 21.14 and
+19.37\,s on prompts of 446, 574, 712, 735, 722, 722, 722 and 722 tokens. After the third
+merge the prompt stops growing --- it is pinned at 722 tokens, being a 437-token
+accumulator plus a 158-token leaf plus the template --- because the accumulator has hit
+the ceiling and cannot get any larger. A flat fold whose prompt stops growing is a flat
+fold that has stopped accumulating. The four terminal calls are also the fastest and the
+most uniform of the run, 19--28\,s, which is what an operator does when it copies its left
+input out again. Of the 251.6\,s, 209.9\,s is generation and 39.2\,s is waiting for a
+worker to claim a queued call, which I obtained by differencing each
+\texttt{broker.enqueue}\,$\to$\,\texttt{broker.claim} pair in the log; the run is
+therefore not distorted by pool starvation the way its \texttt{sat-mb} chain cousin is.
+
+The communication matrix, Figure~\ref{fig:comm}, is a single column of seven edges at
+exactly 158 tokens each, 1{,}106 in total. That is the least fabric traffic of the four
+cells --- against the tree's 1{,}806, the $k$-ary tree's 1{,}537 and the chain's 2{,}448
+--- because only raw leaf reports ever travel and no accumulator is ever sent anywhere.
+The trade is exactly the one the cost model predicts: one communication round bought at
+the price of putting all seven applications on one rank's critical path, giving the
+second-worst wall time in the campaign and the highest prompt-token total, 4{,}643.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+The configuration is by construction and the checks pass: seven messages against a closed
+form of $p-1=7$, one round against 1, \texttt{model\_checks\_agree} 1 of 1. The
+construction most worth naming is the one the hypothesis usually gets wrong about this
+algorithm. A flat reduce is often described as folding all $p$ inputs at the root in a
+single step, which would make it the shallowest possible arrangement and the natural
+upper bound on retention. The implementation does no such thing: the \texttt{flat} branch
+of \texttt{reduce} gathers all $p$ contributions, sorts them by source rank because the
+operator is declared non-commutative, and then applies the \emph{binary} kernel $p-1$
+times in sequence, setting \texttt{fold\_depth = p - 1 = 7} and \texttt{rounds = 1}. The
+trace confirms it: seven distinct labels \texttt{merge:d1} through \texttt{merge:d7} on
+rank 0. This campaign therefore contains three distinct depths, 2, 3 and 7, not four, and
+this cell shares its depth with the chain.
+
+The enforcement regime is the second thing to establish, and the fabric settles it
+unambiguously. Every \texttt{agent\_calls} row records \texttt{max\_tokens: 450} on the
+contract together with a non-empty \texttt{semantics} string instructing the operator to
+``omit whole items rather than abbreviating or re-encoding any''. That is the enforced
+form, and this is the run where the enforcement path fires. Attempt 1 of \texttt{merge:d3}
+returned 472 tokens carrying 40 identifiers over ranks 0--3; the runtime rejected it,
+appended the diagnosis to the prompt, and attempt 2 returned 437 tokens carrying 37. The
+three items that enforcement removed were the difference between a 5\% overrun and
+compliance. The contrast with the advisory regime is stark and is measured elsewhere in my
+set: the \texttt{sat-mb-fidelity} flat cell ran the same $p$, the same twelve items per
+rank and the same nominal 450-token budget with \texttt{max\_tokens: null}, emitted 698
+tokens at the root --- 55\% over --- and scored retention 1.000. A budget that is not
+checked is not a budget, and until it is checked the experiment cannot test anything.
+
+What emerged is the erasure, and this cell is where the mechanism is unarguable because
+the fold advances one rank at a time. Reconstructing every intermediate from the store:
+\texttt{merge:d1} gives 24 identifiers over ranks $\{0,1\}$ at 289 tokens;
+\texttt{merge:d2} gives 36 over $\{0,1,2\}$ at 426; \texttt{merge:d3} attempt 2 gives 37
+over $\{0,1,2,3\}$ at 437; and \texttt{merge:d4}, \texttt{d5}, \texttt{d6} and \texttt{d7}
+each give 37 over $\{0,1,2,3\}$ at 437, the same digest each time. The cause is a
+division. An incompressible item is \texttt{[F-0-0] serial 597623 checksum LVPG}, nine
+tokens of content with no shorter equivalent, 11.81 tokens once quoted into the JSON
+array, so a 450-token ceiling admits $450/11.81 = 38.1$ items and the accumulator saturates
+at 37. From that point the reduction has stopped reducing and is merely forwarding, and
+because the operator writes items in the order it receives them and the runtime sorts
+contributions by source rank, what survives is a strict prefix: ranks 0--2 complete, plus
+\texttt{F-3-0}, and nothing else. That is what \texttt{rank\_position\_correlation}
+$=-0.863$ is measuring. The identical 37 survivors appear in the binomial, chain and
+$k$-ary siblings at depths 3, 7 and 2 --- I compared the sets directly and the symmetric
+difference is empty --- so depth costs nothing under a uniform enforced budget and
+collective selection is a pure cost decision. These four runs are the sole source of
+\texttt{tab\_erasure} and of the macros \texttt{\textbackslash NErasedRanks} and
+\texttt{\textbackslash NErasureCorr}.
+
+Of the flagged findings, the serial-execution warning is expected rather than a defect ---
+a flat reduce puts every application at the root by definition --- and it is worth keeping
+precisely because a reader meeting this pattern in a real harness should be told. The
+8.00$\times$ imbalance is honest and is this algorithm's true cost. The contract violation
+and the second attempt are the enforcement mechanism working, not a fault. The
+calibration warning is real and should be believed: with eight calls spanning only 446 to
+735 prompt tokens the least-squares fit produced a negative intercept, the guard rejected
+it, and any latency prediction from this run's $\alpha$ and $\beta$ is a median rather
+than a model. What is not flagged and should be is the run's central result: four of eight
+operator applications changed nothing, and no counter anywhere in the system notices that
+a lossy reduction has become a no-op. An operator that returns its left operand unchanged
+is exactly the signal a harness could cheaply detect --- compare the result digest against
+the accumulator digest --- and it is not detected.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The executor is real (\texttt{broker}~$\times$~8, \texttt{worker}~$\times$~31), so this is
+model behaviour rather than a surrogate implementing a loss model, and the shared-pool
+threat applies. This run's terminal blob is shared with the binomial and $k$-ary cells, and
+the four cells ran sequentially against one pool of Cursor subagents. I ran the
+determinism test: prompt digest \texttt{baffd868ca96} appears in both this run's
+\texttt{merge:d1} and the binomial cell's, and the two results differ (289 against 288
+tokens, different digests), so the executor is not deterministic and determinism cannot
+explain the identities. What can is that the surviving items are verbatim high-entropy
+strings in rank order, so once the cut lands at 37 there is one canonical string to
+return. That reading also explains why the identity is confined to the saturated
+accumulators and does not extend to the unsaturated intermediates. I cannot exclude pool
+memory, but it has nothing left to account for.
+
+The strongest internal threat is that the four terminal no-ops could be an artefact of how
+\texttt{flat} presents its operands rather than a property of saturation. The kernel
+renders the accumulator as \texttt{REPORT A} and the incoming leaf as \texttt{REPORT B},
+so a model that simply echoed \texttt{REPORT A} would produce this trace whether or not it
+was budget-bound. Three observations argue against that. The first three merges did
+integrate their right operand, growing 24\,$\to$\,36\,$\to$\,37 identifiers with the same
+kernel and the same rendering. The no-ops begin exactly when the accumulator first touches
+437 tokens and not before. And the same 37-item cut appears in the binomial and $k$-ary
+cells, where the operands are two subtree accumulators of comparable size rather than a
+large accumulator and a small leaf. Saturation explains all three; operand-position bias
+explains only the third-to-last.
+
+Third, one trial, and the token constant is computed with \texttt{tokenizer\_exact:
+false}, using the repository's approximate counter --- the same one the contract check
+uses, which is what makes the arithmetic self-consistent internally even if it would not
+transfer to a real tokeniser. The \$0.0574 is modelled from the calibration block, not
+billed. Finally, \texttt{fact\_retention} counts an identifier wherever it appears in the
+result text, and the merge prompt's instruction line contains the literal
+\texttt{[F-3-2]}, which is inside the benchmark's own identifier space. I checked this
+run's result: rank 3's survivor is \texttt{F-3-0}, so no phantom is inflating the score
+here. It is a latent hazard in the metric rather than a fault in this measurement, but it
+does inflate the surrogate campaigns.
 
 \end{document}

@@ -14,25 +14,172 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the depth-3 cell of the only configuration in the whole reduction-fidelity
+experiment that actually loses information: eight ranks, twelve high-entropy items each,
+a 450-token merge budget \emph{enforced} by contract rather than suggested in a prompt.
+Retention is 0.385, and the aggregate is the least interesting thing about it. Ranks 0, 1
+and 2 are retained completely, rank 3 keeps one item of twelve, and ranks 4 through 7
+contribute nothing whatever. I recovered every intermediate from the fabric, and the
+mechanism is visible in a single blob digest: the root's final merge, which was handed the
+37-item accumulator for ranks 0--3 and the 38-item accumulator for ranks 4--7, returned
+result \texttt{9f300f3a45bf} --- byte-for-byte its own left input, 437 tokens, 37
+identifiers. Half the population was discarded in one application that satisfied its
+contract and reported success. The reason is arithmetic rather than algorithmic: an
+incompressible item costs 11.81 tokens in situ, so a 450-token ceiling admits 37 or 38 of
+them and no more, and that ceiling binds at whichever application is last regardless of
+how many preceded it. This cell's three fold levels and the chain's seven and the $k$-ary
+tree's two all land on the same 37 survivors, so the tree-shape hypothesis is not merely
+unsupported here, it is refuted by construction of the budget.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is the textbook binomial tree drawn in wall clock, and it is the
+only cell in this campaign with real concurrency. Three bands of work: ranks 0, 2, 4 and 6
+all busy together from about $t = 1$\,s to $t = 26$\,s, then ranks 0 and 4 together to
+about $t = 55$\,s, then rank 0 alone to 80.27\,s. Peak ranks busy is 4 of 8, achieved
+parallelism 1.90$\times$, and the serial fraction of active time is 45.3\% --- the
+three-level structure means the last level is necessarily serial. Ranks 1, 3, 5 and 7 show
+one tick each within the first 20\,ms and then nothing: they are the leaves of the tree,
+they send their twelve-item report to their parent and return, and their
+\texttt{coll.reduce} records \texttt{fold\_depth: 0}. That is why load imbalance is
+2.94$\times$ and 76.2\% of the rank-seconds paid for went unused; both are what a binomial
+tree at $p=8$ must produce and neither is a defect.
+
+The bars do not grow the way a naive reading would predict, and that is the run's first
+substantive detail. The four depth-1 merges took 16.22, 19.57, 23.36 and 25.24\,s on
+prompts of exactly 446 tokens each; the two depth-2 merges took 19.45 and 28.39\,s on 708
+and 714 tokens; the final depth-3 merge took 20.49\,s on 1{,}014 tokens. Latency is flat
+in prompt size across a 2.3$\times$ range, because the output is pinned near the contract
+ceiling at every level --- 288--294 tokens at depth 1, 437 and 449 at depths 2 and 3 ---
+and generation, not prompt ingestion, dominates. The whole run cost 152.7\,s of
+generation and only 13.7\,s of waiting for a worker to claim a queued call (I decomposed
+each \texttt{broker.enqueue}\,$\to$\,\texttt{broker.claim}\,$\to$\,\texttt{broker.complete}
+triple from the log), so unlike its chain sibling this cell's wall time is honest model
+time. The 18 reattachments and the log's three events after \texttt{job.finish} at
+80.27\,s are the worker pool churning after the job is over; the dashboard's rank health
+table shows all eight ranks red and suspected \texttt{fail\_stop} for that reason, while
+\texttt{metrics.json} records \texttt{ok: true} and no failures.
+
+The communication matrix, Figure~\ref{fig:comm}, is the tree's adjacency: $1\!\to\!0$,
+$3\!\to\!2$, $5\!\to\!4$, $7\!\to\!6$ at 178 tokens each, then $2\!\to\!0$ at 312 and
+$6\!\to\!4$ at 313, then $4\!\to\!0$ at 469, for 1{,}806 tokens over seven messages. The
+edge weights are the story in miniature: a leaf carries 12 items in 178 tokens, a
+half-subtree carries 24 in 312, and the quarter-population edge $4\!\to\!0$ carries 38 in
+469. Traffic grows sublinearly in the number of items represented because the accumulator
+is capped, and the last edge is already at the cap.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+Everything structural here is by construction and both checkable predictions hold: seven
+messages against a closed form of $p-1=7$, three rounds against $\lceil\log_2 8\rceil=3$,
+so \texttt{model\_checks\_agree} is 1 of 1 and Figure~\ref{fig:collectives} carries no red
+diamond. What must be established before anything else is which enforcement regime this
+run is in, because the entire interpretation turns on it, and the fabric settles it. Every
+one of the seven \texttt{agent\_calls} rows records \texttt{contract} =
+\texttt{\{"name": "MergedReport", \dots, "max\_tokens": 450, \dots, "semantics": "findings
+must contain complete, verbatim items\dots"\}}. That is the enforced form: the runtime
+checks the returned token count, rejects an overrun, and re-issues the call with the
+diagnosis appended. Contrast the \texttt{sat-mb-fidelity} siblings, which ran the same
+$p=8$, twelve-items, 450-token configuration with \texttt{max\_tokens: null} and an empty
+semantics string, and scored 1.000 by overrunning the stated budget by up to 55\%. The
+provenance block records commit \texttt{f121647}, in which \texttt{merge\_contract} does
+not yet exist; the enforced contract was committed two minutes after this campaign wrote
+its results, as \texttt{561d8a17}, ``A budget stated in a prompt is not a budget''. The
+commit field is HEAD at launch, not the working tree, and the fabric is the authority.
+
+What emerged is that retention under an enforced budget is a division, not a property of
+the tree. An incompressible item is \texttt{[F-0-0] serial 597623 checksum LVPG}: nine
+tokens of content with no shorter equivalent, 11.81 tokens once quoted inside the JSON
+array. A 450-token ceiling therefore admits $450/11.81 = 38.1$ items, and every merge in
+this run lands exactly there --- 437 tokens for 37 items and 449 for 38, at depths 2 and
+3. The reduction never fails to fill its budget and never exceeds it; it simply stops. So
+the surviving count is fixed at 37 and the aggregate is $37/96 = 0.385$ before the
+algorithm is chosen. Reconstructing the fold from the store makes the consequence concrete.
+The two depth-1 merges under rank 0 return 24 identifiers each; their combination at depth
+2 returns 37, so eleven of rank 3's twelve items were already gone. The mirror subtree
+returns 38 for ranks 4--7. The final application is handed $37 + 38 = 75$ items, has room
+for 37, and returns its left input unchanged --- same digest, same 1{,}444 bytes. Rank 3's
+single survivor is \texttt{F-3-0}, the first of its twelve, so the result is a strict
+prefix of the rank-ordered item list truncated at the budget. This is why
+\texttt{rank\_position\_correlation} is $-0.863$: it is not a subtle positional bias but a
+cut.
+
+The cell's contribution relative to its siblings is that it shows the truncation is
+insensitive to where in the tree it happens. The chain reaches the same 37 identifiers by
+folding right-to-left through seven successive applications, thrashing on the way (its
+depth-4 and depth-6 merges emit only 300 tokens and 25 items, well under the ceiling, then
+recover); the flat cell reaches them at the root and then performs four further merges
+that return the identical blob; the $k$-ary cell reaches them in two levels. Four fold
+orders, four depths from 2 to 7, one survivor set --- I checked set equality directly and
+the symmetric difference is empty. Depth cannot cost fidelity when the last node's budget
+is the same as every other node's, because there is no slack for earlier losses to
+compound into. These four runs are also the sole input to \texttt{table\_erasure} in
+\texttt{make\_tables.py}, which filters to broker-executed incompressible rows, so
+\texttt{tab\_erasure} and the macros \texttt{\textbackslash NErasedRanks} (4),
+\texttt{\textbackslash NTotalRanks} (8) and \texttt{\textbackslash NErasureCorr} ($-0.86$)
+are this campaign and nothing else. One correction the paper's prose needs: it says ``five
+of its eight inputs are missing'' where the table says four ranks erased and a fifth
+reduced to 8\%.
+
+Of the flagged findings, the imbalance note and the reattachment note are expected for a
+binomial tree driven by a shared worker pool, and the model check is the check passing.
+The genuinely alarming property of this run is one the findings list cannot flag, because
+nothing went wrong: seven merges, seven successes, one attempt each, zero contract
+violations, zero hallucinated identifiers, and \texttt{n\_label\_only} is 0 --- every
+identifier that survived carried its correct six-digit serial and four-letter checksum, so
+\texttt{value\_retention} and \texttt{id\_retention} are both 0.3854 exactly. The operator
+was never wrong and never confabulated. It returned a well-formed consolidated report
+from which half the population is absent, and no signal anywhere in the protocol
+distinguishes that from a complete one.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+The executor is real: \texttt{executors} records \texttt{broker}~$\times$~8 and
+\texttt{worker}~$\times$~18, so this measures model behaviour and not a caricature, unlike
+the \texttt{fid-synth} and \texttt{fid-inc-smoke} cells, whose \texttt{function} executor
+implements a drop model by construction. The reading that most needs guarding is
+therefore the byte-identity of results across the four cells. This run's final blob is the
+same object as the \texttt{flat} cell's last five merges and the \texttt{kary} cell's
+level-0 and level-1 results, and the runs shared one persistent pool of Cursor subagents.
+I ran the determinism test the contract requires. Two prompt digests are shared across
+cells --- \texttt{1586acb2d322} between this run's \texttt{merge:d1} and the chain's, and
+\texttt{baffd868ca96} between this run's \texttt{merge:d1} and the flat cell's --- and in
+both cases the results differ (294 against 292 tokens, 288 against 289). Identical input
+does not give identical output here, so determinism does not explain the identities. But
+neither does memory need to: the surviving items are verbatim copies of high-entropy input
+strings emitted in rank order, so once the truncation point is fixed at 37 there is
+essentially one string that can be returned. Convergence is the parsimonious reading and I
+cannot exclude pool memory, but here it would have nothing left to explain.
+
+Second, the 11.81-tokens-per-item constant is measured with \texttt{tokenizer\_exact:
+false}, so the estimator is the repository's own approximate counter --- the same counter
+the contract check uses, which is what makes the arithmetic self-consistent even if it is
+not a real tokeniser's. A different tokeniser would move the cut by an item or two and
+would not move the conclusion. The \$0.0500 is likewise modelled from
+\$3/Mtok in and \$15/Mtok out, not billed.
+
+Third, this is one trial. The latency comparison against the siblings is safe in direction
+because it is mechanical --- three applications on the critical path here against seven
+for chain and flat and two for $k$-ary --- and this run's 80.27\,s against
+\texttt{kary}'s 51.77\,s is close to the 3:2 ratio the structure predicts. The comparison
+against the chain's 634.43\,s is not safe, because the chain's per-call generation times
+average 89\,s against this run's 21.8\,s for equivalent prompts; that is a pool-side
+difference, not an algorithmic one, and I would not report 7.9$\times$ as a property of
+the collective.
+
+Finally, two accounting caveats. \texttt{fact\_retention} scores an identifier as retained
+wherever it appears in the result text, and the merge prompt's own instruction line reads
+``such as [F-3-2]'' --- an identifier inside the benchmark's own space at $p\ge4$ with
+$\ge3$ items per rank. In the surrogate campaigns that line is copied into every
+accumulator and inflates the score; here I checked, and rank 3's survivor is
+\texttt{F-3-0} rather than \texttt{F-3-2}, so this run is clean. It remains a latent
+scoring hazard rather than an error in this measurement. And every \texttt{msg.recv}
+records \texttt{admitted: false}, because the collective's internal receives pass
+\texttt{admit=False}, so context occupancy is 0\% and this run says nothing at all about
+admission pressure despite being the configuration where a root's context should be under
+most strain.
 
 \end{document}
