@@ -130,6 +130,20 @@ cost four minutes; it does not say which rank owed them. Arrival order comes fro
 `coll.join`, so the straggler is the rank the others were actually waiting for
 rather than whichever one happened to poll last.
 
+The same measurements are served live while a job runs:
+
+```bash
+ampi viewer --job-root work/e3/e3-real-p16/job --campaign e3-real-p16
+```
+
+One stdlib server, one self-contained page, no build step — because a viewer that
+needs `npm install` before it can show you a wedged sixty-four rank job is a viewer
+you will not use at the moment you need it. It reads the job rather than a
+snapshot, so the timeline grows as the run does, and it shows the broker queue
+beside the protocol state: on a long run a rank blocked because its peers are busy
+looks exactly like a rank blocked because nobody ever claimed its task, and only
+the queue tells them apart.
+
 **Context safety.** MPI's advice is to test a program by making every send
 synchronous. Here the buffer a harness implicitly relies on is the receiving
 executor's context window, so the penalty for getting it wrong is not a deadlock

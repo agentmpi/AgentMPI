@@ -103,6 +103,20 @@ the mechanism rather than the prompt:
 | `noresearch` | external research; ranks reduce their first-pass guesses |
 | `noseams` | the halo exchange |
 
+## Watching a run
+
+A run at this length is not something to inspect afterwards. Serve the live
+analysis while it goes:
+
+```bash
+ampi viewer --job-root work/e3/e3-real-p16/job --campaign e3-real-p16 --port 7842
+```
+
+The queue panel is the one to watch. Every stall in the p=16 run was an executor
+session ending rather than anything in the protocol, and the signature is always
+the same: tasks in `queued` with no `claimed`, which means the fix is another wave
+of executors and not a change to the harness.
+
 ## Analysis
 
 Per run, from the event log alone:
