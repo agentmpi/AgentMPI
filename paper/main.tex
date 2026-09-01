@@ -825,29 +825,59 @@ achieved parallelism \eThreeRealParsixteen$\times$ on sixteen ranks, or
 analysis says so in as many words. \eThreeRealExecssixteen\ distinct executor
 sessions filled sixteen ranks, because the host's sessions are far shorter lived
 than the job: each ended after one to three tasks and had to be replaced.
-\eThreeStarved\ tasks were published and never claimed by anybody, and the longest
-a task sat in the queue before an executor took it was \eThreeRealMaxWaitsixteen\
-seconds. The population was never fully staffed, and a harness cannot manufacture
-parallelism from executors that do not exist.
+Every published task was eventually claimed, but the longest one sat in the queue
+for \eThreeClaimWait\ seconds before anybody took it, and \eThreeRequeued\ were
+requeued after their claimant vanished mid-task. The population was never fully
+staffed at any instant, and a harness cannot manufacture parallelism from executors
+that do not exist.
+
+The distinction matters for how the number should be read. A queue wait is not
+model latency: it enters the measured wall clock but contributes no tokens, so any
+per-token efficiency computed from this run without separating the two would be
+describing the staffing rather than the protocol.
 
 Distinguishing those two readings is exactly what the trace analysis is for, and
 it is why the report separates \emph{starved} tasks from abandoned ones and from
 slow ones. A run that is slow and a run where nobody showed up are identical in a
 wall-clock summary and opposite in what they tell you to do next.
 
-\paragraph{Result 2: it degraded rather than hanging.} One rank's research task
-timed out after no executor claimed it for 45 minutes. That rank raised, and
-\eThreeRealIncompletesixteen\ collectives consequently recorded fifteen of sixteen
-participants. The other fifteen ranks completed the glossary reduction, the
-broadcast, the prefix scan and the barrier and went on to translate. This is the
-behaviour \S\ref{sec:design} specifies and the one that the legacy project did not
-have: a local failure removed one rank from the population without removing the
-population from the collective.
+\paragraph{Result 2: it degraded rather than hanging, and then it ran out of
+executors.} The run finished with \emph{one} of sixteen ranks completing the whole
+pipeline. Fifteen raised \code{AMPI\_ERR\_TIMEOUT}, each of the form ``no worker
+completed \code{translate:r$n$} within 2700\,s''. It is worth being exact about
+what did and did not work, because the two halves point in opposite directions.
 
-The pull queue carried the other half. Because a rank is a durable role whose state
-lives outside its executor, a fresh wave of executors could be added mid-run
-against exactly the ranks still queued---no harness change, no restart, no loss of
-the work already done. That happened five times.
+The protocol behaved as \S\ref{sec:design} specifies. Rank 3's research task was
+never claimed; that rank raised, and \eThreeRealIncompletesixteen\ collectives
+consequently recorded fifteen of sixteen participants---while the other fifteen
+ranks completed the glossary reduction, the broadcast, the prefix scan and the
+barrier and went on to translate. A local failure removed one rank from the
+population without removing the population from the collective, which is precisely
+what the legacy harness could not do. The pull queue carried the rest: because a
+rank is a durable role whose state lives outside its executor, fresh executors were
+added mid-run five times against exactly the ranks still queued, with no harness
+change, no restart, and no loss of completed work. Thirty-three distinct sessions
+filled sixteen ranks, and eight tasks were requeued after their claimant vanished.
+
+The harness did not. Its per-task timeout of 2700\,s is an assumption about
+executor \emph{supply}---that somebody will claim a published task within
+forty-five minutes---and on a host capping concurrent sessions at ten, with each
+session outliving only a few tasks, that assumption was false: the longest a task
+waited in the queue before anybody claimed it was \eThreeClaimWait\,s---more than
+twice the deadline the harness had set for completing one. So the harness gave
+up on ranks whose work was still being done. Five of the fifteen translation tasks
+were completed and submitted by agents, but four of those arrived after the rank
+that needed them had already raised, and were discarded.
+
+That is the sharpest lesson E3 produced, and it is a harness lesson rather than a
+protocol one. \emph{A broker timeout is a policy about executor supply, not about
+task difficulty.} Written without knowing the supply, it converts a slow run into a
+failed one while the workers are still productively working. The protocol offers
+the two mechanisms that would have avoided it---a quorum, so a collective releases
+on the ranks that arrived rather than on all of them, and a barrier policy of
+\code{proceed}---and we used the second but left the first at 1.0. A quorum of, say,
+0.75 would have let this run complete on twelve ranks. The configuration was ours
+and the trace says so plainly.
 
 \paragraph{Result 3: shared research, and disagreement that scales with the
 population.} The window did what it is for. \eThreeResearched\ terms were
@@ -867,13 +897,22 @@ was arbitrated once at the root, and the conflict set then \emph{directed} the
 research agenda, which is the first use we have of a lifted conflict as a control
 signal rather than as a report.
 
-\paragraph{What we do not report.} We do not report a real-agent result at $p = 32$
-or $p = 64$. Both were attempted; neither finished, for the reason above---the host
-caps concurrent sessions at ten and each session outlives only a few tasks, so a
-run whose agent-task count grows with $p$ cannot be staffed within one sitting. The
-surrogate series covers all three sizes and measures the protocol; the agent series
-covers one size and measures the regime. Presenting either as the other would be
-the more comfortable choice and the wrong one.
+\paragraph{What we do not report.} We do not report a completed book. One rank of
+sixteen finished the pipeline; the population produced 33 agent artifacts including
+five full segment translations, and the assembly ran over one of them. Nor do we
+report a real-agent result at $p = 32$ or $p = 64$: both were attempted and neither
+could be staffed, for the same reason. The surrogate series covers all three sizes
+and measures the protocol; the agent series covers one size and measures the
+regime. Presenting either as the other would be the more comfortable choice and the
+wrong one, and it is the choice the legacy project made when it reported a book
+produced by one agent out of sixteen as a successful sixteen-agent run.
+
+The honest summary is that AgentMPI did what it claims---every collective fired,
+disagreement was lifted rather than merged away, research was shared, a rank died
+without taking the population with it, and executors were replaced mid-flight---and
+that a harness written against it can still fail a job by mis-declaring a timeout.
+The protocol is a set of mechanisms, not a guarantee that they are configured well,
+and the value of the trace is that it distinguishes the two.
 
 \subsection{Oversubscription, and a launcher constraint}
 
@@ -1019,6 +1058,20 @@ necessary, and it is what surfaced this---but it is not sufficient, because the
 party that can measure is not the party that can change it. The budget is now
 derived from the requested term count rather than chosen, which is the only form
 in which the two cannot disagree.
+
+\item \textbf{A broker timeout is a policy about executor supply, not about task
+difficulty.} E3's harness allowed 2700\,s for a worker to complete a published
+task---ample for the work, and an assumption about staffing that was simply false
+on a host capping concurrent sessions at ten. Fifteen of sixteen ranks raised
+\code{ERR\_TIMEOUT}, and five translation tasks were completed and submitted
+\emph{after} the rank that needed them had already given up. The run failed while
+its workers were still productively working. The protocol offers the mechanisms
+that avoid this---a quorum, so a collective releases on the ranks that arrived
+rather than on all of them---and the harness left the quorum at 1.0. A protocol
+cannot stop its user from declaring a deadline the environment cannot meet; what it
+can do is record enough that the distinction between a wedged protocol and an
+unstaffed population is legible afterwards, which is what the starved-task and
+queue-wait measures are for.
 
 \item \textbf{Ambient identity is not merely unsafe, it is unstable.}
 \S\ref{sec:identity} records that shared shells let one rank accumulate

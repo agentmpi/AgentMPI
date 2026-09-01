@@ -370,7 +370,17 @@ def e3_macros() -> None:
             put(f"eThree{key}", None)
 
     metrics = load(RUNS / "e3-real-p16" / "analysis" / "metrics.json")
-    put("eThreeStarved", len(metrics.get("starved_tasks", [])) if metrics else None)
+    if metrics:
+        put("eThreeStarved", len(metrics.get("starved_tasks", [])))
+        # The enqueue-to-claim wait, which is a different quantity from the longest
+        # wait *inside* a collective and answers a different question: not "how long
+        # did coordination take" but "how long before anybody turned up".
+        put("eThreeClaimWait", int(round(metrics.get("max_claim_wait_s", 0))))
+        put("eThreeRequeued", (metrics.get("tasks") or {}).get("requeued", 0))
+        put("eThreeSubmitted", (metrics.get("tasks") or {}).get("submitted", 0))
+    else:
+        for key in ("Starved", "ClaimWait", "Requeued", "Submitted"):
+            put(f"eThree{key}", None)
 
 
 def suite_macros() -> None:
