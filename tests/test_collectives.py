@@ -229,6 +229,13 @@ def test_fold_depth_is_logarithmic_for_trees(tmp_path, size):
     assert depths["binomial"] < depths["chain"] or size <= 2
 
 
+#: Sizes that are *not* powers of two, where collectives take their remainder-handling paths.
+#: Those paths are where the interesting bugs live, and testing only 4 and 8 exercised none of
+#: them: an under-count in the non-power-of-two pre-phase of recursive-doubling allreduce
+#: survived precisely because no test ever ran it at p=10.
+AWKWARD_SIZES = [3, 5, 6, 7, 10]
+
+
 @pytest.mark.parametrize("size", [4, 8])
 def test_message_counts_match_cost_formulas(tmp_path, size):
     """Implementation and cost model must agree on message counts."""
@@ -264,6 +271,85 @@ def test_message_counts_match_cost_formulas(tmp_path, size):
         measured = sum(o.value or 0 for o in job.outcomes)
         _, predicted, _, _ = FORMULAS[(op, alg)](size, 1)
         assert measured == int(predicted), f"{op}/{alg} p={size}: measured {measured} != model {predicted}"
+
+
+@pytest.mark.parametrize("size", AWKWARD_SIZES)
+@pytest.mark.parametrize(
+    "op,alg",
+    [
+        ("bcast", "binomial"),
+        ("bcast", "chain"),
+        ("reduce", "binomial"),
+        ("reduce", "chain"),
+        ("allreduce", "recursive_doubling"),
+        ("allreduce", "reduce_bcast"),
+        ("allgather", "ring"),
+        ("allgather", "bruck"),
+        ("alltoall", "pairwise"),
+        ("barrier", "dissemination"),
+        ("scan", "recursive_doubling"),
+    ],
+)
+def test_self_reported_message_count_equals_the_traffic_actually_logged(tmp_path, size, op, alg):
+    """A collective's own accounting must match the messages the fabric recorded.
+
+    Three numbers should agree: the closed-form prediction, what the collective reports in its
+    ``coll.*`` event, and how many ``msg.send`` events the fabric actually holds. The first two
+    were checked at powers of two; the third was not checked at all, so an instrumentation gap
+    was invisible --- the messages were sent and delivered correctly, and only the *count* the
+    collective reported was wrong.
+
+    That is the failure this pins down. It matters beyond tidiness because the cost report, the
+    calibration, and every table derived from a run read the reported count, not the traffic:
+    an under-reporting collective looks cheaper than it is, which is the one direction of error
+    a cost model must never have.
+
+    Reported traffic is summed over *all* ``coll.*`` records rather than the outer one, because a
+    composed algorithm delegates: ``reduce_bcast`` sends nothing under its own name and the
+    nested reduce and bcast carry the counts. Summing is what makes the invariant hold for
+    composed and primitive algorithms alike.
+    """
+    from agentmpi.cost import FORMULAS
+
+    root = tmp_path / f"acct-{op}-{alg}-{size}"
+
+    def rank_main(comm, op=op, alg=alg):
+        if op == "bcast":
+            comm.bcast("x" * 8 if comm.rank == 0 else None, root=0, algorithm=alg)
+        elif op == "reduce":
+            comm.reduce(1, ampi.SUM, root=0, algorithm=alg)
+        elif op == "allreduce":
+            comm.allreduce(1, ampi.SUM, algorithm=alg)
+        elif op == "allgather":
+            comm.allgather(comm.rank, algorithm=alg)
+        elif op == "alltoall":
+            comm.alltoall([f"{comm.rank}->{j}" for j in range(comm.size)], algorithm=alg)
+        elif op == "scan":
+            comm.scan(1, ampi.SUM, algorithm=alg)
+        else:
+            comm.barrier(algorithm=alg, policy="wait")
+        st = algorithms.LAST_STATS.get(comm.rt.wrank)
+        return st.messages_sent if st else 0
+
+    job = ampi.launch(rank_main, size=size, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+    fabric = ampi.Fabric(root)
+    events = fabric.events()
+    logged = sum(1 for e in events if e["kind"] == "msg.send")
+    reported = sum(
+        int(e["payload"].get("messages_sent") or 0) for e in events if e["kind"].startswith("coll.")
+    )
+
+    assert reported == logged, (
+        f"{op}/{alg} p={size}: collectives report {reported} messages but the fabric logged "
+        f"{logged}"
+    )
+    _, predicted, _, _ = FORMULAS[(op, alg)](size, 1)
+    assert logged == int(predicted), (
+        f"{op}/{alg} p={size}: fabric logged {logged} messages but the model predicts "
+        f"{int(predicted)}"
+    )
 
 
 def test_collectives_are_isolated_from_user_traffic(tmp_path):

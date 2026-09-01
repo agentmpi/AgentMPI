@@ -1090,6 +1090,11 @@ def allreduce(
                     admit=False,
                     _internal=True,
                 )
+                # Counted before folding, because `acc` is about to be overwritten and this
+                # records what went out, not what came back. The odd partner below counts its
+                # half of the same exchange; omitting this one made the collective under-report
+                # by exactly `rem` messages at every non-power-of-two p.
+                tr.sent(_tok(comm, acc))
                 body = got.payload if got.payload is not None else comm.fabric.blobs.get(got.digest, got.kind)
                 depth = max(depth, int(body["depth"])) + 1
                 acc = op.fn(acc, body["acc"], _reduce_ctx(comm, depth, weight + int(body["weight"])))
