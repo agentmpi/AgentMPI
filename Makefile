@@ -1,4 +1,4 @@
-.PHONY: help install test lint paper tables clean microbench translation software campaign-status traces verify-traces viz
+.PHONY: help install test lint paper tables clean microbench translation software campaign-status traces verify-traces viz analysis analysis-shots analysis-status analysis-build
 
 PY ?= python3
 AMPI ?= $(HOME)/.local/bin/ampi
@@ -14,6 +14,10 @@ help:
 	@echo "viz           run the trace viewer (works with no server, from committed traces)"
 	@echo "traces        regenerate the derived trace archive from runs/"
 	@echo "verify-traces check the committed trace archive against the cost model"
+	@echo "analysis      regenerate per-run analysis metrics and figures"
+	@echo "analysis-shots capture the viewer dashboard for every run"
+	@echo "analysis-status how many run analyses are actually written"
+	@echo "analysis-build build the written analysis documents"
 	@echo "clean         remove build and LaTeX intermediates"
 
 install:
@@ -49,6 +53,25 @@ traces:
 # re-derivation of the collective validation from the exported logs alone.
 verify-traces:
 	$(PY) scripts/verify_traces.py
+
+# Per-run analysis packages: metrics, figures, and the generated half of each document.
+# Never overwrites analysis.tex, so re-running is safe once the prose exists.
+analysis:
+	$(PY) scripts/analyze_run.py --all --quiet
+
+# Screenshot the real viewer dashboard for every run. Needs the viewer serving; static mode
+# is enough, so no trace server is required.
+VIEWER_URL ?= http://127.0.0.1:43191
+analysis-shots:
+	$(PY) scripts/shoot_viewer.py --url $(VIEWER_URL) --skip-existing
+
+# How many of the 500 documents actually have their interpretation written, as opposed to
+# merely existing with the placeholders still in place.
+analysis-status:
+	$(PY) scripts/build_analysis.py --status
+
+analysis-build:
+	$(PY) scripts/build_analysis.py --build-written
 
 # The viewer. Reads the live trace server if one is running, otherwise the exported
 # traces. Start the server separately for live runs:
