@@ -86,5 +86,14 @@ Each run contains:
 - `report.json`, `harness.json`, and `harness.trace.jsonl`: outcomes and trace.
 - `broker/`: immutable prompts and worker result files.
 
-No generated translation is committed by this experiment. Keep production run
+Generate a redistributable systems result after trace analysis:
+
+```bash
+python scripts/analyze_run.py /secure/runs/production-01
+python experiments/e3_durov/summarize.py /secure/runs/production-01
+```
+
+The public summary contains source commit/hashes, coverage, artifact digest,
+systems metrics, and protocol event counts, but no book text. No generated
+translation is committed by this experiment. Keep complete production run
 directories in access-controlled storage appropriate for the licensed source.

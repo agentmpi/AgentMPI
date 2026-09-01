@@ -7,8 +7,10 @@ from pathlib import Path
 
 import pytest
 
+from ampi.analysis import analyse_path
 from experiments.e3_durov.harness import SUPPORTED_RANKS, build_parser, main
 from experiments.e3_durov.prepare_corpus import RESEARCH_FILES, _public_repo_url, prepare_corpus
+from experiments.e3_durov.summarize import summarize
 
 
 def _sha(text: str) -> str:
@@ -174,6 +176,17 @@ def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Pa
         command["next_command"].startswith(f"AMPI_WORKER_ID={command['worker_id']} ")
         for command in launch["executors"]
     )
+
+    analysis_dir = run_dir / "analysis"
+    analysis_dir.mkdir()
+    (analysis_dir / "metrics.json").write_text(
+        json.dumps(analyse_path(run_dir / "harness.trace.jsonl").as_dict()),
+        encoding="utf-8",
+    )
+    public = summarize(run_dir)
+    assert public["artifact"]["complete"] is True
+    assert public["artifact"]["pages"] == 99
+    assert public["source"]["licensed_payloads_committed"] is False
 
 
 def test_stub_requires_explicit_test_flag_and_rank_choices() -> None:
