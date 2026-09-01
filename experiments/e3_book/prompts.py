@@ -37,12 +37,30 @@ __all__ = [
     "seam_prompt",
 ]
 
+#: Measured cost of one term entry under the ``structural-v1`` counter, with a
+#: Cyrillic source term and three target-language proposals.  Not guessed: the
+#: p=16 production run's executors each measured it with ``check_size`` and
+#: reported between 130 and 170, converging on ~150.
+TOKENS_PER_TERM = 150
+#: Terms a survey should return.  The budget is derived from this rather than the
+#: other way round.
+SURVEY_TERMS = 24
+
 SURVEY_CONTRACT: dict[str, Any] = {
     "kind": "json",
     "name": "survey",
     "required": ["rank", "terms"],
     "expect": {"rank": "{rank}"},
-    "max_tokens": 2600,
+    # Derived, not chosen.  The first version of this contract asked for "12 to 30
+    # terms" under a flat 2600-token cap, and the two were incompatible: at ~150
+    # tokens per entry, 2600 tokens buys 17 terms, not 30.  Every one of the eight
+    # executors in the p=16 run discovered this independently with `check_size`,
+    # and each resolved it the only way it could -- by dropping terms it had
+    # judged load-bearing, silently and differently from its peers.  A budget the
+    # harness author sets without measuring is a budget that quietly truncates the
+    # population's output, and the failure is invisible in the trace because every
+    # rank returns a conforming result.
+    "max_tokens": SURVEY_TERMS * TOKENS_PER_TERM + 400,
     "semantics": (
         "The terms, names, idioms and historical references in this segment that a "
         "translator must render consistently, each with a first-pass gloss."
@@ -135,8 +153,11 @@ Rules.
   outside the text — who a person is, what an institution did, what a period
   slang term connoted, what an allusion points at. Set it to false when the text
   itself is sufficient.
-- 12 to 30 terms is the useful range. Do not pad, and do not omit an obviously
-  recurring name because it seems too easy.
+- Aim for about {SURVEY_TERMS} terms. Do not pad, and do not omit an obviously
+  recurring name because it seems too easy. If you must choose, keep the terms
+  where an inconsistent rendering would cost a reader the most, and prefer
+  dropping a term outright to compressing every entry until the glosses stop
+  being useful.
 - `proposed` is your first pass, not a commitment. Other ranks are surveying
   other segments and some of them will propose different renderings for the same
   term. That is expected: the disagreements are collected and settled elsewhere,
