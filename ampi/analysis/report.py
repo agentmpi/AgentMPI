@@ -133,6 +133,15 @@ def findings(a: Analysis) -> list[dict[str, str]]:
             f"(ranks {ranks}): the population was not fully staffed, which is a "
             "pool-sizing problem outside the protocol and must not be read as a slow harness",
         )
+    wasted = a.wasted_submissions
+    if wasted:
+        add(
+            "error",
+            f"{len(wasted)} result(s) were submitted after the rank that needed them had "
+            f"already failed, and were discarded (ranks {sorted({w['rank'] for w in wasted})}): "
+            "the task deadline was shorter than the executor supply could satisfy, so the "
+            "run failed while its workers were still productively working",
+        )
     if a.max_claim_wait_s > 60:
         add(
             "note",

@@ -593,6 +593,39 @@ class Analysis:
         ]
 
     @property
+    def wasted_submissions(self) -> list[dict[str, Any]]:
+        """Results submitted after the rank that needed them had already failed.
+
+        The signature of a deadline set without knowing the executor supply.  A
+        harness that times out a task is declaring that waiting longer is worse
+        than proceeding without the answer; when the answer then arrives anyway,
+        the declaration was wrong and the work is thrown away.
+
+        It is worth measuring separately from either failure or slowness, because
+        it is the only one of the three that says the population was *capable* of
+        finishing and the configuration prevented it.  On the p=16 production run
+        this is five of six completed translations.
+        """
+        failed_at: dict[int, float] = {}
+        for e in self.events:
+            if e["kind"] == "rank.error":
+                rank = int(e.get("rank", -1))
+                failed_at.setdefault(rank, e["ts"])
+        out = []
+        for e in self.events:
+            if e["kind"] != "broker.submit":
+                continue
+            rank = int(e.get("rank", -1))
+            when = failed_at.get(rank)
+            if when is not None and e["ts"] > when:
+                out.append({
+                    "rank": rank,
+                    "label": str(e.get("label") or ""),
+                    "late_by_s": round(e["ts"] - when, 1),
+                })
+        return out
+
+    @property
     def has_broker(self) -> bool:
         """Was any rank driven through the broker, so occupancy is observable?
 
@@ -627,6 +660,7 @@ class Analysis:
             "conflicts_lifted": self.conflicts_lifted,
             "max_claim_wait_s": round(self.max_claim_wait_s, 1),
             "starved_tasks": self.starved_tasks,
+            "wasted_submissions": self.wasted_submissions,
             "total_reattachments": self.total_reattachments,
             "n_trouble": len(self.trouble),
             "n_recovery": len(self.recovery),

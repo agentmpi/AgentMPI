@@ -143,6 +143,39 @@ def test_cost_model_is_attached(tmp_path):
         assert c.predicted_messages is not None
 
 
+def test_wasted_submissions_are_identified():
+    """Work the population finished and the harness threw away.
+
+    The signature of a deadline set without knowing the executor supply, and the
+    one measure that says the population was *capable* of finishing while the
+    configuration prevented it. Distinct from a failure and from slowness, and
+    invisible in both a task count and a wall-clock summary.
+    """
+    events = [
+        {"kind": "job.create", "ts": 0.0, "rank": -1, "size": 2, "seq": 1},
+        {"kind": "init", "ts": 1.0, "rank": 0, "seq": 2},
+        {"kind": "init", "ts": 1.0, "rank": 1, "seq": 3},
+        # Rank 0 submits before anything went wrong: not wasted.
+        {"kind": "broker.submit", "ts": 2.0, "rank": 0, "aid": "a", "label": "t0", "seq": 4},
+        {"kind": "rank.error", "ts": 3.0, "rank": 1, "error": "AMPI_ERR_TIMEOUT", "seq": 5},
+        # Rank 1's worker finishes anyway, after the rank gave up.
+        {"kind": "broker.submit", "ts": 9.0, "rank": 1, "aid": "b", "label": "t1", "seq": 6},
+    ]
+    a = analyse(events, name="wasted")
+    wasted = a.wasted_submissions
+    assert [w["rank"] for w in wasted] == [1]
+    assert wasted[0]["label"] == "t1"
+    assert wasted[0]["late_by_s"] == 6.0
+
+    flagged = [f for f in findings(a) if "already failed" in f["text"]]
+    assert flagged and flagged[0]["level"] == "error"
+
+
+def test_no_wasted_submissions_on_a_healthy_run(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    assert analyse(events, name="unit").wasted_submissions == []
+
+
 def test_report_renderings(tmp_path):
     _h, _r, events = _run(tmp_path)
     a = analyse(events, name="unit")

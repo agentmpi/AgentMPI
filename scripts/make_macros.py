@@ -378,8 +378,14 @@ def e3_macros() -> None:
         put("eThreeClaimWait", int(round(metrics.get("max_claim_wait_s", 0))))
         put("eThreeRequeued", (metrics.get("tasks") or {}).get("requeued", 0))
         put("eThreeSubmitted", (metrics.get("tasks") or {}).get("submitted", 0))
+        # Work the population finished and the harness threw away, because it had
+        # already given up on the rank that asked for it.  The one measure of the
+        # three that says the population was capable and the configuration was not.
+        wasted = metrics.get("wasted_submissions") or []
+        put("eThreeWasted", len(wasted))
+        put("eThreeWastedRanks", len({w["rank"] for w in wasted}))
     else:
-        for key in ("Starved", "ClaimWait", "Requeued", "Submitted"):
+        for key in ("Starved", "ClaimWait", "Requeued", "Submitted", "Wasted", "WastedRanks"):
             put(f"eThree{key}", None)
 
 
