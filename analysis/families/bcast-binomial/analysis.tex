@@ -14,30 +14,188 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this algorithm is, what the sweep establishes about it, and
-the single most important thing a reader should take away.}
+The binomial tree is AgentMPI's default broadcast for $p>3$, and this sweep is the evidence
+for that default. Across 21 measured sizes from $p=2$ to $p=32$ it logged exactly $p-1$
+messages --- the same traffic as \texttt{flat} and \texttt{chain} --- while its critical path
+stepped as $\lceil \log_2 p \rceil$: one round at $p=2$, two at $p=3$ and $4$, three from
+$p=5$ to $p=8$, four from $p=10$ to $p=16$, five from $p=20$ to $p=32$. Every size agrees
+with the closed form on both axes and the collective's self-report agrees with the fabric's
+transport log at all 21, so there is no defect to report. The sweep's most useful finding is a
+distinction the round count hides: the implementation also records \texttt{tree\_depth}, the
+number of hops from the root to each rank, and that quantity equals $\lceil\log_2 p\rceil$
+only at powers of two --- at all eight non-power-of-two sizes it is exactly one less. The
+step count and the path length are different things, and the trace measures both. The single
+most important thing to take away is why a logarithmic broadcast is admissible at all: across
+all thirteen sizes the thirty-one messages of the $p=32$ run carried exactly \emph{one}
+distinct content digest, so a three-, four- or five-deep tree delivers byte-identical content
+to the last rank. Depth costs latency here and nothing else, and fold depth is zero at 21 of
+21 sizes.
 \end{abstract}
 
 \input{generated}
 
 \section{How the algorithm scales}
-\TODO{Derive the algorithm's cost from how it works, then compare with what was
-measured. Where does the round count step, and why there? Explain the shape of
-Figure~\ref{fig:family} rather than describing it.}
+
+The implementation is the textbook binomial tree rotated by \texttt{root}, so any rank may be
+the source. Each rank computes a virtual rank $vr = (r - \mathit{root}) \bmod p$ and then scans
+masks $1, 2, 4, \dots$ upward. It receives from the peer that clears its lowest set bit ---
+$\mathit{parent} = vr - \mathit{mask}$, rotated back --- and then walks the masks strictly
+below that one downward, sending to $vr\,|\,\mathit{mask}$ whenever that virtual rank is less
+than $p$. Rank $vr=0$ has no set bit, so it never receives and sends to $vr\,|\,\mathit{mask}$
+for every mask below $2^{\lceil\log_2 p\rceil}$.
+
+Two consequences follow immediately and both are visible in the trace. First, every virtual
+rank except $0$ has exactly one parent, so the message count is $p-1$ --- the same as
+\texttt{flat} and \texttt{chain}, which is the premise of the whole comparison. Second, the
+masks are visited in a definite order, and the root's sends in
+\texttt{mb-free\_\_coll-bcast-binomial-8} go to ranks $4$, then $2$, then $1$: descending
+mask, largest subtree first, which is what allows the deepest branch to begin propagating
+before the root has finished issuing. Rank $4$ then forwards to $6$ and $5$, rank $2$ to $3$,
+and rank $6$ to $7$; the run's seven \texttt{msg.send} events reconstruct the tree exactly.
+
+The round count is a step count, not a path length, and this is the subtlety the family view
+makes visible. The mask loop runs $\lceil\log_2 p\rceil$ times, and the implementation records
+that number as \texttt{rounds}. In the same events it records \texttt{tree\_depth}, which is
+$\mathrm{popcount}(vr)$, the number of hops the payload actually took to reach that rank. At
+$p=8$ the maximum \texttt{tree\_depth} is $3$, at rank $7 = 0\mathrm{b}111$, and it equals
+the round count. At $p=7$ the maximum is $2$: the largest virtual rank present is
+$6 = 0\mathrm{b}110$, and no rank has three set bits, so no payload travels three hops --- yet
+the round count is still $3$, because the root issues three sends in three successive mask
+steps and the rank that receives in the third step (rank $3$, from rank $2$) is therefore
+third in line. Both figures are correct answers to different questions. Checking the measured
+maximum \texttt{tree\_depth} against $\max_{v<p} \mathrm{popcount}(v)$ at all 21 sizes gives
+agreement at 21 of 21.
+
+Figure~\ref{fig:family} is these two facts side by side. The left panel is the straight line
+$p-1$ with every marker on it, identical to \texttt{flat}'s and \texttt{chain}'s left panel:
+the tree buys nothing in volume. The right panel is the staircase, and its treads are at
+$1$ ($p=2$), $2$ ($p=3,4$), $3$ ($p=5,6,7,8$), $4$ ($p=10,12,16$) and $5$ ($p=20,24,32$). The
+risers sit at $p = 2^k+1$, because that is where $\lceil\log_2 p\rceil$ increments, and the
+sweep brackets rather than pins them: it contains $8$ and $10$ but not $9$, and $16$ and $20$
+but not $17$. Every measured point falls on the correct tread, and the two points immediately
+either side of each riser are measured, which is the strongest statement the available sizes
+support.
+
+The viewer screenshot for \texttt{mb-free\_\_coll-bcast-binomial-16} shows the staged
+propagation the tree implies. The collectives panel reports $16$ invocations of
+\texttt{bcast}, algorithm \texttt{binomial}, maximum rounds $4$, $15$ messages, maximum fold
+depth $0$; the stats row reports $0$ agent calls, $0.0$k tokens and \$0.000. In the timeline,
+rank~0 carries a tight cluster of three or four message glyphs early, ranks~8, 4, 2 and 1
+carry their own smaller clusters shortly after, and the leaves carry single ticks last. There
+is no lane that sits idle through the whole span and no lane that carries a long bar --- the
+run is $15$ instantaneous message events across $16$ lanes in $0.04$\,s, and the only
+structure is the fan-out cascade.
 
 \section{Powers of two and everything else}
-\TODO{Whether the non-power-of-two sizes behave like the powers of two. If the
-algorithm has a remainder path, say what it does and whether the measurements show
-it working. This is where defects in collective implementations live.}
+
+The non-power-of-two path in this algorithm is a single guard, \texttt{if child\_v < p}, which
+suppresses sends to virtual ranks that do not exist. That guard is the entire remainder
+handling, and it behaves. All eight non-power-of-two sizes in the sweep logged exactly $p-1$
+messages ($2$ at $p=3$, $4$ at $p=5$, $5$ at $p=6$, $6$ at $p=7$, $9$ at $p=10$, $11$ at
+$p=12$, $19$ at $p=20$, $23$ at $p=24$), all eight reported the same count the fabric logged,
+and all eight recorded the round count $\lceil\log_2 p\rceil$. There are no red crosses in
+Figure~\ref{fig:family}.
+
+The interesting non-power-of-two behaviour is the one already described, and it is a property
+of the tree rather than a defect. At every power of two the maximum \texttt{tree\_depth} equals
+the round count; at every one of the eight other sizes it is exactly one less --- $1$ against
+$2$ at $p=3$, $2$ against $3$ at $p=5,6,7$, $3$ against $4$ at $p=10,12$, $4$ against $5$ at
+$p=20,24$. So the tree at a non-power-of-two size is slightly \emph{shallower} than
+$\lceil\log_2 p\rceil$ and its critical path is nonetheless $\lceil\log_2 p\rceil$ steps,
+because the root's fan-out is $\lceil\log_2 p\rceil$ sends issued in sequence. A harness that
+read \texttt{tree\_depth} as a latency figure would under-predict at those sizes; a harness
+that read \texttt{rounds} as a hop count would over-predict. The implementation exposing both
+is the reason a reader can tell.
+
+Token accounting is exact at all 21 sizes: the sum of the \texttt{tokens} field over
+\texttt{msg.send} events is $p-1$ and the collective reports $p-1$ as
+\texttt{tokens\_sent}. The binomial broadcast forwards \texttt{result} --- the handle it
+received --- with no metadata wrapper, so there is nothing for the two views of the volume to
+disagree about. This is not true of \texttt{reduce/binomial}, which wraps its accumulator in
+a four-field envelope and under-reports the difference.
+
+Eight sizes were measured twice, under \texttt{mb-free} and \texttt{mb-smoke}. At all eight,
+every count is identical between campaigns; the run wall times differ by factors from $1.01$
+to $2.92$, the largest at $p=2$ where the absolute times are $13.5$ and $4.6$\,ms. Two
+independent measurements agreeing on every integer and disagreeing on every duration is a
+statement about which of the two the sweep is competent to measure.
 
 \section{When to choose this algorithm}
-\TODO{Against the alternatives in the same op family, on latency, message count,
-and --- for reductions --- fold depth, which governs how much content survives a
-lossy operator. Be concrete about the crossover.}
+
+For broadcast, essentially always, and the reason is the digest evidence rather than the round
+count. All three broadcast algorithms send $p-1$ messages, so they differ only in depth, and
+the question is whether depth costs anything besides time. For a broadcast in AgentMPI it does
+not, and the sweep shows it: across all thirteen sizes and all three algorithms, the set of
+distinct digests carried by the collective's \texttt{msg.send} events has size exactly one. At
+$p=32$ under \texttt{binomial}, thirty-one messages traversing a five-step, five-deep tree
+carry the single digest the root put in, and \texttt{fold\_depth} is $0$ in all $32$
+\texttt{coll.bcast} records. Interior ranks forward a content-addressed handle, so a
+five-deep tree is not a game of telephone --- it is five hops of pointer copying. The
+contrast is stark against the mirrored reduction: \texttt{reduce/binomial} and
+\texttt{reduce/chain} carry $p-1$ \emph{distinct} digests at every size, one new artifact per
+message, even though every rank contributed the identical value $1$ under \texttt{SUM}. That
+asymmetry is what makes depth a pure latency cost for a broadcast and a potential fidelity
+cost for a reduction.
+
+Against \texttt{chain} the case is decisive and the sweep quantifies it. Both send $p-1$
+messages; chain's critical path is $p-1$ hops and binomial's is $\lceil\log_2 p\rceil$ steps,
+a predicted ratio of $31/5 = 6.2$ at $p=32$. Measured maximum per-rank blocking is $44.8$\,ms
+for binomial against $1{,}481.8$\,ms for chain, a factor of $33$. The measured advantage is
+five times larger than the model's, and the excess is chain's per-hop cost growing with $p$
+(from $10.4$\,ms per hop at $p=2$ to $47.8$\,ms at $p=32$, as thirty-two threads contend on
+one SQLite file) rather than anything binomial does well. The model's $6.2$ is the figure to
+quote; the measured $33$ is the figure that happens to hold on this harness.
+
+Against \texttt{flat} the case is weaker than it looks, and honesty requires saying so. Flat's
+network depth is one --- every leaf receives directly from the root --- and its $p-1$
+``rounds'' are the root's send loop, which measured $0.90$\,ms per send at $p=32$. Flat's
+maximum per-rank blocking at $p=32$ is $28.0$\,ms against binomial's $44.8$\,ms: flat is
+\emph{faster} here. The model disagrees ($3.97$\,s against $0.64$\,s at $n=1000$ tokens)
+because it charges one prompt-processing term per round, and this sweep admitted zero tokens
+into any context across $1{,}110$ \texttt{msg.recv} events, so the term that dominates the
+prediction is the term the measurement zeroes. The defensible reasons to prefer binomial over
+flat are therefore structural rather than measured: it removes the root as a serialisation
+point, it spreads fan-out across $\lceil\log_2 p\rceil$ levels so that no single rank must
+issue $p-1$ sends before returning, and it staggers context admission if the harness admits.
+At $p \le 3$ the two are identical and \texttt{bcast} defaults to \texttt{flat}, which the
+implementation does explicitly.
 
 \section{Threats to this reading}
-\TODO{What would make this wrong. These runs use no agents, so they measure the
-protocol's own behaviour and say nothing about model latency; sub-second wall times
-are dominated by fabric overhead. Be specific.}
+
+The wall times at large $p$ do not measure the collective. In
+\texttt{mb-free\_\_coll-bcast-binomial-32} the thirty-two \texttt{rank.init} events span
+$7.3$ to $63.0$\,ms and the entire run lasts $75.0$\,ms, so most of the run is ranks starting
+up. The $0.075$\,s in the generated table and the $49.8$\,ms spread between the first and last
+rank to record the collective are both dominated by launch stagger. The only duration in this
+family I would defend is the maximum per-rank blocking inside the collective, and at $p=32$
+that is $44.8$\,ms of SQLite writes and event appends.
+
+These runs contain no agents, and the consequence is sharper for a tree than for a chain.
+Every one of the 21 runs reports \texttt{executors = \{"none": p\}}, zero \texttt{agent.call}
+events, zero busy time, an idle fraction of $1.0$ and \$0.000. The argument for logarithmic
+broadcast rests on $\alpha$ being large, and $\alpha$ is exactly zero here. What the sweep
+establishes is that the implementation's structure is the structure the closed form describes;
+that the structure is worth having is an inference from the cost model, and the model's
+coefficients are untested by these runs. Relatedly, the model charges a broadcast no $\alpha$
+at all, on the grounds that forwarding a handle invokes no agent. The sweep is consistent with
+that premise but cannot confirm it, because a harness that chose to admit the payload into a
+forwarding rank's context would incur a cost this sweep never pays: zero of $1{,}110$
+receptions admitted a single token.
+
+Several code paths are unexercised. All 21 runs used \texttt{root = 0}, so the rotation
+$vr = (r-\mathit{root}) \bmod p$ that makes any rank a valid source is never driven with a
+non-zero root --- and that rotation is the part of the binomial implementation most likely to
+be subtly wrong, because it is what forces \texttt{reduce/binomial} to refuse non-commutative
+operators at non-zero roots. All 21 used a one-token scalar payload, so the volume term
+$(p-1)n$ is validated only at $n=1$. And the sweep contains no $p=9$ or $p=17$, so the two
+round-count risers between $p=8$ and $p=32$ are bracketed by measured points but not located
+by them.
+
+Finally, the \texttt{tree\_depth} claim is a comparison between one number the implementation
+reports and one I computed from the definition of the tree, not between two independent
+measurements. It would be stronger if the depth were recovered from the transport log by
+tracing each message's source back to the root; the digests cannot do that here, because all
+$p-1$ messages carry the same digest, which is the very property the previous section relies
+on.
 
 \end{document}

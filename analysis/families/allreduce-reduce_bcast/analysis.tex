@@ -14,30 +14,295 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this algorithm is, what the sweep establishes about it, and
-the single most important thing a reader should take away.}
+\texttt{reduce\_bcast} is the composed allreduce: fold everything to rank 0 with a binomial
+\texttt{reduce}, then hand the single result back out with a binomial \texttt{bcast}. It costs
+$2(p-1)$ messages in $2\lceil\log_2 p\rceil$ rounds with fold depth $\lceil\log_2 p\rceil$, and
+across 21 process counts from 2 to 32 the logged traffic matches that closed form at every size
+--- including all twelve non-power-of-two sizes, because a binomial tree has no remainder path to
+get wrong. It is AgentMPI's default allreduce, and the family view makes the case for that
+default stronger than the textbook comparison suggests. Against
+\texttt{recursive\_doubling} it uses $2.6\times$ fewer messages, $3.9\times$ less wire volume and
+$5.2\times$ fewer operator applications at $p=32$ (31 against 160), and it gives all of that up
+for nothing in latency: its extra $\lceil\log_2 p\rceil$ rounds are \emph{broadcast} rounds, and
+a broadcast in AgentMPI forwards a content-addressed handle rather than invoking the operator, so
+the repository's own cost model puts the two algorithms 0.4\% apart in time at every measured
+size. It also delivers something recursive doubling cannot promise: one value, computed in one
+canonical order, byte-identical everywhere --- at $p=32$ all 31 broadcast sends carry the same
+digest, \texttt{e29c9c180c62}. The reader's trap is the number zero. The outer
+\texttt{coll.allreduce} record reports \texttt{messages\_sent: 0} and \texttt{tokens\_sent: 0} at
+every size, because a composed algorithm's traffic belongs to its constituents; the analysis
+tooling now credits it correctly, and an earlier version that did not reported a phantom
+disagreement at all 21 sizes.
 \end{abstract}
 
 \input{generated}
 
 \section{How the algorithm scales}
-\TODO{Derive the algorithm's cost from how it works, then compare with what was
-measured. Where does the round count step, and why there? Explain the shape of
-Figure~\ref{fig:family} rather than describing it.}
+
+\subsection{Two trees, and where the rounds come from}
+
+\texttt{allreduce(algorithm="reduce\_bcast")} is eleven lines of \texttt{algorithms.py}: call
+\texttt{reduce} to rank 0, call \texttt{bcast} from rank 0, and set
+\texttt{rounds = 2\,\_ilog2\_ceil(p)}. Everything about the cost follows from the two
+constituents.
+
+The binomial \texttt{reduce} is the ordinary bottom-up hypercube fold. Rank $r$'s virtual rank is
+$r$ (the root is 0, so virtual and real coincide), and while its lowest set bit has not been
+reached it absorbs one child per level and then sends to its parent and stops. Every non-root
+rank sends exactly once, giving $p-1$ messages; the longest chain from a leaf to the root is
+$\lceil\log_2 p\rceil$ levels, giving both the round count and the fold depth. The binomial
+\texttt{bcast} is the same tree run downwards: $p-1$ messages, $\lceil\log_2 p\rceil$ rounds, no
+folds. Summing: $2(p-1)$ messages, $2\lceil\log_2 p\rceil$ rounds, fold depth
+$\lceil\log_2 p\rceil$. That is exactly the entry in \texttt{cost.FORMULAS}, and it is exactly
+what the table records at all 21 sizes.
+
+The messages panel of Figure~\ref{fig:family} is therefore a straight line --- the only strictly
+linear family among the allreduce and allgather algorithms --- and the two marker classes are
+indistinguishable on it, which is the point of this algorithm. A binomial tree is defined by bit
+tests on the rank, so it degrades gracefully at any $p$: a rank whose child index exceeds $p$
+simply has no child. There is no remainder phase, no renumbering, and no separate code path for
+the sizes where collective implementations usually go wrong.
+
+The rounds panel is a staircase at twice the height of the usual one, stepping at
+$p = 3, 5, 9, 17$ to 4, 6, 8 and 10. The steps land where $\lceil\log_2 p\rceil$ steps because
+both halves step together.
+
+\subsection{The composition is internally consistent, and checkable}
+
+The claim that the outer round count is the sum of the constituents' is not something to take on
+faith: each constituent emits its own \texttt{coll.*} record with its own \texttt{rounds}, and
+they can be added up. Doing so over the \texttt{mb-free} campaign, the sum of the maximum
+\texttt{reduce} round count and the maximum \texttt{bcast} round count equals the outer
+\texttt{allreduce} report at every size from 4 to 32: $2+2=4$, $3+3=6$, $4+4=8$, $5+5=10$.
+
+There is one exception, and it is instructive. At $p=3$ the outer record says 4 rounds while the
+constituents say $1+2=3$, because both \texttt{reduce} and \texttt{bcast} default to
+\texttt{flat} rather than \texttt{binomial} below $p=4$ (\texttt{algorithm or ("flat" if p <= 3
+else "binomial")} in both), and a flat reduce is one round. The outer figure is hard-coded to
+$2\lceil\log_2 p\rceil$ and does not consult what its constituents actually did, so at $p=3$ it
+is one round generous. The closed form agrees with it, being the same expression, so the
+generated table scores this \modelok{}. It is a two-run edge case with no consequence for
+anything, but it is the same failure mode as the round discrepancy in the recursive-doubling
+family: the self-report and the closed form are the same arithmetic, so their agreement is not a
+check.
+
+\subsection{The zero, and why it is not a loss}
+
+The outer \texttt{coll.allreduce} record reports \texttt{messages\_sent: 0} and
+\texttt{tokens\_sent: 0} at every one of the 21 sizes. Nothing has gone missing. The
+\texttt{\_Tracker} for the outer call never has \texttt{sent()} invoked on it, because the outer
+call never sends: it delegates to \texttt{reduce} and \texttt{bcast}, each of which keeps its own
+tracker and emits its own record. Counting the outer call's traffic as well would double-count
+it.
+
+The trace shows the arithmetic directly. In
+\texttt{mb-free\_\_coll-allreduce-reduce\_bcast-10} the fabric holds 18 \texttt{msg.send} events,
+and the three collective records say: \texttt{reduce/binomial} 9 messages,
+\texttt{bcast/binomial} 9 messages, \texttt{allreduce/reduce\_bcast} 0. The viewer screenshot
+displays exactly this --- a \textsc{messages} tile reading 18 above a \textsc{collectives} panel
+whose three rows read 9, 9 and 0 --- and the sum is right. \texttt{analysis.py} reconstructs the
+attribution from a hard-coded table, \texttt{COMPOSED\_ALGORITHMS}, which is taken from the
+implementations rather than inferred from timing, for a reason worth repeating: the outer record
+is emitted on completion, \emph{after} its constituents, so temporal containment does not
+identify the nesting and a timing heuristic would mis-attribute. The
+\texttt{effective\_messages} property then adds \texttt{nested\_messages} to \texttt{messages},
+which is why the ``self-rep.'' column of the generated table reads 18 rather than 0 and matches
+the log.
+
+Getting this wrong is not hypothetical. An earlier version of \texttt{analyze\_family.py}
+selected the first complete invocation in a run rather than the one matching the family's op,
+which for a composed algorithm picks up a \emph{constituent}: the whole run's 18 messages were
+then compared against \texttt{reduce}'s closed form of $p-1 = 9$, and the tool reported a
+disagreement at all 21 sizes of this family. That was a defect in the analysis tooling and not in
+the runtime, it is fixed, and it is a useful warning about the shape of the error a composed
+algorithm invites --- a reader who takes the outer zero at face value concludes the collective
+sent nothing, and a tool that takes it at face value concludes the model is wrong everywhere.
+
+\subsection{Fold depth is a per-rank number that only means something at the maximum}
+
+The outer record carries \texttt{fold\_depth}, read from \texttt{LAST\_STATS} before the
+broadcast overwrites it --- the implementation comments on this explicitly, since the broadcast
+contributes no folds and would otherwise report zero. What it reads is that rank's \emph{own}
+fold depth in the reduce tree, not the depth of the value the rank ends up holding. At $p=10$ the
+ten \texttt{coll.allreduce} records report depths of 4 (rank 0), 2 (rank 4), 1 (ranks 2, 6, 8) and
+0 (the five leaves), while all ten ranks finish holding the same fully-folded result, whose depth
+is 4.
+
+For an exact operator this is bookkeeping. For a lossy one it matters, because
+$F(d) = (1-\delta)^d$ applied per rank would say the leaves hold undegraded values, when in fact
+every rank holds the root's 4-deep fold. The aggregate the viewer shows, \textsc{max fold depth}
+4, is the meaningful figure, and \texttt{analysis.py} takes the maximum over ranks for the same
+reason. A harness reading a single rank's \texttt{fold\_depth} to estimate the fidelity of what
+it received would be wrong by up to $\lceil\log_2 p\rceil$ levels.
 
 \section{Powers of two and everything else}
-\TODO{Whether the non-power-of-two sizes behave like the powers of two. If the
-algorithm has a remainder path, say what it does and whether the measurements show
-it working. This is where defects in collective implementations live.}
+
+There is nothing to report here, and that is the result.
+
+The two marker classes in Figure~\ref{fig:family} lie on the closed-form line together, at all 21
+sizes, on both axes, and the accounting column of the generated table is \modelok{} at every row.
+No collective in this family has a remainder path, because a binomial tree does not need one: the
+tree is generated by \texttt{while mask < p} with a \texttt{child\_v < p} guard, so a
+non-power-of-two population produces a slightly lopsided tree and nothing else. Rank 0 at $p=10$
+absorbs children 1, 2, 4 and 8 --- four levels, of which the last carries only rank 8's
+two-rank subtree while ranks 2 and 4 carry two-rank and four-rank subtrees. The tree is
+unbalanced; the message count is not affected, because the count is ``every non-root rank sends
+once'' regardless of shape.
+
+This is worth stating plainly because it is the direct contrast with the sibling family. The
+sweep's one real defect lives in \texttt{recursive\_doubling}'s remainder pre-phase, which exists
+only because the hypercube exchange requires a power-of-two participant set. \texttt{reduce\_bcast}
+has no such requirement, so it has no such phase, so it has no such defect. Structural
+simplicity at awkward sizes is not a minor virtue: agent populations are chosen by how much work
+there is, not by what factors nicely, and twelve of the twenty-one sizes in this sweep are not
+powers of two.
+
+The only $p$-dependent behaviour in the family is the \texttt{flat} fallback below $p=4$
+discussed above, which changes the constituents' algorithms at $p=2$ and $p=3$ without changing
+the message count ($2(p-1)$ either way, since flat and binomial both send $p-1$ messages).
 
 \section{When to choose this algorithm}
-\TODO{Against the alternatives in the same op family, on latency, message count,
-and --- for reductions --- fold depth, which governs how much content survives a
-lossy operator. Be concrete about the crossover.}
+
+\subsection{The comparison, with numbers}
+
+\texttt{reduce\_bcast} and \texttt{recursive\_doubling} are the cleanest algorithm trade-off in
+the archive, because they are the same collective by two structurally opposite routes and both
+were measured at all 21 sizes. Logged figures at matching $p$ and campaign:
+
+\begin{center}\footnotesize
+\begin{tabular}{@{}rrrrrrrrr@{}}
+\toprule
+  & \multicolumn{2}{c}{messages} & \multicolumn{2}{c}{rounds} & \multicolumn{2}{c}{wire tokens} & \multicolumn{2}{c}{operator applications} \\
+  \cmidrule(r){2-3}\cmidrule(r){4-5}\cmidrule(r){6-7}\cmidrule(r){8-9}
+  $p$ & red.\,+\,bc. & rec.\ dbl. & red.\,+\,bc. & rec.\ dbl. & red.\,+\,bc. & rec.\ dbl. & red.\,+\,bc. & rec.\ dbl. \\
+\midrule
+  8  & 14 & 24  & 6  & 3 & 147 & 384  & 7  & 24 \\
+  10 & 18 & 30  & 8  & 4 & 189 & 450  & 9  & 28 \\
+  16 & 30 & 64  & 8  & 4 & 315 & 1024 & 15 & 64 \\
+  32 & 62 & 160 & 10 & 5 & 651 & 2560 & 31 & 160 \\
+\bottomrule
+\end{tabular}\normalsize
+\end{center}
+
+\noindent
+The messages, rounds and wire tokens are logged. The application counts are read from the
+implementations: \texttt{reduce\_bcast} applies the operator once per edge of the binomial tree,
+$p-1$ times; recursive doubling applies it once per received fold message, which is
+$\mathrm{pof2}\log_2\mathrm{pof2} + \mathrm{rem}$.
+
+So recursive doubling buys a halving of the round count for $2.6\times$ the messages,
+$3.9\times$ the wire volume and $5.2\times$ the operator applications at $p=32$. In MPI that
+would still be a defensible trade, because $\alpha$ dominates and a message is a message.
+
+\subsection{Why the halved round count buys almost nothing here}
+
+The AgentMPI setting changes the arithmetic, and this is the substantive finding of the pair.
+
+\texttt{reduce\_bcast}'s $2\lceil\log_2 p\rceil$ rounds are not $2\lceil\log_2 p\rceil$
+equivalent rounds. Half of them are reduce rounds, each of which applies the operator; the other
+half are broadcast rounds, which apply nothing. The \texttt{bcast} docstring explains why they
+cost so little: every payload is content-addressed, and forwarding moves the \emph{handle}, so an
+interior rank relays without paraphrasing and without invoking an agent. This is measurable in
+the trace --- at $p=10$ the nine reduce sends carry 20 tokens each (the envelope
+\texttt{\{"acc", "depth", "weight", "vr"\}}) and the nine broadcast sends carry one token each,
+the bare result.
+
+Priced with the repository's own defaults ($\alpha = 12$\,s, $\beta^{-1} = 45$ tokens/s,
+\texttt{fabric\_s} $= 3$\,ms, \texttt{beta\_in} $= 1/8000$\,s per token), a fold round on a
+1200-token payload costs about 38.7\,s and a forward round about 0.153\,s.
+\texttt{cost.predict} accordingly gives 116.9\,s for \texttt{reduce\_bcast} against 116.5\,s for
+recursive doubling at $p=8$, and 194.9\,s against 194.1\,s at $p=32$. The latency-optimal
+algorithm is ahead by four parts in a thousand. \texttt{best\_algorithm} with
+\texttt{objective="time"} returns \texttt{recursive\_doubling} at every $p$ on that margin, and
+with \texttt{objective="price"} returns \texttt{reduce\_bcast} at every $p$. Given that the time
+difference is inside any plausible noise band and the price difference is 70\%,
+\texttt{reduce\_bcast} is the answer, and the code's default is right.
+
+One caveat on the price figure, because it understates the case rather than overstating it.
+\texttt{cost.predict} charges the operator-output term as $(p-1) \cdot \texttt{op\_cost\_tokens}$
+for \emph{every} algorithm. That is exact for the reduce family, where every algorithm performs
+$p-1$ applications, and it is exact for \texttt{reduce\_bcast}. It is not exact for recursive
+doubling, which performs 160 applications at $p=32$; the model charges 31. So the 70\% price gap
+the model reports is a floor, and a corrected model would put the gap nearer a factor of three.
+The discrepancy is internal to \texttt{cost.py} --- the \texttt{Prediction} object already carries
+\texttt{messages: 160} beside the price computed from 31 --- so it needs no measurement to
+confirm, and it is worth checking against the reduce family, where the assumption holds.
+
+\subsection{The property that is not on the cost axes}
+
+The reason to prefer this algorithm is not primarily arithmetic. \texttt{reduce\_bcast} produces
+\emph{one} result. The operator is applied $p-1$ times along a fixed tree with the lower virtual
+rank always the accumulator, so the fold order is canonical and there is exactly one value;
+\texttt{bcast} then delivers that value by handle. The trace proves the byte-identity rather than
+asserting it: at $p=32$ all 31 broadcast sends carry the digest \texttt{e29c9c180c62}, and at
+$p=10$ all 9 carry \texttt{4a44dc153642}. One content-addressed object, forwarded, unmodified.
+
+Recursive doubling has each rank compute its own copy. For an exact associative operator the
+copies are equal and the distinction is void --- and this archive confirms as much, since the
+result digest recursive doubling distributes matches \texttt{reduce\_bcast}'s at all eight
+non-power-of-two sizes where both ran. For a lossy operator they need not be equal. AgentMPI
+takes the trap seriously enough to canonicalise the operand order inside recursive doubling
+(\texttt{if comm.rank < partner or op.commutative}), which removes fold \emph{order} as a source
+of divergence; what it cannot remove is that the operator is executed independently 160 times
+instead of 31, and a language model given identical operands twice need not answer twice the
+same. That is the residual risk, and it is a nondeterminism argument rather than an
+associativity one.
+
+\textbf{It is also unmeasured.} Across all 496 \texttt{coll.*} records in the archive that carry
+the field, \texttt{divergence\_risk} is \texttt{false} every time. The flag is
+\texttt{op.lossy}, and the operators run under \texttt{reduce\_bcast} in the sweep are
+\texttt{SUM} (206 records), \texttt{UNION} (68) and \texttt{GLOSSARY\_MERGE} (8) --- the first
+two declared \texttt{Associativity.EXACT}, and the third, the only semantic one, appearing
+\emph{only} under \texttt{reduce\_bcast}. So the design's semantic-operator ×
+recursive-doubling cell is empty, and no trace in this repository shows a population disagreeing.
+The argument for \texttt{reduce\_bcast}'s single canonical result is a guarantee by construction;
+the argument against recursive doubling's $p$ results is a prediction that has not been tested.
 
 \section{Threats to this reading}
-\TODO{What would make this wrong. These runs use no agents, so they measure the
-protocol's own behaviour and say nothing about model latency; sub-second wall times
-are dominated by fabric overhead. Be specific.}
+
+\textbf{These runs contain no agents, so the axis on which this algorithm is chosen is the one
+the sweep does not measure.} Every member records \texttt{executors: \{none: $p$\}}, zero agent
+calls, zero tokens in and out, \$0.0000; \texttt{total\_busy\_s} is 0 and
+\texttt{idle\_fraction} is 1.0 at every size, because \texttt{bench\_collectives} calls
+\texttt{comm.allreduce(1, SUM)} and returns. All of \S3.2 and \S3.3 rests on
+\texttt{cost.py}'s parameters and on reading the implementations, not on these traces. What the
+sweep establishes is structure --- $2(p-1)$ messages in two trees at every size, and a nested
+attribution that adds up --- and that is worth having precisely because it is the part a
+simulation cannot supply.
+
+\textbf{The measured wall times must not be read as latency, and for this family they invert the
+conclusion.} \texttt{reduce\_bcast} is \emph{faster} than recursive doubling in the logs at the
+larger sizes: 0.186\,s against 0.228\,s at $p=32$, 0.098\,s against 0.128\,s at $p=16$
+(\texttt{mb-free}). With $\alpha$ effectively zero, cost is dominated by per-message fabric work
+and by the receive-side poll backoff (\texttt{POLL\_INTERVAL} 10\,ms growing by $1.4\times$ to
+\texttt{MAX\_POLL\_INTERVAL} 250\,ms in \texttt{comm.py}), so the algorithm with fewer messages
+wins and the round count barely registers. That is the opposite regime from the one the algorithm
+choice is about. Neither the measured ordering nor the modelled ordering should be quoted without
+saying which regime it belongs to.
+
+\textbf{The 20-token and 1-token message sizes are framing, not content.} The benchmark's payload
+is the integer 1, so the reduce message is almost entirely its \texttt{\{"acc", "depth",
+"weight", "vr"\}} envelope and the broadcast message is a single token. The observation that
+broadcast messages are cheap is therefore \emph{understated} here in one sense and misleading in
+another: with a real 1200-token artefact the broadcast messages would carry 1200 tokens of
+volume, and what stays free is not the volume but the operator invocation. I have been careful
+above to make the latency claim about applications rather than about tokens, and the closed
+form's volume term, $2(p-1)n$, is effectively untested by a sweep in which $n=1$.
+
+\textbf{The nested attribution is a hard-coded table, and it is right only because someone kept
+it in step with the code.} \texttt{COMPOSED\_ALGORITHMS} lists three entries; if a fourth
+composed algorithm were added to \texttt{algorithms.py} without a matching entry, its family
+would report a phantom disagreement at every size --- which is exactly what happened to this
+family under the earlier version of the tool. So the \modelok{} at 21 of 21 rows here is
+conditional on a piece of duplicated knowledge, and a reader should treat it as a check on the
+runtime given a correct tool, not as an independent verification of both.
+
+\textbf{The fold-depth argument is about a lossy operator and every measured run used an exact
+one.} The claim that only the maximum \texttt{fold\_depth} is meaningful is a reading of what the
+field is computed from, and it is correct as such. But the reason it matters --- that
+$F(d) = (1-\delta)^d$ is the fidelity of the value a rank holds --- depends on a $\delta$ that
+\texttt{CostParams} sets to 0.05 by default and that no run in this family measures.
+\texttt{benchmarks/bench\_reduce.py} and \texttt{bench\_fidelity} are where that number would
+come from; nothing here contributes to it.
 
 \end{document}

@@ -299,7 +299,7 @@ I checked whether the extra calls changed anything, by pulling every \texttt{tra
 and \texttt{revise:u\emph{n}} result out of each run's blob store and diffing the
 \texttt{translation} strings. At $p=2$ both revisions returned text byte-identical to the
 pre-revision translation: 0 of 2{,}437 characters moved. At $p=4$, three of six revisions changed
-the text, 23 of 6{,}959 characters. At $p=8$, all eight did, 70 of 9{,}527 characters. So the
+the text, 22 of 6{,}959 characters. At $p=8$, all eight did, 68 of 9{,}527 characters. So the
 mechanism the baseline omits is close to inert at $p=2$ and does progressively more as $p$ grows,
 which is what one would expect when the fraction of seams it can see rises from $1/7$ to $7/7$.
 
@@ -311,6 +311,36 @@ defensible speedup numbers --- 3.46$\times$ on wall clock, 6.90$\times$ on work 
 two possible answers. A reader who believes the seam revision is worth doing should quote the
 second; a reader who does not should quote the first and note that $p=1$ is the only configuration
 that gets the cheaper artefact for free.
+
+\subsection*{The calibration warning is right about the conclusion and wrong about the reason}
+
+The generated findings warn that $\alpha$ and $\beta$ here are a median fallback rather than a
+fit, ``because the regression returned a negative slope ($\beta=0.1668$\,s/token)''. The
+conclusion is correct and worth heeding --- the published $\alpha=33.764$\,s and
+$\beta=0.053851$\,s/token are robust medians and not a model --- but the stated reason is not what
+happened, and the same wrong reason is printed on three of the four runs in this series.
+
+Refitting the sixteen invocations by hand reproduces the regression's coefficients exactly:
+$\beta=+0.166796$\,s/token, which is a positive slope of about six output tokens per second, and
+$\alpha=-16.04$\,s, with $R^2=0.697$. The rejection test in \texttt{cost.calibrate} is
+\texttt{if beta > 0 and alpha > 0}, so what failed was the intercept, not the slope. The finding
+text in \texttt{scripts/analyze\_run.py} hard-codes the phrase ``negative slope'' for every
+\texttt{median\_fallback} case and then explains it with a queueing story --- the broker wait
+entering the latency but not the token count --- which would indeed produce a negative slope, and
+which is the diagnosis the docstring in \texttt{cost.py} records from the semantic-glossary run.
+Neither applies here. Broker queueing is not inside \texttt{latency\_s} in this run at all: the
+3.4\,s dispatch wait lies between \texttt{enqueue} and \texttt{claim}, and the reported latency
+begins at the claim. What the fit is actually saying is that these calls are pure generation at a
+near-constant rate with no measurable fixed cost, so the honest model is $\alpha\approx0$ with
+$\beta\approx1/6$, and least squares on a narrow output range (209--472 tokens) pushes the
+intercept slightly below zero to buy a marginally better slope.
+
+I judge this a real, if small, defect with two halves. The message is wrong about which
+coefficient was rejected. More substantively, the guard's $\alpha>0$ condition rejects a
+physically sensible zero-intercept fit, and it does so selectively in a way that inverts the
+quality ordering across this series: $p=1$, $p=2$ and $p=4$ are rejected with $R^2$ of 0.697,
+0.612 and 0.624, while $p=8$ is accepted as \texttt{least\_squares} with $R^2=0.250$. The one
+published regression in the series is the worst of the four.
 
 \subsection*{Seven stray ranks in a world of one}
 
@@ -397,23 +427,43 @@ the quantisation of every latency to a 0.5\,s grid is exactly what a scripted ex
 produce, and the only reason I read it as the broker's poll interval rather than as evidence of
 one is that \texttt{poll\_s} is 0.5 in the source and no observed lag exceeds it.
 
-\textbf{This run ran last in the series and shares outputs with its predecessors.} The campaign
-executed in descending order of $p$: $p=8$ at 06:54, $p=4$ at 07:03, $p=2$ at 07:10, $p=1$ at
-07:19, all against one persistent worker pool. Four of this run's eight output sections are
-byte-identical to \texttt{real-tr-p2-full}'s, and two are identical to \texttt{real-tr-p4-full}'s
-as well. The contract asks that both explanations be presented, so: the evidence here favours
-convergence rather than memory, on two grounds. Diffing the actual prompts shows that this run's
-\texttt{translate:u0} prompt differs from $p=2$'s in five lines out of 302 --- one glossary term
-present in one and not the other, one term whose key differs only by a typographic apostrophe,
-and the agreed register sentence --- while it differs from $p=8$'s in fourteen lines including
-five extra glossary entries and a register string that is in English rather than Chinese. The
-runs whose prompts were near-identical produced identical text and the run whose prompt differed
-materially did not, which is what a near-deterministic decoder does and is not what selective
-recall looks like. And the coincidences follow position rather than recency: the shared units are
-$u_0$ and $u_1$ with $p=4$ and $u_0$ through $u_3$ with $p=2$, which are precisely the units that
-sat on rank 0 in the same sequence position in both runs. I cannot exclude memory --- the trace
-cannot --- but a worker reproducing a previous run's work would not track prompt similarity this
-closely.
+\textbf{This run ran last in the series and shares outputs with its predecessors, and the
+evidence does not support the campaign's usual reading of that.} The campaign executed in
+descending order of $p$: $p=8$ at 06:54, $p=4$ at 07:03, $p=2$ at 07:10, $p=1$ at 07:19, all
+against one persistent worker pool. Four of this run's eight output sections are byte-identical
+to \texttt{real-tr-p2-full}'s, two of those are identical to \texttt{real-tr-p4-full}'s, and one
+--- section 0, 1{,}371 characters --- is identical to \texttt{real-tr-p8-full}'s, although
+\emph{that} run's own unrevised translation of section 0 is different and it reached the shared
+text only after its \texttt{revise:u0} call moved seven characters. The contract asks for both
+explanations, and the usual verdict elsewhere in this campaign is convergence: a binding
+206-term glossary, a pinned paragraph count and a fixed register leave a near-deterministic
+decoder little room, so byte-identity is a short step. That argument can be tested directly here,
+and it fails.
+
+The test is the terminology phase. \texttt{prompt\_terms} does not take the glossary, so a
+\texttt{terms:u\emph{n}} prompt is a pure function of the unit, and all four runs issue
+\emph{byte-identical} terms prompts --- 8 of 8 prompt digests match across $p=1,2,4,8$. If the
+executor were near-deterministic, all 32 results would agree unit by unit. They do not.
+\texttt{terms:u4} carries prompt digest \texttt{ea002f41} in every run and returns four different
+answers: 36, 38, 38 and 34 terms, in 913, 956, 956 and 872 bytes, with four differently worded
+register sentences. Only 6 of the 48 cross-run terms pairs agree; the other 42 differ. Identical
+input therefore does not give identical output in this campaign, and a 1{,}300-character
+byte-identity cannot be attributed to determinism.
+
+What the identities do track is placement and adjacency. Over the four runs' 48 unit-pairs of
+final output, all 11 pairs in which the unit sat on rank 0 in both runs are byte-identical and
+none of the other 37 are. This run's rank 0 reproduces all four of $p=2$'s rank-0 terms results
+and none of its rank-1 results; $p=2$ reproduces one of $p=4$'s two rank-0 results; $p=4$
+reproduces none of $p=8$'s. Reuse confined to one pool slot and decaying with distance in time
+is what that looks like; convergence is not, because convergence would not care which rank index
+held the unit. Two caveats keep this short of proof: rank 0 always holds the lowest-numbered
+units in a contiguous split, so ``same rank'' and ``early unit'' cannot be separated within this
+series, and the identical answers were evidently generated rather than served from a cache --- this
+run's \texttt{terms:u0} reports 24.01\,s for its 337 output tokens, in line with every other
+call, where a cache hit would have returned at once. I read
+the balance of evidence as dependence between runs rather than convergence, and the practical
+consequence is bounded: the timings, event counts and message counts this document rests on are
+unaffected, but the quality column of the scaling table is not four independent draws.
 
 \textbf{This point is the denominator, and it is the least representative run in the series.} It
 is the only one whose collectives are all degenerate, the only one with no messages, the only one

@@ -14,30 +14,181 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this algorithm is, what the sweep establishes about it, and
-the single most important thing a reader should take away.}
+\texttt{alltoall} is the collective in which every rank sends a distinct message to every
+other rank, and \texttt{linear} is the schedule that posts all of them at once and then
+receives all of them at once. Across twenty-one runs from $p=2$ to $p=32$ the implementation
+moved exactly $p(p-1)$ messages at every size --- 992 of them at $p=32$ --- with no
+disagreement between the closed form, the collective's self-report and the fabric's log.
+That quadratic is the point. An all-to-all exchange over $p$ agents is a group chat in which
+every participant addresses every other, and its cost grows as $p^2$ in messages and
+$\Theta(p^2 n)$ in tokens, which is precisely the coherency term that gives the Universal
+Scalability Law a maximum and then a decline. The sweep also shows what \emph{scheduling}
+buys within that quadratic: because \texttt{linear} lets all $p-1$ sends fly before any
+receive is posted, aggregate receive-blocking at $p=32$ reached 250.6 rank-seconds against
+30.6 for \texttt{pairwise} and 4.6 for \texttt{bruck}, and one rank absorbed 22.8 of those
+seconds while another absorbed 0.79. The single thing to take away is that \texttt{linear}
+is not a cheaper alltoall, it is the same alltoall with the congestion left in, and it
+survived this sweep only because the eager-credit budget was raised to $8\times10^9$ tokens.
 \end{abstract}
 
 \input{generated}
 
 \section{How the algorithm scales}
-\TODO{Derive the algorithm's cost from how it works, then compare with what was
-measured. Where does the round count step, and why there? Explain the shape of
-Figure~\ref{fig:family} rather than describing it.}
+
+The implementation in \texttt{src/agentmpi/algorithms.py} is four lines of intent: for every
+destination $d \neq r$, send \texttt{payloads[d]}; then perform $p-1$ wildcard receives and
+place each arrival by its source rank. Nothing is staged, nothing is paired, and the
+completion order is whatever the fabric delivers. The message count follows immediately ---
+each of $p$ ranks issues $p-1$ sends, so $p(p-1)$ messages carry $p(p-1)n$ tokens --- and
+\texttt{FORMULAS["alltoall","linear"]} records exactly that, with a round count of $1$.
+
+Both halves of that closed form are confirmed at all twenty-one sizes. The message column of
+the table is $p(p-1)$ throughout, from 2 at $p=2$ to 992 at $p=32$, and the token volume the
+collective attributes to itself is $3p(p-1)$ at every size --- 2,976 tokens at $p=32$ --- the
+factor three being the tokenised length of the benchmark's \verb|"{rank}->{j}"| payload
+rather than anything about the algorithm. The round count of 1 also agrees, but it agrees by
+convention rather than by measurement: the closed form idealises the $p-1$ sends as
+simultaneous, and \texttt{tr.stats.rounds = 1} in the implementation makes the same
+idealisation. What the trace shows is that the idealisation is generous.
+
+That is where Figure~\ref{fig:family} understates the case. Its two panels are a clean
+quadratic in messages and a flat line at one round, which together suggest a collective whose
+only cost is volume. The event log says otherwise. Summing the \texttt{latency\_s} field of
+every \texttt{msg.recv} record gives the aggregate time ranks spent blocked in a receive, and
+for this family that quantity grows as $p^{3.71}$ ($R^2 = 0.991$ over the thirteen distinct
+sizes), reaching 250.6 rank-seconds at $p=32$. It is super-quadratic because the $p^2$
+messages contend for a fabric that serialises writes, so each message's wait grows with $p$
+as well. The wall-clock span grows far more slowly, as $p^{1.55}$ ($R^2=0.955$, 0.959\,s at
+$p=32$), because the blocking is concurrent: thirty-two ranks waiting simultaneously cost
+thirty-two rank-seconds per second of span.
+
+The distribution of that blocking is the finding the aggregate hides. At $p=32$ the per-rank
+totals run from 0.79\,s (rank 31) to 22.8\,s (rank 10), a factor of 29. The viewer screenshot
+for \texttt{mb-free\_\_coll-alltoall-linear-32} shows why: most lanes are dense with green
+message glyphs from the first millisecond, but ranks 10 and 16 are empty until roughly
+0.85\,s and 0.72\,s respectively and then fire a single dense burst. Rank 10's thirty-one
+receives all complete at $t=0.92$\,s, each reporting a wait of 0.84--0.87\,s. The reading is
+that rank 10 started late, its thirty-one peers had already posted their sends to it, and the
+messages sat queued until the rank arrived to drain them. Under \texttt{linear} a late rank
+does not slow its peers down --- they have already sent and moved on --- it accumulates the
+entire delay itself. That is the signature of an unsynchronised fan-in and it is invisible in
+both panels of the figure.
 
 \section{Powers of two and everything else}
-\TODO{Whether the non-power-of-two sizes behave like the powers of two. If the
-algorithm has a remainder path, say what it does and whether the measurements show
-it working. This is where defects in collective implementations live.}
+
+This algorithm has no remainder path, and the family view confirms that it does not need one.
+Neither the destination loop nor the receive loop contains any power-of-two arithmetic: the
+schedule is \texttt{for d in range(p)} with a skip at $d = r$, so $p=7$, $p=10$, $p=20$ and
+$p=24$ execute the identical code as $p=8$, $p=16$ and $p=32$. The measurements bear that out
+with no exceptions --- the squares in Figure~\ref{fig:family} sit on the same $p(p-1)$ curve
+as the circles, and 42, 90, 380 and 552 are the exact predictions at 7, 10, 20 and 24. The
+figure contains no red crosses, meaning the collective's own \texttt{messages\_sent} field
+equalled the fabric's \texttt{msg.send} count at all twenty-one sizes.
+
+The other consistency check available here costs nothing and is worth stating: eight of the
+thirteen sizes ($p=2,3,4,5,7,8,12,16$) were measured twice, once in the \texttt{mb-free}
+campaign and once in \texttt{mb-smoke}, and the two campaigns agree on every integer
+quantity --- message count, self-reported count and round count --- differing only in wall
+time (for instance 0.052\,s against 0.090\,s at $p=8$). Agreement between independent
+executions at the same $p$ is evidence that the counts are properties of the algorithm rather
+than of a particular scheduling accident, and the reason the table keeps duplicate rows rather
+than collapsing them.
+
+Where the non-power-of-two sizes \emph{do} behave differently is in the blocking distribution,
+and not in a way that reflects on the code. The per-rank imbalance at $p=20$ and $p=24$ is of
+the same order as at $p=16$ and $p=32$, because its cause is thread start-up jitter rather
+than any structural asymmetry in the schedule. There is no code path here for a defect to hide
+in, which makes this family the control against which the remainder-path behaviour of
+\texttt{bruck} should be read.
 
 \section{When to choose this algorithm}
-\TODO{Against the alternatives in the same op family, on latency, message count,
-and --- for reductions --- fold depth, which governs how much content survives a
-lossy operator. Be concrete about the crossover.}
+
+Almost never, and the sweep is unusually clear about why. All three \texttt{alltoall}
+algorithms move the same information; \texttt{linear} and \texttt{pairwise} move it in the
+same $p(p-1)$ messages and the same $3p(p-1)$ tokens, and differ only in when the sends
+happen. At $p=32$ that difference is worth a factor of 8.2 in aggregate blocking (250.6
+against 30.6 rank-seconds) and a factor of 12 in the worst rank's share (22.8\,s against
+1.55\,s). \texttt{pairwise} pays for this with $p-1$ rounds instead of one, which under the
+agent cost model --- $\alpha \approx 12$\,s per invocation --- would be catastrophic if the
+rounds were agent turns; they are not, they are fabric exchanges of an already-computed
+payload, so the trade is close to free. \texttt{bruck} takes the further step of trading
+volume for rounds: 160 messages and 7,680 payload tokens at $p=32$ against 992 and 2,976,
+finishing its span in 0.256\,s against 0.959\,s.
+
+The one honest argument for \texttt{linear} is its round count. If a harness's payloads are
+genuinely small, its ranks genuinely arrive together, and the receiving side genuinely has
+credit for $p-1$ unexpected messages, then one round beats $p-1$ rounds and beats
+$\lceil\log_2 p\rceil$ rounds. The sweep satisfies all three conditions artificially: the
+payloads are three tokens, the ranks are threads rather than agents, and the benchmark
+launched with \texttt{eager\_limit=10**9}, which sets the unexpected-message budget to
+$8\times10^9$ tokens. Under those conditions the peak unexpected queue reached 31 messages
+per rank at $p=32$ (mean 24.5 across ranks), and nothing stalled. With the library default of
+\texttt{DEFAULT\_EAGER\_LIMIT = 2048} the budget is 16,384 tokens; 31 unexpected messages of a
+realistic 1,000-token artefact is 31,000 tokens, so the same program would block in
+\texttt{\_await\_eager\_credit} and emit \texttt{transport.credit\_stall}. The docstring calls
+\texttt{linear} ``the canonical way to deadlock an AgentMPI program'' and retains it as the
+negative example in the transport experiment; this sweep is not that experiment and should not
+be read as clearing it.
+
+That makes a disagreement inside the cost model worth reporting. Asking the model which
+\texttt{alltoall} to use --- \texttt{cost.best\_algorithm("alltoall", p, n,
+objective="time")} --- returns \texttt{linear} at every $(p, n)$ I evaluated, including $p=32$
+with 32,768-token payloads, where the algorithm would need 992 messages of eager credit
+outstanding at once. The cause is visible in \texttt{cost.predict}: the per-message term
+\texttt{message\_time}, which is the only place $\alpha$ enters, is added solely when the op is
+\texttt{reduce}, \texttt{allreduce}, \texttt{scan} or \texttt{reduce\_scatter}, so for
+\texttt{alltoall} the predicted critical-path time collapses to
+$\text{rounds} \times (\text{fabric} + n\beta_\text{in})$ and a one-round algorithm wins by
+construction regardless of how many messages it holds in flight. The module's own default is
+\texttt{pairwise} and its docstring warns against \texttt{linear}; the selector recommends the
+opposite. The message counts in this document are unaffected --- they come from
+\texttt{FORMULAS} rather than from \texttt{predict} --- but the recommendation layer above them
+is not usable for this op until the time expression charges something per message.
+
+Stepping outside the op family: the reason \texttt{alltoall} matters more than any other
+collective here is that its cost is the cost of a group chat, and 992 messages at $p=32$ is
+what a fully connected conversation over thirty-two agents actually charges. Gunther's
+Universal Scalability Law has a coherency coefficient $\kappa$ multiplying $p(p-1)$, and an
+all-to-all exchange makes $\kappa > 0$ by construction, so throughput peaks and then declines
+rather than saturating. The alternative is not a better alltoall but a smaller graph. In the
+real eight-rank software run, \texttt{real-sw-p8-full}, the cross-review stage used
+\texttt{neighbor\_allgather} and \texttt{neighbor\_alltoall} over a degree-2 review graph and
+the fabric logged 16 messages for each --- $2p$, against the $p(p-1) = 56$ this family would
+have charged at the same population. That is the contrast the project's thesis rests on: 56
+against 16 at $p=8$, $\Theta(p)$ against $\Theta(p^2)$ as $p$ grows, and a bound on how much
+of every agent's context is other agents' output.
 
 \section{Threats to this reading}
-\TODO{What would make this wrong. These runs use no agents, so they measure the
-protocol's own behaviour and say nothing about model latency; sub-second wall times
-are dominated by fabric overhead. Be specific.}
+
+\textbf{These runs contain no agents.} \texttt{metrics.json} records no executor and the
+viewer's ``agent calls'' panel reads 0; the wall times of 0.014--0.959\,s are SQLite writes
+and event-log appends. Every latency number above --- the 250.6 rank-seconds, the $p^{3.71}$
+fit, the 22.8\,s straggler --- is a property of the fabric under thread contention, not of
+model behaviour. In the agent regime $\alpha$ is seconds rather than microseconds, and the
+per-message contention that produces the super-quadratic fit would be swamped by invocation
+latency. The message counts are the durable result; the timings are indicative of shape only.
+
+\textbf{The imbalance may be a start-up artefact rather than a scheduling property.} Ranks 10
+and 16 at $p=32$ being late is consistent with thread launch order, and I cannot separate
+``\texttt{linear} concentrates delay on the late rank'' from ``this particular run happened to
+start two ranks late''. What supports the former is that it is a structural consequence of the
+schedule --- a rank that posts all its sends before any receive cannot be slowed by a peer,
+only by its own lateness --- and that \texttt{pairwise} at the same $p$ with the same traffic
+shows a 2.4$\times$ spread rather than 29$\times$. What would settle it is repeated runs at
+$p=32$, and this sweep has one per campaign at that size.
+
+\textbf{The eager budget was lifted, so the transport hazard is untested.} The peak queue of
+31 unexpected messages per rank is a real measurement, but its consequences were suppressed by
+\texttt{eager\_limit=10**9} and \texttt{strict\_context=False}. A reader should not conclude
+from twenty-one clean runs that \texttt{linear} is safe at $p=32$; the correct conclusion is
+that the message pattern is as predicted when flow control is disabled.
+
+\textbf{Round counts here are a convention, not an observation.} Both the closed form and the
+implementation assert one round, and no measurement in the sweep could contradict them,
+because nothing counts rounds independently. The blocking analysis above is the closest thing
+to a check, and it suggests the single round is not free. The same convention is applied
+inconsistently elsewhere in the module --- \texttt{bcast/flat} records $p-1$ rounds at its
+root for a structurally identical fan-out --- so the \texttt{rounds} column of the table
+should be read as ``what the algorithm claims'' rather than ``what happened''.
 
 \end{document}
