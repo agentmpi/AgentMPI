@@ -236,6 +236,7 @@ class JobResult:
             "messages": sum(o.cost.get("messages_sent", 0) for o in self.outcomes),
             "tokens_sent": sum(o.cost.get("tokens_sent", 0) for o in self.outcomes),
             "tokens_deferred": sum(o.cost.get("tokens_deferred", 0) for o in self.outcomes),
+            "tokens_unadmitted": sum(o.cost.get("tokens_unadmitted", 0) for o in self.outcomes),
             "usd": round(sum(o.cost.get("usd", 0.0) for o in self.outcomes), 4),
             "context_high_water": max((o.context.get("high_water", 0) for o in self.outcomes), default=0),
             "context_rejections": sum(o.context.get("rejections", 0) for o in self.outcomes),

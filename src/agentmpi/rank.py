@@ -174,9 +174,22 @@ class CostAccount:
     n_messages_recv: int = 0
     tokens_sent: int = 0
     tokens_recv: int = 0
-    #: Tokens that a rendezvous transfer avoided moving into context.  This is
-    #: the headline number for the transport-mode experiment.
+    #: Tokens that a rendezvous transfer avoided pushing to a peer.  Send-side only, and
+    #: only for ``Mode.RENDEZVOUS``: this is the headline number for the transport-mode
+    #: experiment, and it must remain a subset of ``tokens_sent``.
+    #:
+    #: This field previously also accumulated on the receive side for every message a rank
+    #: declined to admit, which is a different quantity under the same name.  Because
+    #: harnesses pass ``admit=False`` almost everywhere, that made every rendezvous transfer
+    #: count twice and every unadmitted eager arrival count under a label that says
+    #: rendezvous --- inflating the reported figure by 2.6x on the software runs and pushing it
+    #: above ``tokens_sent``, which is impossible for a subset of traffic.
     tokens_deferred: int = 0
+    #: Tokens that arrived addressed to this rank but were never admitted into its context,
+    #: because the receive took the artefact by handle rather than by value.  Counts eager and
+    #: rendezvous arrivals alike, since what it measures is context admission and not
+    #: transport.  Kept separate from ``tokens_deferred`` because conflating the two loses both.
+    tokens_unadmitted: int = 0
     usd_in_per_mtok: float = 3.0
     usd_out_per_mtok: float = 15.0
 
@@ -194,6 +207,7 @@ class CostAccount:
             "tokens_sent": self.tokens_sent,
             "tokens_recv": self.tokens_recv,
             "tokens_deferred": self.tokens_deferred,
+            "tokens_unadmitted": self.tokens_unadmitted,
             "usd": round(self.usd, 4),
         }
 
@@ -249,11 +263,36 @@ class RankRuntime:
         outside the agents and is durable; the runtime *code* is shared mutable state
         that the protocol says nothing about, and a population half of which is
         running a different build is a class of failure no amount of durable state
-        prevents.  We hit exactly this by editing an editable install while a live
+        prevents.          We hit exactly this by editing an editable install while a live
         population executed against it.
+
+        Registration is refused for a rank index outside the job's world size.  Without that
+        check any index was accepted unconditionally, and a shared worker pool leaked ranks into
+        three translation runs: the world-2 run accepted ranks 2--8 and 14, the world-4 run
+        accepted 4--8 and 14, and the world-8 run accepted 8 and 14.  Collectives still resolved
+        correctly, because they go through ``comm_members`` rather than the ``ranks`` table, so
+        the visible damage was a fabric that ended with ten rank rows for an eight-rank world and
+        two of them still renewing leases half an hour after the job finished.
+
+        The dangerous case is the one that did not happen.  This is an upsert keyed on rank index,
+        so a worker misdirected onto an index *inside* the world would have bumped the incumbent's
+        incarnation, taken over its lease, and been handed its mailbox --- silently, because that
+        is exactly the sequence a legitimate reattachment performs.  Refusing out-of-range indices
+        does not close that case, and it cannot be closed here: a worker holding the right index
+        is indistinguishable from the rank it claims to be.  It does close the case we observed,
+        and it turns a silent leak into an error at the point of entry.
         """
         now = time.time()
         self._check_runtime_version()
+        world = self.fabric.get_meta("world_size")
+        if world is not None:
+            size = int(world)
+            if not 0 <= self.wrank < size:
+                raise AmpiUsageError(
+                    "rank index outside the job's world",
+                    rank=self.wrank,
+                    world_size=size,
+                )
         with self.fabric.write() as cur:
             row = cur.execute("SELECT incarnation FROM ranks WHERE rank=?", (self.wrank,)).fetchone()
             if row is None:

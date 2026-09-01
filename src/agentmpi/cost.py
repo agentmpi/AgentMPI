@@ -489,7 +489,10 @@ class RunSummary:
     usd: float
     n_messages: int
     tokens_sent: int
+    #: Send-side, rendezvous only. A subset of ``tokens_sent`` by construction.
     tokens_deferred: int
+    #: Receive-side: arrived but never admitted into a rank's context, any transport mode.
+    tokens_unadmitted: int = 0
     collectives: dict[str, dict[str, Any]] = field(default_factory=dict)
     per_rank: dict[int, dict[str, Any]] = field(default_factory=dict)
     latencies: list[float] = field(default_factory=list)
@@ -509,6 +512,7 @@ class RunSummary:
             "messages": self.n_messages,
             "tokens_sent": self.tokens_sent,
             "tokens_deferred": self.tokens_deferred,
+            "tokens_unadmitted": self.tokens_unadmitted,
             "agent_latency_p50": round(lat[len(lat) // 2], 2) if lat else 0.0,
             "agent_latency_p95": round(lat[int(0.95 * (len(lat) - 1))], 2) if lat else 0.0,
             "agent_latency_max": round(lat[-1], 2) if lat else 0.0,
@@ -550,6 +554,9 @@ def summarise(source: "Fabric | list[dict[str, Any]]") -> RunSummary:
             s.tokens_sent += int(p.get("tokens", 0) or 0)
             if p.get("mode") == "rendezvous":
                 s.tokens_deferred += int(p.get("tokens", 0) or 0)
+        elif kind == "msg.recv":
+            if not p.get("admitted"):
+                s.tokens_unadmitted += int(p.get("tokens", 0) or 0)
         elif kind == "agent.contract_violation":
             s.n_contract_violations += 1
         elif kind in ("ft.declare_failed", "rank.error"):

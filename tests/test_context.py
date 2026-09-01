@@ -217,7 +217,18 @@ def test_compaction_is_traced(tmp_path):
 
 
 def test_deferred_token_accounting(tmp_path):
-    """The headline number for the transport experiment: tokens kept out of context."""
+    """The headline number for the transport experiment: tokens a rendezvous did not push.
+
+    ``tokens_deferred`` is a send-side, rendezvous-only quantity, so it belongs to the sender
+    alone. The receiver's corresponding measurement is ``tokens_unadmitted``: content that
+    arrived and was never taken into context.
+
+    This test previously asserted that the *receiver* also had ``tokens_deferred > 4000``, which
+    is how the conflation survived. Both quantities were accumulating into one field --- the
+    sender on rendezvous, the receiver on any non-admitted arrival --- so the field exceeded
+    ``tokens_sent`` on real runs, which is impossible for a subset of traffic, and a harness
+    passing ``admit=False`` everywhere had every eager arrival reported as a rendezvous saving.
+    """
     payload = _big(5000)
 
     def rank_main(comm):
@@ -229,6 +240,45 @@ def test_deferred_token_accounting(tmp_path):
 
     job = ampi.launch(rank_main, size=2, root=tmp_path / "def")
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
-    assert job.value(0)["tokens_deferred"] > 4000
-    assert job.value(1)["tokens_deferred"] > 4000
-    assert job.value(1)["tokens_recv"] == 0
+
+    sender, receiver = job.value(0), job.value(1)
+    assert sender["tokens_deferred"] > 4000
+    assert sender["tokens_deferred"] <= sender["tokens_sent"], "deferred must be a subset of sent"
+
+    # The receiver deferred nothing: it sent nothing.
+    assert receiver["tokens_deferred"] == 0
+    assert receiver["tokens_unadmitted"] > 4000, "the arrival was never admitted"
+    assert receiver["tokens_recv"] == 0
+
+
+def test_deferred_never_exceeds_sent_when_nothing_is_admitted(tmp_path):
+    """The condition under which the two quantities used to be summed into one.
+
+    Every experiment harness in this repository receives with ``admit=False``, so under the old
+    accounting each rendezvous message was counted twice and each eager one once, under a name
+    that says rendezvous. Eager traffic is included here deliberately: it must contribute to
+    ``tokens_unadmitted`` and nothing at all to ``tokens_deferred``.
+    """
+    payload = _big(3000)
+
+    def rank_main(comm):
+        if comm.rank == 0:
+            comm.send(payload, 1, "eager", mode=Mode.EAGER)
+            comm.send(payload, 1, "rdv", mode=Mode.RENDEZVOUS)
+        else:
+            comm.recv(source=0, tag="eager", admit=False)
+            comm.recv(source=0, tag="rdv", admit=False)
+        return comm.rt.cost.snapshot()
+
+    job = ampi.launch(rank_main, size=2, root=tmp_path / "mixed", eager_limit=10_000_000)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+    sender, receiver = job.value(0), job.value(1)
+
+    # Exactly one of the sender's two messages was rendezvous.
+    assert 0 < sender["tokens_deferred"] < sender["tokens_sent"]
+    assert receiver["tokens_deferred"] == 0
+    # Both arrivals went unadmitted, so the receiver's figure covers eager traffic too.
+    assert receiver["tokens_unadmitted"] > sender["tokens_deferred"]
+
+    totals = job.totals()
+    assert totals["tokens_deferred"] <= totals["tokens_sent"], totals

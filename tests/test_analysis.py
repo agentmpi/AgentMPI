@@ -151,6 +151,22 @@ def test_recursive_doubling_accounting_gap_is_confined_to_the_archive(analyses: 
 # -- structural sanity ----------------------------------------------------------------
 
 
+def test_deferred_tokens_are_a_subset_of_sent_tokens(analyses: list[an.Analysis]) -> None:
+    """A rendezvous saving cannot exceed the traffic it was measured on.
+
+    The archived traces are the evidence for this one. ``RankCost.tokens_deferred`` accumulated on
+    the send side for rendezvous *and* on the receive side for anything not admitted into context,
+    so on the software runs ``job.finish`` reported 2.6x the real figure and a value larger than
+    ``tokens_sent``. The log-derived summary was always right, which is why this holds when
+    computed from the archive and did not hold for the number the runtime wrote into results.
+    """
+    for a in analyses:
+        assert a.summary.tokens_deferred <= a.summary.tokens_sent, (
+            f"{a.name}: deferred {a.summary.tokens_deferred} > sent {a.summary.tokens_sent}"
+        )
+        assert a.tokens_deferred <= a.summary.tokens_sent, a.name
+
+
 def test_participants_never_exceed_communicator_size(analyses: list[an.Analysis]) -> None:
     for a in analyses:
         for c in a.collectives:

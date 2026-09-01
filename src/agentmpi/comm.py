@@ -799,7 +799,10 @@ class Communicator:
         if admit:
             self.rt.admit(row["digest"] if view is None else f"{row['digest']}:{view.describe()}", n_admitted)
         else:
-            self.rt.cost.tokens_deferred += int(row["tokens"])
+            # Not admitted into context, so charged to `tokens_unadmitted`. Charging it to
+            # `tokens_deferred` conflated context admission with transport mode: every eager
+            # arrival that a harness declined to admit was reported as a rendezvous saving.
+            self.rt.cost.tokens_unadmitted += int(row["tokens"])
 
         self.rt.cost.n_messages_recv += 1
         self.rt.cost.tokens_recv += n_admitted if admit else 0
