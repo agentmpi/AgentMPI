@@ -29,9 +29,11 @@ and an entire second round --- 1{,}009.9 of 2{,}270.2 busy rank-seconds, about h
 \$1.1444 --- repairing a phantom. Everything after $t=300.8$\,s in Figure~\ref{fig:timeline}
 is the harness reacting to a report it could not read. The single thing to take away is that
 the population was robust to it: told falsely that its correct work had failed, it rewrote
-six of eight modules and still passed 60/60. Read the flagged 81.8\,\% coordination share
-with care --- it is an artefact of summing per-invocation maxima, and the honest figure for
-time with all eight ranks simultaneously blocked is 0.6\,s, or 0.12\,\% of wall.
+six of eight modules and still passed 60/60. A secondary result is that analysing this run
+turned up a defect in the analysis tooling itself: the coordination share was computed as a
+sum of per-invocation maxima and read 81.8\,\%, a figure that is not a proportion of anything.
+It has since been redefined and now reads 41.7\,\% of rank-seconds, matching the value derived
+by hand here to four significant figures.
 \end{abstract}
 
 \input{generated}
@@ -104,30 +106,49 @@ incarnation~6, are the broker's normal behaviour: a fresh worker process attache
 the 32 tasks, which is why every rank shows four or five worker incarnations, and the
 collectives neither noticed nor cared.
 
-\subsection*{The coordination share is a measurement artefact, not a property of the run}
+\subsection*{Coordination cost, and a metric this run helped correct}
 
-The generated findings note that collectives account for 81.8\,\% of wall time. They do not.
-\texttt{collective\_wall\_s} is the sum over invocations of the \emph{maximum} per-rank
-\texttt{wall\_s}, and for a barrier a rank's \texttt{wall\_s} is its own wait, so the maximum
-is the wait of the rank that arrived \emph{first}. Summing those maxima adds up eight
-different ranks' idle intervals, each of which overlaps by construction with the other seven
-ranks' work. One invocation, \texttt{integrate-r1}, contributes 215.56\,s of the 408.28\,s
-total (52.8\,\%), and for essentially all of that interval between one and seven ranks were
-running agent calls.
+An earlier version of the analysis tooling reported that collectives accounted for 81.8\,\% of
+this run's wall time, and that number was wrong in a way worth recording, because it was wrong
+about the instrument rather than about the run. \texttt{collective\_wall\_s} summed, over
+invocations, the \emph{maximum} per-rank \texttt{wall\_s}. For a barrier a rank's
+\texttt{wall\_s} is its own wait, so the maximum is the wait of the rank that arrived
+\emph{first}; summing those maxima adds up eight different ranks' idle intervals, each of
+which overlaps by construction with the other seven ranks' work, and then divides by wall time
+rather than by anything those intervals are a share of. One invocation,
+\texttt{integrate-r1}, supplied 215.56\,s of the 408.28\,s total, and for essentially all of it
+between one and seven ranks were running agent calls. The quantity was not bounded by 1 and on
+the translation ablations it reached 137\,\%.
 
-Three measures computed directly from the log settle it. First, the wall time during which
-all eight ranks were simultaneously inside a collective is 0.6\,s, 0.12\,\% of the 499.38\,s
-run. Second, the rank-seconds spent blocked in collectives --- summing each rank's own
-\texttt{wall\_s} rather than the per-invocation maximum --- is 1{,}666.2\,s, or 41.7\,\% of
-the $8\times499.38 = 3{,}995$ rank-second pool, which is almost exactly the independently
-computed idle fraction of 43.2\,\% (1{,}724.8 rank-seconds). In other words the ranks were
-blocked in collectives precisely when they were idle, and for the same reason. Third, the
-collectives that actually move data cost almost nothing: \texttt{spec}, both \texttt{collect}
-gathers, both \texttt{report} broadcasts, both \texttt{blame} scatters and the \texttt{review}
-allgather sum to 1.26\,s of maximum wall between them while carrying all 133{,}090 tokens.
-The finding is therefore expected for this configuration and misleadingly worded rather than a
-defect: the run did not spend 81.8\,\% of its time coordinating, it spent 41.7\,\% of its
-rank-seconds waiting for stragglers, and the protocol's own overhead is under half a percent.
+That definition is gone. \texttt{coordination\_share} is now rank-seconds blocked in primitive
+collectives over rank-seconds available, which cannot exceed 1, and composed invocations are
+excluded so that a \texttt{reduce\_bcast} is no longer charged on top of the reduce and
+broadcast it delegates to. For this run the exclusion is a formality --- all 13 invocations are
+primitive --- and the metric now reads \textbf{41.7\,\%}. That is the same 1{,}666.2
+rank-seconds I had computed by hand from the log before the fix existed, which is a useful
+check in both directions: the hand computation was not reading the metric it was meant to
+audit, and the corrected metric reproduces an independently derived number to four significant
+figures. A companion metric, \texttt{coordination\_span\_share}, answers the different question
+of how much of the run had coordination in flight anywhere, as the union of blocking intervals
+over wall clock: \textbf{78.7\,\%}, or 393.0\,s. My own occupancy histogram put the complement
+--- wall time with no rank blocked --- at 106.2\,s, so the two agree here as well.
+
+The two numbers together are the honest reading, and they say different things. Coordination is
+in flight somewhere for 78.7\,\% of the run because the four bulk-synchronous phases each drain
+gradually, so from the moment the first rank finishes until the last one does, somebody is
+blocked. But it costs 41.7\,\% of the rank-second pool, not 81.8\,\% of anything, and that
+41.7\,\% is almost exactly the independently computed idle fraction of 43.2\,\% (1{,}724.8
+rank-seconds): the ranks were blocked in collectives precisely when they were idle, and for the
+same reason. Two further measurements locate the cost. The wall time during which all eight
+ranks were simultaneously blocked is 0.6\,s, 0.12\,\% of the run, so there is essentially no
+global stall. And the collectives that actually move data cost almost nothing: \texttt{spec},
+both \texttt{collect} gathers, both \texttt{report} broadcasts, both \texttt{blame} scatters
+and the \texttt{review} allgather sum to 1.26\,s of maximum wall between them while carrying
+all 133{,}090 tokens. What the run paid for was waiting for stragglers, not moving data or
+running protocol; the barrier is where the module decomposition's imbalance is collected, and
+the next subsection is about where that imbalance came from. The reported figure is also not
+understated in the way it can be on a degraded run: \texttt{coordination\_is\_underreported} is
+false here, because every collective completed and no rank blocked without living to record it.
 
 \subsection*{Load imbalance is genuine module difficulty}
 
@@ -283,21 +304,44 @@ the tail of a valid JSON report --- so it plainly ran the unfixed code too. That
 for the ablation, since both arms received the same false signal, but it means the commit field
 cannot be used to decide which code a run executed.
 
-Three metrics do not mean what their names suggest. \texttt{coordination\_share} is a sum of
-per-invocation maxima and is analysed above. The zero reported for
-\texttt{max\_claim\_wait\_s} is computed
+Two metrics named in this document have since been corrected, and one still needs reading with
+care. The coordination share is discussed above: the definition this run was first analysed
+under could exceed 1 and has been replaced, so any older document or table quoting 81.8\,\% for
+\texttt{real-sw-p8-full} is quoting a retired metric. The zero reported for
+\texttt{max\_claim\_wait\_s} is the one still to watch --- it is computed
 over \texttt{broker.expire} events, of which there are none, so it means ``no task expired
-unclaimed'', not ``no rank queued''. And \texttt{tokens\_deferred} is reported twice in the
-same result file with different values: 212{,}444 from the live cost account and 79{,}354 from
-the post-hoc summariser. The difference is exact and reproducible --- the live account adds
-79{,}354 tokens on the send side under rendezvous and then the full 133{,}090 tokens again on
-the receive side, because \texttt{admit=False} is passed everywhere and the receive path
-charges every unadmitted token to the same counter. The live figure consequently exceeds
-\texttt{tokens\_sent}, which is impossible for a quantity that is supposed to be a subset of
-traffic. I believe this is a bug in AgentMPI rather than in the harness: \texttt{comm.py}
-increments \texttt{cost.tokens\_deferred} at both the rendezvous send and the non-admitting
-receive, while \texttt{cost.summarise} counts only the send, and the only test on the field
-asserts that it exceeds 4{,}000.
+unclaimed'', not ``no rank queued'', and the real dispatch wait has to be recovered from the
+enqueue and claim timestamps as it is above.
+
+The third was \texttt{tokens\_deferred}, which this run's result file reported twice with
+different values: 212{,}444 from the live cost account and 79{,}354 from the post-hoc
+summariser. The difference was exact and reproducible --- the live account added 79{,}354
+tokens on the send side under rendezvous and then the full 133{,}090 tokens again on the
+receive side, because \texttt{admit=False} is passed everywhere and the receive path charged
+every unadmitted arrival to the same counter, so every rendezvous transfer was counted twice.
+The live figure consequently exceeded \texttt{tokens\_sent}, which is impossible for a quantity
+meant to be a subset of traffic. This was a defect in AgentMPI rather than in the harness and
+has been fixed by splitting the field, since both quantities are worth having:
+\texttt{tokens\_deferred} is now send-side and rendezvous-only, a subset of
+\texttt{tokens\_sent} by construction, while \texttt{tokens\_unadmitted} is receive-side and
+transport-agnostic, counting what arrived and was never admitted into context.
+\texttt{cost.summarise} derives both from the log and \texttt{job.totals()} reports both. The
+conflation survived as long as it did because the test that covered it asserted that a
+\emph{receiver} had \texttt{tokens\_deferred > 4000}, which encodes the bug as the expected
+behaviour; the replacement asserts across all 500 archived runs that deferred tokens never
+exceed sent tokens. Two things bound the damage. The inflated value reached \texttt{results/}
+but never reached a published number: the paper's only consumer of the field is the transport
+microbenchmark table, and that microbenchmark admits its receives, which is why its eager rows
+correctly carry no deferred tokens at all. And the log-derived figure was always right, which
+is why the 79{,}354 quoted in this document's headline table needs no revision.
+
+One defect this document reports remains open. In the software harness, the renegotiation
+performed under \texttt{Window.critical} still sets its merged exports from the
+implementation's bare name list rather than from the signature-bearing published interface, and
+still costs 39.4\,\% of the window's content between version~1 and version~2. It is a harness
+defect rather than a protocol one, which is why it has not been fixed alongside the others, but
+it means any run of this experiment at HEAD still degrades its own shared interfaces at the
+moment it claims to be renegotiating them.
 
 Two further caveats on the numbers I have leaned on. Busy time is measured from
 \texttt{broker.claim} to \texttt{broker.complete} and so excludes the dispatch wait that the

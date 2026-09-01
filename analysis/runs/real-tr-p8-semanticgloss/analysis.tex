@@ -75,15 +75,33 @@ partially folded glossary and every other rank was blocked in the collective beh
 incarnation counter tells the story --- incarnation 4 attached at 56.4\,s and never claimed
 anything, and incarnation 5 did not appear until 910.3\,s.
 
-This has a direct consequence for how the viewer's statistics row should be read. It reports
-agent latency p50/p95 of 59.5/388.1\,s and \texttt{metrics.json} gives a maximum of 534.17\,s,
-which is the \texttt{reduce:GLOSSARY\_MERGE:d2} call. Only 34.8\,s of that 534.17 was model
-service; the remaining 499.3\,s was queue. The \texttt{agent.call} event's \texttt{latency\_s}
-field is measured from the harness's point of view --- submission to result --- so on a run where
-workers are scarce it is a scheduling metric wearing a model-latency label. The calibration
-block inherits the problem: $\alpha_{p99}=389.6$\,s and $\beta=0.0761$\,s/token are fitted to
-these inflated latencies, and the $\alpha/\beta$ crossover of 782 tokens should not be believed
-for this run.
+This has a direct consequence for how the viewer's statistics row should be read, and the
+consequence is not confined to this run. The row reports agent latency p50/p95 of 59.5/388.1\,s
+and \texttt{metrics.json} gives a maximum of 534.17\,s, which is the
+\texttt{reduce:GLOSSARY\_MERGE:d2} call. Only 34.8\,s of that 534.17 was model service; the
+remaining 499.3\,s was queue. The \texttt{agent.call} event's \texttt{latency\_s} field is
+measured from the harness's point of view --- submission to result --- so wherever workers are
+scarce it is a scheduling metric wearing a model-latency label.
+
+The cost model inherits that contamination through its calibration path, and this is a general
+caution rather than a local one. \texttt{ampi.cost.calibrate} fits $\text{latency} =
+\alpha + n_{\text{out}}\beta$ by least squares over exactly these \texttt{agent.call}
+\texttt{latency\_s} values, so every run whose broker queue is loaded calibrates a cost model on
+queueing rather than on generation. On this run the effect is severe enough to be
+self-diagnosing: the regression returns a \emph{negative} slope, $\beta=-0.108$\,s/token,
+because the longest queue waits happened to land on the small-output term-sheet calls while the
+largest-output call in the run --- the 1{,}540-token depth-3 merge --- was claimed promptly.
+\texttt{calibrate} has a guard for exactly this, and it fired: the $\alpha=59.521$\,s and
+$\beta=0.076114$\,s/token in \texttt{metrics.json} are not a fit at all but the median-based
+fallback, $\alpha=\operatorname{median}(\text{latency})$ and
+$\beta=\operatorname{median}(\text{latency})/2\operatorname{median}(n_{\text{out}})
+= 59.521/(2\times391)$. Refitting the same regression on service intervals instead
+(\texttt{broker.claim} to \texttt{broker.complete}) gives a well-behaved $\alpha=39.9$\,s and
+$\beta=0.0117$\,s/token, and moves the $\alpha/\beta$ crossover from the reported 782 tokens to
+3{,}406. The guard prevented a nonsensical model from being published, but it did not prevent a
+wrong one: neither the reported $\beta$ nor the crossover should be believed for this run, and
+the same failure mode will silently affect any calibration taken from a run with broker
+contention.
 
 The second island, 348--464\,s, is where the reduction tree is visible. Six ranks finish their
 term sheets almost simultaneously, and then the binomial fold appears as a staircase: rank 2 and
@@ -108,10 +126,10 @@ One asymmetry in the collective table repays attention. The reduce reports \text
 leaves the reduce in 2\,ms, having only sent, and then blocks inside the broadcast until the
 root's answer arrives, so the leaves' waiting is charged to the \texttt{bcast} and the root's
 folding to the \texttt{reduce}. Ranks 1, 5, 7 and 3 record \texttt{reduce} walls of 1.4--2.2\,ms
-and \texttt{bcast} walls of 985.7, 625.2, 624.2 and 618.7\,s respectively. Summing those
-per-rank walls is what produces the 258.7\% coordination share: eight ranks concurrently blocked
-in the same 986\,s collective contribute eight times to a total that is then divided by one
-wall time.
+and \texttt{bcast} walls of 985.7, 625.2, 624.2 and 618.7\,s respectively. Added up over
+participants, the glossary reduce and broadcast account for 5{,}699.4 rank-seconds, 97\% of the
+5{,}861.7 the whole run charges to coordination, and the two dead windows fall entirely inside
+them.
 
 \section{Interpretation}
 
@@ -274,11 +292,43 @@ a $\log_2 p$ tree keeps at most four ranks busy at level 1 and one at level 3 --
 efficiency collapse is dominated by the 742.3\,s in which no rank at all was busy. The exact run
 with the identical harness scores 77.4\%.
 
-The \finding{note} on a 258.7\% coordination share is an artefact of the metric's definition,
-explained above: per-rank collective walls are summed while ranks block concurrently. It should
-be read as ``on average each rank spent 2.6 wall times' worth of rank-seconds inside
-collectives'', which for eight ranks means roughly a third of the population's time, not more
-than all of it.
+The \finding{note} on a 63.6\% coordination share is real, and it needs unpacking, because on its
+face it says the opposite of this section's conclusion. Read naively --- two-thirds of the
+population's rank-seconds inside collectives --- it invites the reading that coordination is the
+run's cost and that the semantic operator, being the thing inside the collective, is the cause.
+The decomposition says otherwise, and separating those two is the sharpest thing this run
+contributes.
+
+Of the 5{,}861.7 rank-seconds charged to coordination out of the $8\times1{,}152.9=9{,}223.2$
+available, 5{,}699.4 are inside the glossary reduce and broadcast. Intersecting each rank's
+blocking interval with the broker records for the seven merge tasks splits that figure three
+ways: 224.5 rank-seconds (3.9\%) with a rank actually executing a merge, 521.8 (9.2\%) with a
+rank holding a merge task that no worker had yet claimed, and 4{,}953.1 (86.9\%) with a rank
+blocked waiting for a peer. Across all primitive collectives, 4{,}245.5 of the 5{,}861.7
+rank-seconds --- 72.4\% --- elapsed during moments when \emph{no rank anywhere in the world was
+executing anything}, and 4{,}160.9 of those fall inside the two long dead windows. So the
+coordination share is high and the semantic fold is only 3.8\% of it.
+
+That both strengthens and sharpens the wall-time argument. It strengthens it because the same
+conclusion now follows from a bounded, additive measure rather than from a wall-clock subtraction:
+coordination dominates the rank-seconds, but coordination here overwhelmingly means \emph{blocked
+on an absent worker}, not \emph{running a language model}. It sharpens it because the companion
+\texttt{coordination\_span\_share} of 88.1\% locates the two dead windows precisely. Coordination
+was in flight somewhere for 1{,}016.1\,s of the 1{,}152.9\,s wall, and the 757.3\,s during which
+nothing ran is almost entirely a subset of that: the run's idleness is not idleness \emph{between}
+collectives, it is idleness \emph{inside} the glossary allreduce, with up to eight ranks parked in
+a collective that could not advance because its root had a queued task and no process to run it.
+
+The comparison against the exact run confirms the attribution, since both figures are now
+proportions on the same scale. Recomputing the same quantity from
+\texttt{real-tr-p8-full}'s trace with today's \texttt{agentmpi.analysis} gives a coordination
+share of 16.4\% on 219.2 rank-seconds, of which its glossary reduce and broadcast are only 52.2
+--- against 5{,}699.4 here, a factor of 109 --- while its \texttt{pre-gather} barrier accounts for
+163.1, three quarters of its total. \texttt{real-tr-p8-rdallreduce} sits at 16.1\% and
+\texttt{real-tr-p8-noglossary}, which has no glossary collective at all, at 10.1\%. Substituting
+a semantic operator therefore did move the coordination share by a factor of four, and the honest
+statement of why is that it converted a free fold into seven scheduled tasks on a scheduler that
+could not keep up, of which the model work itself was two hundred rank-seconds.
 
 The two \finding{ok} findings are both correct and both worth keeping. Fifty-six reattachments,
 five to eight per rank and reaching incarnation 9 on ranks 0, 1, 4 and 6, is nearly double the 31

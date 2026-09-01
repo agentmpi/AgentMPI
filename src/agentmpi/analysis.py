@@ -469,8 +469,25 @@ class Analysis:
         return total + (cur_end - cur_start)
 
     @property
+    def coordination_is_underreported(self) -> bool:
+        """Does the blocking figure omit ranks that never finished a collective?
+
+        A rank records a ``coll.*`` event on *completion*, so a rank that blocks and then dies or
+        times out contributes nothing to the coordination measures. On the p=16 translation run
+        that understates coordination catastrophically: sixteen ranks each blocked 1800\u2009s inside
+        the glossary reduce, and ``coordination_share`` reads 0.0% because none of them ever got to
+        record it. The measures are still correct as defined --- time spent inside *completed*
+        collectives --- but on a degraded run that definition is not the quantity a reader wants,
+        and silence about the difference would be misleading.
+        """
+        return bool(self.incomplete_collectives) or self.ok is False
+
+    @property
     def coordination_share(self) -> float:
-        """Fraction of the run's rank-seconds spent blocked in collectives, in [0, 1].
+        """Fraction of the run's rank-seconds spent blocked in *completed* collectives, in [0, 1].
+
+        Read with ``coordination_is_underreported``: on a run where ranks died inside a collective
+        this omits their blocking entirely, because a collective is recorded on completion.
 
         Defined against rank-seconds available --- ``world_size`` times wall time --- rather than
         against wall time alone. The earlier definition summed each invocation's *maximum* per-rank
@@ -566,6 +583,7 @@ class Analysis:
             "collective_span_s": round(self.collective_span_s, 3),
             "coordination_share": round(self.coordination_share, 4),
             "coordination_span_share": round(self.coordination_span_share, 4),
+            "coordination_is_underreported": self.coordination_is_underreported,
             "n_primitive_collectives": len(self.primitive_collectives),
             "n_collectives": len(self.collectives),
             "model_checks_agree": agree,

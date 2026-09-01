@@ -144,6 +144,14 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
             f"Parallel efficiency is {num(conc.parallel_efficiency * 100, 1)}\\%: "
             f"{num(conc.idle_fraction * 100, 1)}\\% of the rank-seconds paid for went unused.",
         ))
+    if a.coordination_is_underreported:
+        out.append((
+            "warning",
+            "The coordination figures count time inside \\emph{completed} collectives only, and this "
+            "run has ranks that never completed one. A rank records a collective on completion, so "
+            "a rank that blocked and then timed out contributes nothing --- the reported share is a "
+            "floor, and on a badly degraded run a very loose one.",
+        ))
     if a.coordination_share > 0.5:
         out.append((
             "note",
