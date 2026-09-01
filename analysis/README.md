@@ -5,6 +5,11 @@ and in some ways more demanding exercise: a paper selects the evidence that supp
 while a per-run analysis has to account for every run including the ones that failed, the ones
 that measured nothing interesting, and the ones that contradict something stated elsewhere.
 
+Coverage is complete. All 50 runs outside the collective sweeps have an individual analysis, and
+the 450 sweep runs are covered by 23 family analyses — one per `(op, algorithm)` — because a single
+sweep run measures one algorithm at one process count and says almost nothing on its own, while the
+family says what the sweep was built to establish.
+
 Two kinds of document, because the 500 runs are not 500 comparable things.
 
 ## Per-run analyses — `runs/<name>/`
