@@ -192,6 +192,58 @@ def test_calibration_declares_whether_it_fitted_or_fell_back(analyses: list[an.A
         assert a.calibration.beta_s_per_token > 0, a.name
 
 
+def test_wall_time_ends_at_job_finish(analyses: list[an.Analysis]) -> None:
+    """Trailing pool re-registrations are not part of a run's duration.
+
+    Workers attached to a shared pool keep registering against a fabric after its job is over. On
+    the binomial fidelity run those trailing rows were 82.8% of the apparent duration, and since
+    every rate divides by wall time the inflation inverted a comparison: achieved parallelism ranked
+    the flat reduction best when it was the only cell with no concurrency at all.
+    """
+    for a in analyses:
+        finish = [e for e in a.events if e["kind"] == "job.finish"]
+        if not finish:
+            continue
+        assert a.wall_s == pytest.approx(finish[-1]["ts"] - a.t0, abs=1e-6), a.name
+        after = sum(1 for e in a.events if e["ts"] > finish[-1]["ts"])
+        assert a.trailing_events == after, a.name
+
+
+def test_imbalance_counts_ranks_that_did_nothing(analyses: list[an.Analysis]) -> None:
+    """A rank that idles is exactly what an imbalance metric must count.
+
+    Filtering to ``busy_s > 0`` made a flat reduction where one rank did everything and seven did
+    nothing report 1.00 --- read as perfect balance, when it is the most imbalanced arrangement
+    available. Over all eight ranks it is 8.00.
+    """
+    for a in analyses:
+        ranks = a.participating_ranks
+        if len(ranks) < 2 or all(a.ranks[r].busy_s == 0 for r in ranks):
+            continue
+        idle = [r for r in ranks if a.ranks[r].busy_s == 0]
+        if idle:
+            assert a.imbalance > 1.0, (
+                f"{a.name}: {len(idle)} of {len(ranks)} ranks idle yet imbalance is {a.imbalance}"
+            )
+        assert a.imbalance <= len(ranks) + 1e-9, a.name
+
+
+def test_latency_percentiles_are_ordered(analyses: list[an.Analysis]) -> None:
+    """p50 <= p95 <= max, at every sample size.
+
+    Index arithmetic of ``lat[int(0.95 * (n - 1))]`` for p95 and ``lat[n // 2]`` for p50 returns,
+    at n=2, the minimum for p95 and the maximum for p50 --- so every two-call run reported a p95
+    below its p50, on the dashboard as well as in the metrics.
+    """
+    for a in analyses:
+        d = a.summary.as_dict()
+        p50, p95, mx = d["agent_latency_p50"], d["agent_latency_p95"], d["agent_latency_max"]
+        assert p50 <= p95 + 1e-9, f"{a.name}: p50 {p50} > p95 {p95}"
+        assert p95 <= mx + 1e-9, f"{a.name}: p95 {p95} > max {mx}"
+        cal = a.calibration
+        assert cal.alpha_p50 <= cal.alpha_p99 + 1e-9, f"{a.name}: alpha p50 > p99"
+
+
 def test_participants_never_exceed_communicator_size(analyses: list[an.Analysis]) -> None:
     for a in analyses:
         for c in a.collectives:

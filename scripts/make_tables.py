@@ -365,6 +365,28 @@ def table_translation() -> None:
 # ---------------------------------------------------------------- transport table
 
 
+def _log_rendezvous_tokens(n_tokens: int) -> int | None:
+    """Send-side rendezvous tokens for one transport cell, from the committed event log.
+
+    The log is authoritative: it records each send with its transport mode, so the quantity the
+    transport experiment reports can be derived without trusting a counter that has since been
+    corrected. Returns ``None`` when the trace is absent, so the table falls back rather than
+    silently printing a zero.
+    """
+    path = REPO / "traces" / "events" / f"mb-free__transport-rendezvous-{n_tokens}.jsonl"
+    if not path.exists():
+        return None
+    total = 0
+    with path.open(encoding="utf-8") as fh:
+        for line in fh:
+            if not line.strip():
+                continue
+            e = json.loads(line)
+            if e.get("kind") == "msg.send" and (e.get("payload") or {}).get("mode") == "rendezvous":
+                total += int(e["payload"].get("tokens") or 0)
+    return total
+
+
 def table_transport() -> None:
     d = load(RESULTS / "microbench" / "free-transport.json") or load(RESULTS / "microbench" / "free-all.json")
     b = (d or {}).get("benches", {}).get("transport")
@@ -378,10 +400,19 @@ def table_transport() -> None:
     for n in sorted(by_n):
         e = by_n[n].get("eager", {})
         rz = by_n[n].get("rendezvous", {})
+        # Deferred tokens are recomputed from the event log rather than read from the results
+        # file. The recorded figure predates the fix that separated send-side rendezvous deferral
+        # from receive-side non-admission, and this benchmark receives without admitting, so every
+        # rendezvous row in the results is exactly twice the true value. The eager rows were
+        # unaffected and correctly read zero, which is how an earlier check concluded --- wrongly ---
+        # that the table as a whole was safe.
+        deferred = _log_rendezvous_tokens(n)
+        if deferred is None:
+            deferred = rz.get("tokens_deferred")
         lines.append(
             rf"{n:,} & {fmt(e.get('completed'))} & {tex_escape(', '.join(e.get('error_classes') or []) or '--')} & "
             rf"{fmt(e.get('max_context_used'))} & {fmt(rz.get('completed'))} & {fmt(rz.get('max_context_used'))} & "
-            rf"{fmt(rz.get('tokens_deferred'))} \\"
+            rf"{fmt(deferred)} \\"
         )
     limit = b["rows"][0].get("unexpected_limit")
     body = (

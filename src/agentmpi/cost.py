@@ -134,6 +134,26 @@ class CostParams:
         }
 
 
+def _percentile(sorted_values: list[float], q: float) -> float:
+    """Linearly interpolated percentile of an already-sorted list.
+
+    Written out because the index arithmetic it replaces was wrong for small samples. Taking
+    ``lat[int(q * (n - 1))]`` for p95 and ``lat[n // 2]`` for p50 gives, at ``n = 2``, the minimum
+    for p95 and the maximum for p50 --- so the dashboard reported a p95 *below* its p50 for every
+    two-call run, and ``alpha_p99`` had the same defect. Interpolation also stops a small sample
+    reporting a percentile that is simply one of its own extremes.
+    """
+    if not sorted_values:
+        return 0.0
+    if len(sorted_values) == 1:
+        return float(sorted_values[0])
+    pos = q * (len(sorted_values) - 1)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_values) - 1)
+    frac = pos - lo
+    return float(sorted_values[lo] * (1 - frac) + sorted_values[hi] * frac)
+
+
 def calibrate(
     source: "Fabric | list[dict[str, Any]]",
     *,
@@ -196,8 +216,9 @@ def calibrate(
         params.alpha_s = statistics.median(ys)
         params.fit_method = "median_only"
     if ys:
-        params.alpha_p50 = statistics.median(ys)
-        params.alpha_p99 = sorted(ys)[max(0, int(0.99 * (len(ys) - 1)))]
+        ordered = sorted(ys)
+        params.alpha_p50 = _percentile(ordered, 0.50)
+        params.alpha_p99 = _percentile(ordered, 0.99)
     return params
 
 
@@ -530,6 +551,9 @@ class RunSummary:
     def as_dict(self) -> dict[str, Any]:
         lat = sorted(self.latencies)
         return {
+            "agent_latency_p50": round(_percentile(lat, 0.50), 2),
+            "agent_latency_p95": round(_percentile(lat, 0.95), 2),
+            "agent_latency_max": round(lat[-1], 2) if lat else 0.0,
             "wall_s": round(self.wall_s, 2),
             "agent_calls": self.n_agent_calls,
             "tokens_in": self.tokens_in,
@@ -539,9 +563,6 @@ class RunSummary:
             "tokens_sent": self.tokens_sent,
             "tokens_deferred": self.tokens_deferred,
             "tokens_unadmitted": self.tokens_unadmitted,
-            "agent_latency_p50": round(lat[len(lat) // 2], 2) if lat else 0.0,
-            "agent_latency_p95": round(lat[int(0.95 * (len(lat) - 1))], 2) if lat else 0.0,
-            "agent_latency_max": round(lat[-1], 2) if lat else 0.0,
             "context_high_water": self.context_high_water,
             "context_rejections": self.n_context_rejections,
             "contract_violations": self.n_contract_violations,

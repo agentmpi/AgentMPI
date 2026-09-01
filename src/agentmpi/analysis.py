@@ -377,6 +377,10 @@ class Analysis:
     #: timeline figure needs every instant, not just the aggregates --- do not have to re-read and
     #: re-parse the file, and cannot accidentally pair one run's events with another's metrics.
     events: list[Event]
+    #: Events recorded after ``job.finish``, excluded from ``wall_s``. Almost always pool workers
+    #: re-registering against a finished fabric; reported so their exclusion is visible rather than
+    #: silent.
+    trailing_events: int
     ranks: dict[int, RankProfile]
     collectives: list[CollectiveInvocation]
     #: ``(src, dst) -> (n_messages, tokens)`` over world ranks.
@@ -507,10 +511,17 @@ class Analysis:
 
     @property
     def imbalance(self) -> float:
-        """Slowest rank's busy time over the mean. 1.0 is perfect; 2.0 means half the pool idles."""
-        busy = [r.busy_s for r in self.ranks.values() if r.busy_s > 0]
-        if not busy:
+        """Slowest rank's busy time over the mean, over *all* participating ranks.
+
+        Ranks that did no work are included, which is the whole point. Filtering to ``busy_s > 0``
+        made a flat reduction where one rank did everything and seven did nothing report an
+        imbalance of 1.00 --- read as perfect balance, when it is the most imbalanced arrangement
+        possible. A rank that idles is exactly what an imbalance metric must count.
+        """
+        ranks = self.participating_ranks
+        if not ranks:
             return 0.0
+        busy = [self.ranks[r].busy_s for r in ranks]
         mean = sum(busy) / len(busy)
         return max(busy) / mean if mean > 0 else 0.0
 
@@ -576,6 +587,7 @@ class Analysis:
             "n_ranks_seen": self.n_ranks_seen,
             "stray_ranks": self.stray_ranks,
             "n_events": self.n_events,
+            "trailing_events": self.trailing_events,
             "wall_s": round(self.wall_s, 3),
             "ok": self.ok,
             "imbalance": round(self.imbalance, 3),
@@ -853,7 +865,16 @@ def analyse(events: list[Event], name: str = "", experiment: str = "", label: st
         raise ValueError("cannot analyse an empty event log")
 
     t0 = events[0]["ts"]
-    wall_s = events[-1]["ts"] - t0
+    # Wall time ends at `job.finish` when the job recorded one, not at the last event in the log.
+    # Worker processes attached to a shared pool keep re-registering against a fabric after its job
+    # is over, and those trailing `rank.init` rows are not part of the run: on the binomial fidelity
+    # run they were 82.8% of the apparent duration. Because every derived rate divides by this, the
+    # inflation inverted a published comparison --- achieved parallelism ranked the flat reduction
+    # best when it was the only cell with no concurrency at all.
+    finish = next((e["ts"] for e in reversed(events) if e["kind"] == "job.finish"), None)
+    t_end = finish if finish is not None else events[-1]["ts"]
+    wall_s = max(0.0, t_end - t0)
+    trailing = sum(1 for e in events if e["ts"] > t_end)
 
     ranks: dict[int, RankProfile] = {}
     comm: dict[tuple[int, int], list[int]] = defaultdict(lambda: [0, 0])
@@ -986,6 +1007,7 @@ def analyse(events: list[Event], name: str = "", experiment: str = "", label: st
         wall_s=wall_s,
         ok=ok,
         events=events,
+        trailing_events=trailing,
         ranks=ranks,
         collectives=_group_collectives(events, t0),
         comm={k: (v[0], v[1]) for k, v in comm.items()},
