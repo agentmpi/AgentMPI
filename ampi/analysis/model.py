@@ -603,8 +603,15 @@ class Analysis:
 
         It is worth measuring separately from either failure or slowness, because
         it is the only one of the three that says the population was *capable* of
-        finishing and the configuration prevented it.  On the p=16 production run
-        this is five of six completed translations.
+        finishing and the configuration prevented it.
+
+        Read it as a *lower bound*.  The broker accepts a submission whether or not
+        anybody is still waiting for it, so results keep arriving after the harness
+        has exited and this count grows every time the log is re-read --- on the
+        p=16 production run it went five, six, seven over the hours after the run
+        was declared failed.  There is no instant at which a final figure can
+        honestly be taken, which is why a trace should be sealed at a stated time
+        and the count reported against that seal.
         """
         failed_at: dict[int, float] = {}
         for e in self.events:
