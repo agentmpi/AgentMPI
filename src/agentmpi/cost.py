@@ -392,7 +392,19 @@ FORMULAS: dict[tuple[str, str], Any] = {
         _log2c(p),
     ),
     ("alltoall", "pairwise"): lambda p, n: (p - 1, p * (p - 1), p * (p - 1) * n, 0),
-    ("alltoall", "linear"): lambda p, n: (1, p * (p - 1), p * (p - 1) * n, 0),
+    # `linear` posts all its sends without waiting, which is not the same as completing them in one
+    # round: each rank still transfers p-1 messages, so its critical path is p-1, exactly as for
+    # `pairwise`. Recording 1 made the model rank `linear` fastest at every size and so recommend
+    # it --- the schedule this module's own docstring calls the canonical way to deadlock an AgentMPI
+    # program, and the one the sweep measured at 250.6 aggregate receive-blocking rank-seconds at
+    # p=32 against 30.6 for `pairwise` and 4.6 for `bruck`.
+    #
+    # The two are now indistinguishable to this model, which is the honest outcome: they move the
+    # same messages over the same critical path and differ in *concurrency pressure*, which an
+    # alpha-beta-gamma model does not represent. `linear` requires a rank to hold p-1 unexpected
+    # messages at once where `pairwise` requires one, and the sweep only survived it because it ran
+    # with a 10^9-token eager limit. Choose between them on that basis, not on predicted time.
+    ("alltoall", "linear"): lambda p, n: (p - 1, p * (p - 1), p * (p - 1) * n, 0),
     ("alltoall", "bruck"): lambda p, n: (_log2c(p), p * _log2c(p), p * _log2c(p) * n * p / 2, 0),
     ("reduce_scatter", "linear"): lambda p, n: (1, p * (p - 1), p * (p - 1) * n, p - 1),
 }
