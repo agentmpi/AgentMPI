@@ -214,6 +214,27 @@ def e1_macros() -> None:
 # --------------------------------------------------------------------------
 
 
+def provenance_macros() -> None:
+    d = load(RESULTS / "e1_provenance.json")
+    if not d:
+        for k in ("provTasks", "provExecutors", "provDrift", "provDriftPct",
+                  "provRefused", "provSmallDrift"):
+            put(k, None)
+        return
+    by = {a["run"]: a for a in d["audits"]}
+    big = by.get("e1-real-p100")
+    if big:
+        put("provTasks", big["tasks"])
+        put("provExecutors", big["distinct_provenance_labels"])
+        put("provRanks", big["ranks_with_a_task"])
+        put("provDrift", big["provenance_label_drift"]["count"])
+        put("provDriftPct", round(100 * big["provenance_label_drift"]["fraction"], 1), fmt=".1f")
+        put("provRefused", big["protocol_identity_violations"]["rejected_at_submit"])
+    small = by.get("e1-real-p8")
+    if small:
+        put("provSmallDrift", small["provenance_label_drift"]["count"])
+
+
 def e2_macros() -> None:
     d = load(RESULTS / "e2_faults.json")
     if not d:
@@ -258,6 +279,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
+    provenance_macros()
     suite_macros()
 
     lines = [
