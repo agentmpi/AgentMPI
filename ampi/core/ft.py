@@ -45,6 +45,12 @@ from ..constants import (
     STATE_REQUESTED,
 )
 from ..errors import err
+from .payload import summarise
+
+#: A memo note is a phase name or a short progress line, not a payload.  Bounding
+#: it keeps the trace readable and keeps a harness from using the event log as a
+#: side channel for data that belongs in a window.
+MEMO_NOTE_CHARS = 120
 
 __all__ = ["FaultMixin"]
 
@@ -334,7 +340,13 @@ class FaultMixin:
             cell = self.device.read(space, full)
             return {"key": key, "value": cell.value if cell else None}
         self.device.cas(space, full, None, value, writer=self.rank)
-        self.trace("memo", rank=self.rank, key=key)
+        # The memo's *value* goes into the trace, bounded, not just its key.  A
+        # memo is the one event a harness author writes deliberately, so it is the
+        # only place the trace learns what the harness thought it was doing; the
+        # phase segmentation in ``ampi.analysis`` is built from it.  Recording only
+        # the key made every phase of every run indistinguishable from every other.
+        note = value if isinstance(value, str) else summarise(value)
+        self.trace("memo", rank=self.rank, key=key, note=note[:MEMO_NOTE_CHARS])
         return {"key": key, "written": True}
 
     # -- supervision -----------------------------------------------------------

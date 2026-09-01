@@ -1,0 +1,235 @@
+"""The analysis package is a claim about what the trace contains.
+
+These tests are less about the arithmetic than about the contract between the
+runtime and the tooling.  Two of them --- ``test_bcast_is_traced`` and
+``test_every_collective_records_blocking`` --- exist because the runtime once
+failed them: a broadcast emitted no event at all, so it was invisible to any
+analysis, and no collective recorded how long its caller had been blocked, so
+coordination cost could not be separated from work.  Both defects were found by
+writing the analysis and are the reason it lives in the package rather than in a
+script.
+"""
+
+from __future__ import annotations
+
+import json
+
+import pytest
+
+from ampi.analysis import analyse, load_events
+from ampi.analysis import style as st
+from ampi.analysis.figures import render_all
+from ampi.analysis.report import findings, latex, markdown, summary, write_all
+from ampi.harness import Harness
+
+
+def _run(tmp_path, size=6, device="sqlite"):
+    h = Harness(root=str(tmp_path / "job"), size=size, device=device, force=True)
+    h.create()
+
+    def rank_main(amp, rank):
+        amp.barrier("start", timeout=30)
+        amp.memo("phase", "propose")
+        mine = amp.scatter(
+            "assign",
+            payload=[{"rank": i, "unit": i} for i in range(size)] if rank == 0 else None,
+            root=0,
+            timeout=30,
+        )["body"]
+        out = amp.allreduce(
+            "glossary",
+            payload={"shared": f"v{rank % 2}", f"own{rank}": rank},
+            op="union",
+            timeout=30,
+        )
+        amp.memo("phase", "assemble")
+        if rank == 0:
+            amp.bcast("agreed", payload={"ok": True}, root=0, timeout=30)
+        else:
+            amp.bcast("agreed", root=0, timeout=30, materialize=True)
+        amp.gather("final", payload={"rank": rank}, root=0, timeout=30)
+        return {"unit": mine["unit"], "conflicts": len(out.get("conflicts") or [])}
+
+    results = h.run(rank_main, timeout=120)
+    job = h.attach(0)
+    events = job.events()
+    job.close()
+    return h, results, events
+
+
+def test_analysis_reads_a_real_run(tmp_path):
+    _h, results, events = _run(tmp_path)
+    assert all(r.ok for r in results)
+
+    a = analyse(events, name="unit")
+    assert a.world_size == 6
+    assert a.n_ranks_seen == 6
+    assert a.wall_s > 0
+    assert not a.inert_ranks
+    assert not a.degraded
+
+
+def test_bcast_is_traced(tmp_path):
+    """A collective that emits no event is indistinguishable from one that never ran."""
+    _h, _r, events = _run(tmp_path)
+    kinds = {e["kind"] for e in events}
+    for expected in ("barrier", "bcast", "scatter", "gather", "allreduce"):
+        assert expected in kinds, f"{expected} left no trace"
+
+
+def test_every_collective_records_blocking(tmp_path):
+    """Coordination cost is the measurement; it cannot come from a timestamp alone."""
+    _h, _r, events = _run(tmp_path)
+    for e in events:
+        if st.is_collective(e["kind"]):
+            assert "waited_s" in e, f"{e['kind']} did not record how long it blocked"
+            assert e.get("size"), f"{e['kind']} did not record its communicator size"
+
+
+def test_collectives_are_grouped_into_invocations(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    labels = {(c.op, c.label) for c in a.collectives}
+    assert ("allreduce", "glossary") in labels
+    assert ("bcast", "agreed") in labels
+    for c in a.collectives:
+        assert len(set(c.participants)) == len(c.participants), "a rank appeared twice"
+        assert c.complete, f"{c.op}:{c.label} saw {c.n_participants} of {c.size}"
+
+
+def test_straggler_is_attributed(tmp_path):
+    """A skew figure says a barrier cost four minutes; it does not say who owed them."""
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    named = [c for c in a.collectives if c.straggler is not None]
+    assert named, "no collective attributed its last arrival"
+    for c in named:
+        assert c.straggler in c.participants
+        assert c.arrival_skew_s >= 0
+
+
+def test_coordination_share_is_a_proportion(tmp_path):
+    """A quantity that can exceed one cannot be read as a share of anything."""
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    assert 0.0 <= a.coordination_share <= 1.0
+    assert 0.0 <= a.coordination_span_share <= 1.0
+    assert a.collective_span_s <= a.collective_rank_seconds + 1e-6
+
+
+def test_conflicts_are_counted(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    # Every rank proposes `shared` with one of two values, so the union operator
+    # must lift at least one disagreement rather than let a branch decide it.
+    assert a.conflicts_lifted >= 1
+
+
+def test_phases_come_from_the_harness_memos(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    names = [p.name for p in a.phases]
+    assert "propose" in names and "assemble" in names
+    assert all(p.duration_s >= 0 for p in a.phases)
+
+
+def test_cost_model_is_attached(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    costed = a.costed_collectives
+    assert costed, "no collective was costed against a closed form"
+    for c in costed:
+        assert c.predicted_rounds is not None and c.predicted_rounds >= 0
+        assert c.predicted_messages is not None
+
+
+def test_report_renderings(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+
+    text = summary(a)
+    assert "world size" in text and "findings" in text
+
+    md = markdown(a)
+    assert md.startswith("# Run `unit`")
+    assert "## Collectives" in md and "## Ranks" in md
+
+    tex = latex(a, prefix="Unit")
+    assert "\\newcommand{\\UnitSize}{6}" in tex
+    assert "_" not in tex.split("% generated")[1].split("\n")[1]
+
+    flags = findings(a)
+    assert flags and all({"level", "text"} <= set(f) for f in flags)
+
+
+def test_figures_render(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    made = render_all(a, tmp_path / "figs", fmt="png")
+    assert "timeline" in made
+    for path in made.values():
+        assert path.exists() and path.stat().st_size > 1000
+
+
+def test_write_all_is_self_contained(tmp_path):
+    _h, _r, events = _run(tmp_path)
+    a = analyse(events, name="unit")
+    written = write_all(a, tmp_path / "out", tex_prefix="Unit", fmt="png")
+    assert (tmp_path / "out" / "metrics.json").exists()
+    assert (tmp_path / "out" / "report.md").exists()
+    assert (tmp_path / "out" / "generated.tex").exists()
+    metrics = json.loads((tmp_path / "out" / "metrics.json").read_text())
+    assert metrics["world_size"] == 6
+    # Every figure the report links must exist beside it, or the committed report
+    # is a document with broken images the moment it leaves this machine.
+    body = (tmp_path / "out" / "report.md").read_text()
+    for name in ("timeline", "waterfall"):
+        if f"figures/{name}.png" in body:
+            assert (tmp_path / "out" / "figures" / f"{name}.png").exists()
+    assert written["report"].exists()
+
+
+def test_load_events_tolerates_a_truncated_line(tmp_path):
+    """A long run is read while it is still writing; refusing is not an option."""
+    path = tmp_path / "t.trace.jsonl"
+    path.write_text(
+        json.dumps({"kind": "job.create", "ts": 1.0, "rank": -1, "size": 2, "seq": 1})
+        + "\n"
+        + json.dumps({"kind": "init", "ts": 2.0, "rank": 0, "seq": 2})
+        + '\n{"kind": "init", "ts": 3.0, "ra',
+        encoding="utf-8",
+    )
+    events = load_events(path)
+    assert len(events) == 2
+    assert analyse(events, name="partial").world_size == 2
+
+
+def test_empty_log_is_refused():
+    with pytest.raises(ValueError):
+        analyse([], name="empty")
+
+
+def test_style_covers_every_kind_the_runtime_emits(tmp_path):
+    """An unstyled kind still renders, but a *collective* must never be unstyled.
+
+    The collective set drives grouping, not just colour: a collective kind missing
+    from it is silently excluded from every coordination measure in the report.
+    """
+    _h, _r, events = _run(tmp_path)
+    for e in events:
+        kind = e["kind"]
+        assert st.style_for(kind) is not None
+        if kind in ("barrier", "bcast", "scatter", "gather", "allgather", "reduce",
+                    "allreduce", "scan", "exscan", "alltoall"):
+            assert st.is_collective(kind)
+
+
+def test_analysis_is_device_independent(tmp_path):
+    """The same program on two transports must yield the same structural analysis."""
+    _h, _r, sqlite_events = _run(tmp_path / "a", device="sqlite")
+    _h2, _r2, journal_events = _run(tmp_path / "b", device="journal")
+    a = analyse(sqlite_events, name="sqlite")
+    b = analyse(journal_events, name="journal")
+    assert a.world_size == b.world_size
+    assert {(c.op, c.label) for c in a.collectives} == {(c.op, c.label) for c in b.collectives}
+    assert a.conflicts_lifted == b.conflicts_lifted

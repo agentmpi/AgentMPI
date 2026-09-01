@@ -474,6 +474,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=200)
     p.add_argument("--export", default="")
 
+    p = sub.add_parser("analyze", help="measure and visualise a run from its trace")
+    _common(p)
+    p.add_argument("--trace", default="", help="a .trace.jsonl file; omit to read the live job")
+    p.add_argument("--name", default="", help="run name used in the report")
+    p.add_argument("--out", default="", help="directory for metrics, figures and report")
+    p.add_argument("--tex-prefix", default="", help="emit LaTeX macros with this prefix")
+    p.add_argument("--format", default="pdf", choices=["pdf", "png", "svg"])
+    p.add_argument("--json", action="store_true", help="print metrics instead of the digest")
+
     return ap
 
 
@@ -598,6 +607,27 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return ({**d.to_dict(),
                  "gamma_sweep": explain_selection(a.collective, a.size, tokens=a.tokens, op=op)},
                 None, "")
+
+    if cmd == "analyze":
+        from .analysis import analyse, load_events, summary
+        from .analysis.report import write_all
+
+        if a.trace:
+            events = load_events(a.trace)
+            name = a.name or Path(a.trace).name.replace(".trace.jsonl", "")
+        else:
+            amp = _open(a)
+            events = amp.events()
+            name = a.name or amp.manifest.job_id
+        an = analyse(events, name=name)
+        out: dict[str, Any] = {"run": name, "metrics": an.to_dict()} if a.json else {}
+        if a.out:
+            written = write_all(an, a.out, tex_prefix=a.tex_prefix, fmt=a.format)
+            out["written"] = {k: str(v) for k, v in written.items()}
+        if not a.json:
+            print(summary(an))
+            return ({"run": name, **({"written": out["written"]} if a.out else {})}, None, "")
+        return (out, None, "")
 
     # Everything else needs a job -----------------------------------------
     amp = _open(a)

@@ -123,6 +123,49 @@ class CollectiveMixin:
         self.trace("coll.join", rank=self.rank, label=label, kind=kind, comm=comm, tokens=tokens)
         return rec
 
+    def _coll_done(
+        self,
+        kind: str,
+        rec: dict[str, Any] | None,
+        *,
+        comm: str,
+        label: str,
+        **fields: Any,
+    ) -> None:
+        """Record a collective's completion with the fields an analysis needs.
+
+        Every collective traced its own ad-hoc subset before this existed, and the
+        omissions were not distributed randomly: ``bcast`` recorded nothing at all,
+        and no collective recorded how long its caller had been blocked.  Both
+        gaps are invisible in the trace --- a collective that emits no event is
+        indistinguishable from one that never ran --- and both defeat the analysis
+        that a long agent run exists to produce.  Coordination cost *is* the
+        measurement, and it cannot be reconstructed from a completion timestamp
+        alone: what a reader needs is the interval between a rank arriving and the
+        collective releasing it, which only the runtime knows.
+
+        ``waited_s`` is per rank and additive across ranks; the spread between the
+        first and last rank to record a call is the synchronisation skew, and is
+        recovered by the analysis from the timestamps rather than recorded here,
+        because no single rank can observe it.
+        """
+        waited = None
+        if rec is not None and rec.get("joined_at") is not None:
+            waited = round(max(0.0, self.device.clock() - float(rec["joined_at"])), 4)
+        try:
+            size = len(self.comm_members(comm))
+        except AmpiError:  # pragma: no cover - a revoked communicator mid-teardown
+            size = None
+        self.trace(
+            kind,
+            rank=self.rank,
+            label=label,
+            comm=comm,
+            size=size,
+            waited_s=waited,
+            **fields,
+        )
+
     def _participants(self, comm: str, label: str) -> list[dict[str, Any]]:
         return self.device.scan(
             "coll",
@@ -220,7 +263,7 @@ class CollectiveMixin:
         """
         self.assert_identity()
         self._fence_check()
-        self._join_collective(comm, label, "barrier")
+        joined = self._join_collective(comm, label, "barrier")
         try:
             arrived, dropped = self._await_participation(
                 comm, label, kind="barrier", quorum=quorum, timeout=timeout
@@ -246,7 +289,10 @@ class CollectiveMixin:
                 return {"label": label, "released": True, "absent": missing,
                         "policy": policy, "comm": new["name"]}
             raise
-        self.trace("barrier", rank=self.rank, label=label, arrived=len(arrived), dropped=dropped)
+        self._coll_done(
+            "barrier", joined, comm=comm, label=label,
+            arrived=len(arrived), dropped=dropped, quorum=quorum, policy=policy,
+        )
         return {
             "label": label,
             "released": True,
@@ -283,9 +329,9 @@ class CollectiveMixin:
         if me == root:
             if payload is None:
                 raise err("AMPI_ERR_ARG", "the root of a broadcast must supply a payload")
-            self._join_collective(comm, label, "bcast", payload=payload, root=root)
+            joined = self._join_collective(comm, label, "bcast", payload=payload, root=root)
         else:
-            self._join_collective(comm, label, "bcast", root=root)
+            joined = self._join_collective(comm, label, "bcast", root=root)
         world_root = self.comm_members(comm)[root]
         self._await(
             lambda: any(
@@ -296,8 +342,14 @@ class CollectiveMixin:
             what=f"the root of broadcast {label!r} to publish",
         )
         rec = next(p for p in self._participants(comm, label) if p["rank"] == world_root)
-        return self._take(rec, materialize=materialize or me == root, view=view, out=out,
-                          extra={"label": label, "root": root})
+        out_rec = self._take(rec, materialize=materialize or me == root, view=view, out=out,
+                             extra={"label": label, "root": root})
+        self._coll_done(
+            "bcast", joined, comm=comm, label=label, root=root,
+            tokens=rec.get("tokens", 0), charged=out_rec.get("charged", 0),
+            materialized=bool(out_rec.get("body") is not None),
+        )
+        return out_rec
 
     def scatter(
         self,
@@ -330,9 +382,9 @@ class CollectiveMixin:
                     f"got {0 if payload is None else len(payload)}",
                     hint="Use scatterv semantics by padding with nulls if sizes differ.",
                 )
-            self._join_collective(comm, label, "scatter", payload=payload, root=root)
+            joined = self._join_collective(comm, label, "scatter", payload=payload, root=root)
         else:
-            self._join_collective(comm, label, "scatter", root=root)
+            joined = self._join_collective(comm, label, "scatter", root=root)
         world_root = members[root]
         self._await(
             lambda: any(
@@ -369,6 +421,7 @@ class CollectiveMixin:
                 slice_ if isinstance(slice_, str) else json.dumps(slice_, indent=2), encoding="utf-8"
             )
             out_rec.update(saved_to=out, charged=0)
+            self._coll_done("scatter", joined, comm=comm, label=label, root=root, tokens=tokens)
             return out_rec
         if materialize:
             charged, degraded = self.charge(tokens, what="scatter")
@@ -378,7 +431,10 @@ class CollectiveMixin:
             out_rec.update(body=slice_, charged=charged)
         else:
             out_rec.update(handle=self.put_payload(slice_).envelope.handle, tokens=tokens, charged=0)
-        self.trace("scatter", rank=self.rank, label=label, tokens=tokens)
+        self._coll_done(
+            "scatter", joined, comm=comm, label=label, root=root,
+            tokens=tokens, charged=out_rec.get("charged", 0),
+        )
         return out_rec
 
     def _take(
@@ -434,9 +490,17 @@ class CollectiveMixin:
         """
         self.assert_identity()
         kind = "allgather" if everyone else "gather"
-        self._join_collective(comm, label, kind, payload=payload, root=root)
+        joined = self._join_collective(comm, label, kind, payload=payload, root=root)
         me = self.comm_rank(comm)
         if not everyone and me != root:
+            # A non-root contributor to a gather is done the moment it has
+            # contributed.  It still records the event, because a rank that
+            # contributed and a rank that never arrived must not look the same in
+            # the trace --- that distinction is the whole of what a gather's
+            # ``absent`` list means.
+            self._coll_done(
+                kind, joined, comm=comm, label=label, root=root, contributed=True,
+            )
             return {"label": label, "contributed": True, "root": root}
         arrived, dropped = self._await_participation(
             comm, label, kind=kind, quorum=quorum, timeout=timeout
@@ -467,7 +531,11 @@ class CollectiveMixin:
         else:
             result["charged"] = self.charge(40 * len(manifest), what="manifest")[0]
             result["next"] = "ampi obj get HANDLE --view head:400  # per contribution"
-        self.trace(kind, rank=self.rank, label=label, contributors=len(manifest), dropped=dropped)
+        self._coll_done(
+            kind, joined, comm=comm, label=label, root=root,
+            contributors=len(manifest), dropped=dropped, quorum=quorum,
+            tokens=result["total_tokens"], charged=result.get("charged", 0),
+        )
         return result
 
     def allgather(self, label: str, **kw: Any) -> dict[str, Any]:
@@ -496,7 +564,7 @@ class CollectiveMixin:
         members = self.comm_members(comm)
         if len(payload) != len(members):
             raise err("AMPI_ERR_ARG", f"alltoall needs exactly {len(members)} items")
-        self._join_collective(comm, label, "alltoall", payload=payload)
+        joined = self._join_collective(comm, label, "alltoall", payload=payload)
         arrived, dropped = self._await_participation(
             comm, label, kind="alltoall", quorum=quorum, timeout=timeout
         )
@@ -506,7 +574,10 @@ class CollectiveMixin:
             block = self.get_body(p["handle"])
             received.append({"from": p["rank"], "item": block[me]})
         charged, _ = self.charge(count_tokens(canonical(received)), what="alltoall")
-        self.trace("alltoall", rank=self.rank, label=label, received=len(received))
+        self._coll_done(
+            "alltoall", joined, comm=comm, label=label,
+            received=len(received), dropped=dropped, charged=charged,
+        )
         return {"label": label, "received": received, "dropped": dropped, "charged": charged}
 
     # -- reductions -----------------------------------------------------------
@@ -537,12 +608,15 @@ class CollectiveMixin:
         self.assert_identity()
         operator = get_op(op)
         kind = "allreduce" if everyone else "reduce"
-        self._join_collective(comm, label, kind, payload=payload, root=root)
+        joined = self._join_collective(comm, label, kind, payload=payload, root=root)
         arrived, dropped = self._await_participation(
             comm, label, kind=kind, quorum=quorum, timeout=timeout
         )
         me = self.comm_rank(comm)
         if not everyone and me != root and operator.evaluator == "runtime":
+            self._coll_done(
+                kind, joined, comm=comm, label=label, root=root, op=op, contributed=True,
+            )
             return {"label": label, "contributed": True, "root": root}
 
         decision = select_algorithm(
@@ -598,9 +672,12 @@ class CollectiveMixin:
             charged, degraded = self.charge(count_tokens(canonical(value)), what="reduce")
             result["value"] = apply_view(value, degraded) if degraded else value
             result["charged"] = charged
-        self.trace(
-            kind, rank=self.rank, label=label, op=op, algorithm=decision.chosen,
-            depth=folded["depth"], contributors=len(values), conflicts=len(conflicts) or None,
+        self._coll_done(
+            kind, joined, comm=comm, label=label, root=root, op=op,
+            algorithm=decision.chosen, rule=decision.rule,
+            depth=folded["depth"], applications=folded["applications"],
+            contributors=len(values), dropped=dropped,
+            conflicts=len(conflicts) or None, charged=result.get("charged", 0),
         )
         if violations:
             raise err(
@@ -647,7 +724,7 @@ class CollectiveMixin:
                 hint="Use a chain of agent reductions, or a runtime operator.",
             )
         kind = "exscan" if exclusive else "scan"
-        self._join_collective(comm, label, kind, payload=payload)
+        joined = self._join_collective(comm, label, kind, payload=payload)
         arrived, dropped = self._await_participation(
             comm, label, kind=kind, quorum=quorum, timeout=timeout
         )
@@ -661,7 +738,10 @@ class CollectiveMixin:
         ]
         value = serial_fold(operator, prefix) if prefix else identity_like(operator, payload)
         charged, _ = self.charge(count_tokens(canonical(value)), what=kind)
-        self.trace(kind, rank=self.rank, label=label, op=op, prefix=len(prefix))
+        self._coll_done(
+            kind, joined, comm=comm, label=label, op=op,
+            prefix=len(prefix), dropped=dropped, charged=charged,
+        )
         return {
             "label": label,
             "op": op,
