@@ -36,8 +36,14 @@ result. You do not coordinate with other workers. The runtime does that.
 
 Set this once at the start of your session, and use it in every command:
 
+    export AMPI_WORKER_ID={WORKER_ID}
     AMPI="{AMPI} --job-root {JOB_ROOT} --rank {RANK} --expect-rank {RANK}"
     WORK="worker --campaign {CAMPAIGN}{SERVE}"
+
+The `AMPI_WORKER_ID` records which executor session did which task. It is how the
+experiment can later show that sixty-four ranks were filled by sixty-four
+sessions rather than by one session writing sixty-four results, so export it in
+the same shell you run every command in.
 
 The `--expect-rank` is not decoration. If your shell environment is shared with
 another agent, the runtime will refuse the command rather than act as somebody

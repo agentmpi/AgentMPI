@@ -42,10 +42,17 @@ def main() -> None:
                     help="if set below --size, ranks are oversubscribed across this many "
                          "executors, which is what an agent host with a concurrency cap forces")
     ap.add_argument("--ampi", default="/workspace/.venv/bin/ampi")
+    ap.add_argument(
+        "--job-root",
+        default="",
+        help="the live job directory, when it is not runs/<name>/job. E3 keeps its job "
+             "under an untracked working directory, because a running population's "
+             "write-ahead log cannot be committed and must not be near anything that is",
+    )
     a = ap.parse_args()
 
     run_dir = RUNS / a.name
-    job_root = run_dir / "job"
+    job_root = Path(a.job_root) if a.job_root else run_dir / "job"
     prompts = run_dir / "prompts"
     prompts.mkdir(parents=True, exist_ok=True)
     template = worker_template()
@@ -69,6 +76,7 @@ def main() -> None:
             .replace("{CAMPAIGN}", campaign)
             .replace("{JOB_ROOT}", str(job_root))
             .replace("{AMPI}", a.ampi)
+            .replace("{WORKER_ID}", f"{campaign}-x{executor}")
             .replace("{MAX_TASKS}", str(a.max_tasks * max(1, len(ranks))))
         )
         path = prompts / f"exec{executor}.md"
