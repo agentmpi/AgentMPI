@@ -388,3 +388,34 @@ def test_task_json_offers_a_size_check_when_a_budget_exists(tmp_path, capsys):
     assert main(["--root", str(root), "worker", "--rank", "0", "next", "--timeout", "2", "--poll", "0.1"]) == 0
     task2 = json.loads(capsys.readouterr().out)
     assert task2["check_size"] is None
+
+
+def test_worker_reattachment_preserves_the_configured_context_budget(tmp_path, capsys):
+    """A reattaching worker must not overwrite the budget the job configured.
+
+    ``register`` writes the runtime's limits into the ``ranks`` table, so a ``RankRuntime`` built
+    with defaults silently replaces whatever the job set. The CLI read the persisted row in
+    ``_comm`` but not in either ``worker`` path, so a rank configured with a 120,000-token budget
+    reported 128,000 from its second incarnation onward and the fabric ended up holding the default
+    for every rank that had reattached. Nothing failed loudly because those runs admitted nothing
+    into context, so the budget was never tested against.
+    """
+    root = tmp_path / "budget"
+    budget = 120_000
+    job = ampi.launch(lambda comm: comm.rank, size=2, root=root, context_budget=budget)
+    assert job.ok
+
+    fabric = ampi.Fabric(root)
+    for rank in (0, 1):
+        row = fabric.query_one("SELECT context_budget FROM ranks WHERE rank=?", (rank,))
+        assert int(row["context_budget"]) == budget, "launch must persist the configured budget"
+
+    # Reattach the way a worker does, through the CLI's own construction path.
+    assert main(["--root", str(root), "worker", "--rank", "1", "hello"]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "ready"
+
+    row = fabric.query_one("SELECT context_budget, incarnation FROM ranks WHERE rank=1")
+    assert int(row["incarnation"]) > 1, "the worker should have reattached"
+    assert int(row["context_budget"]) == budget, (
+        f"reattachment overwrote the configured budget with {row['context_budget']}"
+    )

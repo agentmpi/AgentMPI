@@ -64,12 +64,20 @@ def _fabric(args: argparse.Namespace, *, create: bool = False) -> Fabric:
     return Fabric(root, create=create)
 
 
-def _comm(args: argparse.Namespace) -> tuple[Fabric, Communicator]:
-    fabric = _fabric(args)
-    rank = args.rank if args.rank is not None else int(os.environ.get("AMPI_RANK", "-1"))
-    if rank < 0:
-        raise SystemExit("no rank: pass --rank or set $AMPI_RANK")
-    row = fabric.query_one("SELECT context_budget, eager_limit, unexpected_limit FROM ranks WHERE rank=?", (rank,))
+def _runtime(fabric: Fabric, rank: int) -> tuple[RankRuntime, Any]:
+    """Build a rank runtime from the configuration the job persisted for that rank.
+
+    The persisted row is authoritative, and reading it is not optional. ``register`` writes the
+    runtime's limits into the ``ranks`` table, so a runtime constructed with defaults silently
+    *overwrites* whatever the job configured: a worker reattaching to a rank whose budget was set
+    to 120,000 replaced it with the 128,000 default, and every incarnation after the first reported
+    the wrong figure. It stayed invisible because the same file already read the row correctly in
+    one place and not in the other two, so this returns the row alongside the runtime and is the
+    only construction path in the CLI.
+    """
+    row = fabric.query_one(
+        "SELECT context_budget, eager_limit, unexpected_limit FROM ranks WHERE rank=?", (rank,)
+    )
     rt = RankRuntime(
         fabric,
         rank,
@@ -78,6 +86,15 @@ def _comm(args: argparse.Namespace) -> tuple[Fabric, Communicator]:
         unexpected_limit=int(row["unexpected_limit"]) if row else None,
         strict_context=False,
     )
+    return rt, row
+
+
+def _comm(args: argparse.Namespace) -> tuple[Fabric, Communicator]:
+    fabric = _fabric(args)
+    rank = args.rank if args.rank is not None else int(os.environ.get("AMPI_RANK", "-1"))
+    if rank < 0:
+        raise SystemExit("no rank: pass --rank or set $AMPI_RANK")
+    rt, row = _runtime(fabric, rank)
     if row is None:
         rt.register(executor_name="cli")
     else:
@@ -539,7 +556,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
         if fabric is None:
             _out({"status": "waiting", "rank": rank, "detail": "campaign has no active job yet"})
             return 0
-        rt = RankRuntime(fabric, rank, strict_context=False)
+        rt, _row = _runtime(fabric, rank)
         rt.register(executor_name="worker")
         _out(
             {
@@ -563,7 +580,7 @@ def cmd_worker(args: argparse.Namespace) -> int:
                 key = str(fabric.root)
                 if key not in registered:
                     registered.add(key)
-                    RankRuntime(fabric, rank, strict_context=False).register(executor_name="worker")
+                    _runtime(fabric, rank)[0].register(executor_name="worker")
                 row = broker_mod.claim_next(fabric, rank, lease_s=args.lease)
                 if row is not None:
                     spool = fabric.root / "spool"
