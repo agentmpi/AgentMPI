@@ -14,30 +14,176 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this algorithm is, what the sweep establishes about it, and
-the single most important thing a reader should take away.}
+The linear gather is the flat fan-in: every non-root rank sends its contribution directly to the
+root, and the root performs $p-1$ wildcard receives and files each arrival by its source. It
+costs $p-1$ messages and $(p-1)n$ tokens, and the sweep confirms both at all twenty-one measured
+sizes --- 7 messages at $p=8$, 31 at $p=32$ --- which is the minimum any gather can achieve,
+since every rank's contribution must cross the network once. What the family view shows is where
+that minimum is paid: the root, alone, and serially. At $p=32$ the root's 31 receives account for
+0.255\,s of the 0.26 rank-seconds of receive-blocking in the whole collective, 98\,\% of it in one
+rank out of thirty-two, and the viewer screenshot is a single lane of thick bars beside
+thirty-one lanes carrying one tick each. That is why the closed form prices the critical path at
+$p-1$ rather than 1, and it is why the trace's own \texttt{rounds} field --- which reports 1 at
+every size --- understates the cost. The more important observation for agent ranks is what
+\emph{did not} happen: all 31 receives are logged \texttt{admitted: false} with
+\texttt{admitted\_tokens: 0} and the root's context high-water is 0, because a gather returns
+handles and lets the root decide what to materialise. A gather that admitted its $pn$ tokens
+would make the root's context window the scalability limit of the whole harness, and in
+\texttt{real-sw-p8-full} that would have been 29,847 tokens of a 120,000-token budget for a
+single fan-in at $p=8$.
 \end{abstract}
 
 \input{generated}
 
 \section{How the algorithm scales}
-\TODO{Derive the algorithm's cost from how it works, then compare with what was
-measured. Where does the round count step, and why there? Explain the shape of
-Figure~\ref{fig:family} rather than describing it.}
+
+The root's branch is \texttt{for \_ in range(p - 1)} wildcard receives, each filed by
+\texttt{msg.source} into an output list; the non-root branch is one \texttt{\_csend} to the root.
+So the message count is $p-1$ and the volume $(p-1)n$, which is
+\texttt{FORMULAS["gather","linear"]}, and the fourth term --- fold depth --- is zero, because a
+gather composes nothing. The closed form gives $p-1$ rounds on the critical path, and that is the
+number worth understanding, because it is the whole difference between this algorithm and its
+binomial sibling: the two move identical message counts, and only the shape of the fan-in
+differs.
+
+The message panel of Figure~\ref{fig:family} is the line $p-1$ and matches at every one of the
+twenty-one rows, from 1 at $p=2$ to 31 at $p=32$; the self-reported token volume is also $p-1$
+at every size, the benchmark's \verb|f"r{rank}"| contribution tokenising to one token. There is
+no shape to explain. The round panel, however, shows a measured 1 against a predicted $p-1$ at
+every size from $p=3$ upward, and that gap is not a defect in the algorithm but a disagreement
+about what ``round'' means, which the family view is the first thing to surface.
+
+The implementation writes \texttt{tr.stats.rounds = 1}: one logical phase, in which all $p-1$
+sends happen and all $p-1$ receives happen. The closed form writes $p-1$: the root cannot
+overlap its receives, so $p-1$ message costs lie in sequence on the path from the first send to
+the last placement. The module is not consistent about which convention it records ---
+\texttt{bcast/flat}, the structurally identical fan-\emph{out}, records
+\texttt{1 if r != root else p - 1}, taking the serialised reading and making it rank-dependent,
+which is the honest choice and the one that would have made this column agree. So the
+\texttt{rounds} column here should be read as ``phases the algorithm believes it executed''
+rather than ``message costs on the critical path''.
+
+The log settles which quantity is the real one. Summing the \texttt{latency\_s} field of every
+\texttt{msg.recv} record at $p=32$ gives 0.26 rank-seconds of receive-blocking, of which 0.255
+belongs to rank 0's thirty-one receives; the aggregate grows as $p^{1.28}$ ($R^2 = 0.978$),
+essentially linearly, because there is only ever one rank waiting. The viewer screenshot for
+\texttt{mb-free\_\_coll-gather-linear-32} draws exactly that: rank 0's lane carries a run of
+thick bars spread across the full 0.09\,s span --- bars, in the viewer's encoding, being glyphs
+with extent --- while all thirty-one other lanes carry a single thin tick, their one send.
+Nothing else in the picture has duration. A reader who took the \texttt{rounds} column at face
+value would conclude this collective completed in one step; the screenshot shows thirty-one
+steps stacked in one lane.
 
 \section{Powers of two and everything else}
-\TODO{Whether the non-power-of-two sizes behave like the powers of two. If the
-algorithm has a remainder path, say what it does and whether the measurements show
-it working. This is where defects in collective implementations live.}
+
+There is nothing power-of-two about this algorithm. The root's loop is \texttt{range(p - 1)} and
+the receive is a wildcard, so no rank's identity enters any arithmetic and the code path at
+$p=7$ is byte-for-byte the path at $p=8$. The family view confirms it: the squares in
+Figure~\ref{fig:family} lie on $p-1$ exactly as the circles do --- 2, 4, 5, 6, 9, 11, 19 and 23
+at $p = 3, 5, 6, 7, 10, 12, 20, 24$ --- there are no red crosses, so the collective's
+self-reported count equalled the fabric's logged traffic at all twenty-one sizes, and the eight
+sizes measured in both \texttt{mb-free} and \texttt{mb-smoke} agree on every integer, differing
+only in wall time (0.027\,s against 0.022\,s at $p=8$).
+
+That makes this family the control for its op. When \texttt{gather/binomial} shows something odd
+at a non-power-of-two size --- and it does, in its volume term --- the question is whether the
+oddity belongs to the tree arithmetic or to the measurement apparatus. A sibling with no bit
+arithmetic and no disagreement at any size answers that: the apparatus is fine.
+
+One asymmetry between the two algorithms is worth recording here even though the sweep cannot
+show it, because it is a semantic difference rather than a cost difference and it hides at
+exactly this boundary. \texttt{gather()} chooses its algorithm as
+\texttt{"linear" if p <= 4 else "binomial"} when the caller does not name one. The
+\texttt{linear} branch honours the caller's \texttt{admit} argument, passing it through to
+\texttt{comm.recv(..., admit=admit)}; the \texttt{binomial} branch hard-codes
+\texttt{admit=False} on its child receives and ignores the argument entirely. So
+\texttt{comm.gather(x, admit=True)} charges the root's context account at $p=4$ and silently does
+not at $p=5$. The sweep cannot expose this because it names the algorithm explicitly and leaves
+\texttt{admit} at its default, so every receive in all twenty-one runs is logged
+\texttt{admitted: false}; the finding comes from reading the two branches side by side, which is
+what a family document is for.
 
 \section{When to choose this algorithm}
-\TODO{Against the alternatives in the same op family, on latency, message count,
-and --- for reductions --- fold depth, which governs how much content survives a
-lossy operator. Be concrete about the crossover.}
+
+The choice between \texttt{linear} and \texttt{binomial} is depth against fan-out at equal
+message count, and it is the cleanest crossover in the sweep because the message counts are
+identical --- $p-1$ in both, at every one of the twenty-one sizes in both families. Nothing is
+traded away in traffic; what changes is where the traffic converges and how much volume passes
+through intermediate ranks.
+
+\texttt{linear} wins on volume, and by exactly the ratio the closed forms give: $(p-1)n$ against
+$np\lceil\log_2 p\rceil/2$, which at $p=32$ is 31 units against 80 --- both figures confirmed by
+the collectives' self-reports in the two sweeps. It loses on depth by the same construction:
+$p-1$ against $\lceil\log_2 p\rceil$, or 31 against 5 at $p=32$. Running that through
+\texttt{cost.predict} at $n = 4{,}096$ tokens per contribution gives 15.97\,s of critical path
+for \texttt{linear} against 2.58\,s for \texttt{binomial}, and 126,976 against 327,680 tokens of
+volume: 6.2 times slower for 2.6 times fewer tokens. \texttt{cost.best\_algorithm} accordingly
+answers \texttt{binomial} on the time objective and \texttt{linear} on the volume objective at
+every $(p, n)$ pair I evaluated, which is an unusually honest crossover --- the two objectives
+genuinely disagree and the model says so rather than picking.
+
+For agent ranks the decision usually goes to \texttt{binomial}, and the reason is not the token
+count but the root. Under \texttt{linear} the root performs $p-1$ receives itself; under
+\texttt{binomial} it performs $\lceil\log_2 p\rceil$, and the sweep measures the difference at
+$p=32$ as 0.255\,s of root blocking against 0.049\,s, a factor of 5.2. If the root is an agent
+rather than a thread, each of those receives is a turn in which it is doing nothing else, and
+$p-1$ of them is a serial section in Amdahl's sense --- the phase that ``must be done by one
+rank'' and does not shrink with $p$. \texttt{linear} is the right choice when the volume penalty
+is what binds: small $p$, large contributions, and a harness that is going to read everything
+anyway.
+
+The larger argument, and the one this family is best placed to make, is about \emph{how} the
+contributions arrive rather than which algorithm delivers them. A gather of $p$ artefacts of $n$
+tokens presents the root with $pn$ tokens, and for realistic $p$ and $n$ that exceeds any context
+window --- which would make the root's context the scalability limit of the whole harness,
+independent of algorithm. AgentMPI's answer is to return handles: \texttt{mode=AUTO} sends large
+contributions by rendezvous and \texttt{admit=False} keeps them out of the root's context, so the
+root receives a list of references and materialises what it needs. The sweep shows the admission
+half of that mechanism working --- all 31 receives at $p=32$ logged \texttt{admitted: false},
+\texttt{admitted\_tokens: 0}, and every rank's finalisation reporting a context high-water of 0
+--- but cannot show the transport half, because the benchmark launched with
+\texttt{eager\_limit=10**9} and \texttt{Mode.AUTO} therefore chose eager for every message.
+The transport half is visible in \texttt{real-sw-p8-full}: all fourteen \texttt{gather} sends
+there are \texttt{mode: rendezvous}, the largest single contribution is 13,206 tokens, the
+\texttt{collect-r1} gather moved 29,847 tokens in seven messages, and the root's context
+high-water is 0 against a 120,000-token budget. Admitting that one fan-in by value would have
+consumed a quarter of the root's window; two rounds of it would have consumed half.
 
 \section{Threats to this reading}
-\TODO{What would make this wrong. These runs use no agents, so they measure the
-protocol's own behaviour and say nothing about model latency; sub-second wall times
-are dominated by fabric overhead. Be specific.}
+
+\textbf{No agents took part, so nothing here is about model behaviour.} No executor is recorded,
+the viewer reports zero agent calls, and the wall times of 0.011--0.083\,s are SQLite writes and
+event-log appends. The root-serialisation measurements --- 0.255\,s across 31 receives, the
+$p^{1.28}$ fit --- are fabric behaviour under thread contention. They demonstrate the
+\emph{shape} of the fan-in, which is what the algorithm determines, and they say nothing about
+what a fan-in costs when each contribution is a model's output.
+
+\textbf{The contributions are one token each, which suppresses the effect the collective exists
+to manage.} The benchmark gathers \verb|f"r{rank}"|, so the total volume at $p=32$ is 31 tokens
+and no context budget could be threatened by it. Every statement above about context pressure is
+therefore an argument from the closed form and from the real run, not a measurement from this
+family. A sweep with realistic payloads would be a different and more informative experiment;
+this one measures the pattern.
+
+\textbf{The transport mode is an artefact of the launch configuration.} All messages are eager
+because \texttt{eager\_limit=10**9} forces \texttt{Mode.AUTO} to eager for any payload, and
+\texttt{strict\_context=False} disables the admission checks. The \texttt{admitted: false}
+records are still meaningful --- they show the collective passing \texttt{admit=False} through to
+the receive, which is a code-path property --- but a reader should not infer that
+\texttt{Mode.AUTO} would have chosen rendezvous here, because it was never given the chance.
+
+\textbf{The round-count gap is a definitional disagreement, not a measurement error, and I have
+not proven which convention is intended.} The implementation says 1, the closed form says $p-1$,
+and \texttt{bcast/flat} in the same module says $p-1$ at the root for the mirror-image
+operation. My reading is that the serialised convention is the useful one and that this branch
+should follow \texttt{bcast/flat}; someone who intended \texttt{rounds} to mean ``phases'' would
+say the closed form is what needs changing. Either way the two do not currently agree, and no
+tooling in the repository compares them --- \texttt{bench\_collectives} records both and tests
+only messages and fold depth.
+
+\textbf{The \texttt{admit} asymmetry is read from source, not observed.} No run in this sweep
+passes \texttt{admit=True}, so the claim that \texttt{binomial} ignores it is a code reading. It
+is a short reading --- one branch passes the argument, the other passes a literal \texttt{False}
+--- but it is not a measurement, and a test would settle it.
 
 \end{document}

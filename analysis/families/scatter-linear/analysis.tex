@@ -14,30 +14,165 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this algorithm is, what the sweep establishes about it, and
-the single most important thing a reader should take away.}
+The linear scatter is the flat fan-out: the root sends \texttt{payloads[d]} directly to each rank
+$d$, and every other rank performs one receive. It costs $p-1$ messages and $(p-1)n$ tokens ---
+the minimum any scatter can achieve, since every rank's work unit must cross the network exactly
+once --- and the sweep confirms both at all twenty-one measured sizes, 7 at $p=8$ and 31 at
+$p=32$. It is the dual of the linear gather and it inherits the same asymmetry from the opposite
+direction: at $p=32$ exactly one rank sends anything, and it sends thirty-one times. The closed
+form prices that at $p-1$ rounds on the critical path, and the trace's own \texttt{rounds} field
+reports 1 at every size, which is a disagreement about what a round is rather than a defect in the
+algorithm --- but it is a disagreement that hides the only cost this algorithm has. For agent
+ranks the important property is the one that distinguishes a scatter from posting the task list to
+the group chat: rank $d$ receives \texttt{payloads[d]} and nothing else, so no rank pays context
+for work assigned to somebody else. Every one of the 31 receives at $p=32$ is logged
+\texttt{admitted: false} with \texttt{admitted\_tokens: 0} and every rank finalises with a context
+high-water of 0, which is the admission half of that guarantee working.
 \end{abstract}
 
 \input{generated}
 
 \section{How the algorithm scales}
-\TODO{Derive the algorithm's cost from how it works, then compare with what was
-measured. Where does the round count step, and why there? Explain the shape of
-Figure~\ref{fig:family} rather than describing it.}
+
+The implementation is a loop and a receive. The root iterates \texttt{for d in range(p)}, skips
+itself, and sends \texttt{payloads[d]} to rank $d$; every other rank performs a single
+\texttt{\_crecv} from the root. So the message count is $p-1$, the volume $(p-1)n$, and the fold
+depth zero --- which is \texttt{FORMULAS["scatter","linear"]}, whose round term is $p-1$.
+
+That round term is the number to understand, because it is the entire difference between this
+algorithm and its binomial sibling; the message counts are identical. The root's $p-1$ sends are
+issued from one thread of control, one after another, so $p-1$ message costs lie in sequence on
+the path from the collective's start to the last rank receiving its work. The measurements make
+this concrete in a way the counts cannot: at $p=32$ the fabric log contains 31
+\texttt{msg.send} records and \emph{every one of them is from rank 0}. No other rank sends
+anything. Each of the thirty-one other ranks performs exactly one receive.
+
+The message panel of Figure~\ref{fig:family} is therefore the least interesting plot in the sweep
+--- the line $p-1$, matched at all twenty-one rows, 1 at $p=2$ through 31 at $p=32$, with the
+self-reported volume also $p-1$ because the benchmark's \verb|f"u{i}"| work units tokenise to one
+token each. The round panel is where the family view earns its keep, and what it shows is a
+measured 1 against a predicted $p-1$ at every size from $p=3$ upward.
+
+That gap is definitional. The implementation writes \texttt{tr.stats.rounds = 1}, meaning one
+logical phase in which all the sends happen. The closed form writes $p-1$, meaning the root's
+serialised path. The module is inconsistent about which it records, and the inconsistency is
+visible within a few hundred lines: \texttt{bcast/flat}, which is structurally the same fan-out
+with the same payload going to every destination, records
+\texttt{1 if r != root else p - 1} --- the serialised reading, made rank-dependent, which is the
+honest choice and the one that would have made this column agree. So the \texttt{rounds} column
+here should be read as ``phases the algorithm believes it executed'', and the $p-1$ beside it as
+the quantity a harness author actually needs.
+
+The log supports the serialised reading. Aggregate receive-blocking at $p=32$ is 0.32
+rank-seconds spread across the thirty-one waiting ranks, and it grows as $p^{1.35}$
+($R^2 = 0.956$): each rank waits for the root to reach it, so the mean wait grows with $p$ and the
+total grows a little faster than linearly. The viewer screenshot for
+\texttt{mb-free\_\_coll-scatter-linear-32} shows one lane with a run of activity spanning the full
+0.08\,s and thirty-one lanes with a single tick each, arriving progressively later down the
+distribution order. That is a picture of a queue at a single server, which is what a linear
+scatter is.
 
 \section{Powers of two and everything else}
-\TODO{Whether the non-power-of-two sizes behave like the powers of two. If the
-algorithm has a remainder path, say what it does and whether the measurements show
-it working. This is where defects in collective implementations live.}
+
+There is nothing power-of-two about this algorithm: the send loop is \texttt{range(p)} with a
+skip, the receive names the root explicitly, and no bit arithmetic appears anywhere in the branch.
+The family view confirms the expected consequence --- the squares in Figure~\ref{fig:family} lie
+on $p-1$ exactly as the circles do, 2, 4, 5, 6, 9, 11, 19 and 23 messages at
+$p = 3, 5, 6, 7, 10, 12, 20, 24$ --- with no red crosses, meaning the collective's self-reported
+count equalled the fabric's logged traffic at all twenty-one sizes. The eight sizes measured in
+both \texttt{mb-free} and \texttt{mb-smoke} agree on every integer count and differ only in wall
+time, for instance 0.023\,s against 0.023\,s at $p=8$ and 0.039\,s against 0.043\,s at $p=16$.
+
+That makes this family the control for its op, in the same way \texttt{gather/linear} is for
+gather. \texttt{scatter/binomial} does have a remainder path --- its subtrees are truncated by $p$
+--- and its volume closed form is inexact at non-powers of two as a result. Establishing that a
+sibling with no bit arithmetic agrees with its closed form at all twenty-one sizes rules out the
+measurement apparatus as the source of that inexactness.
+
+One difference between the two algorithms is not a cost and does not appear in the sweep, but it
+hides at exactly the size boundary this family covers. \texttt{scatter()} picks its algorithm as
+\texttt{"linear" if p <= 4 else "binomial"} when the caller does not name one. The
+\texttt{linear} branch passes the caller's \texttt{admit} argument through to the receive; the
+\texttt{binomial} branch hard-codes \texttt{admit=False} and ignores the argument. So
+\texttt{comm.scatter(units, admit=True)} places a rank's work unit in its context at $p=4$ and
+silently does not at $p=5$. All twenty-one runs here leave \texttt{admit} at its default and so
+log \texttt{admitted: false} throughout; the finding is from reading the two branches together,
+which is what a family document can do and a single run cannot.
 
 \section{When to choose this algorithm}
-\TODO{Against the alternatives in the same op family, on latency, message count,
-and --- for reductions --- fold depth, which governs how much content survives a
-lossy operator. Be concrete about the crossover.}
+
+\texttt{scatter} and \texttt{gather} are duals, and within each op the choice between
+\texttt{linear} and \texttt{binomial} is the same choice: depth against volume at equal message
+count. Both algorithms move $p-1$ messages at every one of the twenty-one sizes in both families,
+so nothing is traded in traffic. \texttt{linear} wins on volume by exactly the closed forms'
+ratio, $(p-1)n$ against $np\lceil\log_2 p\rceil/2$, which at $p=32$ is 31 units against 80 --- both
+confirmed by the collectives' self-reports. It loses on depth by $p-1$ against
+$\lceil\log_2 p\rceil$, 31 against 5. \texttt{cost.predict} at $n = 4{,}096$ tokens per unit gives
+15.97\,s of critical path against 2.58\,s and 126,976 tokens against 327,680, so
+\texttt{cost.best\_algorithm} answers \texttt{linear} on the volume objective and
+\texttt{binomial} on the time objective at every $(p, n)$ pair I evaluated. The two objectives
+disagree honestly.
+
+The tie-breaker for agent ranks is that the root is not replicable, and here that argument is
+starker than for gather. Under \texttt{linear} the root issues every message itself: at $p=32$,
+31 of 31 sends came from rank 0 and no other rank sent anything. If the root is an agent, work
+distribution is a serial section of length $p-1$ that does not shrink as the population grows ---
+the textbook Amdahl term, and in an agent harness the phase that dominates $f$. Under
+\texttt{binomial} the root issues 5 sends at $p=32$ and 15 other ranks share the forwarding.
+\texttt{linear} is the right choice when $p$ is small, when the work units are large enough that
+carrying them through interior ranks is the dominant cost, or when the harness needs the property
+that a unit passes through exactly one hop.
+
+That last property is the one worth stating carefully, because it is what separates a scatter
+from the obvious alternative. Posting the whole task list to a group chat costs every rank the
+full $p$-way list in context; a scatter costs rank $d$ only \texttt{payloads[d]}. Under
+\texttt{linear} that is exact --- one message, one destination, one unit --- and the sweep shows
+the admission side of it holding: at $p=32$ all 31 receives are logged \texttt{admitted: false}
+with \texttt{admitted\_tokens: 0}, and all thirty-two ranks finalise with a context high-water of
+0 against a 128,000-token budget. Under \texttt{binomial} the same guarantee holds for a
+different reason: interior ranks forward blocks belonging to their subtree, so they see other
+ranks' assignments, and the branch receives them with \texttt{admit=False} so that no interior
+agent reads them. Both algorithms deliver work by handle rather than by value; \texttt{linear}
+does it without ever showing a unit to a rank that does not own it.
 
 \section{Threats to this reading}
-\TODO{What would make this wrong. These runs use no agents, so they measure the
-protocol's own behaviour and say nothing about model latency; sub-second wall times
-are dominated by fabric overhead. Be specific.}
+
+\textbf{No agents took part, so nothing here concerns model behaviour.} No executor is recorded,
+the viewer reports zero agent calls, and the wall times of 0.012--0.078\,s are SQLite writes and
+event-log appends. The serialisation measurements --- 31 of 31 sends from one rank, 0.32
+rank-seconds of aggregate waiting, the $p^{1.35}$ fit --- are fabric behaviour under thread
+contention. They establish the \emph{shape} of the fan-out, which is what the algorithm
+determines, and say nothing about the cost of distributing work to models.
+
+\textbf{The work units are one token each, which suppresses the effect that matters.} The
+benchmark scatters \verb|f"u{i}"|, so the whole collective moves 31 tokens at $p=32$ and no
+context budget or transport threshold could be reached. Every claim above about context cost is an
+argument from the closed form and from the real runs, not a measurement from this family. In
+\texttt{real-sw-p8-full} the same op with realistic payloads shows what changes: within a single
+scatter, \texttt{Mode.AUTO} sent a 2,077-token block by \texttt{rendezvous} and 1,044- and
+527-token blocks by \texttt{eager}, splitting at the 2,048-token eager limit. Here that
+mechanism was never engaged.
+
+\textbf{The transport mode is a launch artefact.} All messages are eager because the benchmark
+launched with \texttt{eager\_limit=10**9}, which forces \texttt{Mode.AUTO} to eager for any
+payload, and with \texttt{strict\_context=False}, which disables admission enforcement. The
+\texttt{admitted: false} records remain meaningful as a code-path property --- the collective
+passes \texttt{admit=False} into the receive --- but a reader should not infer that
+\texttt{Mode.AUTO} would have chosen eager for a realistic unit, because it was never offered
+the choice.
+
+\textbf{The round-count gap is definitional and I have not established which convention is
+intended.} The implementation says 1, the closed form says $p-1$, and \texttt{bcast/flat} in the
+same module says $p-1$ at the root for the mirror-image operation. My reading is that the
+serialised convention is the useful one; someone who intended \texttt{rounds} to count phases
+would say the closed form needs changing instead. Either way they disagree today, and no tooling
+compares them: \texttt{bench\_collectives} records both \texttt{rounds\_measured} and
+\texttt{rounds\_model} and then tests only \texttt{messages\_match} and
+\texttt{fold\_depth\_match}.
+
+\textbf{The \texttt{admit} asymmetry is read from source, not observed.} No run in this sweep
+passes \texttt{admit=True}, so the claim that the binomial branch ignores it rests on the literal
+\texttt{False} in its call against the pass-through in this one. It is a short reading but not a
+measurement.
 
 \end{document}
