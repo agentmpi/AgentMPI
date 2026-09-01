@@ -110,7 +110,7 @@ def test_agenda_only_contains_terms_needing_research():
         "A": {"needs_research": True, "kind": "person", "proposed": {"en": "a"}},
         "B": {"needs_research": False, "kind": "org", "proposed": {"en": "b"}},
     }
-    agenda = _agenda_of(terms, {"A": {"en": "arb"}}, 4)
+    agenda = _agenda_of(terms, {"A": {"en": "arb"}}, {})
     assert [i["term"] for i in agenda] == ["A"]
     # The arbitrated proposal wins over the local one: that is the whole point of
     # having arbitrated it.
@@ -119,7 +119,24 @@ def test_agenda_only_contains_terms_needing_research():
 
 def test_agenda_deduplicates():
     terms = {t: {"needs_research": True, "proposed": {}} for t in ("X", "Y")}
-    assert len({i["key"] for i in _agenda_of(terms, {}, 2)}) == 2
+    assert len({i["key"] for i in _agenda_of(terms, {}, {})}) == 2
+
+
+def test_agenda_puts_contested_terms_first_and_respects_the_cap():
+    """The reduction already computed the right research priority; use it.
+
+    A term in the conflict set is one two ranks reading different parts of the
+    book proposed to render differently -- exactly where inconsistency would show,
+    and exactly what a single translator would never notice was contentious.
+    """
+    terms = {t: {"needs_research": True, "proposed": {}} for t in ("A", "B", "C")}
+    agenda = _agenda_of(terms, {}, {"C": ["x", "y"]})
+    assert [i["term"] for i in agenda] == ["C", "A", "B"]
+    assert agenda[0]["contested"] is True and agenda[1]["contested"] is False
+
+    # The cap bounds the agenda independently of p, which is what makes shared
+    # research a saving rather than a cost that grows with the population.
+    assert [i["term"] for i in _agenda_of(terms, {}, {"C": ["x", "y"]}, cap=2)] == ["C", "A"]
 
 
 def test_claim_order_is_rotated_per_rank():

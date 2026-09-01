@@ -188,6 +188,11 @@ def build_args(argv: list[str] | None = None) -> argparse.Namespace:
                     choices=["wait", "proceed", "shrink", "revoke"])
     ap.add_argument("--research-budget", type=int, default=3,
                     help="terms one rank will research before moving on")
+    ap.add_argument("--research-cap", type=int, default=48,
+                    help="size of the research agenda. A population that surveyed the "
+                         "whole book nominates far more terms than a run can afford; the "
+                         "cap keeps the agenda bounded and independent of p, which is what "
+                         "makes shared research a saving rather than a cost")
     ap.add_argument("--algorithm", default=None, help="override the reduction schedule")
     ap.add_argument("--work-dir", default=str(WORK))
     return ap.parse_args(argv)
@@ -332,7 +337,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                     if census.get("conflicts")
                     else census.get("value", {})
                 )
-                need = _agenda_of(terms, settled, corpus.size)
+                # The conflict set is taken *before* arbitration: once the root has
+                # settled a disagreement the value looks unanimous, and the fact
+                # that the population disagreed about it -- which is precisely what
+                # makes it worth researching -- is no longer visible.
+                need = _agenda_of(
+                    terms, settled, census.get("conflicts") or {}, cap=a.research_cap
+                )
                 amp.bcast("agenda", payload=need, root=0, timeout=a.phase_timeout)
                 agenda = need
             else:
@@ -501,20 +512,42 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _agenda_of(terms: dict, settled: Any, size: int) -> list[dict[str, Any]]:
-    """Turn the arbitrated census into a list of research items with stable keys.
+def _agenda_of(
+    terms: dict,
+    settled: Any,
+    conflicts: dict[str, Any] | None = None,
+    *,
+    cap: int = 0,
+) -> list[dict[str, Any]]:
+    """Turn the arbitrated census into a research agenda, contested terms first.
 
     Keyed by a slug rather than by the term itself, because the term is Cyrillic
     and the key becomes a window cell name that appears in traces, filenames and
-    error messages, all of which are read by people and some of which are read by
-    shells.
+    error messages, all of which are read by people and some by shells.
+
+    The ordering is the interesting part.  A population that surveyed the whole
+    book nominates far more terms than a run can afford to research, so the
+    agenda has to be prioritised, and the reduction has already computed the right
+    priority for free: a term in the *conflict set* is one that two ranks, reading
+    different parts of the book, proposed to render differently.  That is exactly
+    the term where inconsistency would be visible to a reader, and exactly the
+    term a single translator would never have noticed was contentious.  Terms
+    nobody disagreed about are cheaper to leave to the first-pass gloss.
+
+    So the conflict set is not merely reported here, it is *used*: it aims the
+    expensive external research at the places the population has demonstrated it
+    is not already in agreement.
     """
+    contested = set(conflicts or {})
     agenda: list[dict[str, Any]] = []
     seen: set[str] = set()
     proposals = settled if isinstance(settled, dict) else {}
-    for term, meta in sorted(terms.items()):
-        if not meta.get("needs_research"):
-            continue
+    ordered = sorted(
+        (t for t, m in terms.items() if m.get("needs_research")),
+        key=lambda t: (t not in contested, t),
+    )
+    for term in ordered:
+        meta = terms[term]
         key = _slug(term)
         if key in seen:
             continue
@@ -525,8 +558,11 @@ def _agenda_of(terms: dict, settled: Any, size: int) -> list[dict[str, Any]]:
             "kind": meta.get("kind", ""),
             "gloss": meta.get("gloss", ""),
             "why_hard": meta.get("why_hard", ""),
+            "contested": term in contested,
             "proposed": proposals.get(term, meta.get("proposed", {})),
         })
+        if cap and len(agenda) >= cap:
+            break
     return agenda
 
 
