@@ -6,6 +6,9 @@
 \documentclass[11pt]{article}
 \input{../../preamble}
 
+%% Long \texttt{} identifiers in running prose leave little room for the line breaker.
+\emergencystretch=2.5em
+
 \title{\textbf{tr-smoke}\\[2pt]\large An AgentMPI run analysis}
 \author{}
 \date{}
@@ -14,25 +17,209 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+This is the translation harness's smoke test: four ranks, four sections, the deterministic
+\texttt{function} executor in place of a model, a 60\,s job budget and a 20\,s barrier timeout. It
+completed in 0.105\,s. \textbf{It is not a data point in the strong-scaling series and no speedup,
+efficiency or latency figure should be taken from it} --- dividing the 576.74\,s sequential
+baseline by this run's wall time gives a speedup of 5{,}493$\times$, which is why
+\texttt{make\_tables.py} selects the scaling curve by campaign label and this run carries the
+label \texttt{tr-smoke} rather than \texttt{real-tr}. What it is worth is two things. First, it is
+the end-to-end check that the harness runs: every phase executed, every contract validated, no
+failures, no violations, and the collectives panel is invocation-for-invocation identical to
+\texttt{real-tr-p4-full}'s --- the same 4 scatters, 8 reduces, 8 broadcasts, 8 allreduces, 4 halo
+exchanges, 4 barriers, 4 gathers, the same algorithms, the same 24 messages. Second, and less
+obviously, it is the only run in this family whose wall clock is \emph{entirely} AgentMPI: with no
+model in the loop, the 0.105\,s is 114 event writes and 24 messages through the SQLite fabric, at
+0.92\,ms per event and a 5.5\,ms median message latency under four-way write contention. Two of
+its three flagged warnings are artefacts of the surrogate executor rather than properties of the
+run, and I say which below.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} has four lanes and effectively no bars, only ticks, because at this
+scale every interval is an instant. The viewer screenshot shows the same: four dense rows of green
+message ticks spread evenly across 0.10\,s, with no visible blue work extent anywhere. That is the
+whole visual finding, and it is by construction --- \texttt{synthetic\_agent} returns a
+dictionary from a regular expression and a string join, so an ``agent call'' here is a function
+return, and eleven of the twelve report \texttt{latency\_s: 0.0}.
+
+What the ticks do show is that all four ranks ran concurrently. The first four
+\texttt{agent.call} events are rank 0 at 0.0131\,s, rank 1 at 0.0142, rank 3 at 0.0166 and rank 2
+at 0.0185, and the four lanes interleave continuously until rank 2 finalises at 0.0845 and the
+others at 0.102--0.105; the four terminology calls are issued 1.1, 2.4 and 1.9\,ms apart. This
+matters because the generated findings say the opposite, and I return to it below.
+
+The phase structure is legible in the ordering even without durations. The \texttt{scatterv} at
+0.008--0.013\,s sends three eager messages of 617, 741 and 629 tokens. The glossary
+\texttt{allreduce} occupies 0.017--0.069\,s and is the most expensive phase in the run: a
+binomial reduce (rank 3 to rank 2, rank 1 to rank 0, rank 2 to rank 0) and a binomial broadcast
+back, twice over, for the glossary and then the register, 12 messages and 52\,ms. Translation
+starts at 0.060\,s, \texttt{cart\_create} and the halo exchange run from 0.061 to 0.082, all four
+ranks issue a \texttt{revise} call, and the \texttt{pre-gather} barrier and \texttt{gather} close
+the run between 0.082 and 0.105.
+
+Figure~\ref{fig:comm} shows the expected superposition of the broadcast tree and the ring, and it
+is more legible here than in the real runs because the payloads are uniform: every halo message is
+exactly 40 tokens, since the synthetic translator emits the same paragraph shape for every unit.
+Figure~\ref{fig:ranks} has both panels near zero --- occupancy because the work intervals have no
+extent, context because every receive is non-admitting. Figure~\ref{fig:collectives} is the
+useful one, and all nine checkable invocations sit on the diagonal.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{What the run establishes}
+
+The harness runs end to end against a four-rank world, and every stage of the pipeline that the
+real runs exercise was exercised here: \texttt{scatterv} of four units, four \texttt{TermSheet}
+calls, a \texttt{UNION} \texttt{allreduce} that produced a 5-term glossary identical at all four
+ranks, four \texttt{Translation} calls, a \texttt{cart\_create} and \texttt{halo\_exchange} on a
+non-periodic line, four \texttt{Revision} calls, a barrier with an empty \texttt{absent} list and
+a rendezvous \texttt{gather}. Zero contract violations, zero failures, zero retries, zero context
+rejections.
+
+The protocol skeleton is identical to the real four-rank run. \texttt{real-tr-p4-full} logs the
+same ten collective invocations with the same algorithms, the same round counts, the same
+per-collective message counts and the same 24 messages in total. The one entry that differs is
+the broadcast's maximum fold depth, 2 here against 0 there, which is a property of the payloads
+rather than of the algorithm. The two runs otherwise differ
+only in payload size and in agent-call count --- 12 here against 22 there, because this run takes
+\texttt{units = ranks = 4} where the real runs pin \texttt{--units 8}, so each rank holds a single
+unit and every rank issues exactly one revision. That equivalence is what makes the smoke test
+useful: it means the message-count and phase-structure claims in the real runs can be regression
+tested deterministically, without an agent and without 300 seconds.
+
+Because there is no model, this run also measures something the others cannot. Its 0.105\,s
+consists of 114 event writes, 24 messages, 10 collective invocations and 8 rank lifecycle
+transitions, which is 0.92\,ms per logged event. The 24 send-to-receive latencies have a median of
+5.0\,ms and a mean of 5.5\,ms, with a range of 1 to 12\,ms. Those figures are a useful complement
+to the sequential baseline's: \texttt{real-tr-p1-full} measures AgentMPI's protocol overhead at
+0.38\,ms per event and 0.05--0.14\,ms per \emph{degenerate} collective, with a single rank and no
+contention. Here four threads write the same SQLite file and a real message costs a few
+milliseconds. Both numbers are small enough that the conclusion is the same in either regime: the
+protocol is not what makes an agent run expensive.
+
+\subsection*{Why this is not a measurement of anything else}
+
+Three specific hazards, all of which the campaign has already been bitten by or would be.
+
+The wall time is 0.105\,s against 308.44\,s for \texttt{real-tr-p4-full}, which is the same world
+size and the same harness. Placed in the scaling table it would report a speedup of 5{,}493$\times$
+and an efficiency of 1{,}373, and it would do so silently, because nothing in the table's
+arithmetic knows that one row had no model in it. \texttt{make\_tables.py} avoids this by
+selecting on the campaign label, and the label is the only thing separating the two runs
+structurally.
+
+The quality metrics are at their ceiling and mean nothing here. Coverage 1.000, consistency
+1.000, \texttt{n\_divergent\_entities} 0, rendering verification 1.000, paragraph fidelity 1.000,
+length plausibility 1.000 --- exactly the same six values \texttt{real-tr-p4-full} reports. What
+separates them is the two metrics nobody quotes: \texttt{target\_script\_ratio} is 0.0326 here
+against 0.8567 in the real run, and \texttt{residual\_source\_per\_kchar} is 73.24 against 0.29.
+The synthetic ``translation'' is a two-character Chinese label meaning ``translated paragraph''
+followed by the paragraph index, then the bracketed entity names, then thirty ideographic full
+stops --- which satisfies every structural check the scorer
+makes --- the paragraph count matches, every canonical entity is rendered, every rendering is
+verifiable in the text, and all four sections agree --- while containing no translation at all. So
+six of the eight deterministic quality metrics in \texttt{common.py} are protocol checks that a
+placeholder passes, and two are content checks that discriminate. That is a genuinely useful
+result from a smoke test, and it argues for reporting
+\texttt{target\_script\_ratio} alongside consistency whenever the latter is quoted.
+
+The cost figure is fictitious. The run is billed \$0.0900 for 9{,}866 prompt and 4{,}027
+completion tokens, because \texttt{cost.summarise} prices whatever token counts the fabric
+recorded and the synthetic executor records token counts. Any campaign-level cost total that
+sweeps in smoke runs is inflated by them.
+
+\subsection*{The flagged findings: one real, two artefacts of the executor}
+
+\finding{warning} \emph{\texttt{halo\_exchange/?} reports 0 messages but the fabric logged 6.}
+Real, and the same instrumentation gap the whole campaign has. \texttt{coll.halo\_exchange} events
+carry only \texttt{\{label, left, right\}} --- no \texttt{algorithm}, no \texttt{rounds}, no
+\texttt{messages\_sent}, no \texttt{wall\_s} --- so the collective's self-report is empty while the
+fabric logged the six messages that $2(p-1)$ predicts for a non-periodic line. In the real runs
+the missing \texttt{wall\_s} silently subtracts the halo's blocking time from
+\texttt{coordination\_share}; here there is no blocking time to lose, so the gap shows up only as
+this warning and as the \modelna\ in the collectives table. The sibling analysis of
+\texttt{real-tr-p8-full} reports the instrumentation closed by commit \texttt{ee21d79}, after
+these traces were taken.
+
+\finding{warning} \emph{Concurrency never exceeded one rank despite a world size of 4: this ran
+serially.} Not true, and it is an artefact of the executor. The run did not execute serially: the
+event log interleaves all four ranks from 0.006\,s onward, and the four \texttt{terms} calls are
+issued 1.1, 3.5 and 5.4\,ms apart. What is true is that \texttt{total\_busy\_s} is 0.001. Busy time
+is reconstructed from \texttt{broker.claim}-to-\texttt{broker.complete} pairs, and this run's
+\texttt{kind\_counts} contains no \texttt{broker.*} events at all --- the \texttt{function}
+executor calls the agent inline and emits only \texttt{agent.call}, with a latency of 0.0. So
+achieved parallelism is computed as $0.01\times$ and peak busy as 1 for want of any interval to
+measure, and the finding fires on the arithmetic rather than on the behaviour. I would call this
+a real false positive in \texttt{scripts/analyze\_run.py} rather than a cosmetic one, because it
+will fire on every \texttt{function} and \texttt{simulated} run in the campaign and its wording
+(``this ran serially'') is a claim about the run, not about the instrumentation. A guard on
+\texttt{executors} containing no broker would suppress it correctly.
+
+\finding{note} \emph{Collectives account for 76.4\% of the run's rank-seconds.} Arithmetically
+true and structurally meaningless in the way the sentence implies. It reads as a warning that
+coordination dominated the work, but with busy time at 0.001\,s there is no work to dominate; the
+run is 0.321 collective rank-seconds out of 0.420 available because coordination is essentially
+all there is. The same denominator problem makes \texttt{imbalance} read exactly 1.00 --- all four
+ranks have a busy time of zero, so they are perfectly balanced --- and makes
+\texttt{idle\_fraction} 99.8\%. None of the concurrency block in the headline table should be read
+for this run.
+
+\finding{note} \emph{Too few distinct output sizes to fit $\beta$.} Expected. Only one of the
+twelve invocations reports a nonzero latency (rank 0's \texttt{translate:u0}, at 1\,ms), and
+\texttt{cost.calibrate} filters on \texttt{lat > 0}, so $n=1$ and the branch taken is
+\texttt{median\_only}. The resulting $\alpha=0.001$\,s and $\beta=0.0222$\,s/token describe the
+Python interpreter, not a model.
+
+\finding{ok} \emph{All 9 checkable collectives sent exactly the number of messages their
+closed-form cost expression predicts.} This is the point of the run and the most valuable line in
+it.
+
+\subsection*{No stray ranks, which is itself evidence}
+
+\texttt{stray\_ranks} is empty and \texttt{n\_ranks\_seen} is 4 against a declared world of 4 ---
+the only run in this family of which that is true. \texttt{real-tr-p1-full} carries seven strays,
+\texttt{real-tr-p2-full} eight, \texttt{real-tr-p4-full} six and \texttt{real-tr-p8-full} two. The
+difference is the executor: this run's ranks are in-process threads created by \texttt{launch},
+so nothing external ever calls \texttt{RankRuntime.register}, whereas the real runs draw from a
+persistent pool of Cursor subagent processes that register themselves by index. That makes this
+run a control for the leak. It confirms that the spurious registrations in the real traces come
+from pool processes attaching to the wrong job and not from anything the harness or
+\texttt{create\_job} does, which is consistent with the diagnosis the sibling analyses give ---
+\texttt{register} performing an unconditional \texttt{INSERT} without consulting the
+\texttt{world\_size} meta key --- and narrows where the fix has to go.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The executor is a surrogate and nothing here says anything about agent behaviour.}
+\texttt{metrics.json} reports \texttt{executors: \{function: 4\}}. \texttt{synthetic\_agent} is
+forty lines of string manipulation. Every latency, every token count, every quality score and the
+entire cost figure are properties of that function. The only claims this document makes that
+survive the substitution are about message counts, phase ordering, collective structure and
+fabric write cost, and I have tried to confine myself to those.
+
+\textbf{The protocol-cost numbers are one draw of a 0.1\,s run and are contended in a way the
+real runs are not.} The 0.92\,ms per event and 5.5\,ms median message latency come from 114 and 24
+observations respectively, on a machine also running whatever else the campaign was doing, with
+four threads writing one SQLite file. They should be read as an order of magnitude, and
+specifically not as a per-message cost for a distributed deployment, where the fabric is the same
+file but the writers are separate processes. The comparison with \texttt{real-tr-p1-full}'s
+0.38\,ms per event is between an uncontended single writer and four contending ones, which is
+suggestive of where the difference comes from but is not an isolation of it.
+
+\textbf{The equivalence with \texttt{real-tr-p4-full} is an equivalence of skeleton, not of
+work.} The two runs agree on collective invocations, algorithms, rounds, messages and fold depths.
+They do not agree on the decomposition: four units here against eight there, so one unit per rank
+against two, so one revision per rank against the $1,2,2,1$ fan-out that dominates the real run's
+idle time. A regression test built on this run would not have caught that asymmetry, and the
+statement that the smoke test validates the protocol should be read with that boundary in mind.
+
+\textbf{The 60\,s job budget and 20\,s barrier timeout were never approached and so were never
+tested.} The run finished in 0.105\,s. Nothing here exercises the deadline composition that killed
+\texttt{real-tr-p16-full}, and a smoke test that always finishes three orders of magnitude inside
+its budget cannot be evidence that the timeout paths work.
 
 \end{document}
