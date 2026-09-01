@@ -171,8 +171,19 @@ class CollectiveInvocation:
     messages: int
     tokens: int
     fold_depth: int
-    #: Longest per-rank wall time inside the call. For a barrier this is the straggler's wait.
+    #: Longest per-rank wall time inside the call. For a barrier this is the straggler's wait, and
+    #: it is a *critical path* figure: it must never be summed across invocations, because two
+    #: invocations whose stragglers waited concurrently would then be charged twice for the same
+    #: wall clock.
     wall_s: float
+    #: Rank-seconds spent blocked inside this call, summed over participants. This is the additive
+    #: quantity: it can be divided by the rank-seconds the run had available to give a share that
+    #: is bounded by one, which ``wall_s`` cannot.
+    rank_wall_s: float = 0.0
+    #: ``(end_time, blocking_duration)`` per participant, relative to the run's first event. Kept so
+    #: overlapping waits can be unioned rather than summed; a collective is recorded on completion,
+    #: so a rank's blocking interval ends at its event and began ``blocking_duration`` earlier.
+    rank_intervals: list[tuple[float, float]] = field(default_factory=list)
     absent: list[int] = field(default_factory=list)
     divergence_risk: bool = False
     predicted_rounds: int | None = None
@@ -272,6 +283,7 @@ class CollectiveInvocation:
             "tokens": self.tokens,
             "fold_depth": self.fold_depth,
             "wall_s": round(self.wall_s, 3),
+            "rank_wall_s": round(self.rank_wall_s, 3),
             "absent": self.absent,
             "divergence_risk": self.divergence_risk,
             "predicted_rounds": self.predicted_rounds,
@@ -412,14 +424,69 @@ class Analysis:
         return [r for r in sorted(self.ranks) if r not in stray]
 
     @property
-    def collective_wall_s(self) -> float:
-        """Wall time attributable to collectives, taking the max per invocation."""
-        return sum(c.wall_s for c in self.collectives)
+    def primitive_collectives(self) -> list[CollectiveInvocation]:
+        """Collectives excluding those that merely delegate to others.
+
+        A composed invocation spans its constituents in time, so counting both charges the same
+        waiting twice. ``reduce_bcast`` is the whole of its nested reduce and bcast.
+        """
+        return [c for c in self.collectives if not c.is_composed]
+
+    @property
+    def collective_rank_seconds(self) -> float:
+        """Rank-seconds spent blocked inside collectives.
+
+        The additive measure of coordination cost. Per-rank blocking times are summed over
+        participants and over primitive invocations, which is legitimate because rank-seconds of
+        two different ranks are genuinely different resources even when they elapse concurrently.
+        """
+        return sum(c.rank_wall_s for c in self.primitive_collectives)
+
+    @property
+    def collective_span_s(self) -> float:
+        """Wall-clock seconds during which at least one rank was inside a collective.
+
+        Computed as a union of intervals rather than a sum, so it answers "how much of the run had
+        coordination in flight" without double counting concurrent waits. Each rank's interval ends
+        when it records the collective and began ``wall_s`` earlier.
+        """
+        intervals: list[tuple[float, float]] = []
+        for c in self.primitive_collectives:
+            for rank_end, rank_wall in c.rank_intervals:
+                if rank_wall > 0:
+                    intervals.append((max(0.0, rank_end - rank_wall), rank_end))
+        if not intervals:
+            return 0.0
+        intervals.sort()
+        total = 0.0
+        cur_start, cur_end = intervals[0]
+        for start, end in intervals[1:]:
+            if start > cur_end:
+                total += cur_end - cur_start
+                cur_start, cur_end = start, end
+            else:
+                cur_end = max(cur_end, end)
+        return total + (cur_end - cur_start)
 
     @property
     def coordination_share(self) -> float:
-        """Collective time over wall time. Above ~0.5 the harness is mostly coordinating."""
-        return self.collective_wall_s / self.wall_s if self.wall_s > 0 else 0.0
+        """Fraction of the run's rank-seconds spent blocked in collectives, in [0, 1].
+
+        Defined against rank-seconds available --- ``world_size`` times wall time --- rather than
+        against wall time alone. The earlier definition summed each invocation's *maximum* per-rank
+        wait and divided by wall time, which is not a share of anything: it charged one rank's wait
+        inside a reduce and another rank's concurrent wait inside the following broadcast as two
+        separate costs, and on the translation ablations it produced 137%. A quantity that can
+        exceed 1 cannot be read as a proportion, and it made a harness that was coordinating less
+        look like one that was coordinating more.
+        """
+        available = self.world_size * self.wall_s
+        return self.collective_rank_seconds / available if available > 0 else 0.0
+
+    @property
+    def coordination_span_share(self) -> float:
+        """Fraction of wall clock with coordination in flight anywhere, in [0, 1]."""
+        return self.collective_span_s / self.wall_s if self.wall_s > 0 else 0.0
 
     @property
     def imbalance(self) -> float:
@@ -495,8 +562,11 @@ class Analysis:
             "wall_s": round(self.wall_s, 3),
             "ok": self.ok,
             "imbalance": round(self.imbalance, 3),
-            "collective_wall_s": round(self.collective_wall_s, 3),
+            "collective_rank_seconds": round(self.collective_rank_seconds, 3),
+            "collective_span_s": round(self.collective_span_s, 3),
             "coordination_share": round(self.coordination_share, 4),
+            "coordination_span_share": round(self.coordination_span_share, 4),
+            "n_primitive_collectives": len(self.primitive_collectives),
             "n_collectives": len(self.collectives),
             "model_checks_agree": agree,
             "model_checks_total": checked,
@@ -730,6 +800,10 @@ def _build_invocation(op: str, label: str, group: list[Event], t0: float) -> Col
         tokens=sum(int(p.get("tokens_sent") or 0) for p in payloads),
         fold_depth=max((int(p.get("fold_depth") or 0) for p in payloads), default=0),
         wall_s=max((float(p.get("wall_s") or 0.0) for p in payloads), default=0.0),
+        rank_wall_s=sum(float(p.get("wall_s") or 0.0) for p in payloads),
+        rank_intervals=[
+            (e["ts"] - t0, float(e["payload"].get("wall_s") or 0.0)) for e in group
+        ],
         absent=sorted(absent),
         divergence_risk=any(bool(p.get("divergence_risk")) for p in payloads),
     )

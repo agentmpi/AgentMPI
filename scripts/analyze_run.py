@@ -147,8 +147,8 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
     if a.coordination_share > 0.5:
         out.append((
             "note",
-            f"Collectives account for {num(a.coordination_share * 100, 1)}\\% of wall time, so this run "
-            f"spent more time coordinating than working.",
+            f"Collectives account for {num(a.coordination_share * 100, 1)}\\% of the run's rank-seconds, "
+            f"so more of the pool's time went to coordination than to work.",
         ))
     if a.imbalance > 1.5:
         out.append(("note", f"Load imbalance is {num(a.imbalance)}$\\times$: the slowest rank was busy far longer than the mean."))
@@ -236,7 +236,16 @@ def _headline_table(a: an.Analysis) -> str:
         ("peak ranks busy", num(c.max_busy), f"of {a.world_size} in the world"),
         ("serial fraction of active time", num(c.serial_fraction_of_busy * 100, 1) + r"\%", "time with exactly one rank busy"),
         ("load imbalance", num(a.imbalance) + r"$\times$", "slowest rank's busy time over the mean"),
-        ("coordination share", num(a.coordination_share * 100, 1) + r"\%", "wall time inside collectives"),
+        (
+            "coordination share",
+            num(a.coordination_share * 100, 1) + r"\%",
+            "rank-seconds blocked in collectives, of those available",
+        ),
+        (
+            "coordination in flight",
+            num(a.coordination_span_share * 100, 1) + r"\%",
+            "wall clock with any rank inside a collective",
+        ),
         (
             "rank reattachments",
             num(a.total_reattachments),
