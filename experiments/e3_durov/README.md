@@ -61,13 +61,13 @@ The run performs:
 
 1. `bcast` of immutable project provenance/research and `scatter` of all pages.
 2. Agent cultural/terminology research requiring URL-backed evidence.
-3. `allreduce(union)` of terminology, lifting conflicts for one root arbitration,
-   followed by a binding glossary broadcast.
+3. `allreduce(union)` of terminology, lifting conflicts for one evidence-grounded
+   root-agent arbitration, followed by a binding glossary broadcast.
 4. RMA `accumulate` of research; CAS-protected review claims.
-5. Agent multilingual literary translation of assigned pages.
-6. A fenced RMA draft epoch, then review/revision of another rank's draft.
-7. An exclusive leased lock, fencing token, and unlock around each reviewed
-   final artifact, followed by another window fence and a policy barrier.
+5. Agent multilingual literary translation in one bounded task per assigned page.
+6. A fenced RMA draft epoch, then one bounded review/revision task per peer page.
+7. Exclusive leased locks and fencing tokens around contended chapter-index
+   updates, followed by another window fence and a policy barrier.
 8. A bounded `gather` manifest and host-side JSONL assembly.
 
 Each run contains:

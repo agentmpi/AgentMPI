@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 from experiments.e3_durov.harness import SUPPORTED_RANKS, build_parser, main
-from experiments.e3_durov.prepare_corpus import RESEARCH_FILES, prepare_corpus
+from experiments.e3_durov.prepare_corpus import RESEARCH_FILES, _public_repo_url, prepare_corpus
 
 
 def _sha(text: str) -> str:
@@ -98,6 +98,16 @@ def test_prepare_corpus_rejects_incomplete_page_set(tmp_path: Path) -> None:
         prepare_corpus(legacy, tmp_path / "corpus.json", source_repo_url="https://example.com")
 
 
+def test_provenance_strips_credentials_from_https_remotes() -> None:
+    assert (
+        _public_repo_url("https://x-access-token:secret@github.com/example/project.git")
+        == "https://github.com/example/project.git"
+    )
+    assert _public_repo_url("git@github.com:example/project.git") == (
+        "git@github.com:example/project.git"
+    )
+
+
 def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
@@ -155,7 +165,7 @@ def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Pa
     assert len(list((run_dir / "out").glob("rank_*.json"))) == 16
     launch = json.loads((run_dir / "launch_plan.json").read_text(encoding="utf-8"))
     assert launch["supported_sizes"] == [16, 32, 64]
-    assert launch["bounds"]["contracts"]["translation"]["max_tokens"] == 24000
+    assert launch["bounds"]["contracts"]["translation"]["max_tokens"] == 12000
 
 
 def test_stub_requires_explicit_test_flag_and_rank_choices() -> None:
