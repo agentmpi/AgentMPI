@@ -1,4 +1,4 @@
-.PHONY: help install test lint paper tables clean microbench translation software campaign-status traces viz
+.PHONY: help install test lint paper tables clean microbench translation software campaign-status traces verify-traces viz
 
 PY ?= python3
 AMPI ?= $(HOME)/.local/bin/ampi
@@ -11,6 +11,9 @@ help:
 	@echo "microbench    run the agent-free microbenchmarks"
 	@echo "translation   run the translation experiment with the synthetic executor"
 	@echo "software      run the software experiment with the synthetic executor"
+	@echo "viz           run the trace viewer (works with no server, from committed traces)"
+	@echo "traces        regenerate the derived trace archive from runs/"
+	@echo "verify-traces check the committed trace archive against the cost model"
 	@echo "clean         remove build and LaTeX intermediates"
 
 install:
@@ -36,12 +39,16 @@ software:
 tables:
 	$(PY) scripts/make_tables.py
 
-# Export run traces to static JSON under viz/public/traces, so the viewer works from a
-# fresh clone with no server and no experiments run. The run directories themselves are
-# hundreds of megabytes and gitignored; this is the derived view, ~600 KiB, committed.
+# Regenerate the derived trace forms from the committed run directories: plain-text event
+# logs under traces/events and viewer payloads under viz/public/traces. Byte-reproducible,
+# so this is a no-op diff unless a run actually changed.
 traces:
-	$(PY) scripts/export_traces.py --min-events 40 \
-		--exclude smoke --exclude "__coll-" --exclude "__transport-" --exclude "__pingpong"
+	$(PY) scripts/export_traces.py
+
+# Check the archive instead of trusting it: digests, completeness against runs/, and a
+# re-derivation of the collective validation from the exported logs alone.
+verify-traces:
+	$(PY) scripts/verify_traces.py
 
 # The viewer. Reads the live trace server if one is running, otherwise the exported
 # traces. Start the server separately for live runs:

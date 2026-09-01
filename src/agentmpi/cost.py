@@ -509,13 +509,19 @@ class RunSummary:
         }
 
 
-def summarise(fabric: Fabric) -> RunSummary:
+def summarise(source: "Fabric | list[dict[str, Any]]") -> RunSummary:
     """Extract a run summary from the event log alone.
 
     The event log is authoritative: a summary computed from in-memory counters
     would not survive a crashed rank, and crashed ranks are the normal case.
+
+    Accepts either a live ``Fabric`` or an already-materialised event list, so an
+    exported ``traces/events/*.jsonl`` log summarises through exactly this code
+    path rather than a reimplementation of it.  That is what lets the archive
+    verifier check a fabric and its export for drift: any divergence is real,
+    not an artefact of two different summarisers.
     """
-    events = fabric.events()
+    events = source.events() if isinstance(source, Fabric) else list(source)
     if not events:
         return RunSummary(0.0, 0, 0, 0, 0.0, 0, 0, 0)
     t0, t1 = events[0]["ts"], events[-1]["ts"]

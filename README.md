@@ -172,9 +172,30 @@ make viz                                          # http://127.0.0.1:43117
 python3 scripts/trace_server.py --runs runs       # optional: serve live runs
 ```
 
-32 recorded traces from the experiments in this repository ship under
-`viz/public/traces`, so the viewer works immediately after a clone with no server and
-nothing run. `make traces` re-exports from `runs/` after an experiment of your own.
+### Every run is in the repository
+
+All 500 runs behind this paper are committed, so nothing has to be re-executed to see
+what happened. `make viz` after a clone shows all of them with no server running and no
+experiment of your own; the sidebar groups them by campaign, and the parameter sweeps stay
+collapsed until you ask for them.
+
+Each run is present in three forms, from primary to derived:
+
+| Path | What it is |
+| --- | --- |
+| `runs/<name>/fabric.sqlite` | the SQLite fabric the runtime actually wrote, plus its content-addressed artifacts under `blobs/` |
+| `traces/events/<name>.jsonl` | the complete event log as plain text, one JSON object per line, for `grep` and `jq` |
+| `viz/public/traces/<name>.json` | the viewer payload, byte-identical to what the live server serves |
+
+Together that is 53,756 events. The derived forms are regenerated with `make traces` and
+are byte-reproducible, so re-exporting unchanged runs produces no diff.
+
+`make verify-traces` checks the archive rather than trusting it. Beyond matching digests
+and line counts, it re-derives the collective validation from the `.jsonl` logs *alone* —
+for all 450 measured configurations, the `msg.send` count in the log must equal the
+closed-form prediction in `agentmpi.cost.FORMULAS` — and confirms that reading a fabric
+and reading its exported log produce the same summary. An archive that passes is not
+merely present, it is sufficient to reconstruct the paper's central quantitative claim.
 
 Diagnostics:
 
