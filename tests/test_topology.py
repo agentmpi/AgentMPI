@@ -139,6 +139,62 @@ def test_neighborhood_beats_alltoall_in_message_count(tmp_path):
     assert total_full > 3 * total_nbr
 
 
+@pytest.mark.parametrize("size", [4, 6, 8])
+def test_neighborhood_collectives_report_the_traffic_they_send(tmp_path, size):
+    """A neighbourhood collective must record its own message count.
+
+    This is not bookkeeping pedantry. The entire argument for these operations is that they cost
+    Θ(degree) instead of Θ(p), and that argument is made *from traces*: a reader looking at a run
+    should be able to see the message count fall. The three neighbourhood collectives originally
+    emitted their in-degree and out-degree but no ``messages_sent``, so every analysis of them
+    read zero traffic --- the one number that demonstrates why they exist was the one number
+    missing, and it stayed missing because the tests asserted on a runtime counter rather than on
+    what the trace recorded.
+    """
+    def rank_main(comm):
+        topo = ampi.dist_graph_create(comm, ampi.review_edges(comm.size, fanout=2))
+        ampi.neighbor_allgather(topo, f"artifact-{comm.rank}")
+        ampi.neighbor_alltoall(topo, [f"{comm.rank}->{d}" for d in topo.destinations])
+        cart = ampi.cart_create(comm, dims=[comm.size], periods=[True])
+        ampi.halo_exchange(cart, f"L{comm.rank}", f"R{comm.rank}")
+        return True
+
+    root = tmp_path / f"nbr-acct-{size}"
+    job = ampi.launch(rank_main, size=size, root=root)
+    assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
+
+    events = ampi.Fabric(root).events()
+    for kind in ("coll.neighbor_allgather", "coll.neighbor_alltoall", "coll.halo_exchange"):
+        records = [e for e in events if e["kind"] == kind]
+        assert records, f"{kind} emitted no event"
+        reported = sum(int(e["payload"].get("messages_sent") or 0) for e in records)
+        assert reported > 0, f"{kind} reported no messages at p={size}"
+        for e in records:
+            assert e["payload"].get("algorithm"), f"{kind} reported no algorithm"
+            assert int(e["payload"].get("size") or 0) == size, f"{kind} reported the wrong size"
+
+    # Every internal message must be attributable to the collective that sent it, which is what
+    # lets an analysis charge traffic to the right operation.
+    tagged = [
+        e for e in events if e["kind"] == "msg.send" and str(e["payload"].get("tag", "")).startswith("_ampi:")
+    ]
+    by_op: dict[str, int] = {}
+    for e in tagged:
+        op = str(e["payload"]["tag"]).split(":")[1]
+        by_op[op] = by_op.get(op, 0) + 1
+    for tag_op, kind in (
+        ("nbr_ag", "coll.neighbor_allgather"),
+        ("nbr_a2a", "coll.neighbor_alltoall"),
+        ("halo", "coll.halo_exchange"),
+    ):
+        reported = sum(
+            int(e["payload"].get("messages_sent") or 0) for e in events if e["kind"] == kind
+        )
+        assert by_op.get(tag_op, 0) == reported, (
+            f"{kind} p={size}: reports {reported} messages but {by_op.get(tag_op, 0)} were logged"
+        )
+
+
 def test_review_findings_return_to_the_author(tmp_path):
     """A critique must reach the rank that can act on it.
 

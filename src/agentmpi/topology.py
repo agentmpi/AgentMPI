@@ -41,6 +41,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from . import tokens as _tokens
 from .constants import Mode
 from .errors import AmpiUsageError
 
@@ -265,12 +266,24 @@ def neighbor_allgather(
             out.append(None)
             continue
         out.append(comm._crecv(s, itag, timeout=timeout, admit=admit))
+    # The traffic figures matter more here than for any other collective: the entire claim of a
+    # neighbourhood collective is that it costs Θ(degree) rather than Θ(p), and a trace that
+    # records only the degree leaves that claim unverifiable from the log. Reported in the same
+    # fields the other collectives use so one analysis reads all of them.
+    sent = sum(1 for d in dsts if d != PROC_NULL)
     comm.fabric.emit(
         "coll.neighbor_allgather",
         rank=comm.rt.wrank,
         ctx=comm.ctx,
+        algorithm="neighbor",
+        op="neighbor_allgather",
+        size=comm.size,
         indegree=len(srcs),
         outdegree=len(dsts),
+        rounds=1 if sent else 0,
+        messages_sent=sent,
+        tokens_sent=sent * _tok(payload),
+        fold_depth=0,
         wall_s=round(_now() - t0, 4),
         label=label,
     )
@@ -310,12 +323,20 @@ def neighbor_alltoall(
             out.append(None)
             continue
         out.append(comm._crecv(s, f"{itag}:{comm.rank}", timeout=timeout, admit=admit))
+    sent = [pl for d, pl in zip(dsts, payloads, strict=True) if d != PROC_NULL]
     comm.fabric.emit(
         "coll.neighbor_alltoall",
         rank=comm.rt.wrank,
         ctx=comm.ctx,
+        algorithm="neighbor",
+        op="neighbor_alltoall",
+        size=comm.size,
         indegree=len(srcs),
         outdegree=len(dsts),
+        rounds=1 if sent else 0,
+        messages_sent=len(sent),
+        tokens_sent=sum(_tok(pl) for pl in sent),
+        fold_depth=0,
         wall_s=round(_now() - t0, 4),
         label=label,
     )
@@ -342,6 +363,7 @@ def halo_exchange(
     epoch = comm._next_epoch("halo")
     itag = comm._itag("halo", epoch)
     left, right = topo.shift(dim, 1)
+    t0 = _now()
 
     from_left: Any = None
     from_right: Any = None
@@ -366,10 +388,35 @@ def halo_exchange(
         if left != PROC_NULL:
             from_left = comm._crecv(left, f"{itag}:R", timeout=timeout, admit=False)
             comm._csend(left_boundary, left, f"{itag}:L", timeout=timeout)
+    sent = sum(1 for peer in (left, right) if peer != PROC_NULL)
     comm.fabric.emit(
-        "coll.halo_exchange", rank=comm.rt.wrank, ctx=comm.ctx, left=left, right=right, label=label
+        "coll.halo_exchange",
+        rank=comm.rt.wrank,
+        ctx=comm.ctx,
+        algorithm="sendrecv",
+        op="halo_exchange",
+        size=comm.size,
+        left=left,
+        right=right,
+        # Two phases when both peers exist -- rightward then leftward -- which is the deadlock-free
+        # ordering and also the critical path a cost model should charge for.
+        rounds=2 if (left != PROC_NULL and right != PROC_NULL) else (1 if sent else 0),
+        messages_sent=sent,
+        tokens_sent=(_tok(right_boundary) if right != PROC_NULL else 0)
+        + (_tok(left_boundary) if left != PROC_NULL else 0),
+        fold_depth=0,
+        wall_s=round(_now() - t0, 4),
+        label=label,
     )
     return from_left, from_right
+
+
+def _tok(payload: Any) -> int:
+    """Token count of a payload, for the traffic figures a neighbourhood collective reports."""
+    try:
+        return _tokens.count(payload)
+    except Exception:
+        return 0
 
 
 def _neighbor_lists(topo: CartTopology | GraphTopology) -> tuple[list[int], list[int]]:
