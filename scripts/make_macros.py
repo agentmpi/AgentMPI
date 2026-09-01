@@ -311,51 +311,66 @@ def e3_macros() -> None:
     """
     rows = load(RUNS / "e3-series" / "series.json")
     scales = (16, 32, 64)
+    keys = ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
+            "Conf", "Imbal", "MaxWait", "Blocked", "Work", "Incomplete")
+
+    def emit(prefix: str, p: int, row: Any) -> None:
+        if not row:
+            for key in keys:
+                put(f"{prefix}{key}{p}", None)
+            return
+        put(f"{prefix}Wall{p}", int(round(row["wall_s"])))
+        put(f"{prefix}WallH{p}", round(row["wall_s"] / 3600, 2), fmt=".2f")
+        put(f"{prefix}Tasks{p}", row["tasks"])
+        put(f"{prefix}Execs{p}", row["executors"])
+        put(f"{prefix}Coord{p}", round(row["coordination_share"] * 100, 1), fmt=".1f")
+        put(f"{prefix}Par{p}", round(row["achieved_parallelism"], 2), fmt=".2f")
+        put(f"{prefix}Eff{p}", round(row["parallel_efficiency"] * 100, 1), fmt=".1f")
+        put(f"{prefix}Conf{p}", row["conflicts"])
+        put(f"{prefix}Imbal{p}", round(row["imbalance"], 2), fmt=".2f")
+        put(f"{prefix}MaxWait{p}", int(round(row["max_single_wait_s"])))
+        put(f"{prefix}Blocked{p}", int(round(row["blocked_rank_s"])))
+        put(f"{prefix}Work{p}", int(round(row["work_rank_s"])))
+        put(f"{prefix}Incomplete{p}", row["incomplete"])
+
     if not rows:
         for p in scales:
-            for key in ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
-                        "Conf", "Imbal", "MaxWait", "Blocked", "Work"):
-                put(f"eThree{key}{p}", None)
-        for key in ("Researched", "Duplicated", "Saved"):
+            emit("eThreeStub", p, None)
+            emit("eThreeReal", p, None)
+        for key in ("Researched", "Duplicated", "Saved", "Sources", "Starved"):
             put(f"eThree{key}", None)
         return
 
-    by_p = {row["p"]: row for row in rows}
+    # Two series, kept apart on purpose.  The surrogate runs measure the protocol
+    # with the operator cost set to zero; the broker run measures the regime where
+    # an executor turn dominates everything else.  Averaging them, or letting one
+    # macro mean either, would produce a number that describes neither.
+    stub = {r["p"]: r for r in rows if r["executor"] != "broker"}
+    real = {r["p"]: r for r in rows if r["executor"] == "broker"}
     for p in scales:
-        row = by_p.get(p)
-        if not row:
-            for key in ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
-                        "Conf", "Imbal", "MaxWait", "Blocked", "Work"):
-                put(f"eThree{key}{p}", None)
-            continue
-        put(f"eThreeWall{p}", int(round(row["wall_s"])))
-        put(f"eThreeWallH{p}", round(row["wall_s"] / 3600, 2), fmt=".2f")
-        put(f"eThreeTasks{p}", row["tasks"])
-        put(f"eThreeExecs{p}", row["executors"])
-        put(f"eThreeCoord{p}", round(row["coordination_share"] * 100, 1), fmt=".1f")
-        put(f"eThreePar{p}", round(row["achieved_parallelism"], 2), fmt=".2f")
-        put(f"eThreeEff{p}", round(row["parallel_efficiency"] * 100, 1), fmt=".1f")
-        put(f"eThreeConf{p}", row["conflicts"])
-        put(f"eThreeImbal{p}", round(row["imbalance"], 2), fmt=".2f")
-        put(f"eThreeMaxWait{p}", int(round(row["max_single_wait_s"])))
-        put(f"eThreeBlocked{p}", int(round(row["blocked_rank_s"])))
-        put(f"eThreeWork{p}", int(round(row["work_rank_s"])))
+        emit("eThreeStub", p, stub.get(p))
+        emit("eThreeReal", p, real.get(p))
 
     # The research-sharing saving, which is the window's whole justification: the
     # agenda is bounded and independent of p, so what a run avoids is every rank
     # researching every contested term.
-    glossary = load(RUNS / "e3-real-p64" / "glossary.json") or load(
-        RUNS / "e3-real-p32" / "glossary.json"
-    ) or load(RUNS / "e3-real-p16" / "glossary.json")
+    glossary = load(RUNS / "e3-real-p16" / "glossary.json")
     if glossary:
         researched = len(glossary)
         put("eThreeResearched", researched)
-        biggest = max((row["p"] for row in rows), default=0)
+        put("eThreeSources", sum(len(v.get("sources") or []) for v in glossary.values()))
+        # What the window bought: without it every rank that met a term would have
+        # researched it, so the saving is the population minus the one rank that
+        # actually did the work.
+        biggest = max(real, default=16)
         put("eThreeDuplicated", researched * biggest)
         put("eThreeSaved", researched * (biggest - 1))
     else:
-        for key in ("Researched", "Duplicated", "Saved"):
+        for key in ("Researched", "Duplicated", "Saved", "Sources"):
             put(f"eThree{key}", None)
+
+    metrics = load(RUNS / "e3-real-p16" / "analysis" / "metrics.json")
+    put("eThreeStarved", len(metrics.get("starved_tasks", [])) if metrics else None)
 
 
 def suite_macros() -> None:
