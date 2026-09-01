@@ -218,6 +218,7 @@ class CollectiveMixin:
         the harness author's declaration --- a missing chapter degrades a
         translation, whereas a missing module kills a build.
         """
+        started = time.monotonic()
         self.assert_identity()
         self._fence_check()
         self._join_collective(comm, label, "barrier")
@@ -246,7 +247,14 @@ class CollectiveMixin:
                 return {"label": label, "released": True, "absent": missing,
                         "policy": policy, "comm": new["name"]}
             raise
-        self.trace("barrier", rank=self.rank, label=label, arrived=len(arrived), dropped=dropped)
+        self.trace(
+            "barrier",
+            rank=self.rank,
+            label=label,
+            arrived=len(arrived),
+            dropped=dropped,
+            elapsed_s=time.monotonic() - started,
+        )
         return {
             "label": label,
             "released": True,
@@ -278,6 +286,7 @@ class CollectiveMixin:
         ones that make the root a bottleneck.  Immutability turns depth from a
         quality risk into a pure latency win.
         """
+        started = time.monotonic()
         self.assert_identity()
         me = self.comm_rank(comm)
         if me == root:
@@ -296,8 +305,22 @@ class CollectiveMixin:
             what=f"the root of broadcast {label!r} to publish",
         )
         rec = next(p for p in self._participants(comm, label) if p["rank"] == world_root)
-        return self._take(rec, materialize=materialize or me == root, view=view, out=out,
-                          extra={"label": label, "root": root})
+        result = self._take(
+            rec,
+            materialize=materialize or me == root,
+            view=view,
+            out=out,
+            extra={"label": label, "root": root},
+        )
+        self.trace(
+            "bcast",
+            rank=self.rank,
+            label=label,
+            root=root,
+            tokens=rec.get("tokens", 0),
+            elapsed_s=time.monotonic() - started,
+        )
+        return result
 
     def scatter(
         self,
@@ -319,6 +342,7 @@ class CollectiveMixin:
         identifies which rank it is for turns a misrouted block into a loud error
         at the receiver rather than a plausible wrong answer three phases later.
         """
+        started = time.monotonic()
         self.assert_identity()
         members = self.comm_members(comm)
         me = self.comm_rank(comm)
@@ -378,7 +402,13 @@ class CollectiveMixin:
             out_rec.update(body=slice_, charged=charged)
         else:
             out_rec.update(handle=self.put_payload(slice_).envelope.handle, tokens=tokens, charged=0)
-        self.trace("scatter", rank=self.rank, label=label, tokens=tokens)
+        self.trace(
+            "scatter",
+            rank=self.rank,
+            label=label,
+            tokens=tokens,
+            elapsed_s=time.monotonic() - started,
+        )
         return out_rec
 
     def _take(
@@ -432,11 +462,19 @@ class CollectiveMixin:
         projection, which is the middle ground between a manifest and a
         concatenation and the one most harnesses actually want.
         """
+        started = time.monotonic()
         self.assert_identity()
         kind = "allgather" if everyone else "gather"
         self._join_collective(comm, label, kind, payload=payload, root=root)
         me = self.comm_rank(comm)
         if not everyone and me != root:
+            self.trace(
+                kind,
+                rank=self.rank,
+                label=label,
+                contributed=True,
+                elapsed_s=time.monotonic() - started,
+            )
             return {"label": label, "contributed": True, "root": root}
         arrived, dropped = self._await_participation(
             comm, label, kind=kind, quorum=quorum, timeout=timeout
@@ -467,7 +505,14 @@ class CollectiveMixin:
         else:
             result["charged"] = self.charge(40 * len(manifest), what="manifest")[0]
             result["next"] = "ampi obj get HANDLE --view head:400  # per contribution"
-        self.trace(kind, rank=self.rank, label=label, contributors=len(manifest), dropped=dropped)
+        self.trace(
+            kind,
+            rank=self.rank,
+            label=label,
+            contributors=len(manifest),
+            dropped=dropped,
+            elapsed_s=time.monotonic() - started,
+        )
         return result
 
     def allgather(self, label: str, **kw: Any) -> dict[str, Any]:
@@ -492,6 +537,7 @@ class CollectiveMixin:
         review graph costs ``O(pn)``, and refusing to make that restriction is why
         group-chat architectures do not scale.
         """
+        started = time.monotonic()
         self.assert_identity()
         members = self.comm_members(comm)
         if len(payload) != len(members):
@@ -506,7 +552,13 @@ class CollectiveMixin:
             block = self.get_body(p["handle"])
             received.append({"from": p["rank"], "item": block[me]})
         charged, _ = self.charge(count_tokens(canonical(received)), what="alltoall")
-        self.trace("alltoall", rank=self.rank, label=label, received=len(received))
+        self.trace(
+            "alltoall",
+            rank=self.rank,
+            label=label,
+            received=len(received),
+            elapsed_s=time.monotonic() - started,
+        )
         return {"label": label, "received": received, "dropped": dropped, "charged": charged}
 
     # -- reductions -----------------------------------------------------------
@@ -534,6 +586,7 @@ class CollectiveMixin:
         it cannot complete inside one call, and the schedule is driven by
         :meth:`op_commit`.
         """
+        started = time.monotonic()
         self.assert_identity()
         operator = get_op(op)
         kind = "allreduce" if everyone else "reduce"
@@ -543,6 +596,14 @@ class CollectiveMixin:
         )
         me = self.comm_rank(comm)
         if not everyone and me != root and operator.evaluator == "runtime":
+            self.trace(
+                kind,
+                rank=self.rank,
+                label=label,
+                op=op,
+                contributed=True,
+                elapsed_s=time.monotonic() - started,
+            )
             return {"label": label, "contributed": True, "root": root}
 
         decision = select_algorithm(
@@ -601,6 +662,7 @@ class CollectiveMixin:
         self.trace(
             kind, rank=self.rank, label=label, op=op, algorithm=decision.chosen,
             depth=folded["depth"], contributors=len(values), conflicts=len(conflicts) or None,
+            elapsed_s=time.monotonic() - started,
         )
         if violations:
             raise err(
@@ -638,6 +700,7 @@ class CollectiveMixin:
         it strictly sequentially pays ``p`` executor latencies; one that ignores
         the dependence produces inconsistent output.
         """
+        started = time.monotonic()
         self.assert_identity()
         operator = get_op(op)
         if operator.evaluator == "agent":
@@ -661,7 +724,14 @@ class CollectiveMixin:
         ]
         value = serial_fold(operator, prefix) if prefix else identity_like(operator, payload)
         charged, _ = self.charge(count_tokens(canonical(value)), what=kind)
-        self.trace(kind, rank=self.rank, label=label, op=op, prefix=len(prefix))
+        self.trace(
+            kind,
+            rank=self.rank,
+            label=label,
+            op=op,
+            prefix=len(prefix),
+            elapsed_s=time.monotonic() - started,
+        )
         return {
             "label": label,
             "op": op,

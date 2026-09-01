@@ -344,11 +344,19 @@ class RmaMixin:
     ) -> dict[str, Any]:
         self.assert_identity()
         space = self._require_win(win, comm)
+        started = time.monotonic()
         deadline = time.time() + timeout
         while True:
             lease = self.device.lease(space, key, holder=self.rank, mode=mode, ttl=ttl)
             if lease is not None:
-                self.trace("win.lock", rank=self.rank, win=win, key=key, token=lease.token)
+                self.trace(
+                    "win.lock",
+                    rank=self.rank,
+                    win=win,
+                    key=key,
+                    token=lease.token,
+                    wait_s=time.monotonic() - started,
+                )
                 return {"win": win, "key": key, "lock_id": lease.lock_id, "token": lease.token,
                         "expires_at": lease.expires_at, "mode": mode}
             held = [lk for lk in self.device.leases(space) if lk.key == key]

@@ -56,14 +56,27 @@ def test_a_local_failure_does_not_remove_a_rank_from_the_population(tmp_path):
 def test_the_report_carries_a_diagnosis_and_the_trace_is_written(tmp_path):
     h = Harness(root=str(tmp_path / "j"), size=2, device="sqlite")
     h.create()
-    results = h.run(lambda amp, r: amp.barrier("only", timeout=20))
+
+    def rank_main(amp, rank):
+        amp.barrier("only", timeout=20)
+        return amp.bcast(
+            "briefing",
+            payload={"revision": 1} if rank == 0 else None,
+            root=0,
+            timeout=20,
+            materialize=True,
+        )
+
+    results = h.run(rank_main)
     out = h.save(results, tmp_path / "report.json")
     report = json.loads(out.read_text())
     assert report["succeeded"] == 2
     assert report["diagnosis"]["verdict"] in ("healthy", "starting", "degraded")
     assert Path(report["trace"]).exists()
-    lines = Path(report["trace"]).read_text().strip().splitlines()
-    assert any(json.loads(line)["kind"] == "barrier" for line in lines)
+    events = [json.loads(line) for line in Path(report["trace"]).read_text().splitlines()]
+    timed = [event for event in events if event["kind"] in {"barrier", "bcast"}]
+    assert {event["kind"] for event in timed} == {"barrier", "bcast"}
+    assert all(event["elapsed_s"] >= 0 for event in timed)
 
 
 # --------------------------------------------------------------------------
