@@ -146,6 +146,35 @@ comment.
 - Do not edit `src/`, `scripts/`, `traces/`, or `runs/`.
 - Do not re-run experiments. The traces are the record; they are not to be regenerated.
 
+## If you were assigned a collective *family* instead of a run
+
+A family is one collective algorithm measured across every process count — `bcast/binomial` at
+p = 2, 3, 4, 5, 6, 7, 8, 10, 12, 16, 20, 24, 32. Its package lives at
+`analysis/families/<op>-<algorithm>/` with the same layout: `metrics.json`, `generated.tex`,
+`figures/family.pdf`, and the `analysis.tex` you write. Regenerate the derived parts with:
+
+```bash
+python3 scripts/analyze_family.py --family <op>/<algorithm>
+```
+
+Everything above still applies, with three additions.
+
+**Derive the cost before you compare it.** Read the algorithm's implementation in
+`src/agentmpi/algorithms.py` and its closed form in `src/agentmpi/cost.py` (`FORMULAS`). Explain
+why the algorithm costs what it costs — where the round count steps and why there — and only then
+compare with the measurements. An analysis that just observes agreement is much less useful than
+one that explains what agreement confirms.
+
+**Powers of two are the interesting axis.** Most collectives take a different code path when p is
+not a power of two, and that path is where implementation defects live. The figure marks the two
+classes with different markers for this reason. Say whether the remainder path behaves, and if the
+figure shows red crosses (the collective's self-reported count disagreeing with the logged
+traffic), that is a defect — investigate it and report it prominently.
+
+**These runs contain no agents.** Wall times are sub-second and dominated by SQLite writes and
+event logging. They measure the protocol, not model latency, and any claim about agent behaviour
+from these runs would be wrong. Say so in the threats section.
+
 ## Report back
 
 Two to four sentences: the single most interesting thing the run shows, any finding you judged to
