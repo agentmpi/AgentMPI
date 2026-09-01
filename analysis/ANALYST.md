@@ -110,6 +110,24 @@ standing in for a real model, an artefact of how the run was driven rather than 
 protocol, a metric that does not mean what it appears to. Be specific; "more runs would help" is
 not a threat, it is a truism.
 
+### A known threat to every ablation: the worker pool was shared
+
+The real-agent runs were executed against one persistent pool of Cursor subagents, and ablations
+ran after their baselines. So an agent filling a rank in an ablation may have carried context from
+the baseline run, and could reproduce text it had already produced — or revised — there.
+
+This is not hypothetical. In `real-tr-p8-nohalo`, which has no seam-reconciliation stage at all,
+three of eight output sections are byte-identical to the *revised* output of `real-tr-p8-full`.
+The harness is not at fault: that run issued only `terms:*` and `translate:*` calls, no `revise:*`
+calls, and each output file equals its own translate result. Either the reconciled rendering was
+what an unreconciled agent would produce anyway — a real result about the mechanism's marginal
+value — or the agent remembered. **The trace cannot distinguish these.**
+
+If your run is an ablation, check whether its outputs coincide with its baseline's, and if they
+do, present both explanations rather than picking one. Compare `runs/<RUN>/output/` against the
+baseline's, and check `runs/<RUN>/spool/` for which stages actually ran. Shared *input* artefacts
+(scatter units, glossary, term sheets) are identical by design and are not evidence of anything.
+
 ### The quality bar
 
 - **Every claim traces to a number or to the figure.** Cite the value. If you cannot support it,
