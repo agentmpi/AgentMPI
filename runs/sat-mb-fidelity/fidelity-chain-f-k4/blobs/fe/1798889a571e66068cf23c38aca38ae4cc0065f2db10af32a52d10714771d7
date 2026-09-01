@@ -1,0 +1,17 @@
+Merge the two reports below into a single consolidated report.
+
+Requirements:
+- Preserve every distinct factual item. Each item carries a bracketed identifier
+  such as [F-3-2]. Keep every identifier that appears in either input, exactly as
+  written, attached to its item.
+- You may compress wording, but you may not drop an item.
+- Your output must be at most 450 tokens. If you cannot fit everything at full
+  length, shorten the wording of items rather than removing any of them.
+
+Return ONLY a JSON object: {"title": "<short>", "findings": ["[F-x-y] <item>", ...]}
+
+--- REPORT A ---
+{"source_rank": 2, "title": "Report from component group 2", "findings": ["[F-2-0] Component system-2.0 reported a measured throughput of 114 units per second under the nominal workload.", "[F-2-1] Component system-2.1 reported a measured throughput of 115 units per second under the degraded workload.", "[F-2-2] Component system-2.2 reported a measured throughput of 116 units per second under the saturated workload.", "[F-2-3] Component system-2.3 reported a measured throughput of 117 units per second under the nominal workload.", "[F-2-4] Component system-2.4 reported a measured throughput of 118 units per second under the degraded workload.", "[F-2-5] Component system-2.5 reported a measured throughput of 119 units per second under the saturated workload.", "[F-2-6] Component system-2.6 reported a measured throughput of 120 units per second under the nominal workload.", "[F-2-7] Component system-2.7 reported a measured throughput of 121 units per second under the degraded workload.", "[F-2-8] Component system-2.8 reported a measured throughput of 122 units per second under the saturated workload.", "[F-2-9] Component system-2.9 reported a measured throughput of 123 units per second under the nominal workload.", "[F-2-10] Component system-2.10 reported a measured throughput of 124 units per second under the degraded workload.", "[F-2-11] Component system-2.11 reported a measured throughput of 125 units per second under the saturated workload."]}
+
+--- REPORT B ---
+{"findings": ["[F-3-0] 121 nom", "[F-3-1] 122 deg", "[F-3-2] 123 sat", "[F-3-3] 124 nom", "[F-3-4] 125 deg", "[F-3-5] 126 sat", "[F-3-6] 127 nom", "[F-3-7] 128 deg", "[F-3-8] 129 sat", "[F-3-9] 130 nom", "[F-3-10] 131 deg", "[F-3-11] 132 sat", "[F-4-0] 128 nom", "[F-4-1] 129 deg", "[F-4-2] 130 sat", "[F-4-3] 131 nom", "[F-4-4] 132 deg", "[F-4-5] 133 sat", "[F-4-6] 134 nom", "[F-4-7] 135 deg", "[F-4-8] 136 sat", "[F-4-9] 137 nom", "[F-4-10] 138 deg", "[F-4-11] 139 sat", "[F-5-0] 135 nom", "[F-5-1] 136 deg", "[F-5-2] 137 sat", "[F-5-3] 138 nom", "[F-5-4] 139 deg", "[F-5-5] 140 sat", "[F-5-6] 141 nom", "[F-5-7] 142 deg", "[F-5-8] 143 sat", "[F-5-9] 144 nom", "[F-5-10] 145 deg", "[F-5-11] 146 sat", "[F-6-0] 142 nom", "[F-6-1] 143 deg", "[F-6-2] 144 sat", "[F-6-3] 145 nom", "[F-6-4] 146 deg", "[F-6-5] 147 sat", "[F-6-6] 148 nom", "[F-6-7] 149 deg", "[F-6-8] 150 sat", "[F-6-9] 151 nom", "[F-6-10] 152 deg", "[F-6-11] 153 sat", "[F-7-0] 149 nom", "[F-7-1] 150 deg", "[F-7-2] 151 sat", "[F-7-3] 152 nom", "[F-7-4] 153 deg", "[F-7-5] 154 sat", "[F-7-6] 155 nom", "[F-7-7] 156 deg", "[F-7-8] 157 sat", "[F-7-9] 158 nom", "[F-7-10] 159 deg", "[F-7-11] 160 sat"], "title": "Merged throughput report, component groups 3-7 (units/s; F-x-y = system-x.y; nom/deg/sat = nominal/degraded/saturated workload)"}

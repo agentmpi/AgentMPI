@@ -1,0 +1,17 @@
+Merge the two reports below into a single consolidated report.
+
+Requirements:
+- Preserve every distinct factual item. Each item carries a bracketed identifier
+  such as [F-3-2]. Keep every identifier that appears in either input, exactly as
+  written, attached to its item.
+- You may compress wording, but you may not drop an item.
+- Your output must be at most 450 tokens. If you cannot fit everything at full
+  length, shorten the wording of items rather than removing any of them.
+
+Return ONLY a JSON object: {"title": "<short>", "findings": ["[F-x-y] <item>", ...]}
+
+--- REPORT A ---
+{"source_rank": 6, "title": "Report from component group 6", "findings": ["[F-6-0] Component system-6.0 reported a measured throughput of 142 units per second under the nominal workload.", "[F-6-1] Component system-6.1 reported a measured throughput of 143 units per second under the degraded workload.", "[F-6-2] Component system-6.2 reported a measured throughput of 144 units per second under the saturated workload.", "[F-6-3] Component system-6.3 reported a measured throughput of 145 units per second under the nominal workload.", "[F-6-4] Component system-6.4 reported a measured throughput of 146 units per second under the degraded workload.", "[F-6-5] Component system-6.5 reported a measured throughput of 147 units per second under the saturated workload.", "[F-6-6] Component system-6.6 reported a measured throughput of 148 units per second under the nominal workload.", "[F-6-7] Component system-6.7 reported a measured throughput of 149 units per second under the degraded workload.", "[F-6-8] Component system-6.8 reported a measured throughput of 150 units per second under the saturated workload.", "[F-6-9] Component system-6.9 reported a measured throughput of 151 units per second under the nominal workload.", "[F-6-10] Component system-6.10 reported a measured throughput of 152 units per second under the degraded workload.", "[F-6-11] Component system-6.11 reported a measured throughput of 153 units per second under the saturated workload."]}
+
+--- REPORT B ---
+{"findings": ["[F-7-0] Component system-7.0 reported a measured throughput of 149 units per second under the nominal workload.", "[F-7-1] Component system-7.1 reported a measured throughput of 150 units per second under the degraded workload.", "[F-7-2] Component system-7.2 reported a measured throughput of 151 units per second under the saturated workload.", "[F-7-3] Component system-7.3 reported a measured throughput of 152 units per second under the nominal workload.", "[F-7-4] Component system-7.4 reported a measured throughput of 153 units per second under the degraded workload.", "[F-7-5] Component system-7.5 reported a measured throughput of 154 units per second under the saturated workload.", "[F-7-6] Component system-7.6 reported a measured throughput of 155 units per second under the nominal workload.", "[F-7-7] Component system-7.7 reported a measured throughput of 156 units per second under the degraded workload.", "[F-7-8] Component system-7.8 reported a measured throughput of 157 units per second under the saturated workload.", "[F-7-9] Component system-7.9 reported a measured throughput of 158 units per second under the nominal workload.", "[F-7-10] Component system-7.10 reported a measured throughput of 159 units per second under the degraded workload.", "[F-7-11] Component system-7.11 reported a measured throughput of 160 units per second under the saturated workload."], "source_rank": 7, "title": "Report from component group 7"}

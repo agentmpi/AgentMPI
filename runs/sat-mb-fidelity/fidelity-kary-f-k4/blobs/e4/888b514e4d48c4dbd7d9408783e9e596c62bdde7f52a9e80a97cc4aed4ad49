@@ -1,0 +1,17 @@
+Merge the 2 reports below into a single consolidated report.
+
+Requirements:
+- Preserve every distinct factual item. Each item carries a bracketed identifier
+  such as [F-3-2]. Keep every identifier that appears in ANY input, exactly as
+  written, attached to its item.
+- You may compress wording, but you may not drop an item.
+- Your output must be at most 450 tokens. If you cannot fit everything at full
+  length, shorten the wording of items rather than removing any of them.
+
+Return ONLY a JSON object: {"title": "<short>", "findings": ["[F-x-y] <item>", ...]}
+
+--- INPUT 0 ---
+{"findings": ["[F-0-0]100n [F-0-1]101d [F-0-2]102s [F-0-3]103n [F-0-4]104d [F-0-5]105s [F-0-6]106n [F-0-7]107d [F-0-8]108s [F-0-9]109n [F-0-10]110d [F-0-11]111s", "[F-1-0]107n [F-1-1]108d [F-1-2]109s [F-1-3]110n [F-1-4]111d [F-1-5]112s [F-1-6]113n [F-1-7]114d [F-1-8]115s [F-1-9]116n [F-1-10]117d [F-1-11]118s", "[F-2-0]114n [F-2-1]115d [F-2-2]116s [F-2-3]117n [F-2-4]118d [F-2-5]119s [F-2-6]120n [F-2-7]121d [F-2-8]122s [F-2-9]123n [F-2-10]124d [F-2-11]125s", "[F-3-0]121n [F-3-1]122d [F-3-2]123s [F-3-3]124n [F-3-4]125d [F-3-5]126s [F-3-6]127n [F-3-7]128d [F-3-8]129s [F-3-9]130n [F-3-10]131d [F-3-11]132s"], "title": "Consolidated throughput report, component groups 0-3 (F-x-y = component system-x.y; value = measured throughput in units/s; n/d/s = nominal/degraded/saturated workload)"}
+
+--- INPUT 1 ---
+{"findings": ["[F-4-0] 128 nominal", "[F-4-1] 129 degraded", "[F-4-2] 130 saturated", "[F-4-3] 131 nominal", "[F-4-4] 132 degraded", "[F-4-5] 133 saturated", "[F-4-6] 134 nominal", "[F-4-7] 135 degraded", "[F-4-8] 136 saturated", "[F-4-9] 137 nominal", "[F-4-10] 138 degraded", "[F-4-11] 139 saturated", "[F-5-0] 135 nominal", "[F-5-1] 136 degraded", "[F-5-2] 137 saturated", "[F-5-3] 138 nominal", "[F-5-4] 139 degraded", "[F-5-5] 140 saturated", "[F-5-6] 141 nominal", "[F-5-7] 142 degraded", "[F-5-8] 143 saturated", "[F-5-9] 144 nominal", "[F-5-10] 145 degraded", "[F-5-11] 146 saturated", "[F-6-0] 142 nominal", "[F-6-1] 143 degraded", "[F-6-2] 144 saturated", "[F-6-3] 145 nominal", "[F-6-4] 146 degraded", "[F-6-5] 147 saturated", "[F-6-6] 148 nominal", "[F-6-7] 149 degraded", "[F-6-8] 150 saturated", "[F-6-9] 151 nominal", "[F-6-10] 152 degraded", "[F-6-11] 153 saturated", "[F-7-0] 149 nominal", "[F-7-1] 150 degraded", "[F-7-2] 151 saturated", "[F-7-3] 152 nominal", "[F-7-4] 153 degraded", "[F-7-5] 154 saturated", "[F-7-6] 155 nominal", "[F-7-7] 156 degraded", "[F-7-8] 157 saturated", "[F-7-9] 158 nominal", "[F-7-10] 159 degraded", "[F-7-11] 160 saturated"], "title": "Merged throughput report, component groups 4-7 (units/s; F-x-y = system-x.y)"}
