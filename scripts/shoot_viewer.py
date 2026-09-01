@@ -199,16 +199,32 @@ class Browser:
 SELECT_JS = """
 (() => {
   const want = %s;
-  const buttons = Array.from(document.querySelectorAll('button.run, button.group-head'));
-  // Expand every collapsed campaign group first: the target may be hidden inside one.
-  for (const b of buttons) {
-    if (b.classList.contains('group-head') && b.getAttribute('aria-expanded') === 'false') b.click();
+  // The sidebar shows the short name -- the part after the campaign prefix -- so short names are
+  // ambiguous across campaigns: mb-free__coll-bcast-flat-16 and mb-smoke__coll-bcast-flat-16 both
+  // render as coll-bcast-flat-16. Matching on the short name alone clicks whichever comes first
+  // and then silently screenshots the wrong run, so the campaign has to be part of the match.
+  const sep = want.indexOf('__');
+  const campaign = sep === -1 ? null : want.slice(0, sep);
+  const short = sep === -1 ? want : want.slice(sep + 2);
+
+  for (const b of Array.from(document.querySelectorAll('button.group-head'))) {
+    if (b.getAttribute('aria-expanded') === 'false') b.click();
   }
+
+  const inGroup = (button) => {
+    const section = button.closest('section.group');
+    const head = section && section.querySelector('.group-name');
+    return head ? head.textContent : null;
+  };
   const runs = Array.from(document.querySelectorAll('button.run'));
-  const hit = runs.find((b) => {
+  const candidates = runs.filter((b) => {
     const n = b.querySelector('.run-name');
-    return n && (n.textContent === want || want.endsWith(n.textContent));
+    return n && n.textContent === short;
   });
+  const hit =
+    candidates.find((b) => inGroup(b) === campaign) ||
+    (campaign === null ? candidates.find((b) => inGroup(b) === null) : null) ||
+    (candidates.length === 1 ? candidates[0] : null);
   if (!hit) return false;
   hit.click();
   return true;
