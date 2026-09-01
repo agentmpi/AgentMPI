@@ -552,6 +552,47 @@ class Analysis:
         return sum(c.conflicts for c in self.collectives)
 
     @property
+    def max_claim_wait_s(self) -> float:
+        """Longest a task waited in the queue before an executor claimed it.
+
+        Its own measure because it separates two failures that a wall-clock
+        summary cannot: a run that was *slow*, and a run where nobody ever showed
+        up.  The second is a pool-sizing problem outside the protocol, and reading
+        it as the first blames the harness for the host's session limits.
+        """
+        published: dict[str, float] = {}
+        waits: list[float] = []
+        for e in self.events:
+            aid = e.get("aid")
+            if not aid:
+                continue
+            if e["kind"] == "broker.publish":
+                published[str(aid)] = e["ts"]
+            elif e["kind"] == "broker.claim":
+                start = published.pop(str(aid), None)
+                if start is not None:
+                    waits.append(e["ts"] - start)
+        return max(waits) if waits else 0.0
+
+    @property
+    def starved_tasks(self) -> list[dict[str, Any]]:
+        """Tasks published that no executor ever claimed.
+
+        The characteristic failure of running a long job against a host whose
+        session lifetime is far shorter than the job's.  It is invisible in a task
+        count --- a task nobody claimed and a task still being worked on are both
+        simply "not done" --- and it is the difference between a harness that is
+        wrong and a population that was never fully staffed.
+        """
+        claimed = {str(e.get("aid")) for e in self.events if e["kind"] == "broker.claim"}
+        return [
+            {"aid": str(e.get("aid")), "rank": int(e.get("rank", -1)),
+             "label": str(e.get("label") or "")}
+            for e in self.events
+            if e["kind"] == "broker.publish" and str(e.get("aid")) not in claimed
+        ]
+
+    @property
     def has_broker(self) -> bool:
         """Was any rank driven through the broker, so occupancy is observable?
 
@@ -584,6 +625,8 @@ class Analysis:
             "n_collectives": len(self.collectives),
             "n_incomplete_collectives": len(self.incomplete_collectives),
             "conflicts_lifted": self.conflicts_lifted,
+            "max_claim_wait_s": round(self.max_claim_wait_s, 1),
+            "starved_tasks": self.starved_tasks,
             "total_reattachments": self.total_reattachments,
             "n_trouble": len(self.trouble),
             "n_recovery": len(self.recovery),

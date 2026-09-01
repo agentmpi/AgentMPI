@@ -124,6 +124,21 @@ def findings(a: Analysis) -> list[dict[str, str]]:
         )
     if a.tasks.get("abandoned"):
         add("warn", f"{a.tasks['abandoned']} task(s) were abandoned by their executor")
+    starved = a.starved_tasks
+    if starved:
+        ranks = sorted({t["rank"] for t in starved})
+        add(
+            "error",
+            f"{len(starved)} task(s) were published and never claimed by any executor "
+            f"(ranks {ranks}): the population was not fully staffed, which is a "
+            "pool-sizing problem outside the protocol and must not be read as a slow harness",
+        )
+    if a.max_claim_wait_s > 60:
+        add(
+            "note",
+            f"the longest a task waited in the queue before an executor claimed it was "
+            f"{a.max_claim_wait_s:.0f}s; queue waits enter measured latency but not token counts",
+        )
     if a.total_reattachments:
         add(
             "note",
