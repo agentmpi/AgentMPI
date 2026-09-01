@@ -1,0 +1,490 @@
+%% Analysis of run: real-tr-p16-full
+%%
+%% generated.tex holds every derived fact and is rewritten by
+%%   python3 scripts/analyze_run.py --run real-tr-p16-full
+%% This file is never overwritten: it is where interpretation lives.
+\documentclass[11pt]{article}
+\input{../../preamble}
+
+\title{\textbf{real-tr-p16-full}\\[2pt]\large An AgentMPI run analysis}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This is the $p=16$ point of the parallel book-translation strong-scaling series, and the
+only outright failure in the 500-run archive: \texttt{job.finish} records
+\texttt{ok: false} with all sixteen ranks in \texttt{failed\_ranks}, no translated
+section on disk, and \$0.0726 spent for nothing. The trace shows a single cause with a
+long shadow. Six of the sixteen rank roles were never bound to a worker process at all
+--- the fabric's \texttt{ranks} table still lists ranks 9--13 and 15 with
+\texttt{executor = broker} at incarnation 1, and their six queued term-extraction calls
+carry \texttt{claimed\_at = NULL} for the whole run --- so the glossary
+\texttt{allreduce} could never complete, and the ten ranks that did their work correctly
+died waiting for the six that had no executor. Every claim below traces to
+\texttt{traces/events/real-tr-p16-full.jsonl} or to the fabric at
+\texttt{runs/real-tr-p16-full/fabric.sqlite}. The reading is that this is a capacity
+failure \emph{observed through} AgentMPI rather than a failure \emph{of} it: the
+protocol detected the condition, named it with the right error class, bounded every wait,
+and refused to report success. The one genuine defect is a composition defect --- the
+broker's 5{,}400\,s expiry is three times the collectives' 1{,}800\,s receive timeout, so
+the harness's degrade-and-stay-in-the-group discipline fires 3{,}600\,s after the peers
+it was meant to rescue have already given up. The single most consequential thing a
+reader should take away is external to the run: this failed run was a row in the paper's
+strong-scaling table, and the p=16 point is not safe to use --- for two independent
+reasons, only one of which has been fixed.
+\end{abstract}
+
+\input{generated}
+
+\section{Reading the timeline}
+
+Figure~\ref{fig:timeline} is almost entirely empty, and the emptiness is the finding. The
+axis runs to 7{,}200\,s. Every blue bar in the figure --- every interval in which a rank
+held an agent task --- lies inside the first 188\,s, or 2.6\% of the axis. The union of
+those intervals is 72.0\,s, one per cent of the wall clock, against a declared world of
+sixteen ranks. The remaining 7{,}012\,s contain four coloured marks per lane and nothing
+else.
+
+The blue work arrives in two batches, not one, and the split is the whole story. Eight
+lanes (ranks 0--7) show a bar beginning at $t \approx 91$--94\,s; two more (ranks 8 and
+14) show a bar beginning at $t \approx 156$\,s; and six lanes (ranks 9, 10, 11, 12, 13,
+15) show \emph{no blue at all}. Those six lanes are the visual signature of a rank that
+never received an executor, and they are visually distinct from a rank that worked and
+then failed. Figure~\ref{fig:concurrency} renders the same fact as a step function:
+concurrency rises to exactly 8, falls to 0, rises to 2, and then flatlines at zero for
+7{,}013\,s beneath a dotted world-size line at 16. The achieved parallelism annotation
+reads $0.04\times$.
+
+The gap between $t\approx0.09$\,s and $t\approx91$\,s is provisioning latency, not
+computation. All sixteen \texttt{broker.enqueue} events are complete by $t=0.09$\,s: the
+\texttt{scatterv} finished in 0.08\,s with 15 messages, exactly the closed form for
+binomial scatter at $p=16$, and every rank immediately published its term-extraction
+prompt to the fabric. Nothing then happens for ninety seconds, because a queued call can
+only be claimed by a worker process bound to that same rank --- the broker's queue is
+per-rank by design, so that a rank's accumulated context cannot be stolen by another
+role. The first ten \texttt{rank.init} events with \texttt{executor: worker} are the
+external worker fleet coming up, and they are what unblocks the eight-then-two pattern.
+Once a worker did attach, the work itself was quick and unremarkable: subtracting
+\texttt{broker.claim} from \texttt{broker.complete} gives per-call service times of
+21.6--37.5\,s, against 19.5--29.5\,s for the same prompts in \texttt{real-tr-p8-full} ---
+a fair comparison because that run's \texttt{max\_claim\_wait\_s} is 0.0, so its recorded
+latencies are service times too. The agents were not slow. Only ten of them existed.
+
+The red marks fall in three temporally separated columns, and reading them left to right
+gives the causal order directly. The first column, at $t = 1{,}915$--1{,}988\,s, carries
+ten \texttt{rank.error} events, one for each rank that had completed a term sheet: ranks
+3, 7, 1, 2, 6, 5, 4, 0 between 1{,}915.60\,s and 1{,}931.11\,s, then ranks 14 and 8 at
+1{,}984.65\,s and 1{,}987.65\,s. The trailing position of the last two is their late
+worker attachment carried forward unchanged. Every one of these ten died exactly
+$1{,}800.0 \pm 0.1$\,s after its own \texttt{agent.call} completed --- rank 3 at
+$115.58 \to 1{,}915.60$, rank 0 at $131.08 \to 1{,}931.11$, rank 8 at $187.60 \to
+1{,}987.65$ --- which is the default receive timeout of
+\texttt{algorithms.reduce}. These ranks were blocked inside the glossary reduce.
+
+The second column, at $t = 5{,}400.15$\,s, is the six unprovisioned ranks: six
+\texttt{broker.expire} events with \texttt{waited\_s: 5400.0}, each immediately followed
+by \texttt{harness.degraded} with \texttt{error\_class: ERR\_TIMEOUT} and the label of
+the task that never ran (\texttt{terms:u9}, \texttt{terms:u10}, \texttt{terms:u11},
+\texttt{terms:u12}, \texttt{terms:u13}, \texttt{terms:u15}). This is
+\texttt{safe\_agent} in \texttt{experiments/translation.py} behaving exactly as its
+docstring promises: the local failure did not remove the rank from the group. Five of the
+six went straight on to contribute an empty term sheet to the reduce, and the
+21-token \texttt{msg.send} events with tag \texttt{\_ampi:reduce:0:3} at $t=5{,}400.15$\,s
+are those contributions. They arrived 3{,}412\,s too late. Ranks 9 and 10 sent to rank 8,
+which had been dead since $t=1{,}987.65$\,s; rank 15 sent to rank 14, dead since
+$t=1{,}984.65$\,s. Those three sends (mid 23, 25 and 27) are the only unmatched messages
+in the run, and they are why the log holds 27 \texttt{msg.send} against 24
+\texttt{msg.recv}.
+
+The third column, at $t = 7{,}200.20$--7{,}200.21\,s, is the remaining six ranks timing
+out. Again the interval is $1{,}800.05$\,s from the moment each entered the reduce at
+$t=5{,}400.15$\,s. It is worth being precise about this number, because 7{,}200\,s looks
+like a cap and is not one: this run was launched with \texttt{job\_timeout: 14400.0}, so
+it had another two hours of budget it never used. All sixteen \texttt{rank.error} records
+carry the identical payload \texttt{AmpiTimeout('receive timed out')} /
+\texttt{ERR\_TIMEOUT}; not one is a job abort. The run's total duration is a derived
+quantity, $5{,}400 + 1{,}800$, and a longer job budget would have changed nothing.
+
+Figure~\ref{fig:comm} shows the consequence in the communication matrix. The binomial
+scatter's outbound fan from rank 0 and the tree's internal forwarding are all there, but
+the reduce's returning traffic is a fragment: rank 0 received 208, 382 and 872 tokens
+from ranks 1, 2 and 4, and nothing from rank 8. Reconstructing the tree from the message
+log gives $0 \leftarrow \{1,2,4,8\}$, $2 \leftarrow \{3\}$, $4 \leftarrow \{5,6\}$, $6
+\leftarrow \{7\}$, $8 \leftarrow \{9,10,12\}$, $10 \leftarrow \{11\}$, $12 \leftarrow
+\{13,14\}$, $14 \leftarrow \{15\}$. Rank 8's three children are ranks 9, 10 and 12 ---
+all three unprovisioned. So rank 8 could not fold, so the root could not complete, so
+the entire left half of the tree, which had done its work correctly and on time, failed
+too. Figure~\ref{fig:ranks} makes the same partition arithmetically: ten ranks at
+21.6--37.5\,s busy, six at exactly 0.00\,s, all sixteen in state \texttt{failed}.
+
+Figure~\ref{fig:collectives} plots one bar pair, not two. The scatter's 15 logged
+messages sit exactly on its closed-form 15. The reduce is absent from the figure
+entirely: the tooling is declining to plot a comparison it has judged not to be
+meaningful, for the reason set out in \S\ref{sec:notamodelfailure}.
+
+\section{Interpretation}
+
+\subsection{What is true by construction}
+
+The harness, the decomposition and the collectives are all as
+\texttt{experiments/translation.py} asked for them. A binomial \texttt{scatterv} of
+sixteen units, a per-rank contract-checked term-sheet extraction, a
+\texttt{reduce\_bcast} \texttt{allreduce} under \texttt{UNION} to agree the glossary, and
+a \texttt{PROCEED} barrier before the \texttt{gather}: the phase structure in the log is
+the phase structure in the source. The executor was \texttt{broker}, so the ten agent
+calls that completed were served by real agents and not by a surrogate --- this run does
+tell us something about agent behaviour, although as it turns out very little, because
+the run died in phase 1 of five. Sixteen agent calls were enqueued in total, ten
+completed, and the run's \texttt{output/} directory contains zero files. No section of
+the book was ever translated.
+
+Two headline numbers are also true by construction rather than emergent. The scatter's
+message count agreeing with its closed form is a real check but a trivially passed one
+at $t<0.1$\,s. And the 20 rank reattachments to incarnation 3 are the worker protocol
+working normally: each \texttt{ampi worker next} invocation registers a fresh
+\texttt{RankRuntime} before claiming, so ten served ranks $\times$ two invocations gives
+exactly 20. The finding that these reattachments preserved rank identity, mailboxes and
+context accounts is correct and is \emph{[ok]}, but it is a property of the ten ranks
+that had workers. The six that did not are frozen at incarnation 1 for 7{,}200\,s, which
+is the more informative half of the same measurement.
+
+\subsection{The cause: a provisioning shortfall, not congestion}
+
+The proximate cause is narrower and more mundane than the trace's shape suggests, and
+four independent records in the fabric agree on it. First, the \texttt{ranks} table lists
+ranks 0--8 and 14 with \texttt{executor = 'worker'} at incarnation 3, and ranks 9--13 and
+15 with \texttt{executor = 'broker'} at incarnation 1: the six were never bound to a
+worker process. Second, the \texttt{agent\_calls} table shows aids 4, 8, 9, 11, 14 and 16
+in state \texttt{expired} with \texttt{claimed\_at = NULL} --- never claimed, as opposed
+to claimed and abandoned. Third, the event log contains zero \texttt{broker.reclaim}
+events, so no worker ever took one of those tasks and dropped it. Fourth, the log
+contains exactly 20 \texttt{rank.init} events with \texttt{executor: worker}, spread over
+those same ten ranks and no others.
+
+This distinction matters because ``a shortage of available agents in the shared worker
+pool'' is not quite what happened. AgentMPI's broker queue is deliberately \emph{not} a
+shared pool: \texttt{executor.claim\_next} selects \texttt{WHERE rank=? AND
+state='pending'}, and the docstring is explicit that a worker cannot steal work belonging
+to another rank's role, precisely so that a rank's identity and accumulated context
+survive across incarnations. A worker bound to rank 4 therefore \emph{cannot} help rank
+9, however idle it is. This is visible in the trace: all eight first-wave workers had
+finished by $t=131.02$\,s, and if the fleet had been a recycling pool of eight it would
+have drained the remaining six tasks by $t\approx170$\,s. Instead two more workers
+attached at $t=155.6$ and $156.4$\,s and then no worker ever attached again for
+7{,}013\,s. Ten rank roles were served; six were never served at all.
+
+So the failure is a capacity problem, and specifically a provisioning problem in the run
+driver rather than contention inside the protocol. It also means the shortfall is not
+merely \emph{first} in the causal order --- it is a precondition of the run, already true
+at $t=0$ before any protocol event was recorded.
+
+\subsection{The causal order, settled}
+
+The timestamps admit only one ordering. The starvation begins at $t=0.09$\,s, when six
+calls enter a queue no worker will ever poll. The receive timeouts occur at
+$t=1{,}915$--1{,}988\,s. The broker expiries occur at $t=5{,}400.15$\,s. The receive
+timeouts are therefore downstream of the starvation by 1{,}800\,s and \emph{upstream} of
+the broker expiries by 3{,}400\,s.
+
+The protocol-problem reading --- that receive timeouts somehow starved the claims --- is
+excluded by more than ordering. It requires a mechanism by which a blocked receive
+prevents a claim, and there is none: the ten ranks that were blocked in the reduce had
+already completed and published their agent calls, and the six that were starved were not
+blocked in any receive at $t=0.09$\,s, they were blocked in \texttt{comm.agent}. The
+dependency runs strictly one way. Rank 0 waited on rank 8; rank 8 waited on ranks 9, 10
+and 12; ranks 9, 10 and 12 waited on worker processes that did not exist. Every receive
+timeout in the run is a consequence of the tail of that chain, and the binomial reduce
+tree is what propagated six unprovisioned ranks into sixteen failed ones.
+
+\subsection{A failure observed through AgentMPI, not a failure of it}
+
+Argued from the evidence, the protocol's own machinery detected and reported this
+condition correctly at every layer, and the run's illegibility budget was never spent.
+
+Nothing hung. Every one of the sixteen ranks terminated at a bounded, configured,
+attributable deadline: ten at 1{,}800\,s after entering a collective, six at 5{,}400\,s
+of broker wait followed by a further 1{,}800\,s. There is no wait in this trace whose
+duration is not the value of a named timeout.
+
+Nothing was mis-classified. All sixteen \texttt{rank.error} records carry the class
+\texttt{ERR\_TIMEOUT} and the message \texttt{receive timed out}, which is what
+happened; none reports a context overflow, a contract violation or an internal error.
+\texttt{contract\_violations} is 0 and \texttt{n\_retries} is 0 across all sixteen ranks
+--- the ten term sheets that did land were contract-clean on the first attempt, so the
+\texttt{TermSheet} contract never had to fire and did not falsely fire either.
+
+Nothing was silently absorbed. \texttt{broker.expire} names the aid and the exact wait;
+\texttt{harness.degraded} names the label of the work that was lost and the class of the
+loss; \texttt{job.finish} records \texttt{ok: false} and enumerates all sixteen failed
+ranks rather than reporting a partial success. The run cost \$0.0726 and produced no
+output, and both facts are in the record.
+
+And the degradation path itself worked. \texttt{safe\_agent} caught the
+\texttt{AmpiTimeout}, contributed the identity element, emitted the trace event and kept
+the rank in the group --- exactly the discipline its docstring argues for --- and five of
+the six degraded ranks went on to send their empty contribution into the reduce. A
+protocol that fails this loudly and this legibly is behaving well.
+
+\subsection{The one genuine defect: an inverted timeout hierarchy}
+
+There is nevertheless something here I would call a real defect rather than expected
+behaviour, and it is a composition defect rather than a bug in any one component. The
+broker's expiry is 5{,}400\,s, set by \texttt{make\_executor\_factory(timeout=5400.0)} in
+\texttt{experiments/common.py}. The collectives' receive timeout is 1{,}800\,s, the
+default in \texttt{algorithms.py}. Each value is individually defensible. Composed, they
+are in the wrong order, and the consequence is that \texttt{safe\_agent}'s
+degrade-and-stay-in-the-group discipline is unreachable by construction: a rank cannot
+rejoin a collective at $t=5{,}400$\,s that its peers abandoned at $t=1{,}800$\,s. The
+trace contains the proof rather than the hypothesis --- ranks 9, 10 and 15 did send their
+degraded contributions, and those three sends are the run's three unmatched messages,
+delivered into the mailboxes of ranks that had been dead for 3{,}412\,s.
+
+The fix requires no new protocol machinery and no change to the harness's structure: the
+agent-call timeout must be shorter than the receive timeout of the next collective the
+rank will enter. Had the broker expired at, say, 900\,s, the six starved ranks would have
+degraded at $t\approx900$\,s, rank 8 would have folded and forwarded, the root would have
+completed the reduce, and the run would have translated ten of sixteen sections with a
+ten-rank glossary and reported the six absentees honestly through \texttt{stats['degraded']}
+and the \texttt{PROCEED} barrier's \texttt{absent} list. A degraded book is what this
+harness was designed to produce under exactly these conditions, and the only thing
+standing between the design and the outcome was the ordering of two timeout constants.
+
+\subsection{What the harness should have done, and why it did not}
+\label{sec:shrink}
+
+The protocol offers \texttt{ft.revoke}, \texttt{ft.shrink} and \texttt{ft.agree} for this
+situation, and the trace is clear both that they would have helped and that nothing
+attempted them. \texttt{revoke} exists to free ranks already blocked inside a collective
+that can never complete, and \texttt{comm.recv} calls \texttt{\_check\_live()} inside its
+poll loop, so a single revoke would have collapsed all sixteen of the 1{,}800\,s waits
+into seconds. \texttt{agree} plus \texttt{shrink} would then have rebuilt the
+communicator over the survivors.
+
+Three pieces of evidence explain why none of this happened. First,
+\texttt{experiments/translation.py} never imports \texttt{revoke}, \texttt{shrink} or
+\texttt{agree}; its only fault-tolerance affordance is the \texttt{PROCEED} barrier
+policy at phase 5, which sits downstream of the phase-2 glossary
+\texttt{allreduce} and was therefore never reached. Second, the \texttt{failures} table
+in the fabric has zero rows and the log has zero \texttt{ft.declare\_failed} events: no
+rank was ever declared failed, which is the precondition for \texttt{shrink}'s agreement
+step. Third, \texttt{role\_counts} records 28 trouble events and has no recovery entry at
+all, and \texttt{n\_recovery} is 0, so the violet recovery colour of the viewer's palette
+appears nowhere in this run --- not because a recovery was attempted and failed, but
+because none was attempted.
+
+One correction to the obvious prescription: the harness should have shrunk to \emph{ten}
+ranks, not twelve. The twelve figure is the count of ranks that emitted a
+\texttt{coll.reduce} record, and it is a different set from the set of ranks that could
+do work. The twelve emitters are the seven served non-root ranks (1--7) plus the five
+starved ranks that folded after degrading (9, 10, 11, 13, 15); the four absentees are the
+root and the interior nodes whose children were starved (0, 8, 12, 14). The set of ranks
+that actually had an executor is $\{0..8, 14\}$, which is ten. A shrink at $t\approx190$\,s
+over those ten is what a correct supervisor would have produced. Whether the resulting run
+would have been fast is an inference rather than a measurement, but a bounded one:
+\texttt{real-tr-p8-full} completed all three agent phases over eight units in 166.8\,s,
+so a ten-rank continuation was minutes of work, not hours.
+
+\subsection{The incomplete reduce is not a cost-model disagreement}
+\label{sec:notamodelfailure}
+
+The generated findings flag the glossary reduce as \emph{[warning]}: reached by 12 of 16
+ranks, 12 messages logged where the closed form predicts 15. This is expected for this
+configuration and specifically is \emph{not} a model failure, and the analysis tooling is
+right to withhold the comparison --- the collective table shows \modelna{} rather than
+\modelbad{}, \texttt{model\_checks\_total} is 1 rather than 2, and
+Figure~\ref{fig:collectives} omits the reduce from the plot entirely.
+
+The reason is structural. The closed form for binomial reduce is derived for a
+communicator of size $p$: every rank contributes, every interior node folds, and $p-1$
+messages cross the tree. A run in which four interior nodes never folded logs fewer
+messages not because the algorithm is cheaper but because it did not happen. Comparing 12
+against 15 would score the model as wrong on the evidence that the run was incomplete,
+which manufactures a defect out of an absence. \texttt{analysis.py}'s
+\texttt{Invocation.complete} gates \texttt{messages\_agree} on
+\texttt{n\_participants >= size} for exactly this reason, and its docstring names this
+run.
+
+The positive form of the same point is worth stating: the one collective in this run that
+\emph{did} complete, the binomial \texttt{scatterv}, logged 15 messages against a
+predicted 15 and 4 rounds against a predicted 4, with 0.06\,s of skew. The cost model was
+validated by this run, on the only invocation where validation was meaningful. The
+reduce's skew of 5{,}284.58\,s --- first fold at 115.58\,s, last at 5{,}400.16\,s --- is
+the honest summary of what went wrong, and it is a far more useful number than a spurious
+model disagreement would have been.
+
+\subsection{What this means for the paper's scaling claims}
+\label{sec:scaling}
+
+This is the most consequential thing in the run, and it is not about the run. As of
+commit \texttt{d4bca31}, \texttt{scripts/make\_tables.py} selected the strong-scaling
+series by campaign label and configuration only:
+
+\begin{center}
+\texttt{if c.get("glossary") and c.get("halo") and c.get("glossary\_op") == "union"} \\
+\texttt{and c.get("allreduce\_alg") == "reduce\_bcast": scal[c["ranks"]] = d}
+\end{center}
+
+There was no test on \texttt{d["job"]["ok"]} anywhere in the translation table builder,
+although the same file already applies exactly that filter to microbenchmark rows in
+\texttt{table\_model\_validation}. The p=16 result matches the selector, so it was
+included, and the generated strong-scaling table under \texttt{paper/generated/} at that
+commit reads:
+
+\begin{center}
+\texttt{16 \& 7,200 \& 0.08 \& 0.01 \& 13.250 \& 10 \& 13,925 \& 0.073 \& 1.000}
+\end{center}
+
+Every derived cell in that row is meaningless and two are actively misleading. A
+Karp--Flatt metric of 13.250 is a serial-fraction estimate, which cannot exceed 1 by
+construction. A consistency of 1.000 is what \texttt{score\_translation} returns when
+\texttt{n\_shared\_entities} is 0, so a run that produced no translated text at all
+reported perfect terminological agreement, in the column a reader scans for quality. The
+7{,}200\,s wall figure is a timeout sum, not a duration.
+
+The contamination propagated into the prose. The paper's \S Q3 asserts that ``the
+\emph{contention} coefficient $\sigma$ is substantial at $0.22$, and the \emph{coherency}
+coefficient $\kappa$ is zero'', and that ``the Karp--Flatt metric agrees: it does not
+grow with $p$''. Both statements are contradicted by the table they cite. Karp--Flatt in
+that table runs 0.000, 0.422, 0.380, 0.188 and then 13.250 --- a seventyfold jump. And
+refitting \texttt{agentmpi.cost.fit\_usl} on the five speedups derived from the recorded
+wall times gives $\sigma = 0.02$, $\kappa = 0.0465$, $R^2 = 0.404$ with p=16 included,
+against $\sigma = 0.220$, $\kappa = 0.0000$, $R^2 = 0.873$ without it. The $0.22$ and
+the zero that the prose quotes are the p=1--8 fit. Because \texttt{make\_tables.py}
+suppresses the fit below $R^2 = 0.5$, the \verb|\NUslFit| macro at \texttt{d4bca31} in
+fact expanded to ``not supported by single-trial data ($R^2=0.404$)'' --- so the paper
+simultaneously asserted a fit and printed a refusal to report one, two sentences apart,
+because of this one run. Its central claim about $\kappa$, the coherency ceiling that
+distinguishes collective coordination from group chat, rested on a number the generated
+macro no longer contained.
+
+This has since been addressed. Commit \texttt{c2d4baa} partitions the series on
+\texttt{d["job"]["ok"]}, reports the failed attempt as a footnoted row with no derived
+quantities, and restores \verb|\NUslFit| to $\sigma=0.220$, $\kappa=0.0000$, $R^2=0.873$.
+That is the right shape of fix: it neither launders the failure nor lets it masquerade as
+a measurement.
+
+\textbf{A second reason the p=16 point is unsafe, which the \texttt{ok} filter does not
+address.} The p=16 run did not translate the same book as its siblings. Its config records
+\texttt{units: 16} against \texttt{units: 8} for p=1, 2, 4 and 8, and because
+\texttt{common.split\_units} advances a cursor through the text taking \texttt{n\_units}
+chunks of at most \texttt{words\_per\_unit} words, total work is proportional to the unit
+count. The recorded \texttt{source} blocks confirm it: 10{,}438 words and 312 paragraphs
+at p=16, against 5{,}109 words and 149 paragraphs at every other point --- $2.04\times$
+the work. The table is captioned ``Strong scaling: identical total work, decreasing
+population'', and for this row that caption is false. The row's surviving wall, calls,
+tokens and USD columns are consequently not comparable with the rows above them even
+after the derived columns were withdrawn.
+
+This is not a driving mistake so much as a structural limit of the sweep, and that makes
+it worth stating rather than merely fixing. At $p=16$ with 8 units, \texttt{n\_local =
+max(1, 8 // 16) = 1}, so ranks 0--7 receive one unit each and ranks 8--15 receive empty
+lists; the halo phase then indexes \texttt{mine[0]} and raises. The strong-scaling series
+\emph{cannot} be extended past $p=8$ at this unit granularity without changing the
+problem. The honest reading is that the strong-scaling curve for this experiment has four
+points, p=1 through p=8, and that p=16 is a weak-scaling attempt that failed for reasons
+unrelated to either kind of scaling.
+
+\subsection{What the run contributes relative to its siblings}
+
+Read against \texttt{real-tr-p1/p2/p4/p8-full}, this run's distinctive contribution is a
+clean separation of two things the successful runs conflate. In all four successful runs
+\texttt{max\_claim\_wait\_s} is 0.0: agents were available the instant they were asked
+for, so those runs measure the harness and tell us nothing about what happens when they
+are not. The p=8 run reached \texttt{max\_busy} 8 of 8 and so cannot distinguish a fleet
+of eight from a fleet of eighty. This run reached \texttt{max\_busy} 8 of 16 and a claim
+wait of 5{,}400\,s, and is the archive's only observation of the protocol under executor
+scarcity.
+
+That observation is worth having, and its content is narrower than the headline. The
+per-call service times measured here (21.6--37.5\,s) sit close to p=8's
+(19.5--29.5\,s) on byte-identical prompts: prompt token counts for \texttt{terms:u0}
+through \texttt{terms:u7} are identical between the two runs, and output token counts
+match for seven of the eight (\texttt{terms:u2} returned 248 tokens here against 255 at
+p=8). The whole of the apparent latency regression, \texttt{agent\_latency\_p50} of 126.57\,s here
+against 46.0\,s at p=8, is queueing, not slower agents. What this run establishes about
+scaling is therefore not that coordination cost explodes at $p=16$ --- the trace has no
+evidence about that, since the run never completed a collective at $p=16$ --- but that the
+harness's operating envelope was bounded by executor supply rather than by protocol
+overhead, and that the boundary is unforgiving: sixteen roles served by ten workers
+produced not a $10/16$ slowdown but total failure, because a binomial reduce has no
+partial answer.
+
+\section{Threats to this reading}
+
+\textbf{The provisioning diagnosis is inferential at one step.} I can show from four
+independent fabric records that no worker process ever registered against ranks 9--13 and
+15. I cannot show \emph{why} from the trace, and the trace is the only evidence I have.
+A launcher that started ten workers and exited, a quota or rate limit that refused the
+remaining six, six worker processes that crashed before their first
+\texttt{RankRuntime.register}, or an operator who launched ten by hand are all consistent
+with what is recorded. The claim I am confident in is that the six roles had no executor;
+the claim ``the fleet was capped at ten'' is a reading of the $t=91$/$t=156$/never
+pattern, not a measurement. If a driver log exists outside the fabric it would settle
+this, and my reading of \S\ref{sec:shrink} would be unaffected either way, since the
+harness's obligation to shrink does not depend on why the ranks were absent.
+
+\textbf{Three headline metrics do not mean what they appear to in this run, and one of
+them is inverted.} ``Load imbalance 1.21$\times$'' reads as near-perfect balance in a run
+whose defining feature is that six of sixteen ranks did nothing; \texttt{Analysis.imbalance}
+filters to \texttt{busy\_s > 0}, so it describes only the ten served ranks. Computed over
+all sixteen ($37.497 / (310.498/16)$) it is 1.93$\times$. ``Coordination share 0.1\%'' is
+worse than incomplete: it is derived from \texttt{coll.*} wall times, which a rank records
+only when it \emph{completes} its part, so the sixteen ranks that each blocked 1{,}800\,s
+inside the glossary reduce contribute nothing to it. Counted properly, 28{,}800 of the
+62{,}570 rank-seconds this run held --- 46\% --- were spent blocked inside a collective,
+against 310.5 rank-seconds (0.5\%) of work. A reader who took the 0.1\% at face value
+would conclude the opposite of the truth. Finally ``rank reattachments 20'' is flagged
+\emph{[ok]} and is genuinely fine, but it counts only ranks that had workers; the six that
+did not are invisible in it.
+
+\textbf{The agent-latency figures are not model latencies.} \texttt{BrokerExecutor}
+computes \texttt{latency\_s = finished\_at - created\_at}, so \texttt{agent.call} latency
+includes broker queue time. Every latency in this run is therefore inflated by 91\,s or
+156\,s of waiting, and \texttt{metrics.json}'s \texttt{calibration.alpha\_p50 = 125.055}
+is a queue-plus-service time reported as an agent invocation latency, which is not what
+$\alpha$ means in the cost model. This does not reach the paper --- \texttt{table\_translation}
+selects the calibration row by \texttt{max(agent\_calls)}, which is the 31-call p=8
+semantic run, not this 10-call one --- but it is a near miss, and any future selector that
+preferred the largest $p$ would import a contaminated $\alpha$.
+
+\textbf{Two counters named \texttt{tokens\_deferred} disagree by 3.1$\times$.} The
+\texttt{job.finish} payload reports 50{,}544; \texttt{metrics.json} reports 16{,}082. Both
+are correct under their own definitions --- 16{,}082 is the token count of the three
+rendezvous sends, and $16{,}082 + 34{,}462 = 50{,}544$ adds every non-admitted receive
+including eager ones --- but they share a key name across two artefacts a reader will put
+side by side. Neither propagates to the paper, which quotes \texttt{tokens\_in +
+tokens\_out}.
+
+\textbf{This is n=1 on the failure itself, and it is the archive's only failure.} The
+protocol behaviours I have credited --- bounded waits, correct error classes, a working
+degrade path, an incomplete-collective exclusion that fires when it should --- are each
+observed exactly once here. That is enough to establish that they work in this instance
+and not enough to establish that they always do. Conversely, the inverted timeout
+hierarchy of \S\ref{sec:shrink} is a property of two constants rather than of this trace,
+so it does not need replication; it can be read off \texttt{common.py} and
+\texttt{algorithms.py} directly, and every run using both defaults has it latent.
+
+\textbf{The `7{,}200\,s job cap' reading is wrong and is circulating.} It is a natural
+misreading --- \texttt{ampi.launch}'s own default timeout is 7{,}200\,s --- and the
+footnote added to the corrected scaling table in \texttt{c2d4baa} states that the wall
+time is the job timeout. It is not: \texttt{job\_timeout} was 14{,}400\,s, all sixteen
+errors are receive timeouts, and $7{,}200 = 5{,}400 + 1{,}800$ exactly. The distinction
+changes the remedy. ``The job cap fired'' suggests a longer budget might have let the run
+finish; ``the reduce receive timed out at broker-expiry plus 1{,}800\,s'' says a longer
+budget would have produced an identical failure two hours earlier than the cap.
+
+\textbf{Finally, a caution about the argument in \S\ref{sec:notamodelfailure}.} I have
+defended the exclusion of the incomplete reduce from model checking, and I believe the
+defence is right, but it should be recognised as a policy that cannot be validated by the
+run it protects. The exclusion means a genuine cost-model defect occurring in a collective
+that also happened not to complete would be invisible. Nothing in this trace suggests that
+is happening: a binomial reduce has every non-root rank send exactly once, so the complete
+form is 15 sends, and the 12 logged are 15 minus precisely the three that ranks 8, 12 and
+14 never made, which is what the recovered topology requires. But the check that would
+catch it is the one being withheld, and that is worth saying out loud rather than resting
+on the tooling's judgement.
+
+\end{document}

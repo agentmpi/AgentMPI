@@ -1,0 +1,293 @@
+%% Analysis of run: vague-sw-p8-vague-shared
+%%
+%% generated.tex holds every derived fact and is rewritten by
+%%   python3 scripts/analyze_run.py --run vague-sw-p8-vague-shared
+%% This file is never overwritten: it is where interpretation lives.
+\documentclass[11pt]{article}
+\input{../../preamble}
+
+\title{\textbf{vague-sw-p8-vague-shared}\\[2pt]\large An AgentMPI run analysis}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Eight agents were each given one module of a small SQL engine and a specification that
+deliberately withholds every module's signatures, so that the RMA interface window was the only
+channel through which a rank could learn what its dependencies expose. They published eight
+interfaces into the window, fenced, read the fourteen interfaces the module dependency graph
+requires, wrote 2{,}201 lines of Python, and passed 60 of 60 acceptance cases at the first
+integration. That first-round success is the reason this cell has the fewest events of the four
+in the $2\times2$ --- 311 against 473--686 --- because the harness breaks out of its repair loop
+on a green build, so the run simply stopped after one round while its siblings each ran two. The
+run is therefore not a story of ranks doing less work; it is a story of not having to do the
+second half. Against its matched sibling \texttt{vague-sw-p8-vague-noshared}, which differs only
+in that the window is withheld, it used half the agent calls (16 against 32), 36\% of the output
+tokens (32{,}304 against 88{,}989) and 39\% of the money (\$0.65 against \$1.64) to reach the
+same 60/60. The single most important caveat is that ``interface agreement'' here means
+publish-once and read-once: no slot ever reached version 2, no lock was ever taken, and one of
+the eight published interfaces was factually wrong about a peer's type name and was never
+corrected.
+\end{abstract}
+
+\input{generated}
+
+\section{Reading the timeline}
+
+Figure~\ref{fig:timeline} shows two bars per rank and nothing else, and that is the whole run.
+The first bar is the interface call, the second is the implementation call, and the vertical
+alignment of every second bar at $t\approx127.6$\,s is the fence. This is bulk-synchronous
+execution in its purest form: two phases, each ending when its slowest member ends.
+
+The phase boundary is set by rank 2, which owns \texttt{nodes}. Its interface call ran for
+127.54\,s and emitted 1{,}939 output tokens, the largest interface in the run and the longest
+single call of the first phase; the fastest, rank 0's \texttt{errors}, finished at 34.51\,s. The
+seven other ranks therefore sat inside \texttt{win\_fence:interfaces-0:interfaces-published}
+waiting for it, and the barrier records how long each waited: 93.51\,s for rank 0, 77.76\,s for
+rank 6, down to 45.76\,s for rank 5, summing to 476.6 rank-seconds of idle. The concurrency trace
+in Figure~\ref{fig:concurrency} shows this as the first staircase, falling from eight busy ranks
+to one and staying at one for the 45.28\,s between 81.83\,s and 127.11\,s when rank 2 alone is
+working. The second phase repeats the shape exactly: \texttt{impl:engine:r1} on rank 6 runs for
+273.58\,s, everyone else arrives early at \texttt{integrate-r1} and waits --- 240.08\,s for rank
+0, 218.06\,s for rank 7, 960.9 rank-seconds in total --- and the last 16.48\,s of the run has
+rank 6 as the only busy rank. Those two spans, 45.28\,s and 16.48\,s, are the entire 15.4\%
+serial fraction reported in the headline table; there is no third contributor.
+
+Adding the two straggler times, $127.57 + 273.58 = 401.15$\,s, accounts for 401.15 of the
+401.86\,s of wall time. Everything the protocol did --- the specification broadcast, the fence's
+own propagation, the gather of every module's source to rank 0, the acceptance run, the report
+broadcast, the scatter of blame and the agreement vote --- fits in the remaining second. The
+oracle itself, the
+only real computation in the run, occupies 58.9\,ms between rank 0's \texttt{coll.gather} at
+401.6435\,s and its \texttt{report-r1} broadcast at 401.7024\,s: it wrote nine files, launched a
+subprocess and ran 60 SQL cases in 0.015\% of the run. This is what the 83.1\% coordination share
+in the headline table actually means, and why it should not be read as coordination overhead. The
+figure counts time spent inside a collective call, and in this run essentially all of that time
+is a rank blocked at a barrier while a peer talks to a model. The collectives cost nothing; the
+waiting costs everything, and the waiting is a consequence of agent latency dispersion, not of
+the protocol.
+
+The fence looks expensive in rank-seconds and is nearly free in makespan. Reconstructing from the
+log what a dependency-triggered start would have given --- each module beginning as soon as the
+last of its declared dependencies had been \texttt{put}, with the measured implementation
+latencies held fixed --- yields a finish at 385.15\,s against the actual 401.40\,s, a saving of
+16.25\,s or 4.0\%. Only \texttt{engine} was genuinely over-constrained, ready at 82.06\,s and
+started at 127.81\,s; but \texttt{parser}, the second-longest implementation, depends on
+\texttt{nodes} and could not have started before 127.57\,s in any case. The last publisher was
+already on the critical path, so the global barrier cost almost nothing beyond what the
+dependency structure cost anyway. That is a property of this particular schedule and not of
+fences in general, and it is worth saying because the 476.6 rank-seconds of fence idle is the
+number a reader will notice first.
+
+Figure~\ref{fig:comm} is the binomial gather tree and nothing else. Rank 4 is the bright cell at
+13{,}375 tokens because it aggregates ranks 5 and 6 before forwarding to rank 0; the
+\texttt{collect-r1} gather moves 31{,}495 tokens, 73\% of the 43{,}079 tokens sent in the entire
+run, in the seven rendezvous messages that are the run's only non-eager traffic. The right-hand
+panel of Figure~\ref{fig:ranks} is empty, and that is by construction: the harness passes
+\texttt{admit=False} on every collective, so all eight ranks finalise with
+\texttt{context\_used}\,=\,0 and this run exercises no admission behaviour at all. Its context
+metrics are vacuous, not encouraging.
+
+\section{Interpretation}
+
+\paragraph{Why the event count is low.} The counter-intuitive fact about this cell is that it has
+the fewest events of the four despite the hardest specification. The trace answers it
+unambiguously and the answer is not that ranks did less: there are 16 \texttt{agent.call} events,
+two per rank, and each rank made exactly one interface call and one implementation call, all 16
+succeeding on \texttt{attempt: 1} with zero contract violations, zero
+\texttt{harness.degraded} events, zero failed ranks and eight \texttt{rank.finalize} events. What
+the run did not do is a second round. The harness loops up to \texttt{rounds}\,=\,2 and breaks
+when \texttt{agree} returns true; the eight \texttt{ft.agree} events between 401.83\,s and
+401.86\,s all carry \texttt{result: true} with all eight ranks as voters and none excluded,
+because the acceptance suite reported 60 of
+60 passing on the first integration. Everything downstream of that vote --- the second
+implementation call per rank, the peer-review \texttt{neighbor\_allgather} pair, the
+\texttt{topo.graph\_create} calls, the second gather, bcast, scatter and agree, and the
+renegotiation \texttt{put} under a lock --- is absent from this trace because the loop exited.
+Its three siblings each ran two rounds and each has 32 agent calls. The 311 events are the cost
+of getting it right the first time.
+
+\paragraph{What the window actually carried.} There were exactly 8 \texttt{win.put} events, one
+per module slot, all writing version 1 over version 0, all with \texttt{locked: false} and
+\texttt{stale\_write: false}; one \texttt{fence}; and exactly 14 \texttt{win.get} events. Fourteen
+is the number of edges in the declared module dependency graph
+($\text{tokens}\,1 + \text{functions}\,1 + \text{parser}\,3 + \text{planner}\,2 + \text{engine}\,3
++ \text{api}\,4$), so every rank read every dependency it declared and no rank read anything else.
+Every one of the fourteen returned \texttt{version: 1} with a non-zero token count, so not one
+read fell through to the \texttt{default=\{\}} the harness supplies; \texttt{errors} was read six
+times, and 15{,}374 tokens were read out of the 9{,}946 tokens published, a fan-out of
+1.55$\times$.
+
+That the reads were used, and not merely performed, can be checked in the delivered source rather
+than inferred. Parsing the round-1 tree, there are 42 names imported across module boundaries and
+all 42 resolve to a definition in the module they were imported from. \texttt{parser} alone
+imports 17 names from \texttt{nodes} --- \texttt{SelectStmt}, \texttt{JoinClause},
+\texttt{OrderItem}, \texttt{SelectItem}, \texttt{TableRef}, \texttt{Star}, \texttt{IsNull},
+\texttt{InList}, \texttt{Like}, \texttt{UnaryOp}, \texttt{BinaryOp}, \texttt{FuncCall},
+\texttt{ColumnRef}, \texttt{Literal}, \texttt{Expr}, \texttt{AGGREGATE\_FUNCTIONS} and
+\texttt{SCALAR\_FUNCTIONS} --- every one of which appears verbatim in the 1{,}939-token interface
+that \texttt{nodes} published, and none of which appears anywhere in the vague specification.
+There are zero \texttt{getattr} or \texttt{hasattr} lookups across a peer-module boundary in the
+whole tree. The window is the only place those names could have come from.
+
+\paragraph{What it did not do.} No slot ever reached version 2. The renegotiation branch is
+guarded on \texttt{my\_failures} being non-empty, and no rank had any failures, so
+\texttt{Window.critical} was never entered: the contention report gives \texttt{n\_locks: 0},
+\texttt{n\_contended: 0}, \texttt{max\_lock\_wait\_s: 0.0} and there is not a single
+\texttt{win.lock} or \texttt{win.unlock} event in the log. The zero stale writes reported for this
+run are therefore true but empty --- \texttt{Window.put} raises a staleness violation only when
+the prior version was greater than zero, and every write here was the first write to a virgin
+slot, so a lost update was structurally impossible. This run says nothing whatever about the
+locking discipline or the staleness detector. What it establishes about the window is narrower
+and cleaner than ``negotiation works'': one exposure epoch, one access epoch, publish once, read
+once, and it was enough.
+
+\paragraph{The exposure epoch cannot converge mutually referential interfaces.} All eight
+interfaces are written inside the same exposure epoch, so no rank can see any other rank's
+interface while writing its own. An interface that mentions a peer's type is therefore a guess,
+and one of the eight guessed wrong. \texttt{parser} published, at 56.04\,s,
+\texttt{def parse(sql: str) -> Select}, with a note reading ``the root node of the tree published
+by \texttt{minidb.nodes} (the \texttt{Select} node type)''. \texttt{nodes} published at 127.57\,s
+and its root is \texttt{SelectStmt}; the name \texttt{Select} does not occur anywhere in the
+delivered \texttt{nodes.py}. After the fence \texttt{parser} read that 1{,}939-token interface and
+implemented \texttt{def parse(sql: str) -> SelectStmt}, quietly correcting itself. Nothing was
+broken, because \texttt{api} --- which read \texttt{parser}'s interface at 127.81\,s and depends
+on it --- binds the result to \texttt{statement: Any} and never names the type. But the record in
+slot \texttt{parser} is still version 1 and is still wrong, and it stayed wrong precisely because
+the run succeeded: the only mechanism the harness has for correcting a published interface runs
+when a round fails. A consumer that had trusted the published return type would have been
+misled, and no part of AgentMPI would have flagged it --- the record is not stale, it is simply
+false, and \texttt{win.get} reports version and token count, not truth. This is a defect of the
+experiment's single-epoch design rather than of the window implementation, but it identifies a
+missing facility: there is no check that an implementation honours the interface its own rank
+published, and this run contains one violation out of eight in the delivered code.
+
+\paragraph{The pairwise comparison, and what it supports.}
+\texttt{vague-sw-p8-vague-noshared} is the right comparator and an unusually tight one: it is the
+next step of the same campaign, at the same commit \texttt{90ca469}, started fourteen minutes
+later against the same worker pool, with \texttt{shared\_interfaces} the only differing flag. The
+interface phase is identical in both: 8 calls, 13{,}862 prompt tokens, 9{,}946 against 9{,}959
+output tokens, and --- checking result digests in the two fabrics --- six of the eight interface
+responses are byte-identical across the two runs. The divergence is entirely downstream. With the
+window, 8 implementation calls emitting 22{,}358 tokens produced a tree that passed 60/60 and
+ended the run. Without it, 8 implementation calls emitting 33{,}764 tokens passed 55/60, which
+bought a peer-review round (8 more calls, 32{,}208 prompt tokens for 7{,}108 of findings) and a
+second implementation round (8 more calls, 38{,}158 tokens) before reaching 60/60. Totals: 16
+against 32 agent calls,
+32{,}304 against 88{,}989 output tokens, \$0.6471 against \$1.6427, and 401.86 against 847.50\,s.
+
+The mechanism visible in the artefacts is more interesting than the totals. Denied a channel to
+learn its neighbours' exports, the no-window population wrote defensively rather than wrongly.
+Its final tree has 6 cross-module imported names against this run's 42; \texttt{parser} imports
+nothing at all from \texttt{nodes} or \texttt{tokens}, \texttt{planner} imports nothing from
+\texttt{nodes}, \texttt{api} imports whole modules and resolves entry points with
+\texttt{getattr} at call time, and \texttt{engine} probes its peers with five
+\texttt{getattr(\_functions, \ldots, None)} lookups. Counting only \texttt{engine} and
+\texttt{api}, there are ten such dynamic lookups into peer modules in that tree and there are
+none anywhere in this one, and the no-window tree is 3{,}562 lines against this run's 2{,}201 ---
+62\% more code for the same score. Per implementation call it emitted 4{,}495 output tokens
+against 2{,}795 here. That is what the window bought: not correctness, which both runs
+eventually reached, but the ability to name a peer's exports instead of defending against not
+knowing them.
+
+One run per cell supports the direction of that difference and not its magnitude. It is a single
+draw, the two runs are not independent given the shared interface responses, and a 2.5$\times$
+cost ratio from $n=1$ per cell should be read as ``roughly a repair round's worth'', which is what
+it structurally is.
+
+\paragraph{The flagged findings.} All three are expected for this configuration. The 83.1\%
+coordination share is a straggler measurement, as argued above: summed over all ranks, the two
+barriers account for 1{,}437.44\,s of collective wall and every other collective in the run for
+1.84\,s between them, and neither barrier took as much as a further second to resolve after its
+last participant arrived. The 23 reattachments to incarnation 4 are
+the broker executor's normal worker cycling and not a fault --- but see below, because the claim
+that the reattachments preserved ``their context accounts'' is not quite true, and seven of the
+23 attached after their rank's last agent call and claimed nothing. The 6-of-6 collective model
+agreement is correct and weak: five of the six invocations are seven-message binomial trees whose
+prediction is trivial, and only the 24-message dissemination barrier is a real check. This run
+also reports \texttt{n\_misreported\_collectives: 0} where all three siblings report 2, but that
+is because it never invoked the neighbourhood collectives at all, not because it is cleaner.
+
+\paragraph{Two defects in AgentMPI itself.} First, \texttt{tokens\_deferred} is reported with two
+different definitions and the two disagree by 2.4$\times$ in this run.
+\texttt{cost.summarise()} counts only the tokens of \texttt{msg.send} events in rendezvous mode
+and yields 31{,}415, which is what \texttt{metrics.json}, the headline table above and the trace
+viewer's stats row all display. \texttt{Job.totals()} sums the per-rank counter, which
+\texttt{comm.py} increments both on a rendezvous send and again on \emph{every} receive taken with
+\texttt{admit=False}, and yields 74{,}494, which is what the \texttt{job.finish} event and the
+results file record. The identity is exact and holds in all four software runs: $31{,}415$
+rendezvous-send tokens plus $43{,}079$ non-admitted-receive tokens equals $74{,}494$, and since
+every receive in this harness is non-admitted, the second term is simply every token sent, counted
+a second time. The docstring on \texttt{summarise} promises that its numbers are ``not an artefact
+of two different summarisers''; here they are. A reader taking the headline number from the
+results file gets a figure 2.4$\times$ the one on the same run's dashboard.
+
+Second, a reattaching worker silently overwrites the rank's configured context budget. The job was
+launched with \texttt{context\_budget=120\_000}, and the eight incarnation-1 \texttt{rank.init}
+events say \texttt{budget: 120000}; every one of the 23 later \texttt{rank.init} events says
+\texttt{budget: 128000}, and the \texttt{ranks} table in the fabric ends the run holding
+\texttt{context\_budget = 128000} for all eight ranks. The cause is that \texttt{cmd\_worker}
+constructs its \texttt{RankRuntime} without passing \texttt{context\_budget}, so it takes
+\texttt{DEFAULT\_CONTEXT\_BUDGET = 128\_000}, and \texttt{register()} writes that value back over
+the persisted one; the sibling code path \texttt{\_comm()} reads the persisted budget from the
+\texttt{ranks} row first and does not have the bug, so the fix is one argument. The same pattern
+appears in all four software runs. Nothing in this run depended on it, because nothing was ever
+admitted, but a run that relied on admission pressure would find its budget raised by 6.7\% at the
+first reattachment, and the generated finding's claim that reattachment preserves the rank's
+context account is false of the budget half of that account.
+
+\section{Threats to this reading}
+
+\emph{The precise-spec half of the $2\times2$ cannot be compared with on outcome.} Both
+\texttt{real-sw-p8-full} and \texttt{real-sw-p8-noshared} report \texttt{importable: false} and
+\texttt{n\_total: 0} for both of their rounds and 0/0 final acceptance. That is not a failure of
+those populations. Their results files record commit \texttt{26ae006}, which predates
+\texttt{parse\_report}; at that commit \texttt{run\_acceptance} parsed the oracle's stdout with
+\texttt{json.loads(out[out.rfind("\{"):])}, which lands inside a nested per-case object and never
+parses, and the stored \texttt{import\_error} for \texttt{real-sw-p8-full} is visibly a truncated
+JSON report full of \texttt{"passed": true} cases. Both of those runs therefore spent their second
+round repairing a phantom, which is exactly the pathology the current
+\texttt{parse\_report} docstring describes. This does not touch my run, which is at commit
+\texttt{90ca469} and post-fix, but it means the framing ``this cell has fewer events than the
+easier cells'' is partly an artefact: two of the three comparators were forced into a second round
+by a plumbing bug rather than by their code.
+
+\emph{Wall time is the least reliable of the comparisons.} The six interface responses that are
+byte-identical between this run and the no-window run took very different times to produce:
+\texttt{iface:nodes} emitted the same 1{,}939 tokens in 127.54\,s here and 29.01\,s there,
+15.2 against 66.8 tokens per second for literally the same output. Median throughput over all
+calls is 18.1 tok/s in this run against 28.9 tok/s in the sibling. Service rate varied by roughly
+3$\times$ between two runs fourteen minutes apart, so the 2.11$\times$ wall-time ratio is mostly
+noise. It happens to be conservative --- the run that won on wall time was the one served more
+slowly --- but the defensible comparisons are the ones that count work rather than time: agent
+calls, output tokens, dollars, and rounds. Relatedly, \texttt{latency\_s} in this trace is
+quantised to 0.5\,s because that is \texttt{BrokerExecutor.poll\_s}; all 16 values are multiples
+of half a second, and they should not be read to millisecond precision.
+
+\emph{The counterfactual makespan is a reconstruction, not a measurement.} The 385.15\,s figure
+holds implementation latencies fixed while moving start times earlier, which assumes the worker
+pool would have served eight overlapping calls at the same rate --- plausible here, since eight
+were already served concurrently in each phase, but it is an assumption and the 16.25\,s saving
+is an estimate.
+
+\emph{The success may be over-determined.} 60 of 60 at the first integration is a ceiling, and a
+ceiling cannot show how much headroom the window has. The vague layout still names each module's
+responsibility and its permitted imports, and \texttt{minidb} is a well-known shape of program; a
+capable model can guess a great deal of the boundary from ``the abstract syntax tree
+representation'' alone. The no-window run reaching 55/60 unaided, and 60/60 after one repair
+round, is the measure of how much: the window's contribution here is real but it is the last five
+cases, not the first fifty-five. On a system whose interfaces were less guessable the gap would
+be larger, and on one more guessable it would vanish --- which is exactly what happened to the
+precise-spec version of this ablation, and why the vague layout exists.
+
+\emph{Two of the run's headline properties are true by construction and should not be read as
+results.} Zero stale writes follows from every put being a first write, as argued above. Zero
+context pressure follows from \texttt{admit=False} on every collective. And
+\texttt{n\_recovery: 8} in \texttt{metrics.json}, rendered as ``fault recovery'' in the viewer
+legend, counts the eight \texttt{ft.agree} votes, which the trace vocabulary classifies as
+recovery events; no fault occurred in this run, no rank was excluded from the vote, and the
+number should be read as ``one agreement, eight participants''.
+
+\end{document}

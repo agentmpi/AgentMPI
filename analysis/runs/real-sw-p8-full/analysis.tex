@@ -1,0 +1,324 @@
+%% Analysis of run: real-sw-p8-full
+%%
+%% generated.tex holds every derived fact and is rewritten by
+%%   python3 scripts/analyze_run.py --run real-sw-p8-full
+%% This file is never overwritten: it is where interpretation lives.
+\documentclass[11pt]{article}
+\input{../../preamble}
+
+\title{\textbf{real-sw-p8-full}\\[2pt]\large An AgentMPI run analysis}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This is the headline run of the collaborative software-development experiment: eight real
+agent ranks, one module each, building \texttt{minidb} --- a small SQL engine graded by a
+60-case acceptance suite --- with interfaces published into an RMA window and cross-review
+enabled. It is the ``less parallelizable'' task in the project, and it succeeded: replaying
+the archived round-1 tree against the acceptance suite gives 60/60, so the population
+composed a working engine at the \emph{first} integration barrier, without any agent seeing
+another agent's code. The trace's most important feature, however, is that the run did not
+know this. The harness parsed the oracle's report by slicing from the last brace in its
+output, which lands inside a nested per-case object and raises \texttt{JSONDecodeError}; the
+suite's valid 7{,}058-byte JSON was therefore recorded as an import failure, scattered back
+to all eight ranks as the definition of done, and the population spent a peer-review phase
+and an entire second round --- 1{,}009.9 of 2{,}270.2 busy rank-seconds, about half the
+\$1.1444 --- repairing a phantom. Everything after $t=300.8$\,s in Figure~\ref{fig:timeline}
+is the harness reacting to a report it could not read. The single thing to take away is that
+the population was robust to it: told falsely that its correct work had failed, it rewrote
+six of eight modules and still passed 60/60. Read the flagged 81.8\,\% coordination share
+with care --- it is an artefact of summing per-invocation maxima, and the honest figure for
+time with all eight ranks simultaneously blocked is 0.6\,s, or 0.12\,\% of wall.
+\end{abstract}
+
+\input{generated}
+
+\section{Reading the timeline}
+
+Figure~\ref{fig:timeline} has four bands of blue work separated by three synchronisation
+points, at $t\approx67$\,s, $t\approx300$\,s and $t\approx383$\,s. They are the harness's
+phases: publish interfaces, implement round~1, cross-review, implement round~2. Nothing else
+happens; there is no lane that is busy while its neighbours are between bands, and no band
+that begins before the previous one has fully drained. That is the visual signature of a
+bulk-synchronous program, and it is by construction --- every phase boundary in
+\texttt{experiments/software.py} is a \texttt{Window.fence} or a \texttt{barrier}.
+
+Figure~\ref{fig:concurrency} is the same structure seen as a sawtooth. Each phase begins with
+all eight ranks busy, holds the ceiling briefly, and then decays as ranks finish and block at
+the next collective. Occupancy reaches the world size of 8 four times and totals 91.3\,s at
+that level (18.3\,\% of wall); it sits at exactly one busy rank for 42.5\,s (8.5\,\%, the
+reported serial fraction) and at zero for 4.2\,s. The area under the curve is the 2{,}270.2
+rank-seconds of work; the area between it and the dotted world-size line is the 1{,}724.8
+rank-seconds --- 43.2\,\% --- that were paid for and unused, and essentially all of that is
+the decay of the four teeth. Computing per-phase efficiency from the broker claim/complete
+spans in the log gives 68\,\% for interface publication, 50\,\% for implement round~1,
+76\,\% for review and 53\,\% for implement round~2. The two implementation phases are where
+the pool empties out.
+
+The longest single wait in the run is rank~0's 215.56\,s at the \texttt{integrate-r1}
+barrier, and it is legible as a gap in Figure~\ref{fig:timeline}: rank~0 finishes
+\texttt{impl:errors:r1} after 18.0\,s of work at $t=85.0$\,s and its lane is empty until the
+review band opens at $t=301.0$\,s. It was waiting for rank~6, whose \texttt{impl:engine:r1}
+call took 233.57\,s and completed at $t=300.4$\,s; the barrier released 0.2\,s later. The
+same pattern repeats with different stragglers: the interface fence at $t=67$\,s waited on
+rank~5 (\texttt{iface:planner}, 66.5\,s), the \texttt{reviewback} exchange on rank~6 (82.0\,s),
+and \texttt{integrate-r2} on rank~4 (\texttt{impl:parser:r2}, 115.5\,s). Within implement
+round~1 the spread between the fastest and slowest rank was $14.5\times$ --- 16.0\,s for
+\texttt{errors} against 232.6\,s for \texttt{engine}.
+
+The amber diamonds are the window operations, and they cluster exactly where the harness puts
+them: eight \texttt{win.put} calls at the trailing edge of the first band, 14 \texttt{win.get}
+calls in a burst at $t\approx67$\,s when each rank opens a fresh access epoch to read its
+dependencies, a lock/get/put/unlock quartet per rank during renegotiation between $t=363.9$\,s
+and $t=383.1$\,s, and 14 more dependency reads at $t\approx383$\,s. The violet diamonds are
+the two \texttt{agree} invocations, at $t=300.8$\,s and $t=499.3$\,s, and both returned false.
+
+Figure~\ref{fig:comm} is dominated by one cell: 26{,}645 tokens from rank~4 to rank~0 in four
+messages, a fifth of all 133{,}090 tokens sent in the run. That is the binomial gather
+fanning in --- rank~4 forwards the subtree $\{4,5,6,7\}$ to the root --- and the two next
+brightest cells, $5\rightarrow4$ (10{,}622 tokens) and $6\rightarrow4$ (8{,}906), are the
+level below it. The plane is otherwise sparse: the review traffic forms a thin off-diagonal
+band consistent with a degree-2 circulant, and there is no unintended all-to-all. The right
+panel of Figure~\ref{fig:ranks} is empty, showing 0\,\% context occupancy for every rank;
+that is not evidence of low context pressure but of the harness passing \texttt{admit=False}
+on every receive, so nothing was ever charged to a context account. Figure~\ref{fig:collectives}
+shows all eleven checkable invocations agreeing exactly with their closed forms, with the two
+neighbourhood collectives omitted for want of a closed form.
+
+\section{Interpretation}
+
+\subsection*{What is true by construction}
+
+The phase sequence, the module assignment and the topology are all dictated by the harness.
+Rank $r$ owns module $r$ because assignment is $i \bmod p$ over the eight-entry module table,
+so rank~0 owns \texttt{errors}, rank~1 \texttt{tokens}, rank~2 \texttt{nodes}, rank~3
+\texttt{functions}, rank~4 \texttt{parser}, rank~5 \texttt{planner}, rank~6 \texttt{engine} and
+rank~7 \texttt{api}; the \texttt{broker.enqueue} labels in the log confirm it. The review graph
+is a degree-2 circulant, so 16 messages is the correct count for both neighbourhood exchanges,
+not a coincidence. The four agent calls per rank --- interface, implement, review, implement ---
+are the maximum the two-round configuration allows. The 38 rank reattachments, up to
+incarnation~6, are the broker's normal behaviour: a fresh worker process attaches for each of
+the 32 tasks, which is why every rank shows four or five worker incarnations, and the
+collectives neither noticed nor cared.
+
+\subsection*{The coordination share is a measurement artefact, not a property of the run}
+
+The generated findings note that collectives account for 81.8\,\% of wall time. They do not.
+\texttt{collective\_wall\_s} is the sum over invocations of the \emph{maximum} per-rank
+\texttt{wall\_s}, and for a barrier a rank's \texttt{wall\_s} is its own wait, so the maximum
+is the wait of the rank that arrived \emph{first}. Summing those maxima adds up eight
+different ranks' idle intervals, each of which overlaps by construction with the other seven
+ranks' work. One invocation, \texttt{integrate-r1}, contributes 215.56\,s of the 408.28\,s
+total (52.8\,\%), and for essentially all of that interval between one and seven ranks were
+running agent calls.
+
+Three measures computed directly from the log settle it. First, the wall time during which
+all eight ranks were simultaneously inside a collective is 0.6\,s, 0.12\,\% of the 499.38\,s
+run. Second, the rank-seconds spent blocked in collectives --- summing each rank's own
+\texttt{wall\_s} rather than the per-invocation maximum --- is 1{,}666.2\,s, or 41.7\,\% of
+the $8\times499.38 = 3{,}995$ rank-second pool, which is almost exactly the independently
+computed idle fraction of 43.2\,\% (1{,}724.8 rank-seconds). In other words the ranks were
+blocked in collectives precisely when they were idle, and for the same reason. Third, the
+collectives that actually move data cost almost nothing: \texttt{spec}, both \texttt{collect}
+gathers, both \texttt{report} broadcasts, both \texttt{blame} scatters and the \texttt{review}
+allgather sum to 1.26\,s of maximum wall between them while carrying all 133{,}090 tokens.
+The finding is therefore expected for this configuration and misleadingly worded rather than a
+defect: the run did not spend 81.8\,\% of its time coordinating, it spent 41.7\,\% of its
+rank-seconds waiting for stragglers, and the protocol's own overhead is under half a percent.
+
+\subsection*{Load imbalance is genuine module difficulty}
+
+The $1.64\times$ imbalance is real and it is not a scheduling artefact. Ranking the eight
+ranks by busy time and by the number of lines their module occupies in the round-1 tree gives
+a Spearman correlation of $\rho = 0.976$ --- the orders differ by a single adjacent
+transposition, \texttt{engine} and \texttt{planner}. Rank~0 owns \texttt{errors}, 17 lines,
+and was busy 103.97\,s; rank~6 owns \texttt{engine}, 429 lines and 37 of the 60 acceptance
+cases, and was busy 464.15\,s. The correlation against completion tokens produced is $0.952$.
+Dispatch cannot explain it: the interval from \texttt{broker.enqueue} to \texttt{broker.claim}
+across all 32 tasks has a median of 1.55\,s and a maximum of 4.77\,s, roughly 51 rank-seconds
+in total, and no task ever expired unclaimed. The imbalance is what the module decomposition
+bought: the harness partitioned a program into eight pieces of very unequal size and then
+synchronised on the largest one, twice.
+
+\subsection*{Sixteen recovery events and no failures}
+
+The 16 events carrying the \texttt{recovery} role are the two \texttt{agree} invocations, one
+event per rank per round. The visual vocabulary in \texttt{trace\_style} maps every
+\texttt{ft.*} event to the fault-tolerance palette,
+and \texttt{ft.agree} is drawn violet along with \texttt{ft.revoke} and \texttt{ft.shrink}.
+Nothing was recovered from. Both invocations record \texttt{voters: [0..7]} and
+\texttt{excluded: []}, no rank was ever declared failed, and the run's zero \texttt{trouble}
+events are the correct reading of the same log. The harness uses \texttt{agree} as its
+\emph{decide} step --- ``is the build green?'' --- because it is the primitive that answers
+that question consistently when some builders have died, not because any had. This is a
+taxonomy artefact of the visual vocabulary, expected for any run that uses \texttt{agree} on
+the happy path, and the viewer displays the tension plainly by showing ``fault recovery 16''
+next to ``FAILURES 0''. One small gap is worth recording: \texttt{agree} calls
+\texttt{\_record\_collective} but emits \texttt{ft.agree} rather than a \texttt{coll.*} event,
+so the collectives table lists 13 invocations for a run that performed 15.
+
+\subsection*{The window: no contention, no lost updates, and a lossy renegotiation}
+
+The RMA traffic is 8 \texttt{win.create}, 16 \texttt{win.put}, 44 \texttt{win.get}, 32
+\texttt{win.sync}, and 8 \texttt{win.lock}/\texttt{win.unlock} pairs. No \texttt{win.put} was
+flagged \texttt{stale\_write}. Every renegotiation put saw version~1, overwrote version~1, and
+advanced its slot to version~2, so no update was lost and none was blind.
+The critical section was never contended --- all eight \texttt{win.lock} events record
+\texttt{contended: false} and \texttt{waited\_s: 0.0}, and \texttt{rma.contention\_report}
+agrees with zero lock waits and zero stale writes. That is expected and it is worth being
+explicit about why: the window is slot-partitioned by ownership, each rank locks only the slot
+for the module it owns, so no two ranks can ever contend. This run therefore does not exercise
+the locking path at all; the \texttt{--no-locks} ablation is the only configuration that would,
+and it is not in this archive. The 44 reads decompose as 14 dependency reads per round
+($\text{errors}~0 + \text{tokens}~1 + \text{nodes}~0 + \text{functions}~1 + \text{parser}~3 +
+\text{planner}~2 + \text{engine}~3 + \text{api}~4$) plus two per rank inside the critical
+section, one for the value and one for the version check.
+
+What the renegotiation actually did is a genuine defect, and unlike the others in this run it
+is still present in the harness at HEAD. The critical section merges the current interface
+with \texttt{exports.get(m["name"])}, which is the \emph{implementation's} export list --- bare
+names --- rather than the signature-bearing list the interface phase published. The window's
+contents shrank from 7{,}700 tokens across the eight slots at version~1 to 4{,}664 at
+version~2, a 39.4\,\% loss, and the per-slot \texttt{win.get} payloads show it item by item:
+\texttt{functions} fell from 1{,}375 tokens to 546, \texttt{nodes} from 1{,}244 to 479,
+\texttt{parser} from 959 to 844. The round-2 dependency reads at $t\approx383$\,s returned
+these degraded version-2 records. The operation is named renegotiation but is measurably a
+degradation: it replaces negotiated signatures with a list of identifiers.
+
+\subsection*{The oracle report never parsed, and half the run is a phantom repair}
+
+This is the run's central finding, and it inverts the headline. The in-run acceptance record
+is \texttt{importable: false, n\_total: 0, n\_passed: 0} for both rounds, and every rank
+received exactly one ``failure'' in each round --- the synthetic \texttt{IMPORT} record the
+harness broadcasts to everyone when the tree will not import. It is false. Replaying the
+archived \texttt{round1} tree against the acceptance suite gives 60/60, matching the offline
+re-scoring stored alongside the result; replaying it against the suite as it stood at the
+run's commit gives 58/59, the single failure being \texttt{keywords\_case\_insensitive}, a
+case in the oracle that contradicted the specification and was itself fixed afterwards.
+
+The mechanism is recoverable exactly from the artefacts. The stored \texttt{import\_error} is
+byte-identical to the last 2{,}000 characters of the suite's own stdout, which is a single
+valid 7{,}058-byte JSON object that \texttt{json.loads} accepts today. At the run's commit,
+\texttt{run\_acceptance} parsed it as \texttt{json.loads(out[out.rfind("\{"):])}; on this
+output \texttt{rfind} lands at offset 6{,}964, the opening brace of the last per-case object,
+and the parse raises \texttt{JSONDecodeError: Extra data: line 1 column 93} on the trailing
+\texttt{]\}}. The \texttt{except} branch returns the unimportable stub with the tail of stdout
+as the error text --- which is why each rank was handed 1{,}200 characters of a report
+containing \texttt{"passed": true} and told it was an import error.
+
+The consequences propagate through every subsequent collective. \texttt{agree} returned false
+at $t=300.8$\,s, which enabled the review phase; the non-empty failure list enabled the
+renegotiation; and round~2 ran to completion. Those two conditional phases account for 1{,}009.9
+of the 2{,}270.2 busy rank-seconds (44.5\,\%), 59{,}331 of 107{,}118 prompt tokens (55.4\,\%),
+27{,}656 of 54{,}871 completion tokens (50.4\,\%) and roughly half of the \$1.1444. This is a
+known defect, fixed in the commit immediately following this run, and the offline re-scoring
+exists precisely because of it. Two things about it are still worth stating. First, it is the
+reason the run's reported outcome and its true outcome disagree, and any reading of this trace
+that takes \texttt{agreed\_green: false} at face value is wrong. Second, and more interesting,
+the population absorbed it: round~2 rewrote six of the eight modules and added 56 net lines,
+and the result still passes 60/60. Being told confidently and falsely that correct work had
+failed produced no regression.
+
+\subsection*{Cross-review was enabled and misdelivered}
+
+The \texttt{full} configuration is defined by shared interfaces \emph{and} cross-review, and
+the second half of that did not work in this run. At the run's commit the return path was
+\texttt{neighbor\_alltoall} over the forward review graph rather than over its transpose. The
+trace shows the consequence directly: \texttt{topo.graph\_create} records rank~0's sources as
+$\{6,7\}$, so rank~0 reviewed \texttt{engine} and \texttt{api}, while its two
+\texttt{reviewback} messages went to ranks~1 and~2. Checking every edge, all 16 reviewback
+messages were delivered to a rank whose module the sender had not reviewed. The 12{,}792 tokens
+of review that reached the round-2 prompts under the heading ``peer review of your module''
+were, without exception, critiques of somebody else's module. The review phase cost 513.7
+rank-seconds and 31{,}873 tokens and could not have delivered a single actionable finding to
+an author. This too was fixed afterwards, in the commit that added the transpose.
+
+\subsection*{The neighbourhood collectives under-report their own traffic}
+
+The two \texttt{warning} findings --- \texttt{neighbor\_allgather} and
+\texttt{neighbor\_alltoall} reporting 0 messages against 16 logged --- are an instrumentation
+gap, not a correctness problem. In this log the payload of a
+\texttt{coll.neighbor\_allgather} event holds only \texttt{indegree}, \texttt{outdegree},
+\texttt{label} and a wall time. There is no message count to read, so the analysis reports the absence as
+zero and correctly flags the disagreement with the fabric's tagged traffic. The traffic itself
+is exactly right: 16 messages each, $8$ ranks $\times$ degree~2, carrying 25{,}396 and 12{,}792
+tokens. The emitters were given message and token counts in a later commit. This is expected
+for an archived trace of this vintage; the analysis is doing its job by refusing to trust the
+collective's self-report.
+
+\subsection*{What this run contributes to the sweep}
+
+Against the single-agent baseline \texttt{real-sw-p1-full}, which took 1{,}213.0\,s and
+\$0.4379 and needed two rounds to reach 60/60, this run reached 60/60 at the first integration
+barrier in 499.4\,s for \$1.1444: $2.43\times$ the speed for $2.61\times$ the money. Against
+its ablation sibling \texttt{real-sw-p8-noshared}, which withheld the window, the re-scored
+difference is one acceptance case --- 60/60 against 59/60 --- with the noshared run also
+slower (528.6\,s) and more imbalanced ($2.28\times$ against $1.64\times$). That near-null gap
+is the confound the harness's own comments concede: the precise specification already pins
+every module's exported signatures, so it \emph{is} a shared interface and the window has
+little left to contribute. The \texttt{vague-sw-*} pair exists to remove that confound. The
+honest contribution of this run to the ablation is therefore not the pass-rate difference but
+the demonstration that the mechanism works end to end --- window, fence, epoch-scoped reads,
+locked update, agreement --- on a task where eight agents genuinely had to compose.
+
+\section{Threats to this reading}
+
+The most serious threat is that two of the three headline behaviours in the second half of
+this trace are properties of the harness at a specific commit rather than of AgentMPI. The
+oracle-parse failure and the review misrouting were both fixed within an hour of this run, so
+the timeline after $t=300$\,s tells you what the population did when misinformed and
+mis-reviewed, and nothing about what the protocol does when the plumbing works. Anyone
+comparing this run to a later one --- the \texttt{vague-sw-*} pair was recorded after both
+fixes --- is comparing across a harness change, not only across a configuration change.
+
+The provenance stamp compounds this and should not be trusted for dating. \texttt{provenance()}
+shells out to \texttt{git rev-parse HEAD} when the result is \emph{written}, not when the run
+starts. This result names commit \texttt{26ae006}, which was committed at 07:51:40 while the
+run began at 07:47:06. The sibling \texttt{real-sw-p8-noshared} names the commit that
+\emph{contains} the parse fix, yet its stored \texttt{import\_error} has the same signature ---
+the tail of a valid JSON report --- so it plainly ran the unfixed code too. That is fortunate
+for the ablation, since both arms received the same false signal, but it means the commit field
+cannot be used to decide which code a run executed.
+
+Three metrics do not mean what their names suggest. \texttt{coordination\_share} is a sum of
+per-invocation maxima and is analysed above. The zero reported for
+\texttt{max\_claim\_wait\_s} is computed
+over \texttt{broker.expire} events, of which there are none, so it means ``no task expired
+unclaimed'', not ``no rank queued''. And \texttt{tokens\_deferred} is reported twice in the
+same result file with different values: 212{,}444 from the live cost account and 79{,}354 from
+the post-hoc summariser. The difference is exact and reproducible --- the live account adds
+79{,}354 tokens on the send side under rendezvous and then the full 133{,}090 tokens again on
+the receive side, because \texttt{admit=False} is passed everywhere and the receive path
+charges every unadmitted token to the same counter. The live figure consequently exceeds
+\texttt{tokens\_sent}, which is impossible for a quantity that is supposed to be a subset of
+traffic. I believe this is a bug in AgentMPI rather than in the harness: \texttt{comm.py}
+increments \texttt{cost.tokens\_deferred} at both the rendezvous send and the non-admitting
+receive, while \texttt{cost.summarise} counts only the send, and the only test on the field
+asserts that it exceeds 4{,}000.
+
+Two further caveats on the numbers I have leaned on. Busy time is measured from
+\texttt{broker.claim} to \texttt{broker.complete} and so excludes the dispatch wait that the
+\texttt{agent.call} latency includes: the per-rank busy totals fall short of the summed
+latencies by between 5.5\,s (rank~7) and 12.0\,s (rank~6), 56.6\,s over the run, which is the
+32 enqueue-to-claim intervals. It is small enough not to disturb the $\rho = 0.976$
+correlation, but it means the 43.2\,\% idle fraction slightly overstates true idleness and
+that occupancy and agent latency are not two views of the same quantity. And
+the 0\,\% context occupancy in Figure~\ref{fig:ranks} is an artefact of the harness's blanket
+\texttt{admit=False}: this run says nothing about admission pressure, and a reader should not
+conclude that eight ranks exchanging 133{,}090 tokens fitted comfortably in a 120{,}000-token
+budget, only that nothing was ever charged against it.
+
+Finally, this is one run of one specification with one model behind the broker, and the
+quantity that matters most --- that the first integration barrier already produced a passing
+build --- rests on a single sample. The executors are real (\texttt{broker} $\times$ 8,
+\texttt{worker} $\times$ 38, \$1.1444 of measured spend, agent latencies from 18.0\,s to
+233.6\,s), so this is evidence about agent behaviour and not only about the protocol; but the
+acceptance suite is 60 cases over a 130-line specification, and a suite that a first attempt
+passes outright is a suite that cannot discriminate between a good decomposition and a lucky
+one. The repair dynamics this harness was built to study remain untested here, because the
+only repair round it ran was answering a question that had already been answered correctly.
+
+\end{document}

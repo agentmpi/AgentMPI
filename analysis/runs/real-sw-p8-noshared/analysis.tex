@@ -1,0 +1,396 @@
+%% Analysis of run: real-sw-p8-noshared
+%%
+%% generated.tex holds every derived fact and is rewritten by
+%%   python3 scripts/analyze_run.py --run real-sw-p8-noshared
+%% This file is never overwritten: it is where interpretation lives.
+\documentclass[11pt]{article}
+\input{../../preamble}
+
+\title{\textbf{real-sw-p8-noshared}\\[2pt]\large An AgentMPI run analysis}
+\author{}
+\date{}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Eight real Cursor subagents, one per module, built the \texttt{minidb} SQL engine with the
+shared interface window withheld: no rank could read the interface its neighbours published.
+Against the otherwise identical baseline \texttt{real-sw-p8-full}, the ablation cost 19.9\%
+fewer prompt tokens in the implementation phase and bought 40.8\% more completion tokens
+(40{,}775 $\rightarrow$ 57{,}393), 37.8\% more delivered source (1{,}954 $\rightarrow$ 2{,}693
+lines) and 4.7$\times$ the defensive-adaptation constructs (7 $\rightarrow$ 33; 3.58
+$\rightarrow$ 12.25 per kloc), while acceptance moved by exactly one case out of sixty
+(60/60 $\rightarrow$ 59/60). Ninety per cent of the extra output is in \texttt{parser.py} and
+\texttt{engine.py}, the two modules whose withheld dependencies the broadcast specification
+does not pin, and the agents' own returned \texttt{concerns} name the mechanism: not failure
+but adaptation --- \texttt{engine.py} routes 47 attribute-name guesses through one tolerant
+accessor rather than calling a published interface. The single most important reading is that
+withholding a shared interface does not show up as a broken build; it shows up as code that
+introspects its collaborators at runtime, as a 1.98 $\rightarrow$ 3.24 jump in the
+straggler-to-mean ratio at the integration barrier, and as \$0.23 of extra completion tokens
+that buy nothing. The run also carries four harness defects and one genuine AgentMPI
+accounting bug, all documented below.
+\end{abstract}
+
+\input{generated}
+
+\section{Reading the timeline}
+
+Figure~\ref{fig:timeline} has three blocks separated by two long silences, and every
+interesting property of this run lives in the silences.
+
+The first block runs from $t=0$ to $t=50.5$\,s with all eight lanes solid: each rank is
+publishing the interface for the module it owns. This block is the run's first oddity. The
+window was never created --- the fabric's \texttt{windows} table has zero rows and the
+\texttt{win.*} event kinds are absent from the vocabulary --- yet the publication step still
+happened, because the harness gates the window on \texttt{cfg.shared\_interfaces} but not the
+agent call that fills it. Those eight calls consumed identical prompt tokens to the baseline's
+(13{,}746 in both, since the interface prompt does not depend on the window), returned 8{,}735
+completion tokens, and cost 276.6\,s of summed agent latency. Their only surviving consumer is
+the author itself, through the ``interface you published'' block of its own implementation
+prompt. Rank~4 finished last at 50.5\,s and the substituted \texttt{interfaces-skipped}
+barrier released, having made the earliest arrival wait 32.70\,s.
+
+The second block, 50.7\,s to 413.2\,s, is the round-1 implementation, and it drains as a
+staircase rather than a block: \texttt{errors} at 65.3\,s, \texttt{nodes} at 68.4,
+\texttt{api} at 83.4, \texttt{tokens} at 93.6, \texttt{functions} at 108.5, \texttt{planner}
+at 126.6 --- and then nothing until \texttt{engine} at 339.0\,s and \texttt{parser} at
+412.7\,s. Figure~\ref{fig:concurrency} shows the consequence directly: the achieved
+parallelism line sits at 3.37$\times$ against a world size of 8, and from roughly $t=130$\,s
+the plot is pinned at one or two. Computed from the claim/complete intervals in the log, this
+run spent 59.2\% of its wall time with at most two ranks busy and 17.7\% with exactly one,
+against 29.1\% and 8.5\% in the baseline; the longest stretch with no more than one rank busy
+is 75.0\,s, from 339.0\,s to 414.0\,s, when rank~4 is alone. That is the whole explanation of
+the two flagged notes. The 2.28$\times$ load imbalance is rank~4 at 508.4\,s busy (96.2\%
+occupancy) against a mean of 222.7, and the 87.9\% coordination share is seven ranks parked in
+\texttt{integrate-r1} while one agent call finishes: summed over ranks, the round-1 integration
+wait is 2{,}008.3\,s here against 926.5\,s in the baseline. Neither number is protocol
+overhead. The \texttt{integrate-r1} barrier sent zero messages; it is pure schedule skew, and
+the skew is what the ablation produced.
+
+Why those two ranks and not others is the load-bearing observation. Rank~4 owns
+\texttt{parser.py}, whose declared dependencies are \texttt{tokens}, \texttt{nodes} and
+\texttt{errors}; rank~6 owns \texttt{engine.py}, which depends on \texttt{planner},
+\texttt{functions} and \texttt{errors}. They are the two modules with a non-trivial withheld
+dependency set, their round-1 agent calls took 362.6\,s and 288.6\,s against a baseline
+172.6\,s and 233.6\,s, and they returned 7{,}676 and 7{,}995 completion tokens against 3{,}876
+and 4{,}184. By contrast \texttt{errors.py} (no dependencies) came back byte-identical to the
+baseline's, and \texttt{nodes.py}, \texttt{tokens.py} and \texttt{functions.py} --- no
+dependencies, or only the one-class \texttt{errors} module --- came back within 5--15\% of it.
+The straggler is not a random draw; it is the rank with the most missing information.
+
+The third block, 413.2\,s to 528.6\,s, is the integration and repair round, and it is dense.
+Figure~\ref{fig:timeline} shows the collective machinery collapsing into a fraction of a
+second: the \texttt{collect-r1} gather completes in 0.26\,s, \texttt{report-r1} in 0.18 and
+\texttt{blame-r1} in 0.01, and the eight violet recovery diamonds at 413.6\,s are the first
+\texttt{agree} vote. Then the review calls fan out, and the green message ticks scattered
+across 437--481\,s are the review-return exchange, whose 31.23\,s skew is the largest in the
+collective table --- a reviewer handed 4{,}968 prompt tokens takes longer than one handed 839,
+so the neighbourhood exchange serialises on the slowest reviewer in each neighbourhood. The
+round-2 implementations then run, and rank~4 is again last at 528.0\,s.
+
+Figure~\ref{fig:comm} is the clearest single picture of what the ablation moved. One cell
+dominates: rank~4 to rank~0 carries 40{,}897 tokens in two messages, 26.3\% of all traffic in
+2 of 81 messages. That is the binomial gather's penultimate hop, and rank~4 sits on it while
+also owning the file that doubled --- so the module that bloated is the module whose bloat
+travels furthest. The same edge carries 26{,}645 tokens in the baseline, so it grew 53.5\%.
+Across both rounds the gather payload rose from 60{,}580 to 82{,}900 tokens (+36.8\%), which
+is the source-code growth measured on the wire. Total tokens sent rose 17.1\% on 48
+\emph{fewer} messages, taking the mean payload from 1{,}032 to 1{,}923 tokens.
+
+Two things are missing from the picture and both matter. There is no amber or orange anywhere:
+the viewer's legend for this run reads \texttt{agent working}, \texttt{messages},
+\texttt{rank lifecycle}, \texttt{fault recovery} and nothing else, where the baseline's trace
+carries 116 \texttt{win.*} events (108 of them in the analyser's \texttt{rma} role). The
+one-sided lane is empty because the window was never opened, and that is the ablation made
+visible. Second, the context panel of Figure~\ref{fig:ranks} is zero for all eight ranks, and
+the per-rank table reports 0.0\% occupancy throughout. That is not health: the harness passes
+\texttt{admit=False} on every message and every collective, so every one of the 81 arrivals is
+recorded \texttt{admitted: false} with \texttt{admitted\_tokens: 0} and the context accountant
+never sees anything. The column carries no information for this run.
+
+\section{Interpretation}
+
+\subsection{What is true by construction}
+
+Four differences from the baseline follow mechanically from the flag and should not be read as
+results. There are no window operations at all, so the step that renegotiates an interface under
+an exclusive lock never ran and the contention report in the result file is empty. The fence was
+replaced
+by an ordinary \texttt{barrier}, which changes the barrier count from 32 to 24 and the
+algorithm mix from sixteen \texttt{dissemination} plus sixteen \texttt{central} to
+twenty-four \texttt{central}. That substitution accounts for the entire message-count
+difference: the baseline's two dissemination fences logged 24 messages each, 48 in total, and
+$129-81=48$ exactly. Both runs ran the fixed two rounds and neither agreed green. And the
+interface publication phase was billed in full for information that only its author could read.
+
+\subsection{What emerged}
+
+The ablation's cost is almost entirely in completion tokens and in the source they encode, and
+the accounting closes exactly. Implementation prompts shrank by 13{,}529 tokens (67{,}895
+$\rightarrow$ 54{,}366, $-19.9$\%), which is the withheld interface text. Implementation output
+grew by 16{,}618 tokens (40{,}775 $\rightarrow$ 57{,}393, $+40.8$\%). Of that growth, 14{,}988
+tokens --- 90.2\% --- is four numbers: \texttt{parser.py} at $+3{,}800$ and $+3{,}559$ tokens
+in rounds 1 and 2, and \texttt{engine.py} at $+3{,}811$ and $+3{,}818$. At the calibrated
+\$3/\$15 per million in and out, the run's \$1.3767 against the baseline's \$1.1444 is
+$+\$0.2323$, and $18{,}064\times15\mathrm{e}{-}6 - 12{,}879\times3\mathrm{e}{-}6 = \$0.2323$
+reproduces it to the cent. So the ablation is a net loss in money as well as in quality: the
+prompt tokens it saves are worth a fifth of the completion tokens it provokes.
+
+On disk the same growth reads as 1{,}954 $\rightarrow$ 2{,}693 lines at round 1 ($+37.8$\%),
+concentrated exactly where the token growth is: \texttt{parser.py} 362 $\rightarrow$ 711 lines
+and \texttt{engine.py} 429 $\rightarrow$ 760, against \texttt{errors.py} and \texttt{api.py}
+byte-identical to the baseline's and \texttt{tokens.py}, \texttt{nodes.py} and
+\texttt{functions.py} within 15\%.
+
+The acceptance result is the least interesting number in the run and needs recovering before it
+can be quoted at all. The harness recorded \texttt{importable: false, n\_total: 0} for both
+rounds, which is false; see \S\ref{sec:defects}. Re-scored against the current suite
+(\texttt{reeval\_software.py}, suite \texttt{0eaa6b695b83}) the delivered tree passes 59 of 60
+against the baseline's 60 of 60, the single failure being \texttt{engine/empty\_table\_select}
+(``QueryError: the select list is empty''). One case in sixty is the near-null result the
+project already knows about, and it is the wrong place to look.
+
+The right place is the shape of the code, and there the ablation is unambiguous. The re-scored
+defensiveness count --- three-argument \texttt{getattr}, \texttt{hasattr}, and handlers for
+\texttt{AttributeError}, \texttt{KeyError}, \texttt{TypeError} or \texttt{IndexError} --- is 33
+constructs at 12.25 per kloc against the baseline's 7 at 3.58, a 3.42$\times$ increase in
+density, and its per-file distribution is the dependency graph: \texttt{planner.py} 16,
+\texttt{parser.py} 11, \texttt{engine.py} 4, \texttt{functions.py} 2, and zero in the four
+modules that either have no dependencies or depend only on \texttt{errors}. The baseline's
+seven are three in \texttt{planner.py}, three in \texttt{engine.py} and one in
+\texttt{functions.py}, with \texttt{parser.py} at zero. The metric understates the gap, because
+this population factored its defence: \texttt{engine.py} defines one accessor
+\texttt{\_field(obj, names, default)} that walks a tuple of candidate attribute names, and
+calls it from 47 sites, each site a different guess at what \texttt{planner.Plan} or a
+\texttt{nodes} dataclass actually named a field. Counting reflective access sites textually
+gives roughly 73 in this tree (47 \texttt{\_field} calls, 16 \texttt{getattr} in
+\texttt{planner.py}, 7 plus \texttt{inspect.signature} and \texttt{dataclasses.fields}
+reflection in \texttt{parser.py}) against 5 in the baseline, whose \texttt{parser.py} contains
+no reflective access of any kind.
+
+What makes this more than a code-style observation is that the population diagnosed it itself,
+in two independent channels. In their returned \texttt{concerns}, all six ranks owning a module
+with declared dependencies state that the interfaces were unavailable and describe what they
+did instead. The \texttt{parser} owner: ``\ldots{}so parser.py cannot know the exact field
+names of the AST dataclasses or the exact token \texttt{kind} strings. Rather than invent
+signatures, it adapts\ldots{} each node is constructed by matching our logical values onto the
+class's real field names (via \texttt{dataclasses.fields} or \texttt{inspect.signature}\ldots).''
+The \texttt{engine} owner: ``\ldots{}the field names of planner.Plan and of the nodes.py AST
+classes are unknown. The engine therefore reads the plan and every expression node through a
+tolerant accessor\ldots{} a published field list for planner.py and nodes.py would remove the
+guesswork.'' And in the review round, peers flagged the adaptation as a contract violation
+rather than as prudence: ``\texttt{\_field}/\texttt{\_source\_entry}/\texttt{\_descending} guess
+attribute names\ldots{} that the Plan interface does not publish; whichever attribute happens to
+exist first wins, so a rename in planner.py silently changes behaviour.'' The defensive coupling
+claim therefore does not rest on a metric we chose; it rests on a metric we chose agreeing with
+what both the authors and their reviewers said in prose.
+
+The parallelism cost is real but subtler than it first looks, because it is not a cost in total
+work. Summed round-1 implementation latency is 894.3\,s here against 944.3\,s in the baseline
+--- \emph{lower} --- while the straggler-to-mean ratio is 3.24 against 1.98. The ablation did
+not make the population do more agent-seconds of work in round 1; it made the distribution of
+that work far more skewed, and a barrier converts latency variance into idle rank-seconds. Total
+integration wait across both rounds is 2{,}167.0\,s against 1{,}357.2 ($+59.7$\%), total busy
+time is 1{,}781.4 rank-seconds against 2{,}270.2, and the idle fraction is 57.9\% against
+43.2\%. This is the general lesson the run contributes to the sweep: information asymmetry among
+ranks is a load-balancing problem, and any collective that synchronises the population pays for
+it at the slowest rank.
+
+The bloat also degraded the review phase, which is a second-order effect worth naming because it
+compounds. The executed harness sliced each reviewed file at 9{,}000 characters. Because the
+ablated \texttt{parser.py} and \texttt{engine.py} are roughly twice the size, that window covered
+35.3\% and 32.9\% of them against 69.9\% and 62.5\% in the baseline, and three of the eight
+reviewers spent a finding on the cut instead of on the code (``the excerpt ends mid-expression in
+\texttt{\_descending}''; ``the listing is truncated before \texttt{\_run}, \texttt{\_eval}, the
+aggregate evaluation and the negative LIMIT/OFFSET check''; ``the listing is truncated inside
+\texttt{\_make\_select}''). Defensive bloat consumes the review budget that would have caught it.
+
+\subsection{The flagged findings}
+
+The two \finding{warning} items are correct and are instrumentation gaps rather than protocol
+defects. At the commit that executed, \texttt{topology.py} emitted only \texttt{indegree},
+\texttt{outdegree}, \texttt{wall\_s} and \texttt{label} for the neighbourhood collectives; the
+event payloads in this trace contain no \texttt{messages\_sent} or \texttt{tokens\_sent} field at
+all, so the analyser's comparison of the collective's self-report against the 16 messages the
+fabric logged under \texttt{\_ampi:nbr\_ag} and \texttt{\_ampi:nbr\_a2a} has nothing to compare
+with and reports zero. The current source emits both fields, with a comment saying precisely why:
+``the entire claim of a neighbourhood collective is that it costs $\Theta(\mathrm{degree})$ rather
+than $\Theta(p)$, and a trace that records only the degree leaves that claim unverifiable from the
+log.'' Expected for a run of this age; already fixed.
+
+Both \finding{note} items are the ablation's signature rather than incidental. The 87.9\%
+coordination share and the 2.28$\times$ imbalance are the same fact --- one straggler per round
+--- expressed twice, and both moved in the predicted direction from the baseline's 81.8\% and
+1.64$\times$. The magnitudes should be read with the caveats in \S\ref{sec:threats}.
+
+The two \finding{ok} items are unremarkable. Forty-five reattachments to incarnation 7 is the
+broker executor's normal behaviour --- a worker process attaches, claims, completes, and the rank
+role with its mailbox and context account outlives it --- and the difference from the baseline's
+38 is a property of the driving pool, not of the run. Ten of ten checkable collectives matching
+their closed-form message count is the reassurance it appears to be; the baseline scored 11 of 11,
+the extra one being a window fence that does not exist here.
+
+\subsection{Defects}
+\label{sec:defects}
+
+\paragraph{An AgentMPI accounting bug.} \texttt{tokens\_deferred} is incremented on two different
+axes and summed into one field. In \texttt{src/agentmpi/comm.py} the send path adds
+\texttt{blob.tokens} when the chosen transport is \texttt{RENDEZVOUS}, and the receive path adds
+\texttt{row["tokens"]} whenever \texttt{admit} is false. This harness passes
+\texttt{admit=False} on every receive, so every rendezvous message is counted twice. The
+arithmetic is exact: the 20 rendezvous sends carry 97{,}526 tokens, all 81 arrivals carry
+155{,}792, and $97{,}526+155{,}792=253{,}318$, which is the \texttt{tokens\_deferred} value in
+this run's \texttt{job.finish} event and result file. The baseline reproduces it:
+$79{,}354+133{,}090=212{,}444$. \texttt{rank.py} documents the field with a single definition
+(``tokens that a rendezvous transfer avoided moving into context''), which the two increment sites
+do not both implement --- the receive-side one measures what an \emph{admission} decision avoided,
+a different quantity. \texttt{analysis.py} computes it correctly from the log, counting only
+rendezvous sends, which is why \texttt{metrics.json} reports 97{,}526 and the headline table above
+is right. The consequence is that the runtime's own \texttt{job.totals()} inflates the number
+2.6$\times$, and that inflated value is what reaches
+\texttt{results/software/real-sw-p8-noshared-locks-review.json} and thence
+\texttt{scripts/make\_tables.py:371}. This is a defect in AgentMPI, not in the harness, and it is
+the most consequential thing this analysis found: the field is described in
+\texttt{rank.py} as ``the headline number for the transport-mode experiment.''
+
+\paragraph{The oracle the population saw was a phantom.} The executed \texttt{run\_acceptance}
+parsed the suite's report with \texttt{json.loads(out[out.rfind("\{"):])}, which slices from the
+last brace in the output --- inside a nested per-case object --- and never parses; the fallback
+stored the last 2{,}000 characters as an import error. Both rounds therefore reported
+\texttt{importable: false} with \texttt{n\_total: 0}, and the \texttt{blame} scatter delivered one
+synthetic \texttt{IMPORT} entry per rank. The trace shows this without reference to the source: the
+scatter payload digests are identical between rounds --- \texttt{bc89dfebb450} to rank~4,
+\texttt{d5c25c881181} to rank~2, \texttt{bc32845d645c} to rank~1 in both \texttt{blame-r1} and
+\texttt{blame-r2} --- so round~2 was handed byte-for-byte the same definition of done as round~1,
+and both \texttt{agree} votes returned \texttt{false} with all eight voters and nobody excluded.
+Re-scoring the delivered trees off-trace gives 59/60. Round~2 was consequently near-inert here:
+seven of the eight files are byte-identical to round~1 (only \texttt{engine.py} changed, 760
+$\rightarrow$ 771 lines), against six of eight changed in the baseline. The phantom cannot explain
+that difference on its own, since the baseline received the same phantom; what distinguishes them
+is that the baseline's round~2 had a genuinely new input --- renegotiated dependency interfaces
+read back through \texttt{win.get} --- and this run's only new input was a misrouted peer review.
+Fixed in the current \texttt{parse\_report}, which is a named function with a test.
+
+\paragraph{The review return path was misrouted.} The executed harness returned reviews over the
+same topology it had distributed code on, passing \texttt{topo} to \texttt{neighbor\_alltoall}
+rather than its transpose. With \texttt{review\_edges(8, fanout=2)} the destinations of rank
+$i$ are $\{i{+}1, i{+}2\}$ and its sources $\{i{-}1, i{-}2\}$ --- confirmed by the
+\texttt{topo.graph\_create} payloads, e.g. rank~7 with destinations $[0,1]$ and sources $[5,6]$ ---
+so rank $i$ received critiques written by ranks $i{-}1$ and $i{-}2$ about the modules of ranks
+$i{-}2$, $i{-}3$ and $i{-}4$, a set that never contains $i$ for $p=8$. No author received a review
+of their own module, and two of them said so in their next report: the \texttt{errors} owner wrote
+``The peer review reports no defect in errors.py; every finding concerns parser.py, planner.py or
+engine.py'', and the \texttt{api} owner ``Every review item in this round is against
+minidb/functions.py and minidb/parser.py''. The phase cost 8 agent calls, 26{,}127 prompt tokens,
+6{,}807 completion tokens and 355.6\,s of summed latency. It was not a total loss --- reviewers
+routinely wrote findings whose \emph{fix} named a third module, and the \texttt{planner} owner
+acted on five of them, opening five round-2 concerns with ``Review point taken'' --- but that is
+luck, not routing. The current source builds a transpose topology for the return path and filters
+findings by owning path.
+
+\paragraph{The ablation prompt understated the condition, and it did not matter here.} All sixteen
+implementation prompts in \texttt{runs/real-sw-p8-noshared/spool/} print
+``PUBLISHED INTERFACES OF YOUR DEPENDENCIES:\ (this module has no dependencies)''. For
+\texttt{errors} and \texttt{nodes} that is true; for the other six it is false, and for
+\texttt{api}, whose entire job is composing the other modules, it is badly false. The condition
+should have said the interfaces were withheld, not that the dependencies did not exist. In this
+run the misstatement was inert: every one of the six affected ranks recovered the true condition
+and said so, because the broadcast \texttt{SPEC.md} names each module's permitted imports, and the
+\texttt{api} owner in particular wrote ``No published interfaces were supplied for the sibling
+modules, so this file calls them exactly as the specification's module-layout table defines them:
+parser.parse(sql) $\rightarrow$ Select, planner.plan(select, tables) $\rightarrow$ Plan,
+engine.execute(plan, tables) $\rightarrow$ list[dict]''. Its \texttt{api.py} uses four static
+relative imports and is byte-identical to the baseline's. The same defect did bite in the later
+vague-specification sibling, where the spec no longer names the boundaries: that run's
+\texttt{api.py} is 123 lines and resolves each stage with \texttt{getattr(module, name, None)}.
+So the defect is real and worth the fix it has since received, but it is not a reason to discount
+this run's numbers.
+
+\paragraph{Provenance drift.} The result file records commit \texttt{1f7bd01}, which already
+contains the fix to \texttt{parse\_report} --- yet the run exhibits exactly the failure that the
+fix removes, and its review-return call is the pre-fix form. \texttt{provenance()} calls
+\texttt{git rev-parse HEAD} when the result is written, not when the job is launched, and HEAD
+advanced during the campaign (the baseline step, nine minutes earlier, records \texttt{26ae006}).
+The commit field is therefore an upper bound on the age of the code that ran, not a description of
+it, which is worth naming given that its stated purpose is to let a number in the paper be traced
+back to the run that produced it.
+
+\section{Threats to this reading}
+\label{sec:threats}
+
+\paragraph{The two runs' workers ran at different speeds, so every wall-clock comparison is
+contaminated.} Implementation-phase throughput was $57{,}393/1{,}211.9 = 47.4$ completion tokens
+per second here against $40{,}775/1{,}440.5 = 28.3$ in the baseline, a 1.67$\times$ difference,
+and the fitted calibration agrees: $\alpha = 16.18$\,s against 32.20\,s, 54.99 tokens/s against
+42.33. The direction is inconvenient in a useful way --- this run's p50 agent latency is 41.0\,s
+against the baseline's 59.5, i.e. \emph{faster}, which is the opposite of what the mechanism
+predicts --- and it means the $+5.9$\% wall-time difference cannot be attributed to the ablation
+at all. Had this run's workers served at the baseline's rate, its extra 18{,}064 completion tokens
+alone would have added roughly 640\,s of agent time. Conversely, the barrier-wait sums quoted in
+seconds (2{,}008.3 against 926.5) are partly exposed to whatever caused the rate difference, most
+likely queueing in the external worker pool. The dimensionless straggler-to-mean ratio (3.24
+against 1.98) and the busy-count distribution are less exposed but not immune. Token counts, the
+delivered source, the defensiveness counts and the re-scored acceptance result do not depend on
+service rate at all, and those are the numbers this analysis leans on.
+
+\paragraph{One run per configuration, so nothing here is statistical.} The acceptance delta is one
+case in sixty, comfortably inside what a single re-roll of eight agents could produce, and it
+should not be quoted as evidence of anything. The defensiveness and source-size deltas are large
+enough (4.7$\times$ and $+37.8$\%) that a coin flip is an implausible explanation, but the reason to
+believe them is not their size: it is their localisation. The extra code and every reflective access
+site sit in exactly the modules whose dependencies were withheld \emph{and} whose boundaries the
+specification leaves open, the modules with no dependencies came back byte-identical, and the
+agents' own prose names the mechanism. That is a mechanism argument standing in for a statistical
+one, and it is what n$=$1 permits.
+
+\paragraph{The ablation was not clean: the broadcast specification is itself a shared interface.}
+This run uses the signature-bearing \texttt{SPEC.md}, whose module-layout table already pins the
+signatures of \texttt{tokenize}, \texttt{parse}, \texttt{plan} and \texttt{execute} together with
+their return types, the \texttt{Token} field names and every
+AST class name. The agents said as much: the \texttt{tokens} owner wrote ``the specification's
+module table gives tokens.py \texttt{errors} as its permitted import and states that QueryError
+lives there'', and the \texttt{planner} owner ``the code is written against the node names and
+fields the specification's module table states''. What the spec does \emph{not} pin is exactly where
+the defensiveness landed --- the token \texttt{kind} vocabulary, the AST dataclass field names, and
+the shape of \texttt{Plan} --- so this run measures the ablation only over the residual the spec
+leaves undetermined, and its 59/60 understates the cost. The \texttt{--vague-spec} sibling pair
+exists to remove the confound and shows a different signature: both trees reach 60/60, but the
+ablated one carries 3{,}564 lines against 2{,}203 and six surviving spellings across three naming
+axes against three. Read this run as a lower bound.
+
+\paragraph{The own-interface echo leaks the very information the ablation withholds.} The
+implementation prompt still contains the rank's own published interface, and a well-written
+interface names its dependencies' call shapes: \texttt{api}'s says it works ``by calling
+parser.parse(sql), planner.plan(select, tables) and engine.execute(plan, tables) in that order''.
+That is why the eight discarded interface calls were not wholly wasted and why \texttt{api.py} came
+out byte-identical to the baseline's. What this run ablates is the cross-rank half of the channel,
+not the channel.
+
+\paragraph{Two headline metrics do not mean what they look like.} \texttt{coordination\_share} at
+87.9\% invites the reading that the protocol spent seven-eighths of the run coordinating; it did
+not. The barriers that dominate it sent zero messages, and the figure is the wall-clock envelope of
+collectives that were waiting for one agent call. Likewise the per-rank context column reads 0.0\%
+for all eight ranks not because context was ample but because \texttt{admit=False} is passed
+everywhere, so \texttt{context\_high\_water} and \texttt{context\_rejections} are structurally zero
+and the run says nothing about admission pressure.
+
+\paragraph{The repair loop was never exercised, so this run says nothing about convergence.} Because
+the oracle's report never parsed, neither round was a repair round in any meaningful sense: the
+population was told twice that a build passing 59 of 60 cases had failed to import, and the second
+round's only real input was a misrouted review. Any reading of the round-1 to round-2 trajectory ---
+including the observation that seven of eight files did not change --- is a statement about the
+broken plumbing, not about whether agents converge under an interface ablation.
+
+\paragraph{The defensiveness metric is a floor, and its denominator moves with the numerator.} It
+counts syntactic three-argument \texttt{getattr}, \texttt{hasattr} and adaptive \texttt{except}
+handlers, so \texttt{engine.py} scores 4 while routing 47 attribute-name guesses through one helper,
+and \texttt{parser.py}'s \texttt{inspect.signature} and \texttt{dataclasses.fields} reflection is not
+counted at all. That biases the measured 3.42$\times$ downwards. In the other direction, the
+per-kloc normalisation divides by a line count that the ablation itself inflated, so the density
+ratio is more conservative than the absolute ratio (3.42$\times$ against 4.71$\times$); both are
+reported above and the absolute count is the one that should be quoted with care, since a larger
+program has more places to be defensive.
+
+\end{document}
