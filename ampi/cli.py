@@ -483,6 +483,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--format", default="pdf", choices=["pdf", "png", "svg"])
     p.add_argument("--json", action="store_true", help="print metrics instead of the digest")
 
+    p = sub.add_parser("viewer", help="serve a live trace viewer over HTTP")
+    _common(p)
+    p.add_argument("--trace", default="", help="a finished .trace.jsonl; omit to read the live job")
+    p.add_argument("--campaign", default="", help="also show this campaign's broker queue")
+    p.add_argument("--name", default="")
+    p.add_argument("--host", default="0.0.0.0")  # noqa: S104 - the point is to be reachable
+    p.add_argument("--port", type=int, default=7842)
+    p.add_argument("--refresh", type=float, default=5.0, help="browser poll interval, seconds")
+
     return ap
 
 
@@ -607,6 +616,20 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return ({**d.to_dict(),
                  "gamma_sweep": explain_selection(a.collective, a.size, tokens=a.tokens, op=op)},
                 None, "")
+
+    if cmd == "viewer":
+        from .analysis.server import serve
+
+        serve(
+            job_root=None if a.trace else (a.job_root or os.environ.get(ENV_ROOT)),
+            trace=a.trace or None,
+            campaign=a.campaign,
+            name=a.name,
+            host=a.host,
+            port=a.port,
+            refresh=a.refresh,
+        )
+        return ({"served": True}, None, "")
 
     if cmd == "analyze":
         from .analysis import analyse, load_events, summary
