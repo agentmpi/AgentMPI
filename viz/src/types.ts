@@ -87,6 +87,7 @@ export interface ConcurrencySummary {
 
 export interface RunDetail {
   name: string;
+  live: boolean;
   events: TraceEvent[];
   report: Record<string, unknown> | null;
   ranks: number[];
@@ -100,6 +101,7 @@ export interface RunDetail {
 
 export interface RunListItem {
   name: string;
+  live: boolean;
   n_events: number;
   n_ranks: number;
   world_size: number;

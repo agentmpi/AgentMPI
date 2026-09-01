@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from ampi import Ampi
 from scripts import trace_server
 
 
@@ -81,6 +82,7 @@ def test_lists_only_valid_direct_harness_traces(runs: Path, tmp_path: Path) -> N
         "duration_s": 5.0,
         "trace_bytes": (runs / "sample" / trace_server.TRACE_NAME).stat().st_size,
         "has_report": True,
+        "live": False,
     }
 
 
@@ -95,6 +97,7 @@ def test_returns_flat_current_events_optional_report_and_concurrency(runs: Path)
 
     detail = trace_server.run_detail("sample")
 
+    assert detail["live"] is False
     assert detail["schema"]["required"]["kind"] == "string"
     assert detail["events"][1]["kind"] == "broker.claim"
     assert "payload" not in detail["events"][1]
@@ -129,6 +132,21 @@ def test_returns_flat_current_events_optional_report_and_concurrency(runs: Path)
 
     (runs / "sample" / trace_server.REPORT_NAME).unlink()
     assert trace_server.run_detail("sample")["report"] is None
+
+
+def test_reads_a_live_job_when_no_exported_trace_exists(runs: Path) -> None:
+    run = runs / "live"
+    amp = Ampi.create(str(run / "job"), 2, device="sqlite")
+    amp.trace("broker.publish", rank=0, aid="live-task", label="research")
+    amp.close()
+
+    detail = trace_server.run_detail("live")
+
+    assert detail["live"] is True
+    assert any(event["kind"] == "broker.publish" for event in detail["events"])
+    listed = {item["name"]: item for item in trace_server.list_runs()}
+    assert listed["live"]["live"] is True
+    assert listed["live"]["world_size"] == 2
 
 
 def test_rejects_invalid_jsonl_event(runs: Path) -> None:

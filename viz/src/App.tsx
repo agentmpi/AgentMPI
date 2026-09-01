@@ -140,18 +140,31 @@ export function App() {
 
   useEffect(() => {
     if (!selected) return;
+    let cancelled = false;
     setDetail(null);
     setError("");
-    fetch(`/api/run?name=${encodeURIComponent(selected)}`)
-      .then(async (response) => {
-        const body = (await response.json()) as RunDetail | { error: string };
-        if (!response.ok || "error" in body) {
-          throw new Error("error" in body ? body.error : `run API returned ${response.status}`);
-        }
-        return body;
-      })
-      .then(setDetail)
-      .catch((caught: unknown) => setError(String(caught)));
+    const load = () => {
+      fetch(`/api/run?name=${encodeURIComponent(selected)}`)
+        .then(async (response) => {
+          const body = (await response.json()) as RunDetail | { error: string };
+          if (!response.ok || "error" in body) {
+            throw new Error("error" in body ? body.error : `run API returned ${response.status}`);
+          }
+          return body;
+        })
+        .then((body) => {
+          if (!cancelled) setDetail(body);
+        })
+        .catch((caught: unknown) => {
+          if (!cancelled) setError(String(caught));
+        });
+    };
+    load();
+    const interval = window.setInterval(load, 5000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
   }, [selected]);
 
   const visualEvents = useMemo(() => (detail ? normalize(detail) : []), [detail]);
@@ -204,6 +217,7 @@ export function App() {
             >
               <span>{run.name}</span>
               <small>
+                {run.live ? "LIVE · " : ""}
                 {run.world_size} ranks · {run.n_events} events · {formatDuration(run.duration_s)}
               </small>
             </button>
@@ -222,6 +236,7 @@ export function App() {
                 <div>
                   <h1>{detail.name}</h1>
                   <p>
+                    {detail.live ? "LIVE · " : ""}
                     {detail.world_size} ranks · {detail.events.length.toLocaleString()} events ·{" "}
                     {formatDuration(detail.duration_s)}
                   </p>

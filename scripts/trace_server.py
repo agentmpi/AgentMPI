@@ -1,8 +1,8 @@
-"""Read-only HTTP API for exported AMPI harness traces.
+"""Read-only HTTP API for exported and live AMPI harness traces.
 
-The server deliberately reads the harness artifacts rather than opening a live
-runtime.  It has no write endpoints and depends only on the Python standard
-library.
+The server prefers immutable exported traces. While a harness is running it opens
+the job read-only through the runtime and snapshots its append-only event stream.
+It has no write endpoints.
 
     python3 scripts/trace_server.py --runs runs --port 43118
 """
@@ -16,6 +16,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlparse
+
+from ampi import Ampi
 
 RUNS = Path("runs")
 RUN_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*\Z")
@@ -44,16 +46,34 @@ def _safe_run_dir(name: str) -> Path:
 
 def _trace_path(name: str) -> Path:
     run_dir = _safe_run_dir(name)
-    trace = (run_dir / TRACE_NAME).resolve()
-    if trace.parent != run_dir:
-        raise TraceError("trace escapes run directory")
-    if not trace.is_file():
+    candidates = (run_dir / TRACE_NAME, run_dir / "evidence" / "trace.jsonl")
+    for candidate in candidates:
+        trace = candidate.resolve()
+        if run_dir not in trace.parents:
+            raise TraceError("trace escapes run directory")
+        if trace.is_file():
+            return trace
+    raise FileNotFoundError(name)
+
+
+def _live_job_root(name: str) -> Path:
+    run_dir = _safe_run_dir(name)
+    job = (run_dir / "job").resolve()
+    if job.parent != run_dir or not (job / "manifest.json").is_file():
         raise FileNotFoundError(name)
-    return trace
+    return job
 
 
 def _read_events(name: str) -> list[dict[str, Any]]:
-    trace = _trace_path(name)
+    try:
+        trace = _trace_path(name)
+    except FileNotFoundError:
+        job = _live_job_root(name)
+        amp = Ampi(str(job), rank=0, allow_volatile=True)
+        try:
+            return amp.events()
+        finally:
+            amp.close()
     events: list[dict[str, Any]] = []
     with trace.open(encoding="utf-8") as stream:
         for line_no, line in enumerate(stream, 1):
@@ -71,6 +91,26 @@ def _read_events(name: str) -> list[dict[str, Any]]:
                 raise TraceError(f"{TRACE_NAME}:{line_no}: event has no numeric timestamp")
             events.append(event)
     return events
+
+
+def _is_live(name: str) -> bool:
+    try:
+        _live_job_root(name)
+    except FileNotFoundError:
+        return False
+    return not (_safe_run_dir(name) / REPORT_NAME).is_file()
+
+
+def _source_bytes(name: str) -> int:
+    try:
+        return _trace_path(name).stat().st_size
+    except FileNotFoundError:
+        job = _live_job_root(name)
+        return sum(
+            path.stat().st_size
+            for path in (job / "journal.db", job / "journal.db-wal")
+            if path.is_file()
+        )
 
 
 def _optional_report(name: str) -> dict[str, Any] | None:
@@ -166,6 +206,7 @@ def run_detail(name: str) -> dict[str, Any]:
     spans = _work_spans(events)
     return {
         "name": name,
+        "live": _is_live(name),
         "schema": SCHEMA_FIELDS,
         "events": events,
         "report": report,
@@ -188,7 +229,6 @@ def list_runs() -> list[dict[str, Any]]:
         if not RUN_NAME.fullmatch(child.name):
             continue
         try:
-            trace = _trace_path(child.name)
             events = _read_events(child.name)
             report = _optional_report(child.name)
             times = [float(event["ts"]) for event in events]
@@ -206,8 +246,9 @@ def list_runs() -> list[dict[str, Any]]:
                         or next((event.get("run") for event in events if event.get("run")), "")
                     ),
                     "duration_s": max(times) - min(times) if times else 0.0,
-                    "trace_bytes": trace.stat().st_size,
+                    "trace_bytes": _source_bytes(child.name),
                     "has_report": report is not None,
+                    "live": _is_live(child.name),
                 }
             )
         except (FileNotFoundError, OSError, TraceError):
