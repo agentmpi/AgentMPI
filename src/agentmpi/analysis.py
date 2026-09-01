@@ -703,8 +703,16 @@ def _attribute_logged_traffic(
     for op in by_op:
         by_op[op].sort()
 
+    # Composed invocations take no epoch of their own --- their constituents do --- so they must be
+    # excluded before the counts are compared. Otherwise a run with two `allreduce/reduce_bcast`
+    # calls sees one tagged group against two invocations, the mismatch guard fires, and
+    # `logged_messages` is left unset for the very collective under study. The log-based check then
+    # silently degrades into a restatement of the self-report, which is the one thing it exists not
+    # to be, and the invocation is also exempted from the misreporting check.
     per_op_invocations: dict[str, list[CollectiveInvocation]] = defaultdict(list)
     for inv in invocations:
+        if inv.is_composed:
+            continue
         per_op_invocations[inv.op].append(inv)
 
     for op, invs in per_op_invocations.items():
