@@ -473,8 +473,21 @@ class Analysis:
         return total + (cur_end - cur_start)
 
     @property
+    def undurated_collectives(self) -> list[CollectiveInvocation]:
+        """Collectives that completed but recorded no duration, so contribute nothing to the total.
+
+        Distinct from an incomplete collective, and invisible to that check. Traces predating the
+        neighbourhood-collective instrumentation fix carry ``coll.halo_exchange`` events with no
+        ``wall_s``, so the halo exchange scores zero rank-seconds even though every rank blocked in
+        it. On the translation series that understated coordination by exactly the halo's blocking:
+        4.1% reported against 10.0% actual at p=2, and 16.3% against 21.5% at p=4 --- which also
+        changed the shape, since the corrected figure peaks at p=4 instead of rising monotonically.
+        """
+        return [c for c in self.primitive_collectives if c.rank_wall_s == 0.0 and c.n_participants > 0]
+
+    @property
     def coordination_is_underreported(self) -> bool:
-        """Does the blocking figure omit ranks that never finished a collective?
+        """Does the blocking figure omit ranks that never finished a collective, or durations?
 
         A rank records a ``coll.*`` event on *completion*, so a rank that blocks and then dies or
         times out contributes nothing to the coordination measures. On the p=16 translation run
@@ -483,8 +496,12 @@ class Analysis:
         record it. The measures are still correct as defined --- time spent inside *completed*
         collectives --- but on a degraded run that definition is not the quantity a reader wants,
         and silence about the difference would be misleading.
+
+        Also true when a collective completed but reported no duration, which the incomplete-check
+        cannot see: a run whose halo exchange recorded no ``wall_s`` has its coordination scored
+        short by exactly that collective's blocking.
         """
-        return bool(self.incomplete_collectives) or self.ok is False
+        return bool(self.incomplete_collectives) or self.ok is False or bool(self.undurated_collectives)
 
     @property
     def coordination_share(self) -> float:
@@ -547,6 +564,18 @@ class Analysis:
         return bool(self.failed_ranks) or self.ok is False or bool(self.incomplete_collectives)
 
     @property
+    def has_broker_executor(self) -> bool:
+        """Was any rank driven through the broker, so that occupancy is observable at all?
+
+        Occupancy is reconstructed from ``broker.claim``/``broker.complete`` pairs, and the
+        in-process ``function`` and ``simulated`` executors emit neither. So a surrogate run reports
+        essentially zero busy time however hard it worked, and any statement about concurrency
+        derived from it is a statement about the instrumentation rather than about the run --- the
+        four ranks of ``tr-smoke`` demonstrably interleave while their measured busy time is 1 ms.
+        """
+        return any(name == "broker" for name in self.executors)
+
+    @property
     def total_reattachments(self) -> int:
         """Agent processes that took over a rank role mid-run, summed over ranks.
 
@@ -596,6 +625,8 @@ class Analysis:
             "coordination_share": round(self.coordination_share, 4),
             "coordination_span_share": round(self.coordination_span_share, 4),
             "coordination_is_underreported": self.coordination_is_underreported,
+            "n_undurated_collectives": len(self.undurated_collectives),
+            "has_broker_executor": self.has_broker_executor,
             "n_primitive_collectives": len(self.primitive_collectives),
             "n_collectives": len(self.collectives),
             "model_checks_agree": agree,

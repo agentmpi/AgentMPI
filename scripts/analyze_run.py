@@ -146,21 +146,42 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
         ))
 
     conc = a.concurrency
-    if a.work_spans and conc.max_busy == 1 and a.world_size > 1:
+    # Only claim serial execution where occupancy is actually observable. The in-process executors
+    # emit no broker events, so their busy time is near zero however hard they worked, and asserting
+    # "this ran serially" from that is a statement about the instrumentation: tr-smoke's four ranks
+    # demonstrably interleave from 6 ms onward while their measured busy time is 1 ms.
+    if a.work_spans and conc.max_busy == 1 and a.world_size > 1 and a.has_broker_executor:
         out.append(("warning", f"Concurrency never exceeded one rank despite a world size of {a.world_size}: this ran serially."))
-    elif a.work_spans and a.world_size > 1 and conc.parallel_efficiency < 0.4:
+    elif a.work_spans and conc.max_busy <= 1 and a.world_size > 1 and not a.has_broker_executor:
+        out.append((
+            "note",
+            f"Occupancy is not measurable for this run: its executors "
+            f"({', '.join(sorted(a.executors)) or 'none'}) emit no broker claim events, so busy time, "
+            f"achieved parallelism, and the idle fraction are artefacts of the instrumentation rather "
+            f"than properties of the run.",
+        ))
+    elif a.work_spans and a.world_size > 1 and conc.parallel_efficiency < 0.4 and a.has_broker_executor:
         out.append((
             "note",
             f"Parallel efficiency is {num(conc.parallel_efficiency * 100, 1)}\\%: "
             f"{num(conc.idle_fraction * 100, 1)}\\% of the rank-seconds paid for went unused.",
         ))
-    if a.coordination_is_underreported:
+    if a.incomplete_collectives or a.ok is False:
         out.append((
             "warning",
             "The coordination figures count time inside \\emph{completed} collectives only, and this "
             "run has ranks that never completed one. A rank records a collective on completion, so "
             "a rank that blocked and then timed out contributes nothing --- the reported share is a "
             "floor, and on a badly degraded run a very loose one.",
+        ))
+    if a.undurated_collectives:
+        kinds = sorted({c.op for c in a.undurated_collectives})
+        out.append((
+            "warning",
+            f"{len(a.undurated_collectives)} collective(s) completed but recorded no duration "
+            f"({', '.join(mono(k) for k in kinds)}), so they contribute nothing to the coordination "
+            f"figures even though every participant blocked in them. The reported coordination share "
+            f"is short by exactly their blocking; it can be recovered from the event timestamps.",
         ))
     if a.coordination_share > 0.5:
         out.append((
@@ -170,16 +191,32 @@ def findings(a: an.Analysis) -> list[tuple[str, str]]:
         ))
     fit = getattr(a.calibration, "fit_method", "default")
     if fit == "median_fallback":
-        rejected = getattr(a.calibration, "fit_rejected_beta", None)
+        beta = getattr(a.calibration, "fit_rejected_beta", None)
+        alpha = getattr(a.calibration, "fit_rejected_alpha", None)
+        r2 = getattr(a.calibration, "fit_rejected_r2", None)
+        # Name the coefficient that actually failed. Asserting a negative slope unconditionally was
+        # wrong on every translation run: their slopes were positive and the intercept was negative.
+        # The two mean opposite things, so conflating them misdiagnoses the run.
+        if beta is not None and beta <= 0:
+            cause = (
+                f"the slope was negative ($\\beta={num(beta, 4)}$\\,s/token), meaning latency fell as "
+                f"output grew --- so something outside the model dominated the measurement, typically "
+                f"queueing, whose wait enters the latency but not the token count"
+            )
+        elif alpha is not None and alpha <= 0:
+            cause = (
+                f"the slope was positive but the intercept was negative "
+                f"($\\alpha={num(alpha, 2)}$\\,s), so the fitted line passes below the origin. That is "
+                f"physically impossible and statistically unremarkable on a narrow token range, and "
+                f"the guard rejects it rather than publish a negative fixed cost"
+            )
+        else:
+            cause = "the regression was rejected by the sign guard"
         out.append((
             "warning",
-            "The cost model's $\\alpha$ and $\\beta$ here are a median fallback, not a fit: the "
-            "regression returned a negative slope"
-            + (f" ($\\beta={num(rejected, 4)}$\\,s/token)" if rejected is not None else "")
-            + " and was rejected. That happens when queueing dominates latency, because the wait "
-            "enters the measured time but not the token count, so the relationship the fit looks "
-            "for is not in the data. Any latency prediction from this run's calibration is a "
-            "median, not a model.",
+            f"The cost model's $\\alpha$ and $\\beta$ here are a median fallback, not a fit: {cause}"
+            + (f", on a fit with $R^2={num(r2, 3)}$" if r2 is not None else "")
+            + ". Any latency prediction from this run's calibration is a median, not a model.",
         ))
     elif fit == "median_only":
         out.append((

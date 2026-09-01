@@ -104,6 +104,17 @@ class CostParams:
     fit_method: str = "default"
     #: The slope the regression produced when it was rejected, for diagnosis.
     fit_rejected_beta: float | None = None
+    #: The intercept the regression produced when it was rejected.  Recorded separately because the
+    #: guard tests both and they fail for different reasons: a negative *slope* means latency fell
+    #: as output grew, which is nonsense and usually means something outside the model dominates;
+    #: a negative *intercept* often means the opposite --- a good fit whose line simply passes below
+    #: the origin, which is physically impossible but statistically unremarkable on a narrow token
+    #: range. Reporting only one of them mislabelled every translation run: their slopes were
+    #: positive and it was the intercept that failed.
+    fit_rejected_alpha: float | None = None
+    #: Coefficient of determination of the rejected fit, so a reader can see whether a rejected
+    #: regression was actually a poor description of the data or merely an inconvenient one.
+    fit_rejected_r2: float | None = None
 
     def message_time(self, n_tokens: int) -> float:
         return self.alpha_s + n_tokens * self.beta_s_per_token
@@ -130,6 +141,12 @@ class CostParams:
             "fit_method": self.fit_method,
             "fit_rejected_beta": (
                 round(self.fit_rejected_beta, 6) if self.fit_rejected_beta is not None else None
+            ),
+            "fit_rejected_alpha": (
+                round(self.fit_rejected_alpha, 4) if self.fit_rejected_alpha is not None else None
+            ),
+            "fit_rejected_r2": (
+                round(self.fit_rejected_r2, 4) if self.fit_rejected_r2 is not None else None
             ),
         }
 
@@ -212,6 +229,10 @@ def calibrate(
             params.beta_s_per_token = max(1e-6, (statistics.median(ys) / max(1.0, statistics.median(xs))) / 2)
             params.fit_method = "median_fallback"
             params.fit_rejected_beta = beta
+            params.fit_rejected_alpha = alpha
+            sst = sum((y - my) ** 2 for y in ys)
+            ssr = sum((y - (alpha + beta * x)) ** 2 for x, y in zip(xs, ys, strict=True))
+            params.fit_rejected_r2 = (1.0 - ssr / sst) if sst > 0 else None
     elif ys:
         params.alpha_s = statistics.median(ys)
         params.fit_method = "median_only"

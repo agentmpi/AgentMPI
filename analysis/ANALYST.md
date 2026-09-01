@@ -128,19 +128,36 @@ do, present both explanations rather than picking one. Compare `runs/<RUN>/outpu
 baseline's, and check `runs/<RUN>/spool/` for which stages actually ran. Shared *input* artefacts
 (scatter units, glossary, term sheets) are identical by design and are not evidence of anything.
 
-Do not jump to contamination. On the run above the evidence favours convergence, and the test
-that discriminates is worth reusing: the overlap in the content-addressed stores is entirely in
-inputs, with **zero shared `gather` digests**, which is not what wholesale output reuse looks
-like. More decisively, for one unit the baseline's *on-disk output* is the revised text while the
-ablation produced the *unrevised* text, which exists nowhere except inside the baseline's spool
-prompt — a worker copying the previous run's outputs would have copied the revised one. Where the
-constraints are tight enough (a binding 206-term glossary, a pinned paragraph count and register,
-a canonical source text) and the revision moved under 1% of characters, byte-identity is a short
-step rather than a leap.
+**The test that settles it is a determinism check, and you must run it before concluding either
+way.** Convergence requires the executor to be near-deterministic. So find a prompt that is a pure
+function of its input — in the translation harness `prompt_terms` does not take the glossary, so a
+`terms:u<n>` prompt depends only on the unit — confirm the prompt digests really are identical
+across runs, and then compare the *results*.
 
-So: look for shared *output* digests specifically, check which stage each shared artefact
-corresponds to, and quantify how much the baseline's revision actually changed. Then say which
-explanation the evidence favours and which you cannot exclude.
+For the translation scaling series that test comes out decisively against convergence. All four
+runs issue byte-identical terms prompts (8 of 8 digests match), yet only 6 of 48 cross-run result
+pairs agree: `terms:u4` carries the same prompt digest in every run and returns 36, 38, 38 and 34
+terms in 913, 956, 956 and 872 bytes. **Identical input does not give identical output here**, so
+determinism cannot explain the identities that do occur. And the identities are not scattered: all
+11 output pairs where the unit sat on rank 0 in both runs are byte-identical, and none of the other
+37 are. Most pointedly, `real-tr-p8-full`'s *revised* `translate:u0` is byte-identical to the
+*unrevised* `translate:u0` of p1, p2 and p4. The reading there is cross-run dependence, not
+convergence.
+
+An earlier version of this section generalised from a single ablation pair and told analysts the
+evidence favoured convergence. That was too strong: the discriminating evidence in that case (store
+overlap confined to inputs, zero shared `gather` digests, and one unit where the ablation produced
+text existing only inside the baseline's *prompt*) is real and still worth checking, but it does not
+license a blanket conclusion, and on a different family of runs the determinism test points the
+other way.
+
+So, in order: check whether identical prompts give identical results; look for shared *output*
+digests specifically rather than input ones; identify which pipeline stage each shared artefact
+belongs to; and see whether the identities correlate with something structural such as rank
+position. Then say which explanation the evidence favours **for your runs** and which you cannot
+exclude. Note the confound that limits even the strong version: a contiguous split puts the
+lowest-numbered units on rank 0 in every configuration, so "same rank" and "early unit" cannot be
+separated within one series.
 
 ### The quality bar
 
