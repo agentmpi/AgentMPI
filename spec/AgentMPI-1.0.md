@@ -1412,14 +1412,25 @@ Byzantine tolerance is acknowledged and out of scope.
 Two requirements sit outside the protocol proper but are necessary for a run to
 mean anything, and both were learned the hard way.
 
-**The runtime version MUST be pinned per job.** Protocol *state* lives outside the
-agents and is durable, which is the design's central move. The runtime *code* is
-shared mutable state, and the specification says nothing about it. An
-implementation SHOULD record its version at job creation and refuse to serve a job
-whose recorded version differs. During our own experiments a worker crashed inside
-the runtime because the package was edited while a live population executed
-against it; the honest description is that we hot-patched a running job, and no
-amount of durable protocol state protects against that.
+**The runtime MUST be pinned per job, by content.** Protocol *state* lives outside
+the agents and is durable, which is the design's central move. The runtime *code*
+is shared mutable state, and the specification says nothing about it. An
+implementation MUST record a fingerprint of its own source at job creation and
+MUST record a diagnostic event when a later caller's fingerprint differs.
+
+> **Rationale, and a correction.** An earlier draft of this appendix said to pin
+> the *version*. That is not pinning. We wrote it after a worker crashed inside the
+> runtime because the package was edited while a live population executed against
+> it --- and then, in a later run, it happened again in exactly the same way, with
+> the version string unchanged throughout, because what changed was the code. An
+> executor reported an ``ImportError`` from a module another session was in the
+> middle of fixing. A content hash catches this and a version string cannot.
+>
+> The event is advisory rather than fatal, deliberately. A developer iterating on
+> a runtime should not be locked out of their own job, and a two-hour agent run
+> should not die because a docstring moved. What matters is that the run's journal
+> records that its runtime changed underneath it, which is the difference between
+> an inexplicable result and an explained one.
 
 **The verifier MUST be versioned, and results MUST be re-scorable.** A
 verification-based fault-tolerance scheme inherits the reliability of its

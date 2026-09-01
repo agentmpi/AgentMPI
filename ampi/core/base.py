@@ -53,6 +53,7 @@ from ..constants import (
     STATE_REQUESTED,
     STATE_RUNNING,
     STATE_SUSPECT,
+    runtime_fingerprint,
 )
 from ..device import Device, open_device
 from ..errors import AmpiError, err
@@ -75,6 +76,7 @@ class JobManifest:
     unexpected_budget: int = DEFAULT_UNEXPECTED_BUDGET
     token_counter: str = ""
     eager_threshold: int = 0
+    runtime_fingerprint: str = ""
     meta: dict[str, Any] | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -219,6 +221,7 @@ class RuntimeBase:
             unexpected_budget=unexpected_budget,
             token_counter=counter_name(),
             eager_threshold=eager_threshold or EAGER_THRESHOLD_TOKENS,
+            runtime_fingerprint=runtime_fingerprint(),
             meta=meta or {},
         )
         marker.write_text(json.dumps(manifest.to_dict(), indent=2))
@@ -290,6 +293,17 @@ class RuntimeBase:
                     hint="Install the pinned runtime. Never edit a runtime under a live job.",
                     pinned=self._manifest.runtime_version,
                     running=RUNTIME_VERSION,
+                )
+            pinned = self._manifest.runtime_fingerprint
+            if pinned and pinned != runtime_fingerprint():
+                # Advisory, not fatal: a developer iterating should not be locked
+                # out, and a two-hour agent run should not die because a docstring
+                # moved.  But the run's own journal now says its runtime changed
+                # underneath it, which is the difference between an inexplicable
+                # result and an explained one.
+                self.trace(
+                    "runtime.changed", pinned=pinned, running=runtime_fingerprint(),
+                    note="the runtime's source changed after this job was created",
                 )
         return self._manifest
 

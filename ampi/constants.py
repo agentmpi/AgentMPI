@@ -11,6 +11,35 @@ from typing import Final
 PROTOCOL_VERSION: Final[str] = "AgentMPI/1.0"
 RUNTIME_VERSION: Final[str] = "1.0.0"
 
+
+def runtime_fingerprint() -> str:
+    """A content hash of the runtime's own source.
+
+    A version string does not pin a runtime.  During our experiments an executor
+    called into the package mid-edit and got an ``ImportError`` from a module
+    another session was in the middle of fixing; the version string had not
+    changed, because the thing that changed was the code.  Appendix D of the
+    specification says the runtime must be pinned per job, and pinning by version
+    is not pinning.
+
+    Hashing the source catches it.  This is advisory rather than fatal --- a
+    developer iterating on the runtime should not be locked out of their own job,
+    and a long agent run should not die because a comment was reflowed --- but the
+    mismatch is recorded, so a run whose behaviour changed halfway through says so
+    in its own journal instead of leaving a reader to wonder.
+    """
+    import hashlib
+    from pathlib import Path
+
+    here = Path(__file__).resolve().parent
+    h = hashlib.sha256()
+    for src in sorted(here.rglob("*.py")):
+        if "__pycache__" in src.parts:
+            continue
+        h.update(src.relative_to(here).as_posix().encode())
+        h.update(src.read_bytes())
+    return h.hexdigest()[:16]
+
 # -- sentinels ---------------------------------------------------------------
 ANY_SOURCE: Final[int] = -1
 ANY_TAG: Final[int] = -1

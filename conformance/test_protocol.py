@@ -1029,3 +1029,30 @@ def test_errors_carry_a_class_a_hint_and_a_retryable_flag(job):
     assert d["error"] == "AMPI_ERR_TIMEOUT"
     assert d["retryable"] is True
     assert d["hint"], "an error a model reads must say what to do"
+
+
+def test_appendix_d_the_runtime_is_pinned_by_content_not_by_version(job):
+    """Appendix D: pinning by version string is not pinning.
+
+    During our experiments an executor called into the package mid-edit and got an
+    ImportError from a module another session was fixing. The version string had
+    not changed, because what changed was the code. A content hash catches it, and
+    the mismatch is advisory rather than fatal: a developer iterating should not be
+    locked out, and a two-hour agent run should not die because a docstring moved.
+    What matters is that the run's own journal says its runtime changed underneath
+    it.
+    """
+    ranks = job(2)
+    manifest = ranks[0].device.read("job", "manifest")
+    assert manifest.value["runtime_fingerprint"], "a job must record its runtime's fingerprint"
+    assert not ranks[0].events(kind="runtime.changed")
+
+    ranks[0].device.cas(
+        "job", "manifest", None,
+        {**manifest.value, "runtime_fingerprint": "0000000000000000"}, writer=-1,
+    )
+    fresh = Ampi(ranks[0].root, rank=1, allow_volatile=True)
+    fresh.init()
+    changed = fresh.events(kind="runtime.changed")
+    assert changed, "a runtime edited under a live job must be recorded"
+    assert changed[0]["pinned"] == "0000000000000000"
