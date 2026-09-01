@@ -6,6 +6,9 @@
 \documentclass[11pt]{article}
 \input{../../preamble}
 
+%% Long \texttt{} identifiers in running prose leave little room for the line breaker.
+\emergencystretch=2.5em
+
 \title{\textbf{real-tr-p2-full}\\[2pt]\large An AgentMPI run analysis}
 \author{}
 \date{}
@@ -14,25 +17,375 @@
 \maketitle
 
 \begin{abstract}
-\TODO{One paragraph: what this run was for, what it shows, and the single most
-important thing a reader should take away. Write this last.}
+Two agent ranks translated the eight-section book by the full stencil decomposition ---
+\texttt{scatterv}, per-unit terminology extraction, a \texttt{UNION} \texttt{allreduce} over the
+glossary, translation, a \texttt{halo\_exchange} on a two-node Cartesian line, and
+\texttt{gather} --- in 410.11\,s with no failures, no contract violations and no retries. It is
+the first point in the strong-scaling series at which the protocol does anything at all, and its
+value is that the protocol is small enough here to be read line by line: eight messages, three
+synchronisation points, and one seam. Speedup over the 576.74\,s sequential baseline is
+1.406$\times$ at efficiency 0.703, and the Karp--Flatt figure of 0.422 is the highest in the
+series. The document's two substantive findings are both about the cost of that single seam.
+First, the \texttt{halo\_exchange} blocked rank 0 for 48.766\,s to move 36 tokens, and none of
+that time appears in \texttt{coordination\_share}, which reads 4.1\% where the trace supports
+10.0\%: the halo events carry no \texttt{wall\_s} and \texttt{coordination\_is\_underreported}
+does not catch the omission. Second, the two revision calls the seam triggered cost 108.33
+rank-seconds of model time and changed nothing --- diffing the pre- and post-revision blobs gives
+0 characters moved out of 2{,}437, while the harness reports \texttt{n\_boundary\_changes: 7},
+because the agents used the \texttt{changes} field to list checks they performed rather than edits
+they made. Seam reconciliation at $p=2$ cost 19.2\% of the run's rank-seconds and altered not one
+character of the book.
 \end{abstract}
 
 \input{generated}
 
 \section{Reading the timeline}
-\TODO{What shape does the timeline have, and why? Address the visual structure a
-reader sees in the dashboard: where ranks idle, where work bunches, what the gaps
-are waiting for. Refer to Figure~\ref{fig:timeline}.}
+
+Figure~\ref{fig:timeline} is two lanes of nine bars each, and the whole run is legible from their
+alignment. Both ranks start together at $t=0$, both hold four terminology bars, both hold four
+translation bars, both hold one revision bar, and they end together. What separates them is that
+rank 1 is behind at every stage: it finishes terminology at 111.56\,s against rank 0's 89.56\,s,
+translation at 347.40 against 298.89, and revision at 409.93 against 399.17. The three gaps in
+rank 0's lane in Figure~\ref{fig:timeline} are the three times it had to wait for rank 1 to catch
+up, and Figure~\ref{fig:concurrency} shows them as three descents from two busy ranks to one.
+There is no interval in the run where both ranks are idle.
+
+The first gap is the glossary. Rank 0 returns \texttt{terms:u3} at 89.555\,s and enters
+\texttt{allreduce(local\_terms, UNION)}; under \texttt{reduce\_bcast} at $p=2$ that is a
+\texttt{flat} reduce to rank 0 followed by a \texttt{flat} broadcast back. Rank 1 does not return
+\texttt{terms:u7} until 111.562\,s and sends its 845-token contribution two milliseconds later.
+Rank 0's \texttt{coll.reduce} lands at 111.800\,s, so it blocked for 22.245\,s, which is the
+22.24\,s the collectives table reports as the reduce's wall time. The broadcast that follows is
+1{,}571 tokens and takes 0.24\,s of rank-1 time and two milliseconds of rank-0 time. Both ranks
+record the same broadcast digest \texttt{2f25c998b83a} and the same 207-term glossary, which is
+what an exact operator over a tree must give and is not a finding.
+
+The second gap is the seam, and it is the largest single wait in the run. Rank 0 returns
+\texttt{translate:u3} at 298.885\,s, creates its Cartesian communicator, and at 298.887\,s sends
+its right boundary --- the last paragraph of unit 3, 27 tokens --- to rank 1. It then blocks.
+Rank 1 is still translating unit 7 and does not reach the exchange until 347.402\,s, at which
+point it reads rank 0's message with a logged queue residency of 48.515\,s, replies with the
+first paragraph of unit 4 (9 tokens), and proceeds. Rank 0's \texttt{coll.halo\_exchange} lands
+at 347.653\,s, so it waited 48.766\,s. Two things about that number matter. It is 11.9\% of the
+whole run spent by half the population inside a collective that moved 36 tokens, and it is set
+entirely by the arrival skew, not by the exchange: rank 1's own cost was 0.002\,s because its
+neighbour's message had been sitting in its mailbox for three quarters of a minute. At $p=2$ the
+neighbourhood collective and a global barrier are the same thing, since a rank's only neighbour
+is the whole rest of the world, so the argument that a halo scales better than a barrier cannot
+be made here --- it needs $p\ge4$ before a rank has a choice of whom to wait for.
+
+The third gap is the \texttt{pre-gather} barrier. Rank 0 finishes its revision at 399.171\,s and
+rank 1 at 409.925\,s, so rank 0 waits 10.942\,s, matching the barrier's reported wall time
+exactly. The \texttt{gather} that follows is one rendezvous message of 1{,}410 tokens and
+completes in 0.187\,s.
+
+Partitioning every rank-second of the run by the interval it falls in --- the boundaries are
+\texttt{broker.enqueue}, \texttt{broker.claim}, \texttt{broker.complete}, \texttt{agent.call},
+\texttt{msg.recv} and \texttt{coll.*} --- gives an idle budget that closes:
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+  where the idle rank-seconds went & rank-s & share \\
+\midrule
+  broker dispatch, \texttt{enqueue} to \texttt{claim} & 61.420 & 41.1\% \\
+  \texttt{halo\_exchange} & 48.766 & 32.6\% \\
+  glossary \texttt{allreduce}, both invocations & 22.509 & 15.1\% \\
+  \texttt{pre-gather} barrier & 10.942 & 7.3\% \\
+  completion polling & 5.800 & 3.9\% \\
+  \texttt{scatterv}, \texttt{gather} and host-side code & 0.075 & 0.1\% \\
+\midrule
+  total idle, of 820.228 rank-s available & 149.512 & 100.0\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The residual against the headline's 18.25\% idle fraction is 0.19\,rank-s, which is the interval
+between rank 1's \texttt{rank.finalize} and the end of the job. The largest row is not a
+collective at all. Sixty-one of the 149.5 idle rank-seconds are the broker publishing a task and
+waiting for a worker process to take it, eighteen times, at a mean of 3.412\,s.
+
+Figure~\ref{fig:comm} is two cells: $0\to1$ carrying 5{,}646 tokens over four messages and
+$1\to0$ carrying 2{,}332 over four. The asymmetry is the scatter, whose single hop is 3{,}911
+tokens --- half the book. Figure~\ref{fig:ranks} shows rank 0 at 73.5\% occupancy against rank 1's
+90.0\%, which is the same fact as the three gaps. Its right-hand panel is empty: every receive in
+this harness is non-admitting and the \texttt{gather} passes \texttt{admit=False}, so context
+occupancy is 0.0\% against a 120{,}000-token budget for both ranks.
+
+The viewer screenshot adds one thing the plot does not. The dashboard draws ten lanes; ranks 2
+through 8 and rank 14 each carry a couple of grey lifecycle ticks and no work at all, in a world
+declared to be of size 2. Figure~\ref{fig:timeline} draws two lanes because \texttt{analyze\_run}
+filters to participating ranks, so the plot is the better picture of the computation and the
+screenshot the better picture of the job.
 
 \section{Interpretation}
-\TODO{What does this run establish? Distinguish what is by construction (the
-harness asked for it) from what emerged. Where a finding above is flagged, say
-whether it is expected for this configuration or a genuine defect.}
+
+\subsection*{What is true by construction}
+
+The phase structure is the harness's. \texttt{translation.py} splits eight units between two
+ranks, four each, and the trace matches instruction for instruction: 2 \texttt{coll.scatter}, 4
+\texttt{coll.reduce}, 4 \texttt{coll.bcast}, 4 \texttt{coll.allreduce}, 2
+\texttt{topo.cart\_create}, 2 \texttt{coll.halo\_exchange}, 2 \texttt{coll.barrier}, 2
+\texttt{coll.gather}, and 18 \texttt{agent.call}. The eighteen calls decompose as eight
+\texttt{terms}, eight \texttt{translate} and two \texttt{revise}, and the two follow from the
+decomposition rather than from any choice: with four units per rank, only the last unit of rank 0
+and the first unit of rank 1 abut a rank boundary, and only those two are handed neighbour
+context.
+
+Nine of the ten collective invocations sent exactly the number of messages their closed form
+predicts, which Figure~\ref{fig:collectives} shows as matched pairs. The tenth is
+\texttt{halo\_exchange}, discussed below.
+
+One property of this point is not by construction but is easy to mistake for it, and it matters
+for the series: $p=2$ is the only completing configuration that takes the \texttt{flat} code path.
+\texttt{algorithms.reduce} and \texttt{algorithms.bcast} choose \texttt{"flat" if p <= 3 else
+"binomial"}, so the glossary at $p=2$ is a one-round flat reduce while at $p=4$ and $p=8$ it is a
+two- and three-round binomial tree. The scaling curve is therefore not algorithmically
+homogeneous across its four points. At this size the distinction costs nothing --- a flat and a
+binomial reduce over two ranks are the same single message --- but a reader comparing round counts
+across the curve should know that the implementation switched.
+
+\subsection*{The seam cost 19\% of the run and changed nothing}
+
+This is the finding the run makes best, and it took the blob store rather than the event log to
+establish.
+
+The seam-reconciliation phase at $p=2$ consists of one rank boundary, one \texttt{halo\_exchange},
+and two \texttt{revise} calls. Its cost is 108.332 rank-seconds of model work (49.76\,s for
+\texttt{revise:u3} on rank 0 and 58.57\,s for \texttt{revise:u4} on rank 1) plus the 48.766
+rank-seconds rank 0 spent blocked in the exchange: 157.10 rank-seconds in total, 19.2\% of the
+820.23 rank-seconds the run had available. Against the sequential baseline it is 100\% extra ---
+\texttt{real-tr-p1-full} skips the phase entirely, because the harness guards it with
+\texttt{cfg.halo and comm.size > 1}.
+
+Its effect on the book is nil. I pulled the \texttt{translate:u3}, \texttt{revise:u3},
+\texttt{translate:u4} and \texttt{revise:u4} results out of \texttt{runs/real-tr-p2-full/blobs},
+extracted the \texttt{translation} field from each, and diffed. Both revisions returned text
+byte-identical to their inputs: 1{,}098 characters in and 1{,}098 out for unit 3, 1{,}339 in and
+1{,}339 out for unit 4, 0 characters moved in either. The revised sections on disk are the same
+bytes as the unrevised translations.
+
+The harness nevertheless records \texttt{n\_boundary\_changes: 3} for rank 0 and \texttt{4} for
+rank 1. Reading the \texttt{changes} lists the agents returned explains the gap and makes it a
+reporting defect rather than a mystery: the entries are descriptions of verification, of the form
+``checked the terminology shared with the next section against the binding glossary and made no
+further alteration''. The \texttt{Revision} contract asks for ``a short list of the boundary or
+terminology fixes you made'' and the agents answered with a list of the boundary and terminology
+items they inspected. So \texttt{n\_boundary\_changes} counts self-reported inspections, and the
+only way to count edits is to diff the artefacts, which nothing in the pipeline does. On this run
+the two quantities differ by the maximum possible amount: seven reported, zero real.
+
+The sibling runs put the result in context rather than contradicting it. Applying the same diff to
+\texttt{real-tr-p4-full} gives three of six revisions altering the text, 23 characters of 6{,}959;
+to \texttt{real-tr-p8-full}, eight of eight, 70 characters of 9{,}527. That ordering has a
+structural explanation. The book has eight units and therefore seven internal seams, and the halo
+exchange can only reconcile seams that fall on a rank boundary --- $1$ of $7$ at $p=2$, $3$ of $7$
+at $p=4$, $7$ of $7$ at $p=8$, $0$ of $7$ at $p=1$. The four seams inside rank 0's own run of
+units, between $u_0$ and $u_1$ and so on, were produced by four separate agent calls with no
+shared context and are exactly as raw as an inter-rank seam, and the mechanism never looks at
+them. Cost per reconciled seam is 157.1 rank-seconds here, 125.2 at $p=4$ and 55.9 at $p=8$, so
+this configuration is the least cost-effective place in the series to run the mechanism: it pays
+the most per seam and reaches the fewest of them.
+
+I would not read this as evidence that the halo exchange is useless. It is evidence that at
+$p=2$ it has almost nothing to do, which is what one would predict, and that the campaign has no
+instrument that would have noticed. Every deterministic quality metric --- coverage 1.000,
+consistency 1.000, \texttt{n\_divergent\_entities} 0, rendering verification 1.000, paragraph
+fidelity 1.000 --- is at its ceiling in this run and in every sibling, including
+\texttt{real-tr-p8-nohalo}, which has no seam mechanism at all.
+
+\subsection*{\texttt{coordination\_share} is wrong by a factor of 2.5, and the flag that should catch it does not fire}
+
+\texttt{metrics.json} reports \texttt{coordination\_share: 0.0408} and
+\texttt{coordination\_span\_share: 0.081}, with \texttt{coordination\_is\_underreported: false}.
+The first two are too low and the third should be true.
+
+\texttt{Analysis.collective\_rank\_seconds} sums \texttt{rank\_wall\_s} over the primitive
+collectives, and \texttt{rank\_wall\_s} is assembled from the \texttt{wall\_s} field each
+\texttt{coll.*} event carries. The \texttt{coll.halo\_exchange} events in this trace carry only
+\texttt{\{label, left, right\}}: no \texttt{algorithm}, no \texttt{rounds}, no
+\texttt{messages\_sent}, no \texttt{wall\_s}. The metric therefore scores the halo at zero, and
+33.474 of the run's blocking rank-seconds are counted where the trace supports 82.24. The
+difference, 48.77, is rank 0's halo wait to the millisecond. Recomputing directly from the event
+log, coordination share is 10.03\% rather than 4.08\%.
+
+The same arithmetic holds at the other points of the series: 200.44 reported against 264.66
+measured at $p=4$ (16.3\% against 21.5\%) and 219.25 against 253.88 at $p=8$ (16.4\% against
+19.0\%), with the shortfall equal to the halo blocking in each case. So the corrected coordination
+share peaks at $p=4$ rather than rising monotonically, which is the opposite of the shape the
+uncorrected numbers suggest.
+
+\texttt{coordination\_is\_underreported} exists precisely to warn a reader when the blocking
+figure is incomplete, but its implementation is \texttt{bool(self.incomplete\_collectives) or
+self.ok is False}. It catches the $p=16$ failure mode, where ranks die inside a collective and
+never record it. It cannot catch this one, where the collective completed and recorded itself but
+omitted its duration. I judge this a genuine defect with two parts: the instrumentation gap in
+\texttt{topology.halo\_exchange}, which the sibling analysis of \texttt{real-tr-p8-full} reports
+as closed by commit \texttt{ee21d79} after this trace was taken, and the underreporting flag,
+which as written would still read \texttt{false} on any run whose blocking is invisible for a
+reason other than failure. The second half is not fixed by the first for traces already recorded,
+and every trace in this campaign predates the fix.
+
+The generated finding that \texttt{halo\_exchange/?} reports 0 messages against 2 logged is the
+visible tip of the same gap and is a real warning, correctly raised. The fabric logged two
+messages tagged \texttt{\_ampi:halo:0:8:R} and \texttt{\_ampi:halo:0:8:L}, which is $2(p-1)=2$ for
+a non-periodic line, and the cost model has no closed form registered for the operation, which is
+why the row shows \modelna\ and Figure~\ref{fig:collectives} omits it.
+
+\subsection*{The decomposition is balanced in the wrong unit}
+
+\texttt{scatterv} exists so that unequal sections can be distributed without idling ranks, and the
+split here is as even as it could be by the measure the harness uses. Rank 0 receives units 0--3,
+2{,}562 words; rank 1 receives units 4--7, 2{,}547 words. That is a load imbalance of 1.003.
+
+The measured busy-time imbalance is 1.100, and rank 1 is the slow one at every phase: 93.42\,s of
+terminology against 76.60, 216.91\,s of translation against 175.26, 58.57\,s of revision against
+49.76. Word count does not explain it, and across the whole campaign it does not explain anything:
+pooling the 32 translation calls of the four completing runs, the correlation between a unit's
+word count and its call duration is $r=-0.071$.
+
+Paragraph count does. The same pooled correlation for paragraphs is $r=+0.489$, and it is the
+quantity the \texttt{Translation} contract actually constrains --- ``produce exactly
+\emph{n} target paragraphs, one per source paragraph''. Rank 0's four units carry 9, 17, 19 and 15
+paragraphs, 60 in total; rank 1's carry 43, 26, 9 and 11, 89 in total. That is a paragraph
+imbalance of 1.195 against a word imbalance of 1.003, and it points the right way. Unit 4 alone
+has 43 paragraphs, more than twice any other unit, and it is the slowest or second-slowest
+translation in every run of the series.
+
+So the imbalance here is inherent to the decomposition, but not to the decomposition the harness
+thinks it is making. \texttt{split\_units} balances words subject to a paragraph boundary
+constraint; the cost driver is paragraphs. This is a small, actionable observation about the
+harness rather than about AgentMPI: \texttt{scatterv} did exactly what it was asked, and it was
+asked for the wrong split. It gets worse with $p$, because the paragraph imbalance of the split is
+1.195 at $p=2$, 1.852 at $p=4$ and 2.309 at $p=8$ while the word imbalance stays between 1.003 and
+1.104.
+
+\subsection*{Eight strays in a world of two}
+
+The generated findings flag ranks 2, 3, 4, 5, 6, 7, 8 and 14 as registering without
+participating. The fabric's \texttt{ranks} table ends with ten rows for
+\texttt{world\_size = 2}, eight of them in state \texttt{running} with leases renewed to thirty
+minutes past a job that has already emitted \texttt{job.finish}.
+
+The framing offered in the campaign --- a shared worker pool, and a worker registering against
+the wrong job --- is well supported here, and this run adds a detail. The stray index set is
+$\{2,\ldots,8,14\}$; \texttt{real-tr-p4-full}'s is $\{4,\ldots,8,14\}$ and
+\texttt{real-tr-p8-full}'s is $\{8,14\}$. In each case it is exactly the pool's index set minus
+the world. The pool held indices 0--8 and 14, and this run, having the smallest world of the
+three, caught the most of it.
+
+Whether AgentMPI accepting these registrations is a defect is settled in the sibling analysis of
+\texttt{real-tr-p8-full}, which traces it to \texttt{RankRuntime.register} performing an
+unconditional \texttt{INSERT} without consulting either the \texttt{world\_size} meta key or
+\texttt{comm\_members}. I agree with that reading and will not repeat the argument. What this run
+contributes is the containment evidence at a second world size: \texttt{comm\_members} holds two
+rows, the reduce and broadcast trees addressed only ranks 0 and 1, the barrier's \texttt{absent}
+list is empty, and none of the eight strays sent or received a byte. The blast radius was again
+nil, and the reason it was nil is again that the misdirected indices happened to fall outside the
+world rather than inside it.
+
+\subsection*{Transport: one message chose rendezvous, one was told to}
+
+Eight messages, six eager and two rendezvous, 7{,}978 tokens sent. Both ranks publish an
+\texttt{eager\_limit} of 2{,}048 tokens in their \texttt{rank.init}, and exactly one payload in
+the run exceeds it: the scatter's single hop, \texttt{mid 1}, 3{,}911 tokens from rank 0 to rank 1
+at $t=0.004$\,s, sent under \texttt{rendezvous} by \texttt{\_choose\_mode}. The other rendezvous
+message is the \texttt{gather}, 1{,}410 tokens, which is rendezvous because the harness writes
+\texttt{mode=Mode.RENDEZVOUS, admit=False} outright and which \texttt{AUTO} would have sent eager.
+The largest eager message is the glossary broadcast at 1{,}571 tokens.
+
+That the scatter hop is the one that crosses the limit is a property of $p$, not of the data. A
+linear scatter over two ranks sends one message carrying half the book, so the hop size is
+$\Theta(1/p)$ of the corpus and this is the largest it will ever be in the series --- 3{,}911
+tokens here against 3{,}919 for the root's first binomial hop at $p=8$, which also carries half
+the book. The reported \texttt{tokens\_deferred} of 5{,}321 is the sum of the two rendezvous
+sends, and it disagrees with the \texttt{job.finish} event's 13{,}299 for the reason the $p=8$
+analysis identifies: \texttt{RankCost.tokens\_deferred} is incremented both when a send chooses
+rendezvous and when a receive declines to admit, and this harness never admits anything. The
+value the analysis pipeline uses, 5{,}321, is the correct one.
+
+\subsection*{What this point contributes to the series}
+
+Wall times are 576.74, 410.11, 308.44 and 166.78\,s at $p=1,2,4,8$, so this point's speedup is
+$576.74/410.11 = 1.406\times$ at efficiency 0.703 and a Karp--Flatt serial fraction of 0.422 ---
+the largest in the column, which then falls to 0.380 and 0.188. A falling Karp--Flatt is not the
+signature of a constant serial section, and the paper's USL fit of $\sigma=0.220$, $\kappa=0.0000$
+is a compromise between this point's 0.422 and $p=8$'s 0.188 that matches neither; its residuals
+have the sign pattern $-,-,+$ rather than a scatter.
+
+This run supplies the cleanest single reason why the empirical serial fraction starts high and
+falls. Efficiency factorises exactly as
+$E(p) = (T_1/W(1))\cdot(W(1)/W(p))\cdot E_{\mathrm{par}}(p)$, where $W(p)$ is model rank-seconds
+and $E_{\mathrm{par}}$ is the achieved parallel efficiency in the headline table. At this point
+that is $1.1131\times0.7728\times0.8175=0.7031$, against the table's 0.70. The middle term is the
+work amplification: $W(2)=670.53$ rank-seconds against the baseline's $518.16$, a factor of 1.294,
+of which 1.085 is the two extra revision calls and 1.193 is the sixteen shared calls simply taking
+longer --- terminology 170.02 rank-seconds against 156.76 and translation 392.17 against 361.40,
+on byte-identical terminology prompts and translation prompts differing by four lines in 302.
+Dividing the amplification out of the whole series gives work-normalised speedups of 1.000, 1.820,
+3.270 and 6.895 and a USL fit of $\sigma=0.025$, $\kappa=0.0000$, $R^2=0.989$.
+
+Against its immediate neighbours, this point is where coordination is cheapest and least
+informative. Corrected coordination share is 10.0\% here, 21.5\% at $p=4$ and 19.0\% at $p=8$. The
+run has one seam where $p=8$ has seven, one collective peer where $p=8$ has three tree neighbours
+and two ring neighbours, and no distinction between a neighbourhood collective and a barrier at
+all. It establishes that the machinery works and how much it costs when there is almost nothing
+for it to do; the structural claims about the decomposition need the larger points.
 
 \section{Threats to this reading}
-\TODO{What would make this interpretation wrong? Single-run noise, a surrogate
-executor standing in for a real model, an artefact of how the run was driven
-rather than of the protocol. Be specific and be honest.}
+
+\textbf{The revision result rests on a diff of two blobs, and the diff is of text, not of
+meaning.} That \texttt{revise:u3} returned its input byte for byte is a measurement and is not in
+doubt. That the revision phase ``changed nothing'' is a claim about the artefact, and the artefact
+is Chinese prose whose only recorded property here is its bytes. If the agents were right that
+the seam already read continuously, then returning the input unchanged is the correct behaviour
+and the phase did its job by confirming a negative --- which is a service, just not one worth
+19.2\% of the rank-seconds. The trace cannot distinguish a correct no-op from a lazy one, and I
+have not read the Chinese.
+
+\textbf{Two ranks is a sample of two, and half the interesting numbers are the larger of two
+draws.} The 22.245\,s glossary wait, the 48.766\,s halo wait and the 10.942\,s barrier wait are
+all the difference between rank 1's completion and rank 0's, and rank 1 happened to be slower at
+every phase. A run in which the two ranks drew closer latencies would show the same structure with
+much smaller gaps and a coordination share nearer zero, without anything about the protocol having
+changed. The claim that rank 1 was slower \emph{because} it holds 89 of the book's 149 paragraphs
+is an inference; it is supported by the pooled $r=+0.489$ between paragraphs and duration across
+32 calls, but at $p=2$ the per-rank evidence is two points.
+
+\textbf{The corrected coordination figure is a partition of intervals, not of causes.} I attribute
+each idle interval to the collective whose event terminates it, which is well defined, but
+``rank 0 was blocked in \texttt{halo\_exchange} for 48.766\,s'' and ``rank 0 was blocked because
+rank 1's fourth translation ran long'' are different kinds of statement. The first is measurement;
+the second is inference, well supported by rank 1's \texttt{translate:u7} completing at 347.40\,s
+and rank 0 exiting the exchange 0.25\,s later, but inference. The 61.4 rank-seconds of broker
+dispatch in the same table are not protocol at all and should not be read as coordination cost.
+
+\textbf{This is a broker-mediated run and the log cannot see inside a worker.}
+\texttt{metrics.json} reports \texttt{executors: \{broker: 2, worker: 33\}}, and the outputs are
+real prose, so this is not a surrogate executor. But every one of the eighteen recorded latencies
+lies within 25\,ms of a multiple of 0.5\,s, which is what a scripted executor would also produce;
+I read it as the broker's \texttt{poll\_s = 0.5} completion poll because that is its value in the
+source and no observed observation lag exceeds it.
+
+\textbf{Four of eight output sections are byte-identical to the sequential baseline's, and the
+pool was shared.} The campaign ran in descending order of $p$, so this run preceded
+\texttt{real-tr-p1-full} by nine minutes against the same worker pool, and sections 0 through 3
+--- rank 0's whole allocation --- are identical in the two runs. Both explanations must be on the
+table. The evidence favours convergence. The shared units are exactly those that occupied the same
+rank at the same position in the sequence in both runs, and they stop being shared exactly where
+that correspondence stops: at $p=4$, where units 2 and 3 move to rank 1, only units 0 and 1 remain
+identical. Diffing the prompts shows why: this run's \texttt{translate:u0} prompt differs from the
+baseline's in five lines of 302 --- one glossary entry, one key differing only by a typographic
+apostrophe, and the agreed register sentence --- while \texttt{real-tr-p8-full}'s differs in
+fourteen lines and shares no output. Near-identical prompts gave identical text and a materially
+different prompt gave different text, which is what a low-temperature decoder does. There are
+zero shared \texttt{revise} digests anywhere in the series. I cannot exclude memory; the trace
+cannot.
+
+\textbf{This point uses a code path the rest of the curve does not.} Reduce and broadcast run
+\texttt{flat} here and \texttt{binomial} at $p=4$ and $p=8$, because the selector is \texttt{p <=
+3}. Nothing in this document depends on the distinction, but any statement of the form ``the
+glossary allreduce costs $X$ as a function of $p$'' drawn across all four points is fitting across
+an implementation change.
 
 \end{document}

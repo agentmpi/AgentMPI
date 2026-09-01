@@ -233,7 +233,7 @@ prediction is trivial, and only the 24-message dissemination barrier is a real c
 also reports \texttt{n\_misreported\_collectives: 0} where all three siblings report 2, but that
 is because it never invoked the neighbourhood collectives at all, not because it is cleaner.
 
-\paragraph{Two accounting defects, one since fixed and one still live.} The first was that
+\paragraph{Two defects this trace exposed, both since fixed.} The first was that
 \texttt{tokens\_deferred} was reported with two different definitions that disagreed by
 2.4$\times$ in this run. \texttt{cost.summarise()} counted only the tokens of \texttt{msg.send}
 events in rendezvous mode and yielded 31{,}415, which is what \texttt{metrics.json} and the trace
@@ -258,27 +258,40 @@ one of them was received without being admitted to a context, because the harnes
 \texttt{admit=False} on every collective. The old conflated 74{,}494 was not a quantity anybody
 wanted.
 
-The second defect is still live at HEAD, and I checked rather than assumed. A reattaching worker
-silently overwrites the rank's configured context budget. In this run the job was launched with
+The second defect was that a reattaching worker silently overwrote the rank's configured context
+budget, and this trace is a record of it happening. The job was launched with
 \texttt{context\_budget=120\_000}, the eight incarnation-1 \texttt{rank.init} events say
 \texttt{budget: 120000}, every one of the 23 later \texttt{rank.init} events says
 \texttt{budget: 128000}, and the \texttt{ranks} table in the fabric ends the run holding
-\texttt{context\_budget = 128000} for all eight ranks. The cause is that \texttt{cmd\_worker}
-constructs its \texttt{RankRuntime} without passing \texttt{context\_budget}, so it takes
-\texttt{DEFAULT\_CONTEXT\_BUDGET = 128\_000}, and the \texttt{UPDATE} branch of
-\texttt{register()} writes that value back over the persisted one; the sibling code path
-\texttt{\_comm()} reads the persisted budget from the \texttt{ranks} row first and does not have
-the bug, so the fix is one argument. Reproducing it against a scratch fabric at HEAD --- create a
-job, register rank 0 with a budget of 120{,}000, then re-register it exactly as
-\texttt{cmd\_worker} does --- the persisted budget still goes 120{,}000 to 128{,}000 and the two
-\texttt{rank.init} events still disagree. A related but distinct hardening has landed in the
-meantime: \texttt{register()} now refuses a rank index outside the job's world size, where it
-previously accepted any index unconditionally. That closes a different hole --- a shared worker
-pool leaking rank rows into the wrong fabric --- and does not touch the budget path, which runs
-after the range check and is unchanged. Nothing in this run depended on the budget, because
-nothing was ever admitted, but a run that relied on admission pressure would find its budget
-raised by 6.7\% at the first reattachment, and the generated finding's claim that reattachment
-preserves the rank's context account remains false of the budget half of that account.
+\texttt{context\_budget = 128000} for all eight ranks. The cause was that \texttt{cmd\_worker}
+constructed its \texttt{RankRuntime} without passing \texttt{context\_budget}, so it took
+\texttt{DEFAULT\_CONTEXT\_BUDGET = 128\_000} --- and because the \texttt{UPDATE} branch of
+\texttt{register()} \emph{writes} the runtime's limits into the \texttt{ranks} table, a runtime
+built from defaults did not merely fail to read the configured value, it replaced it. The same
+file already read the row correctly in \texttt{\_comm()} and in neither of the two worker paths,
+which is why the divergence survived: the correct code and the incorrect code sat a few hundred
+lines apart.
+
+This is now fixed too. All three sites go through a single \texttt{\_runtime(fabric, rank)} helper
+that reads the persisted \texttt{context\_budget}, \texttt{eager\_limit} and
+\texttt{unexpected\_limit}, and it is the only \texttt{RankRuntime} construction left in
+\texttt{cli.py}, so the duplication that let the paths disagree is gone. Repeating my check
+against HEAD --- create a job, register a rank with a budget of 120{,}000, then reattach through
+the CLI's own worker path --- the persisted budget stays at 120{,}000, the incarnation advances
+to 2, and both \texttt{rank.init} events report 120000. A regression test,
+\texttt{test\_worker\_reattachment\_preserves\_the\_configured\_context\_budget}, pins the
+behaviour through that same path, and it passes.
+
+One distinction is worth preserving, because both were found in the same review and they are easy
+to conflate. \texttt{register()} also now refuses a rank index outside the job's world size, where
+it previously accepted any index unconditionally. That is a different bug on a different code
+path --- it closes a shared worker pool leaking rank rows into the wrong fabric --- and it does
+not touch the budget, which is written after the range check; fixing either one would have left
+the other standing. As for consequences here, nothing in this run depended on the budget, because
+nothing was ever admitted. But a run that relied on admission pressure would have had its budget
+raised by 6.7\% at the first reattachment, and for traces recorded before the fix --- this one
+included --- the generated finding's claim that reattachment preserves the rank's context account
+remains false of the budget half of that account.
 
 \section{Threats to this reading}
 
