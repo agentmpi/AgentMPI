@@ -1160,7 +1160,13 @@ def allreduce(
                 tr.sent(_tok(comm, acc))
             else:
                 acc = comm._crecv(r - 1, f"{itag}:post", timeout=timeout, admit=False)
-        tr.stats.rounds = n_rounds
+        # The remainder handling adds two dependent stages around the doubling -- the `pre` exchange
+        # that folds the excess ranks in and the `post` send that hands them the answer -- so the
+        # critical path at a non-power-of-two size is one longer than the doubling round count.
+        # Reporting `n_rounds` throughout understated it at exactly the sizes where the extra
+        # stages run, which the trace shows unambiguously: `pre` and `post` tags appear at every
+        # non-power-of-two p and at none of the powers of two.
+        tr.stats.rounds = n_rounds + (1 if rem else 0)
         tr.stats.fold_depth = depth
         stats = tr.finish(label=label, op=op.name, divergence_risk=op.lossy)
         _record(comm, stats)

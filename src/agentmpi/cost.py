@@ -296,6 +296,27 @@ def _logkc(p: int, k: int) -> int:
     return levels
 
 
+def _operator_applications(op: str, algorithm: str, p: int, depth: int) -> int:
+    """How many times the reduction operator is applied across the whole collective.
+
+    Not ``p - 1`` for every algorithm, which is what the price term assumed. That is right for a
+    tree that folds each contribution once on its way to a root --- the whole ``reduce`` family, and
+    ``reduce_bcast``, which is such a tree followed by a broadcast. It is badly wrong for the
+    algorithms in which *every* rank folds in *every* round: recursive-doubling allreduce performs
+    160 applications at p=32 where ``p - 1`` charges 31, so the 70% price advantage the model
+    reported for ``reduce_bcast`` was a floor rather than an estimate.
+
+    This matters because the operator is a model call. In MPI an application is a few instructions
+    and miscounting them is harmless; here each one is billed.
+    """
+    if op in ("allreduce", "scan") and algorithm == "recursive_doubling":
+        # Every rank folds once per round, and the extra remainder stages fold too.
+        return max(1, p * max(1, depth))
+    if op == "allgather":
+        return 0  # concatenation, not a reduction: no operator is applied
+    return max(1, p - 1)
+
+
 def predict_kary(p: int, n_tokens: int, k: int, params: "CostParams | None" = None, *, op_cost_tokens: int = 0):
     """Cost of a k-ary reduction for an explicit fan-in.
 
@@ -374,8 +395,15 @@ FORMULAS: dict[tuple[str, str], Any] = {
     # that sat out are sent the answer at the end.  The naive p*log2(p) figure is
     # wrong by up to 25% at non-power-of-two sizes, which are the common case for
     # agent populations.
+    # Rounds are the *dependent* stages on the critical path, and at a non-power-of-two size the
+    # remainder handling adds two of them either side of the doubling: a `pre` exchange that folds
+    # the excess ranks in, and a `post` send that hands them the answer. The trace shows both at
+    # every such size, so the true path is log2c(p) + 1 there and log2c(p) at a power of two. Both
+    # this formula and the implementation reported log2c(p) throughout, which is the same failure
+    # mode as the message under-count found in the same branch: a self-report and a closed form
+    # agreeing with each other while both diverge from the traffic actually logged.
     ("allreduce", "recursive_doubling"): lambda p, n: (
-        _log2c(p),
+        _log2c(p) + (1 if (p & (p - 1)) else 0),
         3 * (p - (1 << (p.bit_length() - 1))) + (1 << (p.bit_length() - 1)) * (p.bit_length() - 1),
         (3 * (p - (1 << (p.bit_length() - 1))) + (1 << (p.bit_length() - 1)) * (p.bit_length() - 1)) * n,
         _log2c(p),
@@ -448,7 +476,7 @@ def predict(
         time_s += op_rounds * params.message_time(op_cost_tokens or n_tokens)
     price = params.message_price(volume, 0)
     if op_cost_tokens:
-        price += params.message_price(volume, (p - 1) * op_cost_tokens)
+        price += params.message_price(volume, _operator_applications(op, algorithm, p, depth) * op_cost_tokens)
     return Prediction(
         op=op,
         algorithm=algorithm,

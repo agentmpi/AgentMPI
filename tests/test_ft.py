@@ -153,14 +153,18 @@ def test_agree_excludes_failed_ranks(tmp_path):
         if comm.rank == 0:
             ampi.declare_failed(comm, failed_rank, kind=FailureClass.FAIL_STOP)
         else:
-            deadline = time.time() + 15.0
+            deadline = time.time() + 60.0
             while time.time() < deadline:
                 if failed_rank in ampi.get_failed(comm):
                     break
                 time.sleep(0.02)
             else:
                 raise AssertionError("the failure declaration never became visible")
-        return ampi.agree(comm, True, timeout=15.0)
+        # Generous, because the assertion is about the decision `agree` reaches and not about how
+        # quickly it reaches it. A tight bound turns ordinary contention from the rest of the suite
+        # into a false failure, which is what happened with 15 s: the test passed alone and failed
+        # under load, the least useful shape a test can have.
+        return ampi.agree(comm, True, timeout=60.0)
 
     job = ampi.launch(rank_main, size=4, root=tmp_path / "ag2")
     assert job.ok, [o.traceback for o in job.outcomes if not o.ok]
