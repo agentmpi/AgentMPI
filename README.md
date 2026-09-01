@@ -148,14 +148,21 @@ harness, not in the prompt.
   it is ten times behind a tree. Recursive-doubling allreduce ties
   reduce-then-broadcast on latency at p=64 and performs 384 operator applications
   against 63.
-* **Conflict lifting works on real data.** In an eight-rank glossary reduction with
-  real agents, 17 terms were agreed unanimously and 3 lifted as conflicts — all
-  three the same kind of disagreement (whether the Spanish article belongs in the
-  rendering) — which the root then arbitrated once.
-* **And the quality comparison is null.** Two paired eight-rank runs with 16
-  distinct agents scored identically on terminology consistency, and the glossary
-  arm cost 3.7× the wall clock. We think this is a scale effect and say so, but a
-  null is a null.
+* **Conflict lifting works on real data, and scales as predicted.** At p=8 the
+  glossary reduction agreed 17 terms and lifted 3 conflicts; at p=32 it agreed 8
+  and lifted 12. Quadrupling the population quadrupled the disagreement found. The
+  root arbitrated each once.
+* **And the quality comparison is null at both sizes.** Four arms, 32 distinct
+  agents: weighted terminology consistency is 1.0 everywhere, and under the strict
+  metric the *control* at p=32 scores marginally higher than the treatment. The
+  glossary cost 3.7× the wall clock at p=8 and 1.4× at p=32.
+* **The reason is more interesting than a win would have been.** Every one of the
+  12 conflicts was the same kind — whether the Spanish definite article belongs in
+  the rendering — and in running prose the article is determined by the grammar of
+  the sentence, not by a lexical choice. The collective correctly identified a real
+  disagreement in what the population *said* it would do, and that disagreement
+  never reached what the population *produced*. Before paying a collective to
+  remove a coupling, measure whether the coupling is costing anything.
 * **A scorer bias we caught.** The first version built its vocabulary of candidate
   renderings from each run's own term sheets, and since only the treatment arm
   produces term sheets, the control was scored against an almost-empty vocabulary
@@ -164,11 +171,20 @@ harness, not in the prompt.
 ## What this does not show
 
 It does not show that AgentMPI produces better answers than an ad-hoc harness. The
-one controlled quality comparison is null. Every agent experiment is n=1 per arm,
-one model family, one language pair. The largest agent population is bounded by a
-host concurrency cap of ten sessions, which we handle by oversubscription — a rank
-is a durable role, so one executor can occupy ten of them in turn — and not by
-claiming a scale we did not run.
+controlled quality comparison is null at both sizes we ran. Every agent experiment
+is n=1 per cell, one model family, one language pair, and a corpus whose recurring
+terms are famous enough that a strong model has seen them; a task with genuinely
+novel terminology is where we would expect a glossary to pay, and we have not run
+it.
+
+The largest *completed* agent run is 32 ranks over 8 executors. We attempted 100
+and it did not finish: the host's ten-session cap forced several waves of
+executors, and an operator error later destroyed that run's journal. The pull
+queue handled the first problem — a fresh wave could be added mid-run against
+exactly the ranks still queued, with no harness change and no restart — and the
+second was ours. We report the partial run's identity measurement, which was
+committed before the journal was lost, and we do not report a hundred-rank result,
+because we do not have one.
 
 ## License
 

@@ -180,6 +180,42 @@ def e1_macros() -> None:
         put("eOneP", g.get("size"))
         put("eOneVerdict", g.get("diagnosis", {}).get("verdict", "n/a"))
 
+    conflicts = load(RESULTS / "e1_conflicts.json")
+    if conflicts:
+        for run, key in (("e1-real-p8", "Small"), ("e1-real-p32", "Large")):
+            c = conflicts.get(run)
+            if c:
+                put(f"gloss{key}P", c["size"])
+                put(f"gloss{key}Agreed", c["agreed"])
+                put(f"gloss{key}Lifted", c["lifted"])
+    else:
+        for key in ("Small", "Large"):
+            for f in ("P", "Agreed", "Lifted"):
+                put(f"gloss{key}{f}", None)
+
+    if d:
+        by = {(r["size"], r["arm"]): r for r in d["comparison"]}
+        g32, c32 = by.get((32, "glossary")), by.get((32, "nogloss"))
+        if g32 and c32:
+            put("eLargeGlossConsistency", round(g32["consistency"], 3), fmt=".3f")
+            put("eLargeCtrlConsistency", round(c32["consistency"], 3), fmt=".3f")
+            put("eLargeGlossStrict", round(g32["consistency_strict"], 4), fmt=".4f")
+            put("eLargeCtrlStrict", round(c32["consistency_strict"], 4), fmt=".4f")
+            put("eLargeGlossWall", int(round(g32["wall_s"])))
+            put("eLargeCtrlWall", int(round(c32["wall_s"])))
+            put("eLargeWallRatio", round(g32["wall_s"] / c32["wall_s"], 1), fmt=".1f")
+            put("eLargeTermsScored", g32["scored"])
+            put("eLargeExecutors", g32["executors"])
+            put("eLargeGlossTokens", g32["tokens"])
+            put("eLargeCtrlTokens", c32["tokens"])
+            put("eLargeP", 32)
+        else:
+            for k in ("eLargeGlossConsistency", "eLargeCtrlConsistency", "eLargeGlossStrict",
+                      "eLargeCtrlStrict", "eLargeGlossWall", "eLargeCtrlWall",
+                      "eLargeWallRatio", "eLargeTermsScored", "eLargeExecutors",
+                      "eLargeGlossTokens", "eLargeCtrlTokens", "eLargeP"):
+                put(k, None)
+
     scale = load(RESULTS / "e1_e1-real-p100.json")
     if scale:
         put("eScaleRanks", scale.get("size"))
