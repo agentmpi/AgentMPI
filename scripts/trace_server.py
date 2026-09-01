@@ -59,7 +59,7 @@ def _trace_path(name: str) -> Path:
 def _live_job_root(name: str) -> Path:
     run_dir = _safe_run_dir(name)
     job = (run_dir / "job").resolve()
-    if job.parent != run_dir or not (job / "manifest.json").is_file():
+    if job.parent != run_dir or not (job / "job.json").is_file():
         raise FileNotFoundError(name)
     return job
 
