@@ -137,6 +137,35 @@ of the method — and note what it does *not* contain: no communicator, no
 collective, no barrier, no mention of the experiment. The protocol belongs in the
 harness, not in the prompt.
 
+### Ranks as Claude Code sessions
+
+Any agent host that can run a shell command can serve a rank; the one this
+repository ships a driver for is the Claude Code CLI. `experiments/claude_ranks.py`
+starts one headless `claude -p` session per executor in the launch plan, gives it
+nothing but the rendered worker prompt, and records which session served which
+ranks in `runs/<name>/executors.json`. Run it alongside a harness that owns the
+job with the broker executor:
+
+```bash
+pip install -e ".[tokens]"          # `ampi` on PATH: the runtime's printed submit commands call it by name
+python experiments/e1_translate/harness.py --name demo --size 8 --executor broker &
+python experiments/claude_ranks.py --name demo --size 8 --executors 4 --model sonnet
+python scripts/seal_run.py demo     # once the population is gone
+```
+
+The launcher waits for the job root to appear, so the two can start in either
+order. `--executors` below `--size` is oversubscription; `--concurrency` caps how
+many sessions are alive at once, which is the knob for an API rate limit.
+Sessions get `Bash`, `Read`, `Write` and `Edit` and nothing else, and every task
+they claim is stamped with their worker id, so the sealed journal names the
+session behind each artifact.
+
+A session is a Node process of about 160 MB that spends nearly all of its life
+blocked on the API or on `ampi worker next`. On a 4-vCPU, 16 GB sandbox VM,
+thirty-two sessions serving thirty-two ranks at once completed `E1` end to end
+(`runs/claude-scale-p32`); memory, not CPU, is what bounds the count on one VM,
+and the account's rate limit is what bounds it across VMs.
+
 ## Results, including the negative ones
 
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,

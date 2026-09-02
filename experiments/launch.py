@@ -32,30 +32,33 @@ def worker_template() -> str:
     return m.group(1)
 
 
-def main() -> None:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--name", required=True)
-    ap.add_argument("--size", type=int, required=True)
-    ap.add_argument("--campaign", default=None)
-    ap.add_argument("--max-tasks", type=int, default=4)
-    ap.add_argument("--executors", type=int, default=0,
-                    help="if set below --size, ranks are oversubscribed across this many "
-                         "executors, which is what an agent host with a concurrency cap forces")
-    ap.add_argument("--ampi", default="/workspace/.venv/bin/ampi")
-    a = ap.parse_args()
+def plan_run(
+    *,
+    name: str,
+    size: int,
+    campaign: str | None = None,
+    max_tasks: int = 4,
+    executors: int = 0,
+    ampi: str = "/workspace/.venv/bin/ampi",
+) -> dict:
+    """Render one worker prompt per executor and write the launch plan.
 
-    run_dir = RUNS / a.name
+    Returns the plan.  Kept separate from :func:`main` so that an agent host that
+    *does* start sessions (``claude_ranks.py``) can render exactly the prompts the
+    record describes rather than re-implementing the substitution.
+    """
+    run_dir = RUNS / name
     job_root = run_dir / "job"
     prompts = run_dir / "prompts"
     prompts.mkdir(parents=True, exist_ok=True)
     template = worker_template()
-    campaign = a.campaign or a.name
+    campaign = campaign or name
 
-    n_exec = a.executors or a.size
+    n_exec = executors or size
     # Round-robin rather than blocked, so that one executor's ranks are spread
     # through the corpus and a slow executor does not delay one contiguous region.
     assignment: dict[int, list[int]] = {e: [] for e in range(n_exec)}
-    for rank in range(a.size):
+    for rank in range(size):
         assignment[rank % n_exec].append(rank)
 
     written = []
@@ -68,8 +71,8 @@ def main() -> None:
             .replace("{SERVE}", f" --serve {','.join(map(str, extra))}" if extra else "")
             .replace("{CAMPAIGN}", campaign)
             .replace("{JOB_ROOT}", str(job_root))
-            .replace("{AMPI}", a.ampi)
-            .replace("{MAX_TASKS}", str(a.max_tasks * max(1, len(ranks))))
+            .replace("{AMPI}", ampi)
+            .replace("{MAX_TASKS}", str(max_tasks * max(1, len(ranks))))
         )
         path = prompts / f"exec{executor}.md"
         path.write_text(body, encoding="utf-8")
@@ -77,17 +80,33 @@ def main() -> None:
                         "prompt": str(path)})
 
     plan = {
-        "name": a.name,
+        "name": name,
         "campaign": campaign,
         "job_root": str(job_root),
-        "requested_ranks": list(range(a.size)),
+        "requested_ranks": list(range(size)),
         "executors": len(written),
-        "oversubscription": round(a.size / max(1, len(written)), 2),
+        "oversubscription": round(size / max(1, len(written)), 2),
         "assignment": written,
         "prompts": str(prompts),
-        "max_tasks": a.max_tasks,
+        "max_tasks": max_tasks,
     }
     (run_dir / "worker_plan.json").write_text(json.dumps(plan, indent=2), encoding="utf-8")
+    return plan
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--name", required=True)
+    ap.add_argument("--size", type=int, required=True)
+    ap.add_argument("--campaign", default=None)
+    ap.add_argument("--max-tasks", type=int, default=4)
+    ap.add_argument("--executors", type=int, default=0,
+                    help="if set below --size, ranks are oversubscribed across this many "
+                         "executors, which is what an agent host with a concurrency cap forces")
+    ap.add_argument("--ampi", default="/workspace/.venv/bin/ampi")
+    a = ap.parse_args()
+    plan = plan_run(name=a.name, size=a.size, campaign=a.campaign, max_tasks=a.max_tasks,
+                    executors=a.executors, ampi=a.ampi)
     print(json.dumps(plan, indent=2))
 
 
