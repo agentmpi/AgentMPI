@@ -186,24 +186,31 @@ harness, not in the prompt.
   renderings from each run's own term sheets, and since only the treatment arm
   produces term sheets, the control was scored against an almost-empty vocabulary
   and flattered by it. The vocabulary is now pooled across arms.
+* **The production run completes at 16, 32, and 64 durable ranks.** All three
+  broker-backed cells assemble 99 pages after research, translation, and peer
+  review. With physical concurrency fixed at ten, wall times are 64.1, 91.7, and
+  66.8 minutes; this is placement under oversubscription, not a scaling law. The
+  64-rank run rotates through 27 bounded-lifetime executor sessions and completes
+  263/263 tasks with one stale-claim requeue.
+* **Failed production attempts found the protocol defects.** Retained traces show
+  an undersized claim lease, a harness rank lease not extended across model work,
+  unbounded root arbitration context, staggered launch beyond the join window, and
+  broker validation against a physical primary rank instead of the durable task
+  rank. Each is fixed or made an explicit launcher precondition.
 
 ## What this does not show
 
 It does not show that AgentMPI produces better answers than an ad-hoc harness. The
 controlled quality comparison is null at both sizes we ran. Every agent experiment
 is n=1 per cell, one model family, one language pair, and a corpus whose recurring
-terms are famous enough that a strong model has seen them; a task with genuinely
-novel terminology is where we would expect a glossary to pay, and we have not run
-it.
+terms are famous enough that a strong model has seen them. The production study
+checks source coverage and schema validity, not literary quality; no
+quality-superiority claim is made without blinded bilingual human judges.
 
-The largest *completed* agent run is 32 ranks over 8 executors. We attempted 100
-and it did not finish: the host's ten-session cap forced several waves of
-executors, and an operator error later destroyed that run's journal. The pull
-queue handled the first problem — a fresh wave could be added mid-run against
-exactly the ranks still queued, with no harness change and no restart — and the
-second was ours. We report the partial run's identity measurement, which was
-committed before the journal was lost, and we do not report a hundred-rank result,
-because we do not have one.
+The largest *completed* agent run is 64 durable ranks over 27 executor
+incarnations, at most ten concurrent. An earlier E1 attempt at 100 ranks did not
+finish and lost its journal; only its separately committed partial identity
+measurement is reported, not a hundred-rank result.
 
 ## License
 
