@@ -358,7 +358,11 @@ class BrokerExecutor:
         except json.JSONDecodeError:
             value = raw
         contract = Contract.parse(rec.get("contract"))
-        violations = check_contract(value, contract, subs={"rank": rank})
+        # The contract belongs to the durable task rank, not to the physical
+        # executor's primary rank. Under oversubscription the caller may serve
+        # several ranks; substituting ``rank`` here would validate a mislabelled
+        # result and reject the correctly self-identifying one.
+        violations = check_contract(value, contract, subs={"rank": rec["rank"]})
         if violations:
             amp.trace("broker.reject", rank=rank, aid=aid, violations=violations)
             raise err(

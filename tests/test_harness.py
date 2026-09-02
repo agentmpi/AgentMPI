@@ -170,6 +170,32 @@ def test_a_worker_cannot_submit_another_ranks_task(tmp_path):
     assert e.value.cls_name == "AMPI_ERR_IDENTITY"
 
 
+def test_oversubscribed_submit_validates_the_durable_task_rank(tmp_path):
+    root = str(tmp_path / "j")
+    Ampi.create(root, 2, device="sqlite")
+    amp = Ampi(root, rank=0)
+    amp.init()
+    aid = new_aid()
+    result = tmp_path / "r.json"
+    amp.device.append("task", {
+        "rank": 1, "state": "claimed", "campaign": "c", "run": amp.manifest.job_id,
+        "aid": aid, "label": "x", "prompt_file": "p", "result_file": str(result),
+        "contract": Contract(
+            kind="json",
+            required=("rank",),
+            expect={"rank": "{rank}"},
+        ).to_dict(),
+    })
+
+    result.write_text(json.dumps({"rank": 0}))
+    with pytest.raises(AmpiError) as exc:
+        BrokerExecutor.submit(amp, "c", 0, aid, serve=[1])
+    assert exc.value.cls_name == "AMPI_ERR_TYPE"
+
+    result.write_text(json.dumps({"rank": 1}))
+    assert BrokerExecutor.submit(amp, "c", 0, aid, serve=[1])["status"] == "done"
+
+
 def test_an_abandoned_claim_is_requeued(tmp_path):
     """An executor's session can end at any moment.
 
