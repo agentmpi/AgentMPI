@@ -300,6 +300,62 @@ def e2_macros() -> None:
     put("eTwoExpected", s4["published_expected"])
 
 
+def e3_macros() -> None:
+    runs = {
+        16: load(RESULTS / "e3_e3-durov-p16-final.json"),
+        32: load(RESULTS / "e3_e3-durov-p32.json"),
+        64: load(RESULTS / "e3_e3-durov-p64-final3.json"),
+    }
+    prefixes = {16: "durovSixteen", 32: "durovThirtytwo", 64: "durovSixtyfour"}
+    for size, data in runs.items():
+        prefix = prefixes[size]
+        if not data:
+            for field in (
+                "Ranks", "Executors", "Wall", "Tasks", "Tokens", "Context", "QueueP",
+                "ServiceP", "Events", "Requeues", "MaxBusy", "Efficiency", "Segments",
+                "Coverage",
+            ):
+                put(f"{prefix}{field}", None)
+            continue
+        population = data["population"]
+        artifact = data["artifact"]
+        systems = data["systems"]
+        put(f"{prefix}Ranks", population["succeeded"])
+        put(f"{prefix}Executors", population["observed_executors"])
+        put(f"{prefix}Wall", round(systems["wall_s"] / 60, 1), fmt=".1f")
+        put(f"{prefix}Tasks", systems["broker_tasks"])
+        put(f"{prefix}Tokens", systems["result_tokens"])
+        put(f"{prefix}Context", systems["context_total"])
+        put(f"{prefix}QueueP", systems["queue_p95_s"], fmt=".1f")
+        put(f"{prefix}ServiceP", systems["service_p95_s"], fmt=".1f")
+        put(f"{prefix}Events", systems["trace_events"])
+        put(f"{prefix}Requeues", systems["broker_requeues"])
+        put(f"{prefix}MaxBusy", systems["max_busy"])
+        put(f"{prefix}Efficiency", 100 * systems["parallel_efficiency"], fmt=".1f")
+        put(f"{prefix}Segments", artifact["segments"])
+        put(f"{prefix}Coverage", 100 * artifact["source_coverage_min"], fmt=".2f")
+    if all(runs.values()):
+        wall16 = runs[16]["systems"]["wall_s"]
+        wall32 = runs[32]["systems"]["wall_s"]
+        wall64 = runs[64]["systems"]["wall_s"]
+        put("durovSlowdownThirtytwo", wall32 / wall16, fmt=".2f")
+        put("durovSlowdownSixtyfour", wall64 / wall16, fmt=".2f")
+        put("durovSpeedupSixtyfourvsThirtytwo", wall32 / wall64, fmt=".2f")
+        put(
+            "durovContextGrowthSixtyfour",
+            runs[64]["systems"]["context_total"] / runs[16]["systems"]["context_total"],
+            fmt=".2f",
+        )
+    else:
+        for name in (
+            "durovSlowdownThirtytwo",
+            "durovSlowdownSixtyfour",
+            "durovSpeedupSixtyfourvsThirtytwo",
+            "durovContextGrowthSixtyfour",
+        ):
+            put(name, None)
+
+
 def suite_macros() -> None:
     d = load(RESULTS / "suite.json")
     if not d:
@@ -315,6 +371,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
+    e3_macros()
     provenance_macros()
     suite_macros()
 
