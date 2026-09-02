@@ -215,6 +215,8 @@ def test_stub_run_exercises_production_protocol_and_assembles_pages(tmp_path: Pa
     public = summarize(run_dir)
     assert public["artifact"]["complete"] is True
     assert public["artifact"]["pages"] == 99
+    assert public["artifact"]["source_coverage_min"] == 1.0
+    assert public["artifact"]["source_pages_below_099"] == 0
     assert public["source"]["licensed_payloads_committed"] is False
 
 

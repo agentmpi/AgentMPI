@@ -6,11 +6,14 @@ import argparse
 import hashlib
 import json
 import math
+import re
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any
 
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE.parent / "results"
+RUNNING_HEADER = 'Н. В. Кононов. «Код Дурова. Реальная история «ВКонтакте» и ее создателя»'
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -28,6 +31,13 @@ def _percentile(values: list[float], fraction: float) -> float | None:
     return round(ordered[index], 3)
 
 
+def _source_content(text: str, page: int) -> str:
+    """Normalize extraction boilerplate without forgiving content omissions."""
+    text = text.replace(RUNNING_HEADER, "")
+    lines = ["" if line.strip() == str(page) else line for line in text.splitlines()]
+    return re.sub(r"\s+", "", "".join(lines))
+
+
 def summarize(run_dir: Path) -> dict[str, Any]:
     report = _read_json(run_dir / "report.json")
     provenance = _read_json(run_dir / "provenance.json")
@@ -41,9 +51,25 @@ def summarize(run_dir: Path) -> dict[str, Any]:
     corpus = _read_json(Path(provenance["corpus"]))
     expected_hashes = {page["page"]: page["sha256"] for page in corpus["pages"]}
     observed_hashes = {page["page"]: page["source_sha256"] for page in pages}
+    source_by_page = {page["page"]: page["text"] for page in corpus["pages"]}
+    coverage = []
+    for page in pages:
+        expected = _source_content(source_by_page[page["page"]], page["page"])
+        observed = _source_content(
+            "".join(segment["ru"] for segment in page["segments"]),
+            page["page"],
+        )
+        ratio = 1.0 if expected == observed else SequenceMatcher(
+            None,
+            expected,
+            observed,
+            autojunk=False,
+        ).ratio()
+        coverage.append(ratio)
     complete = (
         [page["page"] for page in pages] == list(range(1, 100))
         and observed_hashes == expected_hashes
+        and min(coverage, default=0.0) >= 0.99
     )
     required = {"id", "ru", "en", "zh", "ja"}
     segments = [segment for page in pages for segment in page["segments"]]
@@ -74,6 +100,9 @@ def summarize(run_dir: Path) -> dict[str, Any]:
             "schema_valid": schema_valid,
             "pages": len(pages),
             "segments": len(segments),
+            "source_coverage_min": round(min(coverage), 6),
+            "source_coverage_mean": round(sum(coverage) / len(coverage), 6),
+            "source_pages_below_099": sum(value < 0.99 for value in coverage),
             "bytes": assembled_path.stat().st_size,
             "sha256": hashlib.sha256(assembled_path.read_bytes()).hexdigest(),
         },
