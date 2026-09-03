@@ -297,6 +297,16 @@ def test_a_paused_rank_resumes_and_replays_over_the_git_device(tmp_path, legacy)
     rank_py = str(ROOT / "experiments" / "e6_book" / "rank.py")
     name = f"t-resume-{os.getpid()}"
     common = ["--name", name, "--remote", str(remote)]
+    try:
+        _resume_scenario(tmp_path, env, rank_py, name, common)
+    finally:
+        import shutil
+
+        shutil.rmtree(ROOT / "runs" / name, ignore_errors=True)
+        shutil.rmtree(ROOT / "work" / "e6" / name, ignore_errors=True)
+
+
+def _resume_scenario(tmp_path, env, rank_py, name, common):
     subprocess.run([sys.executable, rank_py, "create", *common, "--size", "3",
                     "--root", str(tmp_path / "create"), "--corpus", "durov", "--pages", "5-12",
                     "--phase-timeout", "240", "--task-timeout", "30", "--join-deadline", "120",
@@ -320,22 +330,16 @@ def test_a_paused_rank_resumes_and_replays_over_the_git_device(tmp_path, legacy)
                         str(tmp_path / "collect"), "--no-analysis"], env=env,
                        capture_output=True, text=True)
     assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
-    try:
-        report = json.loads((ROOT / "runs" / name / "report.json").read_text())
-        assert report["rank_states"] == {"finalised": 3}
-        assert report["book"]["missing"] == []
-        trace = ROOT / "runs" / name / "harness.trace.jsonl"
-        events = [json.loads(line) for line in trace.read_text().splitlines()]
-        kinds = Counter(e["kind"] for e in events)
-        assert kinds["task.replayed"] >= 1, "the resumed rank replayed memoised tasks"
-        pages_done = [e["page"] for e in events if e["kind"] == "page.done"]
-        assert len(pages_done) == len(set(pages_done)) == 8, "every page translated exactly once"
-        assert kinds["failure.convict"] == 0, "a pause shorter than the lease is not a failure"
-    finally:
-        import shutil
-
-        shutil.rmtree(ROOT / "runs" / name, ignore_errors=True)
-        shutil.rmtree(ROOT / "work" / "e6" / name, ignore_errors=True)
+    report = json.loads((ROOT / "runs" / name / "report.json").read_text())
+    assert report["rank_states"] == {"finalised": 3}
+    assert report["book"]["missing"] == []
+    trace = ROOT / "runs" / name / "harness.trace.jsonl"
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    kinds = Counter(e["kind"] for e in events)
+    assert kinds["task.replayed"] >= 1, "the resumed rank replayed memoised tasks"
+    pages_done = [e["page"] for e in events if e["kind"] == "page.done"]
+    assert len(pages_done) == len(set(pages_done)) == 8, "every page translated exactly once"
+    assert kinds["failure.convict"] == 0, "a pause shorter than the lease is not a failure"
 
 
 def test_session_prompt_mentions_no_protocol():
