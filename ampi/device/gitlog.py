@@ -202,6 +202,9 @@ class GitDevice(Device):
         self.read_interval = (read_interval if read_interval is not None
                               else float(os.environ.get(ENV_READ_INTERVAL, "0.5")))
         self._last_fetch = 0.0
+        # Readers' parsed copy of the state file, keyed by the file's identity, so
+        # that a poll loop that finds the file unchanged does not parse it again.
+        self._cached: tuple[tuple[int, int], dict[str, Any]] | None = None
         self._tlock = threading.RLock()
         self._depth = 0
         self._counter = itertools.count()
@@ -343,6 +346,46 @@ class GitDevice(Device):
             return _empty_state()
         return json.loads(p.read_text(encoding="utf-8"))
 
+    def _snapshot(self) -> dict[str, Any]:
+        """The state as a reader sees it.  Readers must not mutate the result.
+
+        Found at 128 ranks over four machines: readers took the same lock as the
+        batching writer, whose CAS loop holds it for the whole push contest with
+        the other machines.  A lock is not a queue, so with thirty polling readers
+        and a writer that reacquires the moment it releases, one reader could wait
+        a quarter of an hour --- longer than its lease --- and be convicted for the
+        crime of reading.  Readers now take the lock only to fetch, and a writer
+        that fetched within ``read_interval`` has already done that for them: the
+        working tree is the remote head, and the state file is replaced
+        atomically, so the copy on disk is safe to read without the lock.
+        """
+        if time.time() - self._last_fetch < self.read_interval:
+            return self._read_cached()
+        with self._locked():
+            return self._sync(fresh=False)
+
+    def _read_cached(self) -> dict[str, Any]:
+        p = self.root / STATE_FILE
+        for _ in range(50):
+            try:
+                st = p.stat()
+                ident = (st.st_mtime_ns, st.st_size)
+                cached = self._cached
+                if cached is not None and cached[0] == ident:
+                    return cached[1]
+                state = json.loads(p.read_text(encoding="utf-8"))
+                self._cached = (ident, state)
+                return state
+            except FileNotFoundError:
+                if not (self.root / ".git").exists():
+                    return _empty_state()
+            except json.JSONDecodeError:
+                pass
+            # git is replacing the file underneath us; it is a small file
+            time.sleep(0.02)
+        with self._locked():
+            return self._read_state()
+
     def _write_state(self, state: dict[str, Any]) -> None:
         tmp = self.root / (STATE_FILE + ".tmp")
         tmp.write_text(json.dumps(state, separators=(",", ":"), default=list),
@@ -405,8 +448,7 @@ class GitDevice(Device):
         descending: bool = False,
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         rows = [dict(r) for r in sorted(state["streams"].get(stream, []),
                                         key=lambda r: r.get(order_by) or 0, reverse=descending)
                 if matches(r, predicate)]
@@ -421,8 +463,7 @@ class GitDevice(Device):
         return Cell(**d)
 
     def read(self, space: str, key: str, *, version: int | None = None) -> Cell | None:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         versions = state["cells"].get(_cell_key(space, key)) or []
         if not versions:
             return None
@@ -451,8 +492,7 @@ class GitDevice(Device):
         return ok, self._cell(cell)
 
     def keys(self, space: str, *, prefix: str = "") -> list[Cell]:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         out = []
         for ck, versions in state["cells"].items():
             sp, key = ck.split("\t", 1)
@@ -463,8 +503,7 @@ class GitDevice(Device):
         return sorted(out, key=lambda c: c.key)
 
     def history(self, space: str, key: str, *, limit: int | None = None) -> list[Cell]:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         versions = [self._cell(c) for c in reversed(state["cells"].get(_cell_key(space, key), []))]
         return versions[:limit] if limit is not None else versions
 
@@ -481,8 +520,7 @@ class GitDevice(Device):
         return self._mutate(lambda st: apply_release(st, lock_id, holder), f"release {lock_id}")
 
     def leases(self, space: str = "", *, include_expired: bool = False) -> list[Lease]:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         now = self.clock()
         return [Lease(**lk) for lk in state["locks"].values()
                 if (not space or lk["space"] == space)
@@ -497,8 +535,7 @@ class GitDevice(Device):
         self._mutate(lambda st: apply_put_object(st, digest, body), f"put {digest[:12]}")
 
     def get_object(self, digest: str) -> str | None:
-        with self._locked():
-            state = self._sync(fresh=False)
+        state = self._snapshot()
         return state["obj"].get(digest)
 
     # -- introspection -------------------------------------------------------

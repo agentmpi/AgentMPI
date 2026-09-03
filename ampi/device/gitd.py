@@ -81,6 +81,7 @@ ENV_BATCH = "AMPI_GITD_BATCH_S"
 ENV_READ_INTERVAL = "AMPI_GITD_READ_INTERVAL"
 DEFAULT_IDLE_S = 300.0
 DEFAULT_BATCH_S = 0.25
+MAX_BATCH_S = 4.0
 DEFAULT_READ_INTERVAL = 2.0
 MAX_BATCH = 2000
 MUTATIONS = frozenset({"append", "match", "update", "cas", "lease", "release", "put_object"})
@@ -164,8 +165,13 @@ class GitDaemon:
             read_interval=(read_interval if read_interval is not None
                            else float(os.environ.get(ENV_READ_INTERVAL, DEFAULT_READ_INTERVAL))),
         )
-        self.batch_window = (batch_window if batch_window is not None
-                             else float(os.environ.get(ENV_BATCH, DEFAULT_BATCH_S)))
+        self.base_window = (batch_window if batch_window is not None
+                            else float(os.environ.get(ENV_BATCH, DEFAULT_BATCH_S)))
+        #: The current batch window.  It widens while pushes are being rejected
+        #: --- other machines are writing the same branch, and the way to win
+        #: more often is to push less often with more in each push --- and
+        #: relaxes back to the base window when pushes land first time.
+        self.batch_window = self.base_window
         self.idle_s = idle_s if idle_s is not None else float(os.environ.get(ENV_IDLE, DEFAULT_IDLE_S))
         self.sock = sock or socket_path(root)
         self._q: queue.Queue[tuple[str, dict[str, Any], threading.Event, list[Any]]] = queue.Queue()
@@ -194,7 +200,12 @@ class GitDaemon:
                     batch.append(self._q.get(timeout=remaining))
                 except queue.Empty:
                     break
+            rejected_before = self.dev.rejections
             results = self._commit(batch)
+            if self.dev.rejections > rejected_before:
+                self.batch_window = min(MAX_BATCH_S, self.batch_window * 2)
+            else:
+                self.batch_window = max(self.base_window, self.batch_window / 2)
             self.batches += 1
             self.batched_ops += len(batch)
             self.largest_batch = max(self.largest_batch, len(batch))
@@ -265,7 +276,8 @@ class GitDaemon:
             return {**d.stats(), "daemon": {"pid": os.getpid(), "clients": self._clients,
                                             "batches": self.batches, "batched_ops": self.batched_ops,
                                             "largest_batch": self.largest_batch,
-                                            "batch_window_s": self.batch_window}}
+                                            "batch_window_s": self.batch_window,
+                                            "base_window_s": self.base_window}}
         if op == "ping":
             return "pong"
         if op == "hello":

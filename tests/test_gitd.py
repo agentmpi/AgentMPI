@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import threading
+from typing import Any
 
 import pytest
 
@@ -112,3 +113,97 @@ def test_a_stale_daemon_is_replaced(tmp_path, monkeypatch):
         assert not stat.exists() or stat.read_text().split()[2] == "Z"
     finally:
         second.shutdown_daemon()
+
+
+def test_readers_do_not_wait_for_a_busy_writer(tmp_path):
+    """A reader that has a fresh copy must not queue behind the writer's lock."""
+    import time
+
+    from ampi.device.gitlog import GitDevice
+
+    dev = GitDevice(tmp_path / "job", read_interval=30.0)
+    dev.initialize()
+    dev.append("event", {"kind": "t", "rank": 0, "run": "r"})   # fetched just now
+    held = threading.Event()
+
+    def hold_the_lock() -> None:
+        with dev._locked():
+            held.set()
+            time.sleep(2.0)
+
+    t = threading.Thread(target=hold_the_lock)
+    t.start()
+    held.wait()
+    t0 = time.time()
+    rows = dev.scan("event", {"kind": "t"})
+    assert time.time() - t0 < 0.5 and len(rows) == 1
+    # the parsed copy is reused while the file is unchanged, and refreshed when it is not
+    assert dev._cached is not None
+    dev.append("event", {"kind": "t", "rank": 1, "run": "r"})
+    assert len(dev.scan("event", {"kind": "t"})) == 2
+    t.join()
+
+
+def test_clients_survive_a_daemon_that_dies_mid_call(tmp_path, monkeypatch):
+    """The daemon is replaced from under a connected client; the client reconnects."""
+    import os
+    import signal
+    import time
+
+    monkeypatch.setenv("AMPI_GITD_IDLE_S", "30")
+    root = tmp_path / "job"
+    dev = GitdDevice(root)
+    dev.initialize()
+    dev.append("event", {"kind": "t", "rank": 0, "run": "r"})
+    pid = dev._call("hello")["pid"]
+    results: list[Any] = []
+
+    def poll() -> None:
+        for _ in range(40):
+            try:
+                results.append(len(dev.scan("event", {"kind": "t"})))
+            except Exception as exc:  # noqa: BLE001
+                results.append(exc)
+            time.sleep(0.05)
+
+    t = threading.Thread(target=poll)
+    t.start()
+    time.sleep(0.3)
+    os.kill(pid, signal.SIGKILL)
+    t.join()
+    try:
+        assert all(r == 1 for r in results), results
+        assert dev._call("hello")["pid"] != pid
+    finally:
+        dev.shutdown_daemon()
+
+
+def test_batch_window_widens_under_rejection(tmp_path, monkeypatch):
+    """The worker doubles its window while pushes are rejected and relaxes after."""
+    import time
+
+    from ampi.device.gitd import MAX_BATCH_S, GitDaemon
+
+    d = GitDaemon(tmp_path / "job", batch_window=0.05)
+    rejected = {"per_batch": 1}
+
+    def commit(batch):
+        d.dev.rejections += rejected["per_batch"]
+        return [("ok", 1)] * len(batch)
+
+    monkeypatch.setattr(d, "_commit", commit)
+    worker = threading.Thread(target=d._worker, daemon=True)
+    worker.start()
+    try:
+        windows = []
+        for per_batch in (1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0):
+            rejected["per_batch"] = per_batch
+            ev, slot = d.enqueue("append", {})
+            assert ev.wait(5) and slot[0] == ("ok", 1)
+            windows.append(d.batch_window)
+        assert MAX_BATCH_S in windows[:8], windows
+        assert windows[-1] == pytest.approx(0.05), windows
+        assert d.batches == 16
+    finally:
+        d._stop.set()
+        worker.join(2)
