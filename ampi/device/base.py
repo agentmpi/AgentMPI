@@ -288,6 +288,11 @@ class Device(abc.ABC):
     name: str = "abstract"
     #: Whether the device survives process exit.  ``memory`` does not.
     durable: bool = True
+    #: How often a blocked rank should renew its lease through this device, in
+    #: seconds.  A write on a shared filesystem costs microseconds; on a device
+    #: whose every write is a network round trip the same renewal rate turns a
+    #: barrier into a push storm, so the device says how often it can afford it.
+    touch_interval_s: float = 5.0
 
     # -- lifecycle ---------------------------------------------------------
     @abc.abstractmethod

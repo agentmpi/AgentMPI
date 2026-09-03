@@ -1255,6 +1255,34 @@ Tracing is unconditional and is part of the protocol, not an add-on.
 An implementation SHOULD provide a diagnostic that reads only the trace and names
 the rank responsible for a stall.
 
+**Executor spans.** An executor that is invoked in-process --- a model API call
+made by the rank's own process rather than claimed by an external worker --- MUST
+record the interval it occupies as a pair of events (``task.start``,
+``task.done``, with ``task.fail`` for an invocation abandoned after its repair
+budget), carrying the executor's identity, the model, the exact prompt and
+completion token counts the provider reported, the number of calls and tool
+calls, and the cost.  An analysis MUST read these as it reads a broker's
+claim/submit pair: the two record the same quantity, the time a rank spent inside
+its executor, and a run staffed by processes and a run staffed by agent sessions
+MUST be measurable with one ruler.
+
+> **Rationale.** The prompt of a raw API call *is* the executor's entire context,
+> and the provider reports its size exactly.  That is the first place in this
+> protocol where the context ledger of S6.1 can be checked against a measurement
+> rather than an estimate, and it is why the token counts are mandatory fields
+> rather than optional ones.
+
+**Replayed collectives.** A rank that re-enters a collective it already joined ---
+a restarted executor replaying its program, or a retried command --- MUST have
+its completion event marked ``replayed``, with the wait measured from the
+re-entry rather than from the original join.  An analysis MUST NOT count a
+replayed completion as a second invocation or as blocked time.
+
+> **Rationale.** Without the mark, a rank restarted an hour into a run and
+> re-entering a barrier that closed fifty-nine minutes earlier records
+> fifty-nine minutes of waiting it never did, and the run's coordination share
+> exceeds one.  We measured exactly that before the mark existed.
+
 > **Rationale.** MPI's answer to a mismatched collective is undefined behaviour,
 > which in practice is a hang with no output. That is survivable when you can
 > attach a debugger to every process. It is not survivable when the population is a
@@ -1328,6 +1356,59 @@ against each.
 > fields, so a wildcard receive posted as `-1` read back as `"-1"` and silently
 > stopped matching — a divergence that existed on one device only and would
 > otherwise have surfaced as an inexplicable protocol bug.
+
+## S15. Process management, and a job across machines
+
+### S15.1 The process manager is not the protocol
+
+As in MPI, how ranks are started is outside the specification.  An implementation
+SHOULD nonetheless ship a launcher (``ampirun``) that: creates the job before any
+rank starts, so the set of ranks *requested* is recorded independently of the set
+that answers; starts one operating-system process per rank with the rank's
+identity in its environment (S1.2); distributes ranks over machines by contiguous
+blocks, so a harness that partitions contiguous work by rank keeps neighbours on
+one machine; and supervises its processes, restarting one that exits before
+finalising through the runtime's ``respawn`` (S10.7) rather than by starting a
+second process under the same identity.
+
+> **Rationale for restart through the runtime.** A launcher that restarts a dead
+> rank's process without telling the runtime hands the successor the
+> predecessor's epoch, and the successor then either repeats the predecessor's
+> injected failure or is fenced as a zombie.  Going through ``respawn`` gives the
+> successor a new epoch, breaks the predecessor's locks and marks it absent in
+> its open collectives; the harness then re-enters its program and finds its
+> closed collectives returning stored results (S7.6) and its stored task results
+> in the window it checkpointed them to.  That is checkpoint and restart, and it
+> costs the harness author nothing beyond the discipline of keeping a rank's
+> state in the device.
+
+### S15.2 Devices for machines that share nothing
+
+A device MAY be implemented over a shared git remote, with a ref as the
+compare-and-swap cell (fetch, apply, commit, push, retry on rejection).  Its
+mutations MUST be pure functions of the device state, so a rejected push can
+re-apply them against fresher state.
+
+An implementation of such a device SHOULD place a daemon on each machine that
+owns the working tree and serves the machine's ranks over a local socket, and
+that daemon SHOULD group-commit every mutation it receives within a window into
+one push.  The guarantee each rank observes is unchanged --- a mutation returns
+only once it is on the remote --- while the number of pushes on the wire is
+bounded by the machine's rate of bursts, not its ranks' rate of operations.  A
+device MAY additionally offer a *pipelined* mode in which a caller that does not
+read a mutation's result sends several without waiting; the runtime SHOULD use
+it when requesting the ranks of a job.
+
+> **Rationale.** This is intra-node aggregation, which every production MPI does
+> before it touches the interconnect.  Measured before it existed: thirty-two
+> ranks on thirty-two machines made 1131 pushes and suffered 13415 rejections in
+> forty-two minutes for four collectives.  Measured with it: sixteen ranks on two
+> daemons made 470 operations in 98 pushes with no rank aware of the difference.
+
+The runtime's lease renewal while blocked (S10.4) SHOULD be paced to the
+device's mutation cost: a poll loop that renews a lease every few seconds is
+correct on a shared filesystem and ruinous on a device whose every write is a
+network round trip.
 
 ---
 

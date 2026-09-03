@@ -580,7 +580,8 @@ class RuntimeBase:
         are very different write volumes and only the first is required.
         """
         now = time.time()
-        if now - getattr(self, "_last_touch", 0.0) < self._TOUCH_INTERVAL_S:
+        interval = max(self._TOUCH_INTERVAL_S, getattr(self.device, "touch_interval_s", 0.0))
+        if now - getattr(self, "_last_touch", 0.0) < interval:
             return
         self._last_touch = now
         try:

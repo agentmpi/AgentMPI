@@ -184,6 +184,7 @@ def apply_op(state: dict[str, Any], op: str, args: dict[str, Any], now: float) -
 class GitDevice(Device):
     name = "git"
     durable = True
+    touch_interval_s = 60.0
 
     def __init__(
         self,

@@ -335,6 +335,7 @@ class GitDaemon:
 class GitdDevice(Device):
     name = "gitd"
     durable = True
+    touch_interval_s = 60.0
 
     def __init__(
         self,
