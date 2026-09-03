@@ -92,6 +92,22 @@ AMPI_RANK=0 .venv/bin/ampi man          # the manual is a command
 AMPI_RANK=0 .venv/bin/ampi doctor       # names the rank that has not arrived
 ```
 
+### Codex environment
+
+The repository includes a repeatable Codex environment setup and a launcher
+that maps separate `codex exec` processes onto AgentMPI ranks:
+
+```bash
+.codex/setup.sh
+codex login
+scripts/launch_codex_ranks.sh 4
+```
+
+Each rank receives a detached Git worktree and shares a SQLite-backed AgentMPI
+job. Logs and live state are written below `.codex/runs/` and are ignored by
+Git. See [`.codex/README.md`](.codex/README.md) for cloud configuration,
+custom prompts, capacity guidance, and cleanup.
+
 ## The three ideas worth knowing
 
 **The narrow waist.** Six device operations — `append`, `match`, `scan`, `cas`,
