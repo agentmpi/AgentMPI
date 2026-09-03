@@ -78,13 +78,17 @@ from .prompts import (
     translate_prompt,
 )
 
-__all__ = ["Config", "BookHarness", "TaskFailed", "run_one", "assemble_cells", "PAGES_WIN",
+__all__ = ["Config", "BookHarness", "TaskFailed", "run_one", "assemble_cells", "PAGES_WIN", "MEMO_WIN",
            "RESEARCH_WIN", "REGISTRY_WIN"]
 
 PAGES_WIN = "pages"
 RESEARCH_WIN = "research"
 REGISTRY_WIN = "registry"
 RING = "ring"
+#: Where a rank records each task's result so that a restart replays instead
+#: of redoing it.  Keyed ``{rank}/{label}``; pages are not memoised here
+#: because the page window already holds them.
+MEMO_WIN = "memo"
 
 
 @dataclass
@@ -121,6 +125,11 @@ class Config:
     context_chars: int = 500
     #: A page subset such as "13-16", for smoke tests; empty means the whole book.
     pages: str = ""
+    #: Record every task result in a window and replay it on restart.  A machine
+    #: that is paused and resumed re-runs its rank program from the top; with
+    #: the memo it re-runs it in seconds, through collectives that are already
+    #: complete, and pays for no task twice.
+    memo: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -225,6 +234,12 @@ class BookHarness:
         of lease.
         """
         retries = self.cfg.retries if retries is None else retries
+        memo_key = f"{rank}/{label}"
+        if self.cfg.memo:
+            cell = self._cell(amp, MEMO_WIN, memo_key)
+            if cell is not None:
+                amp.trace("task.replayed", rank=rank, label=label)
+                return cell
         parsed = Contract.parse(contract)
         base_meta = {"claim_ttl_s": self.cfg.claim_ttl_s, "claim_wait_s": self.cfg.claim_wait_s,
                      **(meta or {})}
@@ -261,6 +276,8 @@ class BookHarness:
             if not violations:
                 amp.trace("task.done", rank=rank, label=label, aid=aid, attempts=attempt + 1,
                           seconds=round(time.time() - t0, 1))
+                if self.cfg.memo and not memo_key.split("/", 1)[1].startswith(("translate:", "revise:")):
+                    amp.put(MEMO_WIN, memo_key, result)
                 return result
             amp.trace("task.invalid", rank=rank, label=label, aid=aid, violations=violations[:6])
             if attempt >= retries:
@@ -282,6 +299,12 @@ class BookHarness:
             self._last_heartbeat[rank] = now
 
     # -- bulk window reads, without charging the ledger -----------------------
+    @staticmethod
+    def _cell(amp: Ampi, win: str, key: str) -> Any:
+        """One cell's value straight from the device, or None; not charged."""
+        cell = amp.device.read(amp._space(win), key)
+        return None if cell is None else cell.value
+
     @staticmethod
     def _cells(amp: Ampi, win: str, prefix: str) -> dict[str, Any]:
         """Read every cell under a prefix straight from the device.
@@ -371,6 +394,16 @@ class BookHarness:
         page = self.page_payload(n, registry)
         L = self.cfg.languages
         contract = {**TRANSLATE_CONTRACT, "expect": {"page": str(n)}}
+        have = self._cell(amp, PAGES_WIN, f"page/{n}")
+        if isinstance(have, dict) and isinstance(have.get("data"), dict):
+            # Already translated, by this rank before it was restarted or by a
+            # survivor that stole it while this rank was away.  Either way the
+            # page is done and the book needs one translation of it, not two.
+            amp.trace("page.replayed", rank=rank, page=n, by=have.get("by"),
+                      revision=have.get("revision"))
+            return have["data"]
+        if self._cell(amp, PAGES_WIN, f"failed/{n}") is not None:
+            return None
         try:
             result = self.invoke(
                 amp, rank, f"translate:{n}",
@@ -437,7 +470,7 @@ class BookHarness:
         # -- launch ---------------------------------------------------------
         amp.memo("phase", "launch")
         if rank == 0:
-            for w in (PAGES_WIN, RESEARCH_WIN, REGISTRY_WIN):
+            for w in (PAGES_WIN, RESEARCH_WIN, REGISTRY_WIN, MEMO_WIN):
                 amp.win_create(w)
         amp.barrier("launch", quorum=q, timeout=T, policy=pol)
 
@@ -555,7 +588,10 @@ class BookHarness:
                     attempts += 1
                     # Compare-and-swap, not a lock: a claim taken by a rank whose
                     # machine then dies must not wedge the term behind a lease.
-                    if not amp.claim(RESEARCH_WIN, f"claim/{item['key']}")["claimed"]:
+                    got_claim = amp.claim(RESEARCH_WIN, f"claim/{item['key']}")
+                    holder = got_claim.get("holder")
+                    mine = isinstance(holder, dict) and holder.get("claimed_by") == rank
+                    if not got_claim["claimed"] and not mine:
                         continue
                     try:
                         finding = self.invoke(amp, rank, f"research:{item['key']}",
@@ -659,6 +695,12 @@ class BookHarness:
             for n in sorted(drafts):
                 rv = amp.get(PAGES_WIN, f"review/{n}")
                 if not rv.get("present") or (rv.get("value") or {}).get("verdict") != "revise":
+                    continue
+                have = self._cell(amp, PAGES_WIN, f"page/{n}")
+                if isinstance(have, dict) and (have.get("revision") or 0) >= 2:
+                    drafts[n] = have.get("data") or drafts[n]
+                    revised.append(n)
+                    amp.trace("page.replayed", rank=rank, page=n, revision=have.get("revision"))
                     continue
                 page = self.page_payload(n, registry)
                 try:

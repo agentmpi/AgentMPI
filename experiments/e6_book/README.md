@@ -70,15 +70,47 @@ than every five seconds; and a reader whose fetches keep finding nothing backs o
 
 ## Running the series
 
+A cloud session is not told its rank; its machine takes one. The branch carries
+`LAUNCH.json`, and a `SessionStart` hook (`.claude/hooks/session-start.sh`) on
+every cloud session started from the branch reads it, claims free rank slots by
+compare-and-swap on the job (`slot/<r>`, version 0, from a random start offset),
+and starts the harness for them in the background. The session is given only
+the worker instruction (`session-prompt`), which contains no protocol words.
+Ranks are claimed, not assigned, because the launcher cannot address a machine
+before it exists; and the hook starts the harness because asking the session to
+do it is asking a permission classifier, which in one launch refused half the
+machines.
+
+A machine may hold several ranks (`ranks_per_machine` in `LAUNCH.json`): each
+is its own clone, lease and writer on the shared branch, exactly as on its own
+machine, and they share one local task queue that the session serves for all of
+them (`ampi worker --serve`). This is how sixty-four ranks are run without
+sixty-four sessions.
+
+The harness is **restartable**. A cloud container is paused when its session
+idles or when the account hits its usage limit, and the harness process does
+not survive the pause. Every task result is memoised in a window (`memo`, keyed
+`rank/label`; pages live in the page window already), so on resume the hook
+restarts the harness (`autostart --resume`), the rank program runs again from
+the top, replays every finished task from the memo, passes through the
+collectives it already completed (joining one is idempotent per rank), and
+continues where it stopped. A pause shorter than the lease is not a failure
+and convicts nobody; a longer one convicts the rank, its pages are stolen, and
+the same replay lets it re-init at a new epoch and finish whatever is left.
+
 ```bash
 # once, from anywhere with push access to the repository
-python experiments/e6_book/rank.py create --name e6-book-p16 --size 16
+python experiments/e6_book/rank.py create --name e6-book-p16 --size 16 --pages 1-64
+# then set LAUNCH.json: name, enabled, ranks_per_machine, launcher_session; commit; push;
+# and create one cloud session per machine from the branch with the bootstrap prompt:
+python experiments/e6_book/rank.py session-prompt --name e6-book-p16 --size 16 --bootstrap
 
-# per rank: the instruction a cloud session is created with
-python experiments/e6_book/rank.py session-prompt --name e6-book-p16 --rank 7 --size 16
+# what the hook runs on each machine, and what it runs again after a pause
+python experiments/e6_book/rank.py autostart
+python experiments/e6_book/rank.py autostart --resume
 
-# what the session runs, in the background, on its machine
-python experiments/e6_book/rank.py run --name e6-book-p16 --rank 7
+# the same rank program, by hand, for one or several ranks on this machine
+python experiments/e6_book/rank.py run --name e6-book-p16 --rank 6,7 [--resume]
 
 # while it runs, and afterwards
 python experiments/e6_book/rank.py status  --name e6-book-p16 --brief

@@ -14,6 +14,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 
 import pytest
@@ -284,10 +285,63 @@ def test_three_processes_complete_a_job_over_the_git_device(tmp_path, legacy):
         shutil.rmtree(ROOT / "work" / "e6" / name, ignore_errors=True)
 
 
+@pytest.mark.slow
+def test_a_paused_rank_resumes_and_replays_over_the_git_device(tmp_path, legacy):
+    """Rank 0's process ends silently after three tasks (a paused machine) while
+    ranks 1 and 2 hold two ranks on one "machine"; rank 0 is then resumed and
+    must replay its memoised work, rejoin the collectives its peers are blocked
+    in, and finish the book with no page translated twice."""
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "init", "-q", "--bare", str(remote)], check=True)
+    env = dict(os.environ, E6_LEGACY_DIR=str(legacy))
+    rank_py = str(ROOT / "experiments" / "e6_book" / "rank.py")
+    name = f"t-resume-{os.getpid()}"
+    common = ["--name", name, "--remote", str(remote)]
+    subprocess.run([sys.executable, rank_py, "create", *common, "--size", "3",
+                    "--root", str(tmp_path / "create"), "--corpus", "durov", "--pages", "5-12",
+                    "--phase-timeout", "240", "--task-timeout", "30", "--join-deadline", "120",
+                    "--research-cap", "4", "--review-cap", "1"],
+                   check=True, env=env, capture_output=True)
+    peers = subprocess.Popen([sys.executable, rank_py, "run", *common, "--rank", "1,2",
+                              "--root", str(tmp_path / "peers"), "--executor", "stub"],
+                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    first = subprocess.run([sys.executable, rank_py, "run", *common, "--rank", "0",
+                            "--root", str(tmp_path / "r0"), "--executor", "stub",
+                            "--stub-die-after", "3"],
+                           env=env, capture_output=True, text=True, timeout=300)
+    assert '"paused": true' in first.stdout, first.stdout[-2000:]
+    second = subprocess.run([sys.executable, rank_py, "run", *common, "--rank", "0",
+                             "--root", str(tmp_path / "r0"), "--executor", "stub", "--resume"],
+                            env=env, capture_output=True, text=True, timeout=400)
+    assert second.returncode == 0 and '"ok": true' in second.stdout, second.stdout[-2000:]
+    out = peers.communicate(timeout=400)[0]
+    assert peers.returncode == 0 and '"ranks": [1, 2], "ok": true' in out, out[-2000:]
+    r = subprocess.run([sys.executable, rank_py, "collect", *common, "--root",
+                        str(tmp_path / "collect"), "--no-analysis"], env=env,
+                       capture_output=True, text=True)
+    assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
+    try:
+        report = json.loads((ROOT / "runs" / name / "report.json").read_text())
+        assert report["rank_states"] == {"finalised": 3}
+        assert report["book"]["missing"] == []
+        trace = ROOT / "runs" / name / "harness.trace.jsonl"
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        kinds = Counter(e["kind"] for e in events)
+        assert kinds["task.replayed"] >= 1, "the resumed rank replayed memoised tasks"
+        pages_done = [e["page"] for e in events if e["kind"] == "page.done"]
+        assert len(pages_done) == len(set(pages_done)) == 8, "every page translated exactly once"
+        assert kinds["failure.convict"] == 0, "a pause shorter than the lease is not a failure"
+    finally:
+        import shutil
+
+        shutil.rmtree(ROOT / "runs" / name, ignore_errors=True)
+        shutil.rmtree(ROOT / "work" / "e6" / name, ignore_errors=True)
+
+
 def test_session_prompt_mentions_no_protocol():
     text = session_prompt("job", 3, 16, "https://example.invalid/r", "main")
-    assert "16 ranks" in text and "--rank RANK --expect-rank RANK" in text
-    assert "slot.json" in text, "a machine learns its rank from the slot it claimed"
+    assert "16 ranks" in text and "next.sh" in text
+    assert "slot.json" in text, "a machine learns its ranks from the slots it claimed"
     # "fence" is deliberately absent from this list: the prompt forbids a
     # *markdown* fence around the JSON, which is not a protocol word.
     import re

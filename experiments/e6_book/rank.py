@@ -93,8 +93,16 @@ def _config(a: argparse.Namespace) -> Config:
     return cfg
 
 
-def _job_root(a: argparse.Namespace) -> Path:
-    return Path(a.root) if getattr(a, "root", None) else WORK / a.name / "job"
+def _job_root(a: argparse.Namespace, rank: int | None = None) -> Path:
+    """Where this machine's copy of the shared job lives.
+
+    On the git device a job root is a clone, and a machine that holds several
+    ranks needs one clone per rank: each rank is its own writer with its own
+    lease and its own view of the branch, exactly as it would be on its own
+    machine.
+    """
+    base = Path(a.root) if getattr(a, "root", None) else WORK / a.name / "job"
+    return base if rank is None else base / f"r{rank}"
 
 
 # ---------------------------------------------------------------------------
@@ -136,23 +144,23 @@ def cmd_create(a: argparse.Namespace) -> dict[str, Any]:
 
 
 SESSION_PROMPT = """\
-You are one machine of a distributed book-translation job named "{name}" with {size} ranks. This machine's rank harness was started automatically when this session began (a SessionStart hook runs it): it claimed a rank number, joined the job, and does every bit of coordination with the other machines (assignment, shared terminology, research claims, review, assembly, failure handling). You do the language work it hands you, one task at a time, and nothing else. Do not read the repository's code, do not investigate the protocol, do not try to contact other machines, do not translate anything you were not handed, and do not start or restart the harness yourself.
+You are one machine of a distributed book-translation job named "{name}" with {size} ranks. This machine's rank harness was started automatically when this session began (a SessionStart hook runs it, and restarts it if the session is resumed after a pause): it claimed one or more rank numbers, joined the job, and does every bit of coordination with the other machines (assignment, shared terminology, research claims, review, assembly, failure handling). You do the language work it hands you, one task at a time, and nothing else. Do not read the repository's code, do not investigate the protocol, do not try to contact other machines, do not translate anything you were not handed, and do not start or restart the harness yourself.
 
 SETUP, once:
 
-1. Find your rank. Run: cat /home/user/AgentMPI/work/e6/{name}/slot.json
-   It contains a JSON object whose "rank" field is your rank number. If the file does not exist yet, wait 30 seconds and try again, for up to ten minutes. If after ten minutes it still does not exist, or its "rank" is null, run: tail -n 40 /home/user/AgentMPI/work/e6/{name}/autostart.log ; report that output verbatim and stop.
-2. Remember your rank number; below, RANK stands for it. Check the harness joined the job: tail -n 3 /home/user/AgentMPI/work/e6/{name}/rankRANK.log
+1. Find your ranks. Run: cat /home/user/AgentMPI/work/e6/{name}/slot.json
+   It contains a JSON object whose "ranks" field lists the rank numbers this machine holds. If the file does not exist yet, wait 30 seconds and try again, for up to ten minutes. If after ten minutes it still does not exist, or "ranks" is empty, run: tail -n 40 /home/user/AgentMPI/work/e6/{name}/autostart.log ; report that output verbatim and stop.
+2. Check the harness joined the job: for each rank number R in that list, run tail -n 2 /home/user/AgentMPI/work/e6/{name}/rankR.log
 
 WORK LOOP. Repeat until the runtime tells you to exit:
 
-1. Ask for work. Run this exact command with your rank substituted for RANK, giving the Bash tool a timeout of 600000 milliseconds (ten minutes; the command blocks server-side for up to 540 seconds, and asking less often is what keeps the run within the account's budget):
+1. Ask for work. Run this exact command, giving the Bash tool a timeout of 600000 milliseconds (ten minutes; the command blocks server-side for up to 540 seconds, and asking less often is what keeps the run within the account's budget):
 
-   AMPI_WORKER_ID="cloud:$CLAUDE_CODE_REMOTE_SESSION_ID" ampi worker --job-root /home/user/AgentMPI/work/e6/{name}/local --rank RANK --expect-rank RANK --campaign {name} next --timeout 540
+   bash /home/user/AgentMPI/work/e6/{name}/next.sh
 
    It prints one JSON object. Read its "status":
      - "task": go to step 2.
-     - "idle": nothing was available during the wait. Ask again. Long idle stretches are normal: the harness is waiting for other machines. Only if you have been idle for more than 90 minutes in a row, check whether the harness has finished: the file /home/user/AgentMPI/work/e6/{name}/rankRANK.json exists once it has. If it exists, print the last 40 lines of the rank log and stop.
+     - "idle": nothing was available during the wait. Ask again. Long idle stretches are normal: the harness is waiting for other machines. Only if you have been idle for more than 90 minutes in a row, check whether the harness has finished: the file /home/user/AgentMPI/work/e6/{name}/done.json exists once it has. If it exists, print it and stop.
      - "exit": the job is over. Go to WHEN YOU FINISH.
    If you ever see "error": "AMPI_ERR_IDENTITY", stop and report it verbatim.
 
@@ -160,13 +168,15 @@ WORK LOOP. Repeat until the runtime tells you to exit:
 
    "Read the file <prompt_file> and do exactly what it says. Write your answer to <result_file> using the Write tool: only the JSON object the task asks for, with no prose before it and no markdown fence around it. If the task asks you to research, use WebSearch and WebFetch and cite the URLs you used. Never invent content to fill a requirement you cannot meet. <If the task JSON has a non-empty check_size: 'Then run this command and, if it exits non-zero, shorten the file until it passes: <check_size>'> Reply with the single word DONE when the file is written."
 
-3. Submit by running the exact command in the task's "submit" field. Confirm the output says "status": "done". If it reports AMPI_ERR_TYPE, read its "violations" list, hand the violations and the two file paths to a new subagent to fix the result file, and submit again; give up after three rejections by running the exact "give_up" command with a one-line reason.
+3. Submit by running the exact command in the task's "submit" field. Confirm the output says "status": "done". If it reports AMPI_ERR_TYPE, read its "violations" list, hand the violations and the two file paths to a new subagent to fix the result file, and submit again; give up after three rejections by running the exact "give_up" command with a one-line reason. If it reports that there is no such task (AMPI_ERR_ARG), the harness was restarted while you worked: discard the task and go back to step 1.
 
 4. Return to step 1.
 
 EFFICIENCY. One task is: one shell call to get it, one subagent, one shell call to submit. Do not read the prompt or result files yourself, do not poll in a tight loop, do not explore the repository.
 
-WHEN YOU FINISH. After "exit", wait for the harness process to end: check once a minute, for up to 15 minutes, whether /home/user/AgentMPI/work/e6/{name}/rankRANK.json exists. Then print the last 30 lines of /home/user/AgentMPI/work/e6/{name}/rankRANK.log, and report how many tasks you completed with their "label" values and anything that went wrong.
+IF YOU ARE RESUMED after a pause with a message telling you to continue, simply return to step 1 of the work loop.
+
+WHEN YOU FINISH. After "exit", wait for the harness process to end: check once a minute, for up to 15 minutes, whether /home/user/AgentMPI/work/e6/{name}/done.json exists. Then print it, and report how many tasks you completed with their "label" values and anything that went wrong.
 """
 
 
@@ -199,36 +209,57 @@ def cmd_session_prompt(a: argparse.Namespace) -> str:
 # ---------------------------------------------------------------------------
 
 
-def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
-    _git_env(a)
+def _open_local_queue(a: argparse.Namespace, size: int, *, fresh: bool) -> Any:
+    """The machine-local task queue every rank on this machine publishes to.
+
+    One SQLite job for the whole machine: the session serving it claims tasks for
+    every rank the machine holds (``ampi worker --serve``), so K ranks cost one
+    session, not K.  ``fresh`` wipes it; a restart keeps it so that a task the
+    session is in the middle of can still be submitted.
+    """
+    from ampi.runtime import Ampi
+
+    local_root = WORK / a.name / "local"
+    if fresh or not (local_root / "job.json").exists():
+        return Ampi.create(str(local_root), size, device="sqlite", force=True,
+                           meta={"role": "local-broker", "job": a.name})
+    return Ampi(str(local_root), allow_volatile=True)
+
+
+def run_rank(a: argparse.Namespace, rank: int, local: Any | None, work: Path,
+             cfg_override: Config | None = None) -> dict[str, Any]:
+    """Be one rank: join the shared job, execute the rank program, leave a record.
+
+    Called once per rank on this machine, in its own thread when the machine
+    holds several.  The rank's own git clone, lease, executor and log are all
+    per rank; only the local task queue is shared.
+    """
     from ampi.executor import BrokerExecutor
     from ampi.runtime import Ampi
 
-    root = _job_root(a)
-    work = WORK / a.name
-    work.mkdir(parents=True, exist_ok=True)
-    log = {"rank": a.rank, "name": a.name, "started_at": time.time(), "identity": identity(a.rank)}
-    print(json.dumps({"joining": str(root), "rank": a.rank, "branch": os.environ["AMPI_GIT_BRANCH"]}),
-          flush=True)
-    amp = Ampi(str(root), rank=a.rank, expect_rank=a.rank)
+    root = _job_root(a, rank)
+    log = {"rank": rank, "name": a.name, "started_at": time.time(), "identity": identity(rank)}
+    out_log = open(work / f"rank{rank}.log", "a", encoding="utf-8")  # noqa: SIM115
+
+    def say(obj: dict[str, Any]) -> None:
+        line = json.dumps(obj, default=str)
+        out_log.write(line + "\n")
+        out_log.flush()
+        print(line, flush=True)
+
+    say({"joining": str(root), "rank": rank, "branch": os.environ["AMPI_GIT_BRANCH"]})
+    amp = Ampi(str(root), rank=rank, expect_rank=rank)
     meta = amp.manifest.meta or {}
-    cfg = Config.from_dict(meta.get("e6") or {"name": a.name, "size": amp.size})
-    print(json.dumps({"joined": amp.manifest.job_id, "size": amp.size, "config": cfg.to_dict()}),
-          flush=True)
+    cfg = cfg_override or Config.from_dict(meta.get("e6") or {"name": a.name, "size": amp.size})
+    say({"joined": amp.manifest.job_id, "size": amp.size, "config": cfg.to_dict()})
     corpus = corpus_mod.build(WORK, cfg.size, corpus=cfg.corpus, legacy_dir=a.legacy_dir, pages=cfg.pages)
 
-    local_root = work / "local"
     broker_dir = work / "broker"
     executor: Any
-    local = None
     if a.executor == "broker":
-        # A machine-local queue.  The task stream would be a mutation per
-        # publish, claim and submission on the shared transport; here it costs
-        # nothing, and the session serving it is on this machine anyway.  The
-        # broker mirrors its events into the shared trace so the analysis sees
-        # the work spans in the one log that survives the machine.
-        local = Ampi.create(str(local_root), cfg.size, device="sqlite", force=True,
-                            meta={"role": "local-broker", "rank": a.rank, "job": a.name})
+        # The broker mirrors its events into the shared trace so the analysis
+        # sees the work spans in the one log that survives the machine.
+        assert local is not None
         executor = BrokerExecutor(
             local, campaign=a.name, work_dir=broker_dir, timeout_s=cfg.task_timeout_s,
             claim_ttl_s=cfg.claim_ttl_s, claim_wait_s=cfg.claim_wait_s, trace_to=amp,
@@ -238,33 +269,102 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         executor.open()
     elif a.executor == "claude":
         executor = ClaudeCliExecutor(broker_dir, model=a.model, timeout_s=cfg.task_timeout_s,
-                                     worker_id=f"claude-cli:{a.name}:r{a.rank}", effort=a.effort)
+                                     worker_id=f"claude-cli:{a.name}:r{rank}", effort=a.effort)
     else:
         executor = stub_executor(corpus, cfg.languages, latency_s=a.stub_latency)
+        if getattr(a, "stub_die_after", None):
+            # Fault injection for the restart path: the machine "pauses" (the
+            # process ends without a word) after this many tasks, and a later
+            # ``--resume`` must pick the rank up where it stopped.
+            executor = _dying(executor, int(a.stub_die_after), say)
 
     harness = BookHarness(cfg, corpus, executor, work)
-    try:
-        out = run_one(amp, a.rank, harness, lease_s=cfg.lease_s, identity=log["identity"])
-    finally:
-        if local is not None:
-            try:
-                executor.close()
-            except Exception as exc:  # noqa: BLE001 - closing is best effort
-                print(json.dumps({"close_failed": str(exc)}), flush=True)
-            # The local queue's own trace, for provenance of what this session did.
-            with open(work / f"rank{a.rank}.local.trace.jsonl", "w", encoding="utf-8") as fh:
-                for e in local.events():
-                    fh.write(json.dumps(e, default=str) + "\n")
-            local.close()
+    out = run_one(amp, rank, harness, lease_s=cfg.lease_s, identity=log["identity"])
     log.update(out, finished_at=time.time(), device=amp.device.stats())
     if hasattr(executor, "stats"):
         log["executor"] = executor.stats()
-    (work / f"rank{a.rank}.json").write_text(json.dumps(log, indent=2, default=str),
-                                              encoding="utf-8")
-    print(json.dumps({k: log.get(k) for k in ("rank", "ok", "error", "seconds", "device")},
-                     default=str), flush=True)
+    (work / f"rank{rank}.json").write_text(json.dumps(log, indent=2, default=str),
+                                            encoding="utf-8")
+    say({k: log.get(k) for k in ("rank", "ok", "error", "seconds", "device")})
     amp.close()
+    out_log.close()
     return log
+
+
+def _dying(executor: Any, after: int, say: Any) -> Any:
+    from ampi.executor import FunctionExecutor
+
+    count = {"n": 0}
+
+    def fn(task: Any) -> Any:
+        count["n"] += 1
+        if count["n"] > after:
+            say({"paused": True, "after_tasks": after, "at": task.label})
+            os._exit(0)
+        return executor.invoke(task)
+
+    return FunctionExecutor(fn)
+
+
+def run_ranks(a: argparse.Namespace, ranks: list[int], *, fresh: bool) -> dict[str, Any]:
+    """Run this machine's ranks, each in a thread, over one local queue.
+
+    The campaign closes only when every rank on the machine is finished, so the
+    session serving the queue is told to exit exactly once.  A rank that fails
+    is a result, not a crash: the other ranks on the machine carry on, as they
+    would if it had been on another machine.
+    """
+    import threading
+
+    from ampi.runtime import Ampi
+
+    work = WORK / a.name
+    work.mkdir(parents=True, exist_ok=True)
+    probe = Ampi(str(_job_root(a, ranks[0])), allow_volatile=True)
+    size = probe.size
+    probe.close()
+    local = _open_local_queue(a, size, fresh=fresh) if a.executor == "broker" else None
+    results: dict[int, dict[str, Any]] = {}
+
+    def body(r: int) -> None:
+        try:
+            results[r] = run_rank(a, r, local, work)
+        except Exception as exc:  # noqa: BLE001 - recorded, the other ranks continue
+            results[r] = {"rank": r, "ok": False, "error": str(exc)[:300],
+                          "error_class": type(exc).__name__}
+            (work / f"rank{r}.json").write_text(json.dumps(results[r], indent=2), encoding="utf-8")
+            with open(work / f"rank{r}.log", "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(results[r]) + "\n")
+
+    threads = [threading.Thread(target=body, args=(r,), name=f"rank{r}", daemon=True) for r in ranks]
+    for t in threads:
+        t.start()
+        time.sleep(2.0)  # stagger the clones so they do not all fetch the same second
+    for t in threads:
+        t.join()
+    if local is not None:
+        from ampi.executor import BrokerExecutor
+
+        try:
+            BrokerExecutor(local, campaign=a.name, work_dir=work / "broker").close()
+        except Exception as exc:  # noqa: BLE001 - closing is best effort
+            print(json.dumps({"close_failed": str(exc)}), flush=True)
+        with open(work / "local.trace.jsonl", "w", encoding="utf-8") as fh:
+            for e in local.events():
+                fh.write(json.dumps(e, default=str) + "\n")
+        local.close()
+    summary = {"name": a.name, "ranks": ranks, "ok": all(results.get(r, {}).get("ok") for r in ranks),
+               "results": {str(r): {k: results.get(r, {}).get(k) for k in ("ok", "error", "seconds")}
+                           for r in ranks}, "finished_at": time.time()}
+    (work / "done.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    print(json.dumps(summary, default=str), flush=True)
+    return summary
+
+
+def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
+    _git_env(a)
+    ranks = [int(x) for x in str(a.rank).split(",") if x.strip()]
+    return run_ranks(a, ranks, fresh=not getattr(a, "resume", False))
 
 
 # ---------------------------------------------------------------------------
@@ -316,10 +416,38 @@ def claim_slot(root: Path, size: int, me: dict[str, Any]) -> int | None:
         amp.close()
 
 
+def write_next_script(work: Path, name: str, ranks: list[int]) -> Path:
+    """The one command the session runs to ask for work, written out verbatim.
+
+    The session substitutes nothing: every value an agent might mistype (the
+    rank, the ranks it serves, the queue's path, the identity assertion) is in
+    the file the harness wrote.
+    """
+    others = ",".join(str(r) for r in ranks[1:])
+    serve = f" --serve {others}" if others else ""
+    script = (
+        "#!/bin/bash\n"
+        f"# Written by the rank harness of job {name}: claim the next task for ranks {ranks}.\n"
+        f'exec env AMPI_WORKER_ID="cloud:${{CLAUDE_CODE_REMOTE_SESSION_ID:-$(hostname)}}" '
+        f"ampi worker --job-root {WORK / name / 'local'} --rank {ranks[0]} --expect-rank {ranks[0]} "
+        f"--campaign {name}{serve} next --timeout 540\n"
+    )
+    path = work / "next.sh"
+    path.write_text(script, encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
 def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
     spec = launch_spec()
     if spec is None:
         print(json.dumps({"autostart": "no enabled launch spec"}), flush=True)
+        return None
+    me = identity(-1)
+    if spec.get("launcher_session") and me.get("session") == spec["launcher_session"]:
+        # The conversation that created the job also starts sessions on this
+        # branch; it must not become a rank of its own experiment.
+        print(json.dumps({"autostart": "this is the launcher's own session"}), flush=True)
         return None
     name = spec["name"]
     work = WORK / name
@@ -329,11 +457,30 @@ def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
     a.branch = spec.get("branch")
     a.root = None
     a.read_interval = spec.get("read_interval")
+    a.executor = spec.get("executor", "broker")
+    a.model = spec.get("model")
+    a.effort = spec.get("effort")
+    a.keepalive = float(spec.get("keepalive", 60.0))
+    a.stub_latency = 0.0
+    a.legacy_dir = None
     _git_env(a)
+
+    slot_file = work / "slot.json"
+    if getattr(a, "resume", False):
+        if not slot_file.exists():
+            print(json.dumps({"autostart": "nothing to resume"}), flush=True)
+            return None
+        slot = json.loads(slot_file.read_text(encoding="utf-8"))
+        ranks = [r for r in slot.get("ranks") or [] if not (work / f"rank{r}.json").exists()]
+        if not ranks:
+            print(json.dumps({"autostart": "every rank on this machine is finished"}), flush=True)
+            return None
+        print(json.dumps({"autostart": "resuming", "ranks": ranks}), flush=True)
+        return run_ranks(a, ranks, fresh=False)
+
     from ampi.runtime import Ampi
 
     root = _job_root(a)
-    me = identity(-1)
     me["claimed_at"] = time.time()
     try:
         probe = Ampi(str(root), allow_volatile=True)
@@ -342,23 +489,24 @@ def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
     except Exception as exc:  # noqa: BLE001 - the job may not exist yet
         print(json.dumps({"autostart": "no job", "error": str(exc)[:200]}), flush=True)
         return None
-    rank = claim_slot(root, size, me)
-    if rank is None:
+    want = max(1, int(spec.get("ranks_per_machine", 1)))
+    ranks: list[int] = []
+    for _ in range(want):
+        r = claim_slot(root, size, me)
+        if r is None:
+            break
+        ranks.append(r)
+    ranks.sort()
+    if not ranks:
         print(json.dumps({"autostart": "every slot is taken", "size": size}), flush=True)
-        (work / "slot.json").write_text(json.dumps({"rank": None, "name": name, "size": size,
-                                                    "note": "every slot is taken"}), encoding="utf-8")
+        slot_file.write_text(json.dumps({"rank": None, "ranks": [], "name": name, "size": size,
+                                         "note": "every slot is taken"}), encoding="utf-8")
         return None
-    (work / "slot.json").write_text(json.dumps({"rank": rank, "name": name, "size": size,
-                                                "session": me.get("session")}), encoding="utf-8")
-    print(json.dumps({"autostart": "claimed", "rank": rank, "size": size}), flush=True)
-    a.rank = rank
-    a.executor = spec.get("executor", "broker")
-    a.model = spec.get("model")
-    a.effort = spec.get("effort")
-    a.keepalive = float(spec.get("keepalive", 60.0))
-    a.stub_latency = 0.0
-    a.legacy_dir = None
-    return cmd_run(a)
+    write_next_script(work, name, ranks)
+    slot_file.write_text(json.dumps({"rank": ranks[0], "ranks": ranks, "name": name, "size": size,
+                                     "session": me.get("session")}), encoding="utf-8")
+    print(json.dumps({"autostart": "claimed", "ranks": ranks, "size": size}), flush=True)
+    return run_ranks(a, ranks, fresh=True)
 
 
 def cmd_slot(a: argparse.Namespace) -> dict[str, Any]:
@@ -662,19 +810,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--bootstrap", action="store_true",
                    help="print the short prompt a session is created with, which fetches the full one")
 
-    p = sub.add_parser("autostart", help="claim a rank slot from LAUNCH.json and run it")
+    p = sub.add_parser("autostart", help="claim rank slots from LAUNCH.json and run them")
+    p.add_argument("--resume", action="store_true",
+                   help="re-run the ranks this machine already claimed (after a pause)")
     p = sub.add_parser("slot", help="print the rank this machine claimed")
     p.add_argument("--name", required=True)
 
     p = sub.add_parser("run")
     p.add_argument("--name", required=True)
-    p.add_argument("--rank", type=int, required=True)
+    p.add_argument("--rank", required=True, help="a rank, or several comma-separated ranks")
+    p.add_argument("--resume", action="store_true", help="keep the local queue; replay memoised work")
     p.add_argument("--executor", default="broker", choices=["broker", "claude", "stub"])
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
     p.add_argument("--keepalive", type=float, default=0.0,
                    help="seconds between lease renewals while an executor works; default lease/3")
     p.add_argument("--stub-latency", type=float, default=0.0)
+    p.add_argument("--stub-die-after", type=int, default=None,
+                   help="fault injection: the stub process exits silently after N tasks")
     p.add_argument("--legacy-dir", default=None)
     _git_args(p)
 
