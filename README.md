@@ -44,21 +44,45 @@ point-to-point.
 
 ## What is here
 
+The repository is four layers, and each directory belongs to exactly one of
+them.
+
 ```
-spec/AgentMPI-1.0.md   the normative specification
-ampi/                  the reference runtime
-  device/              the narrow waist: 6 operations, 3 transports
-  core/                everything above the waist, transport independent
-  cli.py               the command binding an agent calls
-  harness.py           the SPMD driver
-  executor.py          function, replay, and broker (pull-queue) executors
-  doctor.py            "which rank has not arrived, and what do I do"
-conformance/           one suite, run against every transport
-experiments/           E0 microbenchmarks, E1 translation, corpus, scoring
-runs/                  committed run artifacts: prompts, per-rank output, traces
-research/              four scholarly dossiers and their bibliographies
-paper/                 the paper; every number is a macro generated from run data
+1. The concepts            spec/AgentMPI-1.0.md     the normative specification: what a rank,
+                                                    a collective, a window and a failure are
+                           spec/background/         four dossiers on MPI's history, collective
+                                                    algorithms, fault tolerance and the agent
+                                                    landscape, with their bibliographies
+
+2. The reference           ampi/                    the runtime: everything the specification
+   implementation            core/                  requires, written over the device waist
+                             device/                the waist: 6 operations, 5 transports
+                                                    (sqlite, journal, memory, git, gitd)
+                             cli.py                 the command binding an agent calls
+                           conformance/             one suite, run unchanged against every
+                                                    transport; the artifact that makes this a
+                                                    specification rather than a library
+                           tests/                   unit tests of both packages
+
+3. The auxiliary code      ampitools/               what a harness author uses around the
+   and harness               harness.py             protocol and the specification does not
+                             executor.py            require: the SPMD driver; function,
+                             model.py, tools.py     replay and broker executors; the raw-API
+                             launcher.py            executor with its tool loop; ampirun,
+                             doctor.py              the process manager; the diagnosis;
+                             analysis/              trace analysis, figures and the viewer
+
+4. The experiments         experiments/             E0 microbenchmarks, E1 and E2 (session
+   and analysis                                     ranks), E5 (machines), E7 (process ranks)
+                             tools/                 sealing a run, collecting the suite
+                           runs/                    committed evidence: launch plans, traces,
+                                                    per-rank reports, analyses; no book text
+                           paper/                   the paper; every number is a macro that
+                             tools/                 paper/tools/ generates from runs/
 ```
+
+The dependency runs downward only: `ampi` imports nothing from the layers below
+it, `ampitools` imports `ampi`, and the experiments import both.
 
 ## Quick start
 
@@ -67,7 +91,7 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 
 # Harness-side: the protocol lives in your code.
 .venv/bin/python - <<'PY'
-from ampi.harness import Harness
+from ampitools.harness import Harness
 h = Harness(root="/tmp/job", size=4, device="sqlite", force=True)
 h.create()
 
@@ -122,7 +146,7 @@ whether declaring rendezvous repairs it.
 ## Reproducing
 
 ```bash
-make test          # 568 tests: conformance against 3 devices, plus unit tests
+make test          # conformance against every device, plus unit tests of both packages
 make bench         # E0 microbenchmarks; fits alpha and beta per device
 make paper         # regenerate macros from run data, then build the PDF
 make check         # lint, plus verify the PDF matches its sources
@@ -150,7 +174,7 @@ job with the broker executor:
 pip install -e ".[tokens]"          # `ampi` on PATH: the runtime's printed submit commands call it by name
 python experiments/e1_translate/harness.py --name demo --size 8 --executor broker &
 python experiments/claude_ranks.py --name demo --size 8 --executors 4 --model sonnet
-python scripts/seal_run.py demo     # once the population is gone
+python experiments/tools/seal_run.py demo     # once the population is gone
 ```
 
 The launcher waits for the job root to appear, so the two can start in either
@@ -197,14 +221,14 @@ across NTP-disciplined VMs and nowhere else.
 
 Every production run above sixteen ranks that used an agent host as its executor
 spent its wall time waiting for an executor to exist: the host capped concurrent
-sessions at ten. `ampi/model.py` removes the host. A rank is an operating-system
+sessions at ten. `ampitools/model.py` removes the host. A rank is an operating-system
 process; its executor is a chat-completions call with a small tool loop
-(`ampi/tools.py`: an encyclopaedia search, an article, a page fetch); its
+(`ampitools/tools.py`: an encyclopaedia search, an article, a page fetch); its
 concurrency limit is the provider's. Contract violations are repaired in the same
 conversation, every call's tokens and cost land in the trace as `task.*` events,
 and the analysis reads them exactly as it reads the broker's claim/submit pair.
 
-`ampirun` (`ampi/launcher.py`) is the process manager MPI leaves unspecified: one
+`ampirun` (`ampitools/launcher.py`) is the process manager MPI leaves unspecified: one
 process per rank with `AMPI_ROOT`/`AMPI_RANK` set, block-distributed over nodes,
 supervised, and restarted through the runtime's `respawn` so a successor gets a
 new epoch and re-enters its collectives (traced as `replayed`).

@@ -61,10 +61,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .core.payload import canonical, check_contract
-from .errors import AmpiError, err
+from ampi.core.payload import canonical, check_contract
+from ampi.errors import AmpiError, err
+from ampi.tokens import count_tokens
+
 from .executor import Task
-from .tokens import count_tokens
 
 __all__ = [
     "ChatModel",

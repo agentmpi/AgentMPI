@@ -311,7 +311,7 @@ class GitDevice(Device):
             # A force push races with the other machines' ordinary pushes to the
             # same branch: the remote refuses to move a ref that changed while it
             # was being updated ("cannot lock ref").  The wipe wins by trying again.
-            for attempt in range(20):
+            for _attempt in range(20):
                 r = subprocess.run(["git", *GIT_IDENTITY, "push", "-q", "--force", "origin",
                                     self.branch], cwd=str(self.root), capture_output=True,
                                    text=True)

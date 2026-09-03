@@ -618,7 +618,7 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
                 None, "")
 
     if cmd == "viewer":
-        from .analysis.server import serve
+        from ampitools.analysis.server import serve
 
         serve(
             job_root=None if a.trace else (a.job_root or os.environ.get(ENV_ROOT)),
@@ -632,8 +632,8 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return ({"served": True}, None, "")
 
     if cmd == "analyze":
-        from .analysis import analyse, load_events, summary
-        from .analysis.report import write_all
+        from ampitools.analysis import analyse, load_events, summary
+        from ampitools.analysis.report import write_all
 
         if a.trace:
             events = load_events(a.trace)
@@ -689,7 +689,7 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
     if cmd == "status":
         return amp.status(), rank, job
     if cmd == "doctor":
-        from .doctor import diagnose
+        from ampitools.doctor import diagnose
         return diagnose(amp), rank, job
     if cmd == "failed":
         return amp.failures(comm=a.comm), rank, job
@@ -897,7 +897,7 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return {"handle": p.envelope.handle, **p.envelope.to_dict()}, amp.rank, job
 
     if cmd == "worker":
-        from .executor import BrokerExecutor
+        from ampitools.executor import BrokerExecutor
 
         # The worker subcommand is the only surface the agents in our experiments
         # ever touch, and it skipped this call.  Two executors reported that

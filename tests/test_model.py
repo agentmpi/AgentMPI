@@ -9,10 +9,10 @@ import pytest
 
 from ampi.core.payload import Contract
 from ampi.errors import AmpiError
-from ampi.executor import Task
-from ampi.harness import Harness
-from ampi.launcher import ranks_of_node
-from ampi.model import ChatModel, ModelError, ModelExecutor, Tool, Usage, extract_json
+from ampitools.executor import Task
+from ampitools.harness import Harness
+from ampitools.launcher import ranks_of_node
+from ampitools.model import ChatModel, ModelError, ModelExecutor, Tool, Usage, extract_json
 
 
 def _reply(content: str, *, tool_calls: list[dict] | None = None, usage: dict | None = None,
@@ -169,7 +169,7 @@ def test_exhausted_attempts_fail_loudly_and_are_traced(job):
 
 def test_transport_errors_are_retried_with_backoff(job, monkeypatch):
     amp = _amp(job)
-    monkeypatch.setattr("ampi.model.time.sleep", lambda s: None)
+    monkeypatch.setattr("ampitools.model.time.sleep", lambda s: None)
     script = Script([
         ModelError("HTTP 429: slow down", status=429, retryable=True),
         {"error": {"code": 502, "message": "upstream"}},
@@ -205,7 +205,7 @@ def test_per_label_model_override_and_logging(job, tmp_path):
 
 
 def test_analysis_reads_task_events_as_work_spans(job):
-    from ampi.analysis import analyse
+    from ampitools.analysis import analyse
 
     amp = _amp(job)
     script = Script([_reply("x"), _reply("y")])

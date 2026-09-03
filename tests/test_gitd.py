@@ -180,7 +180,6 @@ def test_clients_survive_a_daemon_that_dies_mid_call(tmp_path, monkeypatch):
 
 def test_batch_window_widens_under_rejection(tmp_path, monkeypatch):
     """The worker doubles its window while pushes are rejected and relaxes after."""
-    import time
 
     from ampi.device.gitd import MAX_BATCH_S, GitDaemon
 

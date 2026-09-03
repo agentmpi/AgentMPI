@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any
 
 from ampi.errors import AmpiError
-from ampi.harness import Harness
+from ampitools.harness import Harness
 
 RESULTS = Path(__file__).resolve().parent.parent / "results"
 

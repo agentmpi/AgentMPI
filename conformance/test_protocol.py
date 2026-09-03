@@ -373,7 +373,7 @@ def test_s6_a_reordered_collective_is_named_rather_than_silently_paired(job):
     assert e.value.detail["label"] in ("a", "b")
     assert e.value.detail["missing"], "the error must name who has not arrived"
 
-    from ampi.doctor import diagnose
+    from ampitools.doctor import diagnose
 
     open_labels = {
         f["what"] for f in diagnose(ranks[0])["findings"] if "collective" in f["what"]
@@ -992,7 +992,7 @@ def test_s11_error_events_make_retry_behaviour_measurable(job):
 
 
 def test_doctor_names_the_rank_that_has_not_entered_a_collective(job):
-    from ampi.doctor import diagnose
+    from ampitools.doctor import diagnose
 
     ranks = job(4)
     for r in ranks[:3]:
@@ -1004,7 +1004,7 @@ def test_doctor_names_the_rank_that_has_not_entered_a_collective(job):
 
 
 def test_doctor_reports_healthy_when_nothing_is_wrong(job):
-    from ampi.doctor import diagnose
+    from ampitools.doctor import diagnose
 
     ranks = job(2)
     for r in ranks:

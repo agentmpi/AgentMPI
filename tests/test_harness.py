@@ -14,8 +14,8 @@ import pytest
 from ampi import Ampi
 from ampi.core.payload import Contract
 from ampi.errors import AmpiError
-from ampi.executor import BrokerExecutor, FunctionExecutor, ReplayExecutor, Task, new_aid
-from ampi.harness import Harness
+from ampitools.executor import BrokerExecutor, FunctionExecutor, ReplayExecutor, Task, new_aid
+from ampitools.harness import Harness
 
 
 def test_the_driver_runs_every_rank_and_collects_results(tmp_path):

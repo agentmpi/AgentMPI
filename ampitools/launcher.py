@@ -40,7 +40,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .constants import DEFAULT_CTX_BUDGET
+from ampi.constants import DEFAULT_CTX_BUDGET
 
 __all__ = ["launch", "main", "node_identity", "ranks_of_node"]
 
@@ -85,7 +85,7 @@ def _wait_for_job(root: Path, device: str, timeout: float) -> None:
     On a shared filesystem that is a file appearing.  On the git device it is a
     branch appearing on the remote, so the wait opens the device and asks it.
     """
-    from .device import open_device
+    from ampi.device import open_device
 
     deadline = time.time() + timeout
     while True:
@@ -160,7 +160,7 @@ def launch(
     launch_path = log_dir / f"launch-node{node}.json"
     launch_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
-    from .runtime import Ampi
+    from ampi.runtime import Ampi
 
     if should_create:
         job = Ampi.create(str(root), size, device=device, force=force, ctx_budget=ctx_budget,
@@ -341,8 +341,9 @@ def export(root: str | Path, out_dir: str | Path, *, name: str = "") -> dict[str
     the device.  Kept separate from :func:`launch` because on a multi-node job no
     single launcher knows when the others are done.
     """
+    from ampi.runtime import Ampi
+
     from .doctor import diagnose
-    from .runtime import Ampi
 
     out = Path(out_dir)
     out.mkdir(parents=True, exist_ok=True)

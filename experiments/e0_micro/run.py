@@ -37,8 +37,8 @@ from typing import Any
 from ampi import Ampi
 from ampi.core.algorithms import CATALOGUE, build_schedule, cost_of
 from ampi.core.context import ResidencyModel
-from ampi.harness import Harness
 from ampi.tokens import counter_name
+from ampitools.harness import Harness
 
 HERE = Path(__file__).resolve().parent
 RESULTS = HERE.parent / "results"

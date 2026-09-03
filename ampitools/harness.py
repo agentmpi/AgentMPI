@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .constants import DEFAULT_CTX_BUDGET
-from .errors import AmpiError
-from .runtime import Ampi
+from ampi.constants import DEFAULT_CTX_BUDGET
+from ampi.errors import AmpiError
+from ampi.runtime import Ampi
 
 __all__ = ["Harness", "RankResult", "run"]
 

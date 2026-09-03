@@ -50,7 +50,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ..core.algorithms import build_schedule, cost_of
+from ampi.core.algorithms import build_schedule, cost_of
+
 from . import style as st
 
 __all__ = [

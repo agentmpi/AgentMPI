@@ -38,8 +38,8 @@ from typing import Any
 
 from ampi import Ampi
 from ampi.core.payload import Contract
-from ampi.executor import BrokerExecutor, FunctionExecutor, Task, new_aid
-from ampi.harness import Harness
+from ampitools.executor import BrokerExecutor, FunctionExecutor, Task, new_aid
+from ampitools.harness import Harness
 
 HERE = Path(__file__).resolve().parent
 DATA = HERE.parent / "data"

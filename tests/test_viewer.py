@@ -15,9 +15,9 @@ from http.server import ThreadingHTTPServer
 
 import pytest
 
-from ampi.analysis import style as st
-from ampi.analysis.server import PAGE, TraceSource, _handler
-from ampi.harness import Harness
+from ampitools.analysis import style as st
+from ampitools.analysis.server import PAGE, TraceSource, _handler
+from ampitools.harness import Harness
 
 
 def _trace(tmp_path):
@@ -77,7 +77,7 @@ def test_serves_the_page_and_the_state(tmp_path):
 
 def test_state_agrees_with_the_analysis_it_claims_to_show(tmp_path):
     """A viewer that disagreed with the figures would be worse than no viewer."""
-    from ampi.analysis import analyse, load_events
+    from ampitools.analysis import analyse, load_events
 
     path = _trace(tmp_path)
     a = analyse(load_events(path), name="unit")

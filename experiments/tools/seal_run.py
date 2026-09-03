@@ -30,7 +30,7 @@ from collections import Counter
 from pathlib import Path
 from typing import Any
 
-ROOT = Path(__file__).resolve().parent.parent
+ROOT = Path(__file__).resolve().parent.parent.parent
 RUNS = ROOT / "runs"
 
 
@@ -88,7 +88,7 @@ def summarise(job_root: Path) -> dict[str, Any]:
             "degradations": sum((v.ctx or {}).get("degradations", 0) for v in ranks),
         },
     }
-    from ampi.doctor import diagnose
+    from ampitools.doctor import diagnose
 
     out["diagnosis"] = diagnose(amp)
     trace = [e for e in events]

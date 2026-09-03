@@ -16,11 +16,11 @@ import json
 
 import pytest
 
-from ampi.analysis import analyse, load_events
-from ampi.analysis import style as st
-from ampi.analysis.figures import render_all
-from ampi.analysis.report import findings, latex, markdown, summary, write_all
-from ampi.harness import Harness
+from ampitools.analysis import analyse, load_events
+from ampitools.analysis import style as st
+from ampitools.analysis.figures import render_all
+from ampitools.analysis.report import findings, latex, markdown, summary, write_all
+from ampitools.harness import Harness
 
 
 def _run(tmp_path, size=6, device="sqlite"):

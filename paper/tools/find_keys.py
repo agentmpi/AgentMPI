@@ -2,7 +2,7 @@
 
 A paper that cites a key the bibliography does not define produces a silent
 question mark in the PDF, which is the single easiest way to ship an embarrassing
-artifact.  This is the lookup that avoids it; ``scripts/check_tex.py`` is the check
+artifact.  This is the lookup that avoids it; ``paper/tools/check_tex.py`` is the check
 that catches it if this is skipped.
 """
 
@@ -12,7 +12,7 @@ import re
 import sys
 from pathlib import Path
 
-BIB = Path(__file__).resolve().parent.parent / "paper" / "refs.bib"
+BIB = Path(__file__).resolve().parent / ".." / "refs.bib"
 
 
 def entries() -> dict[str, str]:

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from .constants import STATE_FAILED, STATE_FENCED, STATE_REQUESTED, STATE_RUNNING, STATE_SUSPECT
+from ampi.constants import STATE_FAILED, STATE_FENCED, STATE_REQUESTED, STATE_RUNNING, STATE_SUSPECT
 
 __all__ = ["diagnose"]
 

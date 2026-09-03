@@ -7,8 +7,8 @@ import sys
 import textwrap
 from pathlib import Path
 
-from ampi.launcher import EXIT_EXECUTOR_DIED, export, launch, main
 from ampi.runtime import Ampi
+from ampitools.launcher import EXIT_EXECUTOR_DIED, export, launch, main
 
 PROGRAM = textwrap.dedent(
     """

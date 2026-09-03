@@ -37,9 +37,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Protocol
 
-from .core.payload import Contract, canonical, check_contract
-from .errors import err
-from .tokens import count_tokens
+from ampi.core.payload import Contract, canonical, check_contract
+from ampi.errors import err
+from ampi.tokens import count_tokens
 
 __all__ = [
     "Task",
@@ -267,7 +267,7 @@ class BrokerExecutor:
         the executor blocks on nothing, so one session can serve ten roles in
         sequence within a single phase.
         """
-        from .device import In
+        from ampi.device import In
 
         serving = sorted({rank, *(serve or [])})
         deadline = time.time() + timeout

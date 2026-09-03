@@ -5,8 +5,8 @@ were agent-host sessions, the host capped them at ten, and every production run
 above p=16 spent its wall time waiting for an executor to exist.  E7 keeps E3's
 design --- the same nine collectives, for the same reasons --- and changes what a
 rank *is*: an operating-system process whose executor is a chat-completions call
-with a small tool loop (:mod:`ampi.model`), launched by ``ampirun``
-(:mod:`ampi.launcher`) on one machine or across several.  Executor supply stops
+with a small tool loop (:mod:`ampitools.model`), launched by ``ampirun``
+(:mod:`ampitools.launcher`) on one machine or across several.  Executor supply stops
 being the experiment's limiting resource, so for the first time the population can
 be scaled --- 16, 32, 64 on one node; 128 and 256 over several --- and the
 protocol's own cost measured against a fixed workload.
@@ -69,9 +69,9 @@ from ampi import Ampi
 from ampi.core.ops import arbitrate as default_arbitrate
 from ampi.core.payload import Contract
 from ampi.errors import AmpiError
-from ampi.executor import FunctionExecutor, Task, new_aid
-from ampi.harness import Harness
-from ampi.launcher import EXIT_EXECUTOR_DIED
+from ampitools.executor import FunctionExecutor, Task, new_aid
+from ampitools.harness import Harness
+from ampitools.launcher import EXIT_EXECUTOR_DIED
 
 from . import corpus as corpus_mod
 from .prompts import (
@@ -230,8 +230,8 @@ def model_for_rank(spec: str, rank: int) -> str:
 
 
 def model_executor(amp: Ampi, cfg: Config, log_dir: Path) -> Any:
-    from ampi.model import ChatModel, ModelExecutor
-    from ampi.tools import research_tools
+    from ampitools.model import ChatModel, ModelExecutor
+    from ampitools.tools import research_tools
 
     reasoning = ({"enabled": False} if cfg.reasoning in ("none", "off")
                  else {"effort": cfg.reasoning})
@@ -1050,7 +1050,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
                          "errors": [{"rank": r.rank, "error": r.error} for r in results if not r.ok]}
         job.close()
     else:
-        from ampi.launcher import export, launch
+        from ampitools.launcher import export, launch
 
         cmd = [sys.executable, "-m", "experiments.e7_rawapi_book.harness", "rank", "--name", cfg.name]
         if cfg.run_dir:
