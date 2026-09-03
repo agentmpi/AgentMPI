@@ -171,6 +171,12 @@ def test_scan_limit_and_direction(dev):
 
 def test_update_patches_in_place(dev):
     seq = dev.append("event", {"rank": 1, "kind": "k", "note": "before"})
+    if "event" in dev.deferred_streams:
+        # A deferred record has no sequence number until it is written; the
+        # contract is that after a flush it is addressable like any other.
+        dev.flush()
+        (rec,) = dev.scan("event", {"rank": 1})
+        seq = rec["seq"]
     assert dev.update("event", seq, {"note": "after", "kind": "k2"}) is True
     (rec,) = dev.scan("event", {"rank": 1})
     assert rec["note"] == "after" and rec["kind"] == "k2"
