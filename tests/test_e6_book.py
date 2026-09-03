@@ -49,7 +49,7 @@ def legacy() -> Path:
 
 
 def test_partition_is_contiguous_balanced_and_covers_every_page(legacy):
-    pages = corpus_mod.load_pages(legacy)
+    pages = corpus_mod.load_pages_durov(legacy)
     assert 90 <= len(pages) <= 99
     for size in (1, 4, 16, 32, 64):
         segs = corpus_mod.partition(pages, size)
@@ -65,7 +65,7 @@ def test_partition_is_contiguous_balanced_and_covers_every_page(legacy):
 
 
 def test_manifest_carries_metadata_and_never_text(legacy, tmp_path):
-    corpus = corpus_mod.build(tmp_path, 8, legacy_dir=legacy)
+    corpus = corpus_mod.build(tmp_path, 8, corpus="durov", legacy_dir=legacy)
     m = corpus_mod.manifest(corpus)
     assert m["n_segments"] == 8 and m["n_pages"] == len(corpus.pages)
     assert all("text" not in p for p in m["pages"])
@@ -92,6 +92,44 @@ def test_page_subset_and_rotation():
     items = list(range(10))
     seen = {tuple(rotate(items, r, 5))[0] for r in range(5)}
     assert len(seen) == 5, "ranks start at different agenda items"
+
+
+def _chairs_cache() -> Path | None:
+    for candidate in (ROOT / "work" / "e6", Path(os.environ.get("E6_WORK_DIR", ""))):
+        if candidate and (candidate / "chairs" / "raw" / "chapter_01.wiki").exists():
+            return candidate
+    return None
+
+
+def test_wikitext_cleaning_keeps_prose_and_verse_and_drops_markup():
+    raw = ("{{Отексте\n|АВТОР=x\n}}\n=== Глава I. Безенчук и «нимфы» ===\n"
+           "В уездном городе N было {{razr|много}} заведений.\n   \n"
+           "<center>{{рамка2}}\n{{fs|80%|{{bss|<center>ПОГРЕБАЛЬНАЯ КОНТОРА</center>}}}}\n"
+           "{{конец рамки2}}</center>\n\n''Курсив'' и [[ссылка|текст]].<ref>note</ref>\n\n"
+           "{{poemx1||Первая строка\nВторая строка|}}\n")
+    title, text = corpus_mod.wikitext_to_text(raw)
+    assert title == "Глава I. Безенчук и «нимфы»"
+    assert "В уездном городе N было много заведений." in text
+    assert "ПОГРЕБАЛЬНАЯ КОНТОРА" in text
+    assert "Курсив и текст." in text and "note" not in text
+    assert "Первая строка\nВторая строка" in text
+    assert not any(c in text for c in "{}[]<>")
+
+
+def test_chairs_corpus_paginates_part_one_into_comparable_pages(tmp_path):
+    cache = _chairs_cache()
+    if cache is None:
+        pytest.skip("no cached Wikisource text; the fetch needs the network")
+    corpus = corpus_mod.build(cache, 16, corpus="chairs")
+    assert 80 <= len(corpus.pages) <= 120
+    sizes = [p.chars for p in corpus.pages.values()]
+    assert min(sizes) > 600 and max(sizes) < 5000
+    assert corpus.pages[1].chapter_title.startswith("Глава I.")
+    assert {p.chapter for p in corpus.pages.values()} == set(range(1, 22))
+    assert corpus.pages[1].chapter_first_page == 1
+    m = corpus_mod.manifest(corpus)
+    assert m["corpus"] == "chairs" and "public domain" in m["rights"]
+    assert all("text" not in e for e in m["pages"])
 
 
 # ---------------------------------------------------------------------------
@@ -123,9 +161,9 @@ def test_validate_page_catches_gaps_missing_languages_and_summaries():
 def _run_local(tmp_path, legacy, size, *, pages="5-20", kill=None, **cfg_kw):
     from ampi.harness import Harness
 
-    cfg = Config(name="t", size=size, phase_timeout_s=120, task_timeout_s=30, pages=pages,
-                 review_cap=2, research_cap=6, **cfg_kw)
-    corpus = corpus_mod.build(tmp_path, size, legacy_dir=legacy, pages=pages)
+    cfg = Config(name="t", size=size, corpus="durov", phase_timeout_s=120, task_timeout_s=30,
+                 pages=pages, review_cap=2, research_cap=6, **cfg_kw)
+    corpus = corpus_mod.build(tmp_path, size, corpus="durov", legacy_dir=legacy, pages=pages)
     h = Harness(root=str(tmp_path / "job"), size=size, device="sqlite", ctx_budget=cfg.ctx_budget,
                 force=True)
     h.create()
@@ -213,7 +251,8 @@ def test_three_processes_complete_a_job_over_the_git_device(tmp_path, legacy):
     name = f"t-git-{os.getpid()}"
     common = ["--name", name, "--remote", str(remote)]
     subprocess.run([sys.executable, rank_py, "create", *common, "--size", "3",
-                    "--root", str(tmp_path / "create"), "--pages", "5-12", "--phase-timeout", "120",
+                    "--root", str(tmp_path / "create"), "--corpus", "durov", "--pages", "5-12",
+                    "--phase-timeout", "120",
                     "--task-timeout", "30", "--join-deadline", "120", "--research-cap", "4",
                     "--review-cap", "1"], check=True, env=env, capture_output=True)
     procs = [

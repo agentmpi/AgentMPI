@@ -46,7 +46,7 @@ def test_append_returns_increasing_sequence_numbers(dev):
         # that once flushed they carry increasing, unique sequence numbers in
         # append order; the immediate return value is -1 by declaration.
         assert set(seqs) == {-1}
-        assert dev.flush() == 20
+        assert 0 < dev.flush() <= 20  # part may already have been flushed on size
         seqs = [r["seq"] for r in dev.scan("event", {})]
         assert [r["rank"] for r in dev.scan("event", {})] == list(range(20))
     assert seqs == sorted(seqs), "sequence numbers must increase"

@@ -90,37 +90,13 @@ def _langs(languages: list[str]) -> str:
     return "\n".join(f"- **{c}** — {LANG_NAMES.get(c, c)}" for c in languages)
 
 
-def _brief() -> str:
-    return """\
-## The book
-
-*Код Дурова* (Nikolai Kononov, 2013) is a reported biography of Pavel Durov and
-the early history of VKontakte: non-fiction, close to its subjects, wry, dense
-with St Petersburg detail, 2000s Russian internet culture, university and
-start-up slang, and metaphors a Russian reader of 2013 caught without help.
-
-## The reader, and what the translation is for
-
-A multilingual edition: every Russian sentence followed by its English, Chinese
-and Japanese renderings, read side by side. The reader is a bilingual or
-trilingual technical reader — a graduate student in the sciences who programs,
-uses Telegram, and is curious about Durov's worldview — not a specialist in
-Russia. Cultural references must therefore *carry over*: a Soviet-era housing
-term, a Petersburg district, a Russian academic institution, a piece of net
-slang each needs a rendering the target reader understands without a footnote,
-and a short translator's note only where no rendering can do that.
-
-Durov's voice is sharp, direct, provocative, precise about code. Keep it.
-"""
-
-
 # ---------------------------------------------------------------------------
 # Survey
 # ---------------------------------------------------------------------------
 
 
 def survey_prompt(rank: int, pages: list[dict[str, Any]], languages: list[str],
-                  seed: dict[str, dict[str, str]]) -> str:
+                  seed: dict[str, dict[str, str]], brief: str) -> str:
     seed_lines = "\n".join(
         f"- {ru}: " + ", ".join(f"{c}={v.get(c, '')}" for c in languages)
         for ru, v in list(seed.items())[:60]
@@ -133,7 +109,7 @@ def survey_prompt(rank: int, pages: list[dict[str, Any]], languages: list[str],
     return f"""\
 # Rank {rank}: survey your pages
 
-{_brief()}
+{brief}
 Your job in this task is **not** to translate. It is to read your pages and find
 everything a translator must decide *once* and apply consistently across the
 whole book, and to propose a first rendering for each.
@@ -193,7 +169,7 @@ Rules.
 
 
 def arbitrate_prompt(conflicts: dict[str, list[Any]], context: dict[str, dict[str, Any]],
-                     languages: list[str]) -> str:
+                     languages: list[str], brief: str) -> str:
     items = []
     for term, candidates in conflicts.items():
         meta = context.get(term, {})
@@ -205,7 +181,7 @@ def arbitrate_prompt(conflicts: dict[str, list[Any]], context: dict[str, dict[st
     return f"""\
 # Arbitrate the contested renderings
 
-{_brief()}
+{brief}
 Several translators, each reading different pages, proposed renderings for the
 terms below, and they disagreed. One rendering per term must now be bound for
 the whole book. You decide.
@@ -237,12 +213,12 @@ Rules.
 # ---------------------------------------------------------------------------
 
 
-def research_prompt(rank: int, item: dict[str, Any], languages: list[str]) -> str:
+def research_prompt(rank: int, item: dict[str, Any], languages: list[str], brief: str) -> str:
     shape = ", ".join(f'"{c}": "<the rendering to bind>"' for c in languages)
     return f"""\
 # Rank {rank}: research one term
 
-{_brief()}
+{brief}
 One term needs a grounded rendering decision before the book is translated:
 
     term:  {item["term"]}
@@ -315,7 +291,7 @@ def _schema(languages: list[str]) -> str:
 
 def translate_prompt(rank: int, page: dict[str, Any], languages: list[str],
                      glossary: dict[str, Any], conventions: list[str],
-                     context_before: str, context_after: str) -> str:
+                     context_before: str, context_after: str, brief: str) -> str:
     gloss_block = (
         json.dumps(glossary, ensure_ascii=False, indent=1) if glossary else "(no bound terms)"
     )
@@ -325,11 +301,10 @@ def translate_prompt(rank: int, page: dict[str, Any], languages: list[str],
     return f"""\
 # Rank {rank}: translate page {page["page"]}
 
-{_brief()}
+{brief}
 Translate the page below from Russian into every target language, sentence by
-sentence, into the exact JSON schema given. This page is one of about a hundred
-being translated in parallel by other translators, so the shared decisions
-below are binding.
+sentence, into the exact JSON schema given. Other translators are rendering the
+neighbouring pages at the same time, so the shared decisions below are binding.
 
 ## The binding glossary
 
@@ -403,11 +378,11 @@ def fix_prompt(original: str, violations: list[str]) -> str:
 
 
 def review_prompt(rank: int, page: dict[str, Any], draft: dict[str, Any],
-                  languages: list[str], glossary: dict[str, Any]) -> str:
+                  languages: list[str], glossary: dict[str, Any], brief: str) -> str:
     return f"""\
 # Rank {rank}: review a peer's translation of page {page["page"]}
 
-{_brief()}
+{brief}
 Another translator rendered the page below. Review it against the source. You
 are checking for what the translator could not see: completeness, fidelity,
 consistency with the binding glossary, and naturalness in each language.

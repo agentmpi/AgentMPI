@@ -36,9 +36,9 @@ one mechanism:
 | 1 | `scatter` | each rank its contiguous pages, in a self-identifying slice |
 | 2 | agent **survey**; `win_lock` + `put` | the terms to render consistently; chapter titles and conventions merged into a registry under an exclusive lock (read-modify-write) |
 | 3 | `allreduce(union)`; `gather`; agent **arbitrate**; `op_arbitrate`; `bcast` | the term census with disagreements *lifted*; the root settles every conflict once; the agenda, contested terms first |
-| 4 | `put`, `barrier`, `compare_and_swap`, agent **research**, `win_fence` | each term claimed by exactly one rank and researched on the web; the epoch closes with its writes visible |
+| 4 | `put`, `compare_and_swap`, agent **research**, `win_fence` | each term claimed by exactly one rank and researched on the web; the epoch closes with its writes visible |
 | 5 | `allreduce(union)`, `bcast` | the binding glossary — an invariant: this reduction must lift nothing |
-| 6 | `exscan(sum)`, `barrier` | each rank's offset in the book, in log p rounds |
+| 6 | `exscan(sum)` | each rank's offset in the book, in log p rounds |
 | 7 | agent **translate**, `put`; `detect_failures` + `compare_and_swap` | one page per task under the glossary; pages of a convicted rank are claimed and translated by survivors |
 | 8 | `win_fence`, `cart_shift`, `get`, agent **review**, `win_fence`, agent **revise** | a review ring: each rank reviews its right neighbour's pages; authors revise their own |
 | 9 | `neighbor_allgather`, agent **seam** | boundary sentences exchanged on the ring; each rank revises only its own edges |
@@ -48,9 +48,9 @@ Failure semantics worth stating: an executor's death is a rank's death. A task
 nobody claims within the claim window makes the harness kill its own rank
 (`AMPI_ERR_NO_WORKER` → `kill`), so its peers drop it at their next collective
 rather than waiting out a phase timeout, and its pages are stolen. A machine that
-dies outright loses its lease; the executor's once-a-minute keepalive keeps a
-short lease alive across long steps instead of extending a long one once, so
-conviction takes minutes, not a step's worth of lease.
+dies outright loses its lease; the executor's periodic keepalive keeps the lease
+alive across long steps instead of extending it once per step, so conviction
+takes a bounded time rather than a step's worth of lease.
 
 ## Two devices per machine
 
@@ -63,10 +63,10 @@ the shared trace with their original timestamps, so the analysis sees the work
 spans in the one log that survives the machine.
 
 Three things were changed in the runtime to make the git transport bearable at
-64 writers, and each is a measurement: trace appends are deferred and folded into
-the next commit (they were half the commits on the branch); a blocked rank renews
-its lease every few minutes rather than every five seconds; and a reader whose fetches
-keep finding nothing backs off.
+64 writers, and each is a measurement: trace appends and payload bodies are deferred and
+folded into the device's next commit (they were half the commits on the branch);
+a rank renews its lease every ten minutes against a thirty-minute lease rather
+than every five seconds; and a reader whose fetches keep finding nothing backs off.
 
 ## Running the series
 
@@ -100,11 +100,37 @@ python experiments/e6_book/rank.py local --name e6-claude-p2 --size 2 --executor
     --pages 13-16                                         # real agents, four pages
 ```
 
-## The corpus
+## The corpus, and why it is not the Durov book
 
-Cloned from the legacy repository at run time into `work/e6/legacy` (untracked)
-and never vendored here; `runs/<name>/corpus_manifest.json` carries per-page
-digests so two runs can be shown to have cut the same book. The unit of work is
-the page because the deliverable is per page; pages are assigned as contiguous
-segments balanced by character count, which is what gives the seam exchange
-something to reconcile.
+The harness was written against the legacy project's corpus, N. V. Kononov's
+*Код Дурова* (2013), and `--corpus durov` still runs it: the legacy page
+extraction is cloned at run time, its glossary seeds the survey, and the output
+is its page schema. The production series did **not** run on it. In the
+real-agent smoke test the translate executor declined the page, in its own
+words, because it was being asked for a verbatim sentence-by-sentence rendering
+of an in-copyright book as one of a hundred pages being translated in parallel,
+which is a full derivative work rather than a quotation. A retry produced the
+page, so the refusal is not a hard rule, but driving ninety-eight pages of an
+in-copyright book through executors that object to exactly that is not
+something this harness will do, and its prompts were not reworded to get past
+the objection. A rights holder can run the series unchanged.
+
+The series runs instead on Ilf and Petrov's *Двенадцать стульев* (1928),
+Part One, from Russian Wikisource (`--corpus chairs`, the default). Both authors
+died before 1943 and the book was published in 1928, so it is in the public
+domain everywhere the series is read. It is the right substitute for the
+question: NEP-era institutions and acronyms, church and pre-revolutionary
+vocabulary, Odessa and Moscow slang, parodied newspaper prose, verse, and
+allusions a reader of 1928 caught without help. Rendering it well is a
+comparative literary and historical problem, which is what makes the
+terminology coupling between pages real, and it is famously difficult to
+translate, which is what makes the research window earn its keep.
+
+The forty chapters are fetched as raw wikitext, cached under `work/e6/chairs`
+(untracked), converted to paragraphs, and the first twenty-one chapters are cut
+into 93 pages of about 3,000 characters at paragraph boundaries, matching the
+Durov extraction's page size so that a task costs the same on either corpus.
+`runs/<name>/corpus_manifest.json` carries per-page digests and a digest of the
+fetched wikitext, so two runs can be shown to have cut the same text. Pages are
+assigned as contiguous segments balanced by character count, which is what
+gives the seam exchange something to reconcile.

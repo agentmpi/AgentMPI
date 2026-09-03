@@ -100,12 +100,16 @@ class GitDevice(Device):
         self._last_fetch = 0.0
         self._idle_fetches = 0
         self._pending: list[tuple[str, dict[str, Any]]] = []
+        self._pending_objects: dict[str, str] = {}
         self._pending_since: float | None = None
         #: A blocked rank renews its lease this often.  Five seconds is right for
         #: a local database and ruinous for a transport whose write is a network
-        #: round trip serialised across the population; a minute renews a
-        #: five-minute lease five times over.
-        self.touch_interval_s = float(os.environ.get(ENV_TOUCH_INTERVAL, "150"))
+        #: round trip serialised across the population: at sixty-four ranks the
+        #: renewals alone would consume the branch's whole acceptance rate.  Ten
+        #: minutes against a thirty-minute lease means a machine that dies is
+        #: convicted in half an hour, which is the price of liveness on a
+        #: transport where liveness costs what a collective step costs.
+        self.touch_interval_s = float(os.environ.get(ENV_TOUCH_INTERVAL, "600"))
         self.max_read_interval = float(os.environ.get(ENV_MAX_READ_INTERVAL, "10"))
         self._tlock = threading.RLock()
         self._depth = 0
@@ -194,13 +198,14 @@ class GitDevice(Device):
 
     def close(self) -> None:
         with self._locked():
-            if self._pending:
+            if self._pending or self._pending_objects:
                 self.flush()
 
     def wipe(self) -> None:
         with self._locked():
             if not (self.root / ".git").exists():
                 self.initialize()
+            self._pending, self._pending_objects, self._pending_since = [], {}, None
             self._sync()
             self._write_state(_empty_state())
             for p in self.root.iterdir():
@@ -277,8 +282,10 @@ class GitDevice(Device):
             for attempt in range(self._max_retries):
                 state = self._sync()
                 pending = list(self._pending)
+                pending_objects = dict(self._pending_objects)
                 for stream, rec in pending:
                     self._append_to(state, stream, rec)
+                state["obj"].update(pending_objects)
                 result = fn(state)
                 self._write_state(state)
                 self._git("add", "-A")
@@ -291,9 +298,12 @@ class GitDevice(Device):
                                    cwd=str(self.root), capture_output=True, text=True)
                 if r.returncode == 0:
                     self.pushes += 1
-                    if pending:
+                    if pending or pending_objects:
                         self._pending = self._pending[len(pending):]
-                        self._pending_since = time.time() if self._pending else None
+                        for k in pending_objects:
+                            self._pending_objects.pop(k, None)
+                        self._pending_since = (
+                            time.time() if (self._pending or self._pending_objects) else None)
                     return result
                 self.rejections += 1
                 # Lost the race: somebody else's commit landed first.  The winner's
@@ -301,7 +311,7 @@ class GitDevice(Device):
                 # loses again; spread the losers over a window that grows with the
                 # number of consecutive defeats, which is a proxy for how many
                 # writers are contending.
-                time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 10)))
+                time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 20)))
             raise RuntimeError(f"git device: push of {label!r} rejected {self._max_retries} times")
 
     # -- deferred trace appends ------------------------------------------------
@@ -317,7 +327,9 @@ class GitDevice(Device):
     def _drain_pending(self, state: dict[str, Any]) -> None:
         for stream, rec in self._pending:
             self._append_to(state, stream, rec)
+        state["obj"].update(self._pending_objects)
         self._pending = []
+        self._pending_objects = {}
         self._pending_since = None
 
     def _append_to(self, state: dict[str, Any], stream: str, record: dict[str, Any]) -> int:
@@ -332,16 +344,16 @@ class GitDevice(Device):
         return seq
 
     def flush(self) -> int:
-        """Commit any buffered trace records now.  Returns how many were written."""
+        """Commit any buffered records now.  Returns how many were written."""
         with self._locked():
-            n = len(self._pending)
+            n = len(self._pending) + len(self._pending_objects)
             if not n:
                 return 0
             self._mutate(lambda state: None, "flush events")
             return n
 
     def _maybe_flush(self) -> None:
-        if self._pending and self._pending_since is not None and \
+        if (self._pending or self._pending_objects) and self._pending_since is not None and \
                 time.time() - self._pending_since > self.FLUSH_AFTER_S:
             self.flush()
 
@@ -510,12 +522,23 @@ class GitDevice(Device):
 
     # -- object store --------------------------------------------------------
     def put_object(self, digest: str, body: str) -> None:
-        def fn(state: dict[str, Any]) -> None:
-            state["obj"][digest] = body
-        self._mutate(fn, f"put {digest[:12]}")
+        """Store a payload body, deferred to the next commit.
+
+        A body is content-addressed and unreachable until a record names its
+        handle, and the record that names it is the caller's very next mutation
+        (a collective join, a window write), so folding the body into that
+        commit costs nothing and halves the round trips of every collective.
+        A local read of a pending body is served from the buffer.
+        """
+        with self._locked():
+            self._pending_objects[digest] = body
+            if self._pending_since is None:
+                self._pending_since = time.time()
 
     def get_object(self, digest: str) -> str | None:
         with self._locked():
+            if digest in self._pending_objects:
+                return self._pending_objects[digest]
             state = self._sync(fresh=False)
         return state["obj"].get(digest)
 

@@ -15,13 +15,12 @@ test of:
                gather                   term metadata to the root, by handle
                agent: arbitrate         the root settles every lifted conflict, once
                op_arbitrate + bcast     the settled census and the research agenda
-    4          put + barrier            the agenda's claim cells
+    4          put                      the agenda's claim cells, ordered by the bcast
                compare_and_swap         each term researched by exactly one rank
                agent: research          web-grounded, one term per task
                win_fence                the research epoch closes: writes visible
     5          allreduce(union) + bcast the binding glossary (an invariant: no conflicts)
     6          exscan(sum)              each rank's offset in the book
-               barrier                  ready to translate
     7          agent: translate         one page per task, under the glossary
                put                      the draft, into the shared window
                failure detection +      pages of a convicted rank are claimed by
@@ -99,6 +98,7 @@ class Config:
 
     name: str
     size: int
+    corpus: str = "chairs"
     languages: list[str] = field(default_factory=lambda: ["en", "zh", "ja"])
     arm: str = "full"
     phase_timeout_s: float = 10800.0
@@ -107,7 +107,7 @@ class Config:
     #: Seconds a published task may sit unclaimed before the rank concludes its
     #: executor is gone and fails itself.
     claim_wait_s: float = 1200.0
-    lease_s: float = 600.0
+    lease_s: float = 1800.0
     quorum: float = 1.0
     barrier_policy: str = "proceed"
     research_cap: int = 48
@@ -174,9 +174,8 @@ class BookHarness:
         p = self.corpus.pages[n]
         title = p.chapter_title
         if registry:
-            first = next((f for f, last, ch, _t, _k in corpus_mod.CHAPTERS if f <= n <= last), None)
-            found = (registry.get("chapter_titles") or {}).get(str(first))
-            if found:
+            found = (registry.get("chapter_titles") or {}).get(str(p.chapter_first_page))
+            if found and found not in title:
                 title = f"{found} ({p.chapter_title.split('(')[-1].rstrip(')')})" \
                     if "(" in p.chapter_title else found
         return {"page": n, "chapter": p.chapter, "chapter_title": title,
@@ -194,12 +193,12 @@ class BookHarness:
 
     def commission(self) -> dict[str, Any]:
         return {
-            "book": corpus_mod.TITLE, "author": corpus_mod.AUTHOR,
+            "corpus": self.corpus.source,
+            "book": self.corpus.title, "author": self.corpus.author,
             "languages": self.cfg.languages, "arm": self.cfg.arm,
             "segments": [list(s) for s in self.corpus.segments],
             "digests": {str(n): p.digest for n, p in self.corpus.pages.items()},
-            "source_commit": self.corpus.legacy_commit,
-            "chapters": [list(c) for c in corpus_mod.CHAPTERS],
+            "source_commit": self.corpus.origin_commit,
             "rules": ["the binding glossary overrides local preference",
                       "translate every sentence; never summarise",
                       "one JSON file per page in the legacy schema"],
@@ -372,7 +371,8 @@ class BookHarness:
             result = self.invoke(
                 amp, rank, f"translate:{n}",
                 translate_prompt(rank, page, L, glossary, conventions,
-                                 self.context(n, before=True), self.context(n, before=False)),
+                                 self.context(n, before=True), self.context(n, before=False),
+                                 self.corpus.brief),
                 contract, meta={"page": n},
                 validate=lambda r: validate_page(r, page, L),
             )
@@ -444,9 +444,9 @@ class BookHarness:
         else:
             commission = amp.bcast("commission", root=0, timeout=T, materialize=True)["body"]
         segments: list[list[int]] = [list(s) for s in commission["segments"]]
-        if commission.get("source_commit") and self.corpus.legacy_commit and \
-                commission["source_commit"] != self.corpus.legacy_commit:
-            amp.trace("corpus.mismatch", rank=rank, mine=self.corpus.legacy_commit,
+        if commission.get("source_commit") and self.corpus.origin_commit and \
+                commission["source_commit"] != self.corpus.origin_commit:
+            amp.trace("corpus.mismatch", rank=rank, mine=self.corpus.origin_commit,
                       root=commission["source_commit"])
 
         # -- 1. scatter the segments ------------------------------------------
@@ -465,7 +465,7 @@ class BookHarness:
             survey = self.invoke(
                 amp, rank, "survey",
                 survey_prompt(rank, [self.page_payload(n) for n in my_pages], L,
-                              self.corpus.seed_glossary),
+                              self.corpus.seed_glossary, self.corpus.brief),
                 SURVEY_CONTRACT, meta={"pages": my_pages},
             )
         except TaskFailed as exc:
@@ -508,7 +508,7 @@ class BookHarness:
                     rulings: dict[str, Any] = {}
                     try:
                         arb = self.invoke(amp, 0, "arbitrate:census",
-                                          arbitrate_prompt(capped, meta_all, L),
+                                          arbitrate_prompt(capped, meta_all, L, self.corpus.brief),
                                           ARBITRATE_CONTRACT, meta={"conflicts": capped})
                         rulings = {k: v for k, v in (arb.get("rulings") or {}).items()
                                    if k in conflicts and isinstance(v, dict)}
@@ -524,6 +524,12 @@ class BookHarness:
                     settled = census.get("value", {}) or {}
                 settled = {k: v for k, v in settled.items() if not k.startswith("__")}
                 agenda = self.agenda(meta_all, settled, conflicts)
+                # The claim cells are posted before the agenda is broadcast, so
+                # the broadcast itself orders them: no rank can learn of an item
+                # before its cell exists, and no barrier is needed to say so.
+                if cfg.arm != "noresearch":
+                    for item in agenda:
+                        amp.put(RESEARCH_WIN, f"claim/{item['key']}", "unclaimed")
                 amp.bcast("agenda", payload={"agenda": agenda, "settled": settled},
                           root=0, timeout=T)
             else:
@@ -535,10 +541,6 @@ class BookHarness:
             findings: dict[str, Any] = {}
             if cfg.arm != "noresearch" and agenda:
                 amp.memo("phase", "research")
-                if rank == 0:
-                    for item in agenda:
-                        amp.put(RESEARCH_WIN, f"claim/{item['key']}", "unclaimed")
-                amp.barrier("agenda-posted", quorum=q, timeout=T, policy=pol)
                 live = max(1, len(amp.live_ranks()))
                 budget = cfg.research_budget or (math.ceil(len(agenda) / live) + 1)
                 done = 0
@@ -553,7 +555,8 @@ class BookHarness:
                         continue
                     try:
                         finding = self.invoke(amp, rank, f"research:{item['key']}",
-                                              research_prompt(rank, item, L), RESEARCH_CONTRACT,
+                                              research_prompt(rank, item, L, self.corpus.brief),
+                                              RESEARCH_CONTRACT,
                                               meta={"term": item["term"]})
                     except TaskFailed as exc:
                         amp.put(RESEARCH_WIN, f"finding/{item['key']}",
@@ -603,7 +606,6 @@ class BookHarness:
         chars = sum(self.corpus.pages[n].chars for n in my_pages)
         offset = amp.exscan("offsets", payload=chars, op="sum", quorum=q, timeout=T)
         report["offset"] = offset.get("value", 0)
-        amp.barrier("ready-to-translate", quorum=q, timeout=T, policy=pol)
 
         # -- 7. translate -----------------------------------------------------------
         amp.memo("phase", "translate")
@@ -637,7 +639,8 @@ class BookHarness:
                     try:
                         review = self.invoke(
                             amp, rank, f"review:{n}",
-                            review_prompt(rank, self.page_payload(n, registry), draft, L, glossary),
+                            review_prompt(rank, self.page_payload(n, registry), draft, L, glossary,
+                                          self.corpus.brief),
                             {**REVIEW_CONTRACT, "expect": {"page": str(n)}}, meta={"page": n},
                         )
                     except TaskFailed as exc:

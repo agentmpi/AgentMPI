@@ -107,13 +107,13 @@ def cmd_create(a: argparse.Namespace) -> dict[str, Any]:
     from ampi.runtime import Ampi
 
     cfg = _config(a)
-    corpus = corpus_mod.build(WORK, cfg.size, legacy_dir=a.legacy_dir, pages=cfg.pages)
+    corpus = corpus_mod.build(WORK, cfg.size, corpus=cfg.corpus, legacy_dir=a.legacy_dir, pages=cfg.pages)
     root = _job_root(a)
     job = Ampi.create(
         str(root), cfg.size, device=a.device, force=True, join_deadline_s=a.join_deadline,
         ctx_budget=cfg.ctx_budget,
         meta={"experiment": "e6_book", "e6": cfg.to_dict(), "remote": a.remote,
-              "branch": os.environ.get("AMPI_GIT_BRANCH"), "source_commit": corpus.legacy_commit},
+              "branch": os.environ.get("AMPI_GIT_BRANCH"), "source_commit": corpus.origin_commit},
     )
     run_dir = RUNS / a.name
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -219,7 +219,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     cfg = Config.from_dict(meta.get("e6") or {"name": a.name, "size": amp.size})
     print(json.dumps({"joined": amp.manifest.job_id, "size": amp.size, "config": cfg.to_dict()}),
           flush=True)
-    corpus = corpus_mod.build(WORK, cfg.size, legacy_dir=a.legacy_dir, pages=cfg.pages)
+    corpus = corpus_mod.build(WORK, cfg.size, corpus=cfg.corpus, legacy_dir=a.legacy_dir, pages=cfg.pages)
 
     local_root = work / "local"
     broker_dir = work / "broker"
@@ -236,7 +236,8 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         executor = BrokerExecutor(
             local, campaign=a.name, work_dir=broker_dir, timeout_s=cfg.task_timeout_s,
             claim_ttl_s=cfg.claim_ttl_s, claim_wait_s=cfg.claim_wait_s, trace_to=amp,
-            keepalive=lambda: amp.heartbeat(extend=cfg.lease_s), keepalive_every_s=a.keepalive,
+            keepalive=lambda: amp.heartbeat(extend=cfg.lease_s),
+            keepalive_every_s=a.keepalive or cfg.lease_s / 3,
         )
         executor.open()
     elif a.executor == "claude":
@@ -283,7 +284,7 @@ def cmd_local(a: argparse.Namespace) -> dict[str, Any]:
     run_dir = RUNS / a.name
     for d in (work, run_dir):
         d.mkdir(parents=True, exist_ok=True)
-    corpus = corpus_mod.build(WORK, cfg.size, legacy_dir=a.legacy_dir, pages=cfg.pages)
+    corpus = corpus_mod.build(WORK, cfg.size, corpus=cfg.corpus, legacy_dir=a.legacy_dir, pages=cfg.pages)
     corpus_mod.write_manifest(corpus, run_dir / "corpus_manifest.json")
     h = Harness(root=str(work / "job"), size=cfg.size, device=a.device, ctx_budget=cfg.ctx_budget,
                 force=True, meta={"experiment": "e6_book", "e6": cfg.to_dict(), "executor": a.executor})
@@ -442,7 +443,7 @@ def cmd_collect(a: argparse.Namespace) -> dict[str, Any]:
     cfg = Config.from_dict((manifest.get("meta") or {}).get("e6") or {"name": a.name, "size": 0})
     corpus = None
     try:
-        corpus = corpus_mod.build(WORK, cfg.size, legacy_dir=a.legacy_dir, pages=cfg.pages) if cfg.size else None
+        corpus = corpus_mod.build(WORK, cfg.size, corpus=cfg.corpus, legacy_dir=a.legacy_dir, pages=cfg.pages) if cfg.size else None
     except Exception as exc:  # noqa: BLE001 - the corpus is not needed for the evidence
         print(json.dumps({"corpus_unavailable": str(exc)}), flush=True)
     pages_cells = cells_of("/pages")
@@ -512,6 +513,8 @@ def cmd_collect(a: argparse.Namespace) -> dict[str, Any]:
 
 
 def _config_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--corpus", default=None, choices=sorted(corpus_mod.SOURCES),
+                   help="which book; default chairs (Ilf and Petrov, public domain)")
     p.add_argument("--languages", default=None, help="comma-separated; default en,zh,ja")
     p.add_argument("--arm", default=None,
                    choices=["full", "noglossary", "noresearch", "noreview", "noseams"])
@@ -568,7 +571,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--executor", default="broker", choices=["broker", "claude", "stub"])
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
-    p.add_argument("--keepalive", type=float, default=60.0)
+    p.add_argument("--keepalive", type=float, default=0.0,
+                   help="seconds between lease renewals while an executor works; default lease/3")
     p.add_argument("--stub-latency", type=float, default=0.0)
     p.add_argument("--legacy-dir", default=None)
     _git_args(p)

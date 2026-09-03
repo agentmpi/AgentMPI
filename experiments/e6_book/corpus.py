@@ -1,28 +1,39 @@
-"""The E6 corpus: the legacy project's page extraction, partitioned by rank.
+"""The E6 corpora: a book, partitioned by page and by rank.
 
-The source is N. V. Kononov, *Код Дурова* (Mann, Ivanov & Ferber, 2013), by way
-of the page-level text extraction that the legacy translation project this
-experiment replaces published in its repository.  It is the right corpus for the
-question: rendering it is a comparative literary and historical problem rather
-than a lexical one --- period slang, institutional names, internet-culture
-allusions, a preface full of metaphors --- so the terminology coupling between
-segments is real, and that coupling is exactly what the reductions and the
-shared-research window exist to manage.
+Two sources, selected by ``Config.corpus``:
 
-The text is never vendored here.  Each machine clones the legacy repository at
-run time (a git read is the one network operation every sandbox can perform)
-into an untracked working directory; what this repository carries is a
-*manifest* --- per page a chapter, a character and token count, and a digest of
-the exact bytes a rank was given --- which is enough to check that two runs at
-different scales cut the same book and that every rank translated what it was
-handed.
+``chairs``  Ilf and Petrov, *Двенадцать стульев* (1928), Part One (chapters
+            I–XXI), from Russian Wikisource.  The production series runs on
+            this.  It is in the public domain (both authors died before 1943;
+            first published 1928), and it is exactly as hard as the task needs:
+            NEP-era institutions and acronyms, Odessa and Moscow slang, a
+            narrator's deadpan irony, jokes that turn on 1920s Soviet realia
+            and on pre-revolutionary ones, verse, and allusions a Russian
+            reader of 1928 caught without help.  Rendering it is a comparative
+            literary and historical problem, which is what makes the
+            terminology coupling between pages real rather than contrived.
+``durov``   N. V. Kononov, *Код Дурова* (2013), by way of the page extraction
+            in the legacy translation project this experiment replaces.  The
+            harness was written against it and stays compatible with it, so a
+            rights holder can run the same series on it.  The series was not
+            run on it here: when asked for a sentence-by-sentence rendering of
+            a page as one of a hundred being translated in parallel, the
+            executors declined to reproduce an in-copyright book in full, and
+            that judgement was not engineered around.  See the README.
 
-The unit of work is the **page**, because that is the unit of the deliverable:
-the legacy project's output schema is one JSON file per page, sentence-aligned
-across four languages, which its PDF compiler consumes.  Pages are assigned to
-ranks as *contiguous* segments, not strided: the difficulty of literary text is
-local (a scene, an argument, a run of dialogue), and contiguity is what gives the
-seam exchange something to reconcile.
+Neither text is vendored.  Each machine fetches its corpus at run time into an
+untracked working directory (a git clone for ``durov``; forty raw-wikitext
+requests for ``chairs``, cached), and what the repository carries is a
+*manifest*: per page a chapter, a character and token count, and a digest of
+the exact bytes a rank was given, which is enough to show two runs cut the
+same book and that every rank translated what it was handed.
+
+The unit of work is the **page**, because that is the unit of the legacy
+deliverable: one JSON file per page, sentence-aligned across four languages,
+which its PDF compiler consumes.  Pages are assigned to ranks as *contiguous*
+segments balanced by character count, not strided: the difficulty of literary
+text is local, and contiguity is what gives the seam exchange something to
+reconcile.
 """
 
 from __future__ import annotations
@@ -32,6 +43,9 @@ import json
 import os
 import re
 import subprocess
+import time
+import urllib.parse
+import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,21 +53,95 @@ from typing import Any
 from ampi.tokens import count_tokens
 
 __all__ = [
-    "LEGACY_REPO", "Page", "Corpus", "ensure_legacy", "load_pages", "partition",
-    "seed_glossary", "build", "manifest", "write_manifest",
+    "LEGACY_REPO", "SOURCES", "Page", "Corpus", "ensure_legacy", "load_pages", "partition",
+    "seed_glossary", "build", "manifest", "write_manifest", "parse_pages", "clean", "wikitext_to_text",
 ]
 
 LEGACY_REPO = "https://github.com/XinShuo-ph/durov_code_translation_multi_agent"
 ENV_LEGACY_DIR = "E6_LEGACY_DIR"
 N_PAGES = 99
-TITLE = "Код Дурова. Реальная история «ВКонтакте» и ее создателя"
-AUTHOR = "Николай В. Кононов"
+WIKISOURCE = "https://ru.wikisource.org/w/index.php"
+CHAIRS_TITLE = "Двенадцать стульев (Ильф и Петров)"
+CHAIRS_CHAPTERS = 21  # Part One, «Старгородский лев»
+#: Target page size for a source that has no pages of its own.  The Durov
+#: extraction averages 3.3k characters per page, and matching it keeps the two
+#: corpora comparable per task.
+PAGE_CHARS = 3300
 
-#: (first page, last page, chapter number, working title, page type).  The
-#: chapter numbers and ranges come from the legacy project's STATE.md; the titles
-#: of chapters 2-7 are not in that file, so the survey phase reports the titles
-#: it finds at chapter openings and the population registers them under a lock.
-CHAPTERS: tuple[tuple[int, int, int, str, str], ...] = (
+ROMAN = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII", "XIII", "XIV",
+         "XV", "XVI", "XVII", "XVIII", "XIX", "XX", "XXI", "XXII", "XXIII", "XXIV", "XXV", "XXVI",
+         "XXVII", "XXVIII", "XXIX", "XXX", "XXXI", "XXXII", "XXXIII", "XXXIV", "XXXV", "XXXVI",
+         "XXXVII", "XXXVIII", "XXXIX", "XL"]
+
+SOURCES: dict[str, dict[str, Any]] = {
+    "chairs": {
+        "title": "Двенадцать стульев",
+        "author": "Илья Ильф и Евгений Петров",
+        "year": 1928,
+        "rights": "public domain (authors died 1937 and 1942; first published 1928); "
+                  "text from Russian Wikisource, licence PD-old-70",
+        "source": f"{WIKISOURCE}?title={urllib.parse.quote(CHAIRS_TITLE.replace(' ', '_'))}",
+        "brief": """\
+## The book
+
+*Двенадцать стульев* (Ilf and Petrov, 1928) is a satirical novel of the NEP
+years: a former marshal of the nobility and a young con man chase twelve
+dining-room chairs, one of which has a fortune in jewels sewn into its seat,
+across provincial Russia and Moscow. It is written in a deadpan comic
+narration dense with 1920s Soviet institutions and acronyms, church and
+pre-revolutionary vocabulary that the characters half-remember, Odessa and
+Moscow slang, bureaucratic jargon, parodies of newspaper prose, songs and
+verse, and allusions to Pushkin, Gogol, the Bible and the popular culture of
+the day that a Russian reader of 1928 caught without help. Its phrases became
+proverbs; a translator must decide which jokes can be carried and which need
+a note.
+
+## The reader, and what the translation is for
+
+A multilingual edition: every Russian sentence followed by its English, Chinese
+and Japanese renderings, read side by side. The reader is a bilingual or
+trilingual technical reader — a graduate student in the sciences who programs
+and is curious about Russian culture — not a specialist in Russia. Cultural
+references must therefore *carry over*: a Soviet institution, a NEP-era job, a
+pre-revolutionary rank, a Petersburg or Odessa turn of phrase each needs a
+rendering the target reader understands without a footnote, and a short
+translator's note only where no rendering can do that.
+
+The narrators' voice is dry, precise, mock-solemn, and very funny. Keep it.
+""",
+    },
+    "durov": {
+        "title": "Код Дурова. Реальная история «ВКонтакте» и ее создателя",
+        "author": "Николай В. Кононов",
+        "year": 2013,
+        "rights": "in copyright; cloned from the legacy project at run time, not vendored",
+        "source": LEGACY_REPO,
+        "brief": """\
+## The book
+
+*Код Дурова* (Nikolai Kononov, 2013) is a reported biography of Pavel Durov and
+the early history of VKontakte: non-fiction, close to its subjects, wry, dense
+with St Petersburg detail, 2000s Russian internet culture, university and
+start-up slang, and metaphors a Russian reader of 2013 caught without help.
+
+## The reader, and what the translation is for
+
+A multilingual edition: every Russian sentence followed by its English, Chinese
+and Japanese renderings, read side by side. The reader is a bilingual or
+trilingual technical reader — a graduate student in the sciences who programs,
+uses Telegram, and is curious about Durov's worldview — not a specialist in
+Russia. Cultural references must therefore *carry over*: a Soviet-era housing
+term, a Petersburg district, a Russian academic institution, a piece of net
+slang each needs a rendering the target reader understands without a footnote,
+and a short translator's note only where no rendering can do that.
+
+Durov's voice is sharp, direct, provocative, precise about code. Keep it.
+""",
+    },
+}
+
+#: The Durov extraction's chapter ranges, from the legacy project's STATE.md.
+DUROV_CHAPTERS: tuple[tuple[int, int, int, str, str], ...] = (
     (1, 4, 0, "Титульный лист и содержание (Front matter)", "front_matter"),
     (5, 6, 0, "Предисловие (Preface)", "narrative"),
     (7, 12, 0, "Пролог (Prologue)", "narrative"),
@@ -67,9 +155,8 @@ CHAPTERS: tuple[tuple[int, int, int, str, str], ...] = (
     (99, 99, 8, "Об авторе (About the author)", "about_author"),
 )
 
-#: The running header the extraction repeats on every page.  Left in, ninety-nine
-#: ranks would each propose a rendering for the book's own title and manufacture
-#: a terminology conflict that is an artefact of the PDF.
+#: The running header the Durov extraction repeats on every page.  Left in,
+#: ninety-nine ranks would each propose a rendering for the book's own title.
 _HEADER = re.compile(r"^\s*Н\.\s*В\.\s*Кононов\.\s*«Код Дурова.*$", re.M)
 
 
@@ -80,6 +167,9 @@ class Page:
     chapter: int
     chapter_title: str
     page_type: str
+    #: The first page of the page's chapter, which is where the survey reports a
+    #: chapter title it found and where the registry keys it.
+    chapter_first_page: int = 0
 
     @property
     def chars(self) -> int:
@@ -96,18 +186,31 @@ class Page:
     def metadata(self) -> dict[str, Any]:
         """Everything about the page except the page."""
         return {"page": self.n, "chapter": self.chapter, "chapter_title": self.chapter_title,
-                "page_type": self.page_type, "chars": self.chars, "tokens": self.tokens,
-                "sha256_16": self.digest}
+                "chapter_first_page": self.chapter_first_page, "page_type": self.page_type,
+                "chars": self.chars, "tokens": self.tokens, "sha256_16": self.digest}
 
 
 @dataclass
 class Corpus:
+    source: str
     pages: dict[int, Page]
     segments: list[list[int]]
     seed_glossary: dict[str, dict[str, str]]
     summaries: str
-    legacy_dir: str
-    legacy_commit: str
+    origin: str
+    origin_commit: str
+
+    @property
+    def title(self) -> str:
+        return SOURCES[self.source]["title"]
+
+    @property
+    def author(self) -> str:
+        return SOURCES[self.source]["author"]
+
+    @property
+    def brief(self) -> str:
+        return SOURCES[self.source]["brief"]
 
     @property
     def size(self) -> int:
@@ -123,25 +226,13 @@ class Corpus:
         raise KeyError(page)
 
 
-def chapter_of(n: int) -> tuple[int, str, str]:
-    for first, last, ch, title, kind in CHAPTERS:
-        if first <= n <= last:
-            return ch, title, kind
-    return 0, "", "narrative"
-
-
 # ---------------------------------------------------------------------------
-# Fetching and cleaning
+# Source: durov (the legacy extraction)
 # ---------------------------------------------------------------------------
 
 
 def ensure_legacy(work_dir: str | Path, legacy_dir: str | Path | None = None) -> Path:
-    """Return a checkout of the legacy repository, cloning it if necessary.
-
-    Cloned rather than fetched file by file: the sandboxes these ranks run in
-    admit git traffic to the hosting service and little else, and one shallow
-    clone is also simply faster than a hundred HTTP requests.
-    """
+    """Return a checkout of the legacy repository, cloning it if necessary."""
     candidate = legacy_dir or os.environ.get(ENV_LEGACY_DIR)
     if candidate:
         p = Path(candidate)
@@ -164,13 +255,7 @@ def legacy_commit(legacy: Path) -> str:
 
 
 def clean(raw: str) -> str:
-    """Strip the running header and restore paragraphs.
-
-    The extraction wraps at the PDF's line width and marks a paragraph's first
-    line with a deep indent, so a paragraph arrives as one indented line followed
-    by flush continuation lines.  Rejoining them gives the translator (and the
-    seam exchange) the unit they actually work in.
-    """
+    """Strip the Durov extraction's running header and restore paragraphs."""
     raw = _HEADER.sub("", raw)
     paras: list[str] = []
     for line in raw.splitlines():
@@ -189,7 +274,14 @@ def clean(raw: str) -> str:
     return text.strip()
 
 
-def load_pages(legacy: Path) -> dict[int, Page]:
+def _durov_chapter(n: int) -> tuple[int, str, str, int]:
+    for first, last, ch, title, kind in DUROV_CHAPTERS:
+        if first <= n <= last:
+            return ch, title, kind, first
+    return 0, "", "narrative", n
+
+
+def load_pages_durov(legacy: Path) -> dict[int, Page]:
     pages: dict[int, Page] = {}
     for n in range(1, N_PAGES + 1):
         f = legacy / "extracted" / "pages" / f"page_{n:03d}.txt"
@@ -197,73 +289,14 @@ def load_pages(legacy: Path) -> dict[int, Page]:
             continue
         text = clean(f.read_text(encoding="utf-8", errors="replace"))
         if len(text) < 40:
-            # Page 1 of the extraction is empty; a rank handed it would have
-            # nothing to translate and everything to distort in a load measure.
             continue
-        ch, title, kind = chapter_of(n)
-        pages[n] = Page(n, text, ch, title, kind)
+        ch, title, kind, first = _durov_chapter(n)
+        pages[n] = Page(n, text, ch, title, kind, first)
     return pages
 
 
-# ---------------------------------------------------------------------------
-# Partitioning
-# ---------------------------------------------------------------------------
-
-
-def partition(pages: dict[int, Page], size: int) -> list[list[int]]:
-    """Contiguous segments balanced by character count, one per rank.
-
-    Balanced by characters rather than by page count because pages are uneven
-    (a chapter's last page may be a third full) and the translation cost is in
-    the characters.  Contiguous because the seam exchange needs neighbours to be
-    neighbours in the book.  Every rank gets at least one page; a population
-    larger than the book is refused rather than padded with idle ranks.
-    """
-    order = sorted(pages)
-    if size > len(order):
-        raise ValueError(f"{size} ranks but only {len(order)} pages")
-    if size <= 0:
-        raise ValueError("size must be positive")
-    total = sum(pages[n].chars for n in order)
-    segments: list[list[int]] = []
-    i = 0
-    acc = 0
-    for r in range(size):
-        remaining_ranks = size - r
-        remaining_pages = len(order) - i
-        seg = [order[i]]
-        acc += pages[order[i]].chars
-        i += 1
-        target = (r + 1) * total / size
-        # Take pages while under target, but never so many that a later rank is
-        # left without one.
-        while i < len(order) and (len(order) - i) > (remaining_ranks - 1) \
-                and acc + pages[order[i]].chars / 2 < target:
-            seg.append(order[i])
-            acc += pages[order[i]].chars
-            i += 1
-        # The last rank takes whatever is left.
-        if r == size - 1:
-            while i < len(order):
-                seg.append(order[i])
-                i += 1
-        segments.append(seg)
-        del remaining_pages
-    return segments
-
-
-# ---------------------------------------------------------------------------
-# The legacy project's research, as seed material
-# ---------------------------------------------------------------------------
-
-
 def seed_glossary(legacy: Path) -> dict[str, dict[str, str]]:
-    """Parse the legacy glossary's markdown tables into ``term -> renderings``.
-
-    Seed material, not a binding glossary.  The population surveys the book
-    itself and decides; the seed is what a translator would have been handed on
-    day one, and the survey prompt says so.
-    """
+    """Parse the legacy glossary's markdown tables into ``term -> renderings``."""
     f = legacy / "research" / "glossary.md"
     if not f.exists():
         return {}
@@ -288,8 +321,166 @@ def chapter_summaries(legacy: Path, *, limit: int = 7000) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Building and describing a corpus
+# Source: chairs (Wikisource)
 # ---------------------------------------------------------------------------
+
+
+def fetch_chapters(work_dir: str | Path, *, chapters: int = CHAIRS_CHAPTERS) -> list[str]:
+    """Fetch the raw wikitext of the first ``chapters`` chapters, cached on disk."""
+    cache = Path(work_dir) / "chairs" / "raw"
+    cache.mkdir(parents=True, exist_ok=True)
+    out: list[str] = []
+    for i in range(1, chapters + 1):
+        f = cache / f"chapter_{i:02d}.wiki"
+        if not f.exists():
+            title = f"{CHAIRS_TITLE}/Глава {ROMAN[i - 1]}"
+            url = f"{WIKISOURCE}?title={urllib.parse.quote(title.replace(' ', '_'))}&action=raw"
+            req = urllib.request.Request(
+                url, headers={"User-Agent": "AgentMPI-E6/1.0 (research corpus fetch)"})
+            with urllib.request.urlopen(req, timeout=60) as fh:  # noqa: S310
+                f.write_bytes(fh.read())
+            time.sleep(0.3)
+        out.append(f.read_text(encoding="utf-8"))
+    return out
+
+
+_DROP_TEMPLATES = {"акут", "рамка2", "конец рамки2", "indent", "noindent", "heading",
+                   "block center/s", "block center/e", "multicol", "multicol-break",
+                   "multicol-end", "^", "отексте"}
+
+
+def _template(m: re.Match[str]) -> str:
+    inner = m.group(1)
+    parts = [p for p in inner.split("|")]
+    name = parts[0].strip().lower()
+    args = parts[1:]
+    if name in _DROP_TEMPLATES:
+        return ""
+    if name == "gap":
+        return " "
+    if name == "опечатка2":
+        return args[-1] if args else ""
+    if name == "так в тексте":
+        return args[0] if args else ""
+    if name == "poemx1":
+        return "\n" + "\n".join(a for a in args if "=" not in a[:20]) + "\n"
+    positional = [a for a in args if "=" not in a[:20]]
+    if not positional:
+        return ""
+    return max(positional, key=len)
+
+
+def wikitext_to_text(raw: str) -> tuple[str, str]:
+    """Wikitext to plain paragraphs.  Returns ``(chapter title, text)``."""
+    s = re.sub(r"^\{\{Отексте.*?\n\}\}\n", "", raw, flags=re.S)
+    s = re.sub(r"<!--.*?-->", "", s, flags=re.S)
+    s = re.sub(r"<noinclude>.*?</noinclude>", "", s, flags=re.S)
+    s = re.sub(r"<ref[^>]*>.*?</ref>", "", s, flags=re.S)
+    title_m = re.search(r"^=+\s*(.*?)\s*=+\s*$", s, flags=re.M)
+    title = re.sub(r"\s+", " ", title_m.group(1)).strip() if title_m else ""
+    s = re.sub(r"^=+.*?=+\s*$", "", s, flags=re.M)
+    for _ in range(8):
+        s2 = re.sub(r"\{\{([^{}]*)\}\}", _template, s)
+        if s2 == s:
+            break
+        s = s2
+    s = re.sub(r"\[\[[^\]|]*\|([^\]]*)\]\]", r"\1", s)
+    s = re.sub(r"\[\[([^\]]*)\]\]", r"\1", s)
+    # Wikitables (a theatre bill, a timetable) keep their cell text and lose
+    # their markup: table rows begin with |, !, |- or |} and tables with {|.
+    s = re.sub(r"^\{\|.*$|^\|\}\s*$|^\|-.*$", "", s, flags=re.M)
+    s = re.sub(r"^[|!]\s*(?:[^|]*\|(?!\|))?", "", s, flags=re.M)
+    s = re.sub(r"^[:;#*]+\s*", "", s, flags=re.M)  # list and indent markers
+    s = re.sub(r"<br\s*/?>", "\n", s)
+    s = re.sub(r"</?(center|small|i|b|poem|div|span|p)[^>]*>", "", s)
+    s = s.replace("'''", "").replace("''", "")
+    s = s.replace("\xa0", " ").replace("&nbsp;", " ")
+    paras: list[str] = []
+    for block in re.split(r"\n\s*\n", s):
+        lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in block.splitlines()]
+        lines = [ln for ln in lines if ln]
+        if not lines:
+            continue
+        # Verse keeps its line breaks; prose is one line per paragraph already.
+        paras.append("\n".join(lines) if len(lines) > 1 and all(len(ln) < 80 for ln in lines)
+                     else " ".join(lines))
+    return title, "\n\n".join(paras).strip()
+
+
+def _paginate(paras: list[str], target: int) -> list[str]:
+    """Greedy paragraph packing to about ``target`` characters per page."""
+    pages: list[str] = []
+    cur: list[str] = []
+    size = 0
+    for p in paras:
+        if cur and size + len(p) / 2 > target:
+            pages.append("\n\n".join(cur))
+            cur, size = [], 0
+        cur.append(p)
+        size += len(p)
+    if cur:
+        # A chapter's last few lines do not deserve a page of their own; a page
+        # that small would be a rank's whole assignment at p = 64.
+        if pages and size < target / 4:
+            pages[-1] = pages[-1] + "\n\n" + "\n\n".join(cur)
+        else:
+            pages.append("\n\n".join(cur))
+    return pages
+
+
+def load_pages_chairs(work_dir: str | Path, *, chapters: int = CHAIRS_CHAPTERS,
+                      page_chars: int = PAGE_CHARS) -> dict[int, Page]:
+    pages: dict[int, Page] = {}
+    n = 0
+    for i, raw in enumerate(fetch_chapters(work_dir, chapters=chapters), 1):
+        title, text = wikitext_to_text(raw)
+        paras = [p for p in text.split("\n\n") if p.strip()]
+        first = n + 1
+        for chunk in _paginate(paras, page_chars):
+            n += 1
+            pages[n] = Page(n, chunk, i, title or f"Глава {ROMAN[i - 1]}", "narrative", first)
+    return pages
+
+
+# ---------------------------------------------------------------------------
+# Partitioning
+# ---------------------------------------------------------------------------
+
+
+def partition(pages: dict[int, Page], size: int) -> list[list[int]]:
+    """Contiguous segments balanced by character count, one per rank.
+
+    Balanced by characters rather than by page count because pages are uneven
+    and the translation cost is in the characters; contiguous because the seam
+    exchange needs neighbours to be neighbours in the book.  Every rank gets at
+    least one page; a population larger than the book is refused.
+    """
+    order = sorted(pages)
+    if size > len(order):
+        raise ValueError(f"{size} ranks but only {len(order)} pages")
+    if size <= 0:
+        raise ValueError("size must be positive")
+    total = sum(pages[n].chars for n in order)
+    segments: list[list[int]] = []
+    i = 0
+    acc = 0
+    for r in range(size):
+        remaining_ranks = size - r
+        seg = [order[i]]
+        acc += pages[order[i]].chars
+        i += 1
+        target = (r + 1) * total / size
+        while i < len(order) and (len(order) - i) > (remaining_ranks - 1) \
+                and acc + pages[order[i]].chars / 2 < target:
+            seg.append(order[i])
+            acc += pages[order[i]].chars
+            i += 1
+        if r == size - 1:
+            while i < len(order):
+                seg.append(order[i])
+                i += 1
+        segments.append(seg)
+    return segments
 
 
 def parse_pages(spec: str | None) -> set[int] | None:
@@ -309,38 +500,53 @@ def parse_pages(spec: str | None) -> set[int] | None:
     return out
 
 
-def build(work_dir: str | Path, size: int, *, legacy_dir: str | Path | None = None,
-          pages: str | None = None) -> Corpus:
+# ---------------------------------------------------------------------------
+# Building and describing a corpus
+# ---------------------------------------------------------------------------
+
+
+def load_pages(work_dir: str | Path, corpus: str = "chairs", *,
+               legacy_dir: str | Path | None = None) -> tuple[dict[int, Page], dict[str, Any]]:
+    """Load a source's pages and the provenance to record beside them."""
+    if corpus == "durov":
+        legacy = ensure_legacy(work_dir, legacy_dir)
+        return load_pages_durov(legacy), {
+            "origin": str(legacy), "commit": legacy_commit(legacy),
+            "seed": seed_glossary(legacy), "summaries": chapter_summaries(legacy)}
+    if corpus == "chairs":
+        pages = load_pages_chairs(work_dir)
+        raw = Path(work_dir) / "chairs" / "raw"
+        digest = hashlib.sha256()
+        for f in sorted(raw.glob("chapter_*.wiki")):
+            digest.update(f.read_bytes())
+        return pages, {"origin": SOURCES["chairs"]["source"], "commit": digest.hexdigest()[:16],
+                       "seed": {}, "summaries": ""}
+    raise ValueError(f"unknown corpus {corpus!r}; choose from {sorted(SOURCES)}")
+
+
+def build(work_dir: str | Path, size: int, *, corpus: str = "chairs",
+          legacy_dir: str | Path | None = None, pages: str | None = None) -> Corpus:
     """Build the corpus.  ``pages`` restricts it to a subset, for smoke tests."""
-    legacy = ensure_legacy(work_dir, legacy_dir)
-    loaded = load_pages(legacy)
+    loaded, prov = load_pages(work_dir, corpus, legacy_dir=legacy_dir)
     keep = parse_pages(pages)
     if keep is not None:
         loaded = {n: p for n, p in loaded.items() if n in keep}
         if not loaded:
             raise ValueError(f"no pages match {pages!r}")
-    pages_ = loaded
-    return _build(pages_, size, legacy)
-
-
-def _build(pages: dict[int, Page], size: int, legacy: Path) -> Corpus:
     return Corpus(
-        pages=pages,
-        segments=partition(pages, size),
-        seed_glossary=seed_glossary(legacy),
-        summaries=chapter_summaries(legacy),
-        legacy_dir=str(legacy),
-        legacy_commit=legacy_commit(legacy),
+        source=corpus, pages=loaded, segments=partition(loaded, size),
+        seed_glossary=prov["seed"], summaries=prov["summaries"],
+        origin=prov["origin"], origin_commit=prov["commit"],
     )
 
 
 def manifest(corpus: Corpus) -> dict[str, Any]:
+    src = SOURCES[corpus.source]
     return {
-        "title": TITLE,
-        "author": AUTHOR,
-        "source": LEGACY_REPO,
-        "source_commit": corpus.legacy_commit,
-        "rights": "in copyright; cloned from the legacy project at run time, not vendored",
+        "corpus": corpus.source,
+        "title": src["title"], "author": src["author"], "year": src["year"],
+        "source": src["source"], "source_digest": corpus.origin_commit,
+        "rights": src["rights"],
         "n_pages": len(corpus.pages),
         "n_segments": corpus.size,
         "total_chars": sum(p.chars for p in corpus.pages.values()),
