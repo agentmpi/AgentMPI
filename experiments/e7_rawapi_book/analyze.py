@@ -123,7 +123,7 @@ def row_of(run: dict[str, Any]) -> dict[str, Any]:
         "tool_calls": int(m.get("total_tool_calls") or 0),
         "cost_usd": round(cost, 3),
         "paragraphs": int(book.get("paragraphs") or 0),
-        "coverage": float(book.get("coverage") or 0.0),
+        "coverage": float(book.get("coverage_of_book") or book.get("coverage") or 0.0),
         "seam_revised": int(book.get("seam_revised") or 0),
         "glossary_terms": int(ev.get("glossary_terms") or 0),
         "findings": int(ev.get("findings") or 0),

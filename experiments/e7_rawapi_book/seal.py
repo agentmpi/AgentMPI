@@ -60,6 +60,21 @@ def seal(name: str, *, work_dir: Path | None = None) -> dict[str, Any]:
     report = json.loads((run_dir / "report.json").read_text(encoding="utf-8")) \
         if (run_dir / "report.json").exists() else {}
     plan = json.loads((run_dir / "launch_plan.json").read_text(encoding="utf-8"))
+    # Coverage against the whole book, not against the segments that arrived: a
+    # rank that failed and was dropped leaves its segment out of the window, and
+    # the driver's count of assembled paragraphs does not see it.
+    manifest_p = run_dir / "corpus_manifest.json"
+    total_paragraphs = (json.loads(manifest_p.read_text(encoding="utf-8")).get("n_paragraphs")
+                        if manifest_p.exists() else None)
+    book = report.get("book") or {}
+    if total_paragraphs and book:
+        rendered = int(book.get("paragraphs", 0)) - int(book.get("missing", 0))
+        book["paragraphs_in_book"] = total_paragraphs
+        book["rendered"] = rendered
+        book["coverage_of_book"] = round(rendered / total_paragraphs, 4)
+        report["book"] = book
+        (run_dir / "report.json").write_text(json.dumps(report, indent=2, default=str),
+                                             encoding="utf-8")
     rank_reports = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(ranks_dir.glob("*.json"))]
     nodes = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(launch_dir.glob("*.json"))]
     machines = {n.get("node_identity", {}).get("boot_id") for n in nodes} - {None}
@@ -92,7 +107,8 @@ def seal(name: str, *, work_dir: Path | None = None) -> dict[str, Any]:
         f"| prompt / completion tokens | {metrics.get('total_prompt_tokens', 0):,} / {metrics.get('total_completion_tokens', 0):,} |",
         f"| tool calls | {metrics.get('total_tool_calls')} |",
         f"| spend | ${metrics.get('total_cost_usd', 0):.2f} |",
-        f"| coverage (paragraphs) | {100 * (report.get('book') or {}).get('coverage', 0):.1f}% of {(report.get('book') or {}).get('paragraphs')} |",
+        f"| coverage of the book | {100 * (report.get('book') or {}).get('coverage_of_book', (report.get('book') or {}).get('coverage', 0)):.1f}% "
+        f"({(report.get('book') or {}).get('rendered', '?')} of {(report.get('book') or {}).get('paragraphs_in_book', '?')} paragraphs) |",
         f"| glossary / findings / sources | {(report.get('evidence') or {}).get('glossary_terms')} / {(report.get('evidence') or {}).get('findings')} / {(report.get('evidence') or {}).get('sources_cited')} |",
         f"| amendments / clashes | {(report.get('evidence') or {}).get('amendments')} / {(report.get('evidence') or {}).get('amendment_clashes')} |",
         "",
