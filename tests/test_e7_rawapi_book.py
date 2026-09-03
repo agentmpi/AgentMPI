@@ -1,4 +1,4 @@
-"""E6: the paragraph partition, the harness helpers, and a whole stub run."""
+"""E7: the paragraph partition, the harness helpers, and a whole stub run."""
 
 from __future__ import annotations
 
@@ -7,8 +7,8 @@ from pathlib import Path
 
 import pytest
 
-from experiments.e6_book import corpus as c
-from experiments.e6_book import harness as h
+from experiments.e7_rawapi_book import corpus as c
+from experiments.e7_rawapi_book import harness as h
 
 PAGE = """\
 Н. В. Кононов. «Код Дурова. Реальная история «ВКонтакте» и ее создателя»

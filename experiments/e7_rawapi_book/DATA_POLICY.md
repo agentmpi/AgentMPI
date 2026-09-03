@@ -1,4 +1,4 @@
-# Data policy for E6
+# Data policy for E7
 
 The source is a commercial book in copyright: N. V. Kononov, *Код Дурова.
 Реальная история «ВКонтакте» и ее создателя* (Mann, Ivanov & Ferber, 2013,

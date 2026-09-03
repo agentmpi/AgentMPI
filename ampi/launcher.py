@@ -208,6 +208,15 @@ def launch(
 
     deadline = time.time() + timeout_s
     timed_out = False
+
+    # A terminated launcher must take its ranks with it.  Python's default
+    # SIGTERM disposition skips ``finally``, which orphaned sixteen rank
+    # processes --- each still calling a paid endpoint --- when a run was
+    # stopped by hand.
+    def _terminate(signum: int, _frame: Any) -> None:
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    previous = signal.signal(signal.SIGTERM, _terminate)
     try:
         while procs:
             for rank, p in list(procs.items()):
@@ -263,6 +272,7 @@ def launch(
             for fh in fhs:
                 fh.close()
         supervisor.close()
+        signal.signal(signal.SIGTERM, previous)
 
     record.update(
         finished_at=time.time(),

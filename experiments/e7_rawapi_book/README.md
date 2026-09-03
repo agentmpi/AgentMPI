@@ -1,11 +1,11 @@
-# E6: the production book translation on raw-API ranks, one node to many
+# E7: the production book translation on raw-API ranks, one node to many
 
-E6 is the experiment E3 designed and could not staff. Same task — render
+E7 is the experiment E3 designed and could not staff. Same task — render
 N. V. Kononov's *Код Дурова* (2013) into English, Chinese and Japanese as a
 comparative cultural job, not a lexical one — same nine collectives, for the
 same reasons. What changes is what a rank *is*.
 
-| | E3 | E6 |
+| | E3 | E7 |
 |---|---|---|
 | executor | an agent-host session, claimed through the broker | a process calling a chat-completions endpoint, with a tool loop |
 | executor supply | capped by the host (10 concurrent sessions) | the provider's rate limit |
@@ -19,25 +19,25 @@ same reasons. What changes is what a rank *is*.
 
 ```bash
 # a surrogate population, to debug the protocol before paying for one
-python -m experiments.e6_book.harness run --name e6-stub-p16 --size 16 --executor stub
+python -m experiments.e7_rawapi_book.harness run --name e7-stub-p16 --size 16 --executor stub
 
 # the real thing, on this machine, sixteen processes
 export OPENROUTER_API_KEY=...
-python -m experiments.e6_book.harness run --name e6-or-p16 --size 16 --executor model \
+python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p16 --size 16 --executor model \
     --model moonshotai/kimi-k3 --reasoning low --respawn 1
 
 # with a tenth of the executors dying in the translate phase
-python -m experiments.e6_book.harness run --name e6-or-p32-die --size 32 --executor model \
+python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p32-die --size 32 --executor model \
     --die-fraction 0.1 --die-phase translate --respawn 1
 
 # 256 ranks over eight machines: run this on each, with --node 0..7.  Node 0
 # creates the job; the others join it through the git device.
-python -m experiments.e6_book.harness run --name e6-or-p256 --size 256 --executor model \
+python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p256 --size 256 --executor model \
     --device git --remote https://github.com/agentmpi/AgentMPI --nodes 8 --node $K
 ```
 
 The driver writes `runs/<name>/config.json` and the partition, then runs
-`ampirun -np <size> -- python -m experiments.e6_book.harness rank --name <name>`.
+`ampirun -np <size> -- python -m experiments.e7_rawapi_book.harness rank --name <name>`.
 Every rank process reads the same config and the same partition, attaches to the
 job named in its environment (`AMPI_ROOT`, `AMPI_RANK`), and runs `rank_main`.
 `--launch threads` runs the same `rank_main` in one process, which is what the
@@ -80,5 +80,5 @@ holds a few paragraphs of the page the legacy project itself published as its
 example, for comparison; `analysis/` is `ampi analyze`'s output.
 
 The book — source, partition, per-call prompts and replies, per-rank drafts and
-the assembled translation in four files — lives under `work/e6/<name>/`, which
+the assembled translation in four files — lives under `work/e7/<name>/`, which
 is untracked. See `DATA_POLICY.md`.

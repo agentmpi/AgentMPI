@@ -1,4 +1,4 @@
-"""The E6 corpus: the same book as E3, cut at the paragraph so that p can reach 256.
+"""The E7 corpus: the same book as E3, cut at the paragraph so that p can reach 256.
 
 E3 partitioned the book by page and therefore could not run more ranks than there
 are prose pages (95).  This experiment asks how the protocol behaves as the
@@ -307,8 +307,8 @@ def dump_segments(corpus: Corpus, path: str | Path) -> Path:
 if __name__ == "__main__":
     import argparse
 
-    ap = argparse.ArgumentParser(description="cut the E6 corpus and describe the partition")
-    ap.add_argument("--work-dir", default="work/e6")
+    ap = argparse.ArgumentParser(description="cut the E7 corpus and describe the partition")
+    ap.add_argument("--work-dir", default="work/e7")
     ap.add_argument("--size", type=int, required=True)
     ap.add_argument("--out", default="")
     a = ap.parse_args()

@@ -1,11 +1,11 @@
-"""The five model prompts of E6, and the contracts their results must satisfy.
+"""The five model prompts of E7, and the contracts their results must satisfy.
 
 Checked in because they are the method.  As in E3, no prompt mentions a barrier,
 a reduction, a window, a lock, a neighbour exchange, or the existence of other
 ranks as parties to a protocol: the executor is told what artifact to produce and
 what shape it must have, and every coordination decision is made by the harness.
 
-E6 adds one prompt E3 did not have.  E3's root settled lifted conflicts with the
+E7 adds one prompt E3 did not have.  E3's root settled lifted conflicts with the
 runtime's default rule, which picks a candidate but exercises no judgement.  Here
 the root *asks the model*: arbitration is an agent-evaluated step, given every
 candidate the population proposed and asked to choose once for the whole book.

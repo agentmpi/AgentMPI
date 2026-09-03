@@ -1,8 +1,8 @@
-"""E6: the production book translation, on raw-API ranks, from one node to many.
+"""E7: the production book translation, on raw-API ranks, from one node to many.
 
 E3 wrote the protocol for this task and then could not staff it: its executors
 were agent-host sessions, the host capped them at ten, and every production run
-above p=16 spent its wall time waiting for an executor to exist.  E6 keeps E3's
+above p=16 spent its wall time waiting for an executor to exist.  E7 keeps E3's
 design --- the same nine collectives, for the same reasons --- and changes what a
 rank *is*: an operating-system process whose executor is a chat-completions call
 with a small tool loop (:mod:`ampi.model`), launched by ``ampirun``
@@ -91,7 +91,7 @@ from .prompts import (
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 RUNS = ROOT / "runs"
-WORK = ROOT / "work" / "e6"
+WORK = ROOT / "work" / "e7"
 
 RESEARCH_WIN = "research"
 BOOK_WIN = "book"
@@ -552,7 +552,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         report["contributors"] = got.get("contributors")
         report["manifest"] = [b["body"] for b in got.get("bodies", [])]
     phase("done")
-    amp.finalize(note="e6 done")
+    amp.finalize(note="e7 done")
     return report
 
 
@@ -940,7 +940,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         d.mkdir(parents=True, exist_ok=True)
     job_root = work_dir / "job"
     env = {"AMPI_TOOL_CACHE": str(WORK / "tool-cache")}
-    if cfg.device == "git":
+    if cfg.device in ("git", "gitd"):
         env["AMPI_GIT_BRANCH"] = cfg.branch or f"ampi-jobs/{cfg.name}"
         if cfg.remote:
             env["AMPI_GIT_REMOTE"] = cfg.remote
@@ -953,7 +953,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         cfg.save(run_dir / "config.json")
         corpus_mod.write_manifest(corpus, run_dir / "corpus_manifest.json")
         (run_dir / "launch_plan.json").write_text(json.dumps({
-            "experiment": "e6_book", "name": cfg.name, "size": cfg.size, "nodes": cfg.nodes,
+            "experiment": "e7_rawapi_book", "name": cfg.name, "size": cfg.size, "nodes": cfg.nodes,
             "launch": a.launch, "device": cfg.device, "executor": cfg.executor,
             "model": cfg.model, "research_model": cfg.research_model or cfg.model,
             "arbiter_model": cfg.arbiter_model or cfg.model, "reasoning": cfg.reasoning,
@@ -977,7 +977,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     if a.launch == "threads":
         h = Harness(root=str(job_root), size=cfg.size, device=cfg.device, force=True,
                     ctx_budget=cfg.ctx_budget,
-                    meta={"experiment": "e6_book", "arm": cfg.arm, "executor": cfg.executor,
+                    meta={"experiment": "e7_rawapi_book", "arm": cfg.arm, "executor": cfg.executor,
                           "model": cfg.model})
         job = h.create()
         execs: dict[int, Any] = {}
@@ -1001,16 +1001,16 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     else:
         from ampi.launcher import export, launch
 
-        cmd = [sys.executable, "-m", "experiments.e6_book.harness", "rank", "--name", cfg.name]
+        cmd = [sys.executable, "-m", "experiments.e7_rawapi_book.harness", "rank", "--name", cfg.name]
         if cfg.run_dir:
             cmd += ["--run-dir", cfg.run_dir]
         launch_record = launch(
             cmd, size=cfg.size, root=job_root, device=cfg.device, nodes=cfg.nodes, node=a.node,
             ctx_budget=cfg.ctx_budget, join_deadline_s=cfg.phase_timeout,
-            meta={"experiment": "e6_book", "arm": cfg.arm, "executor": cfg.executor,
+            meta={"experiment": "e7_rawapi_book", "arm": cfg.arm, "executor": cfg.executor,
                   "model": cfg.model, "name": cfg.name},
             log_dir=work_dir / "launch", env=env, respawn=cfg.respawn,
-            timeout_s=cfg.phase_timeout * 4, worker_prefix="e6", quiet=a.quiet,
+            timeout_s=cfg.phase_timeout * 4, worker_prefix="e7", quiet=a.quiet,
         )
         if a.node == 0 and cfg.nodes > 1:
             _wait_for_population(job_root, cfg.size, cfg.phase_timeout)
@@ -1098,7 +1098,7 @@ def _sample(out_dir: Path, run_dir: Path, languages: list[str], *, page: int = 1
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ap = argparse.ArgumentParser(description="E6: book translation on raw-API ranks")
+    ap = argparse.ArgumentParser(description="E7: book translation on raw-API ranks")
     sub = ap.add_subparsers(dest="cmd", required=True)
     r = sub.add_parser("rank", help="be one rank (run by ampirun)")
     r.add_argument("--name", required=True)
