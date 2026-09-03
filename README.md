@@ -199,6 +199,29 @@ delete branches (the hosting proxy this was written against refuses deletes) and
 does not compact, and its clock is the local wall clock, which is comparable
 across NTP-disciplined VMs and nowhere else.
 
+### E6: a book, one rank per machine, in production
+
+`experiments/e6_book/` is the experiment the protocol was designed for: a Russian
+novel rendered into English, Chinese and Japanese by 16, 32 and 64 ranks, each a
+Claude Code session on its own cloud machine, with the git device as the only
+thing the machines share. Every phase is a test of one mechanism --- a lifted
+allreduce for the terminology census arbitrated once by an agent at the root,
+compare-and-swap claims over a research window closed by a fence, an exclusive
+lock around a shared registry, a review ring by `cart_shift`, a halo exchange for
+the seams, an exscan for offsets, a manifest gather --- and a rank whose
+executor disappears kills itself so that survivors steal its pages. The product
+is the legacy translation project's own per-page schema; the evidence is the
+trace, analysed by `ampi analyze` per run and by `experiments/e6_book/analyze.py`
+across the series. See [`experiments/e6_book/README.md`](experiments/e6_book/README.md),
+including why the series runs on Ilf and Petrov rather than on the in-copyright
+book the legacy project chose.
+
+```bash
+python experiments/e6_book/rank.py create  --name e6-book-p16 --size 16          # the job, on a branch
+python experiments/e6_book/rank.py session-prompt --name e6-book-p16 --rank 7 --size 16 --bootstrap
+python experiments/e6_book/rank.py collect --name e6-book-p16                    # evidence, book, analysis
+```
+
 ## Results, including the negative ones
 
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,

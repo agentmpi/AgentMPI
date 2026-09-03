@@ -1064,6 +1064,16 @@ executor first calls in.
 A blocked rank MUST, while waiting: renew its own lease, run the failure detector,
 and observe revocation.
 
+The renewal interval is a property of the transport, not of the protocol, and an
+implementation SHOULD scale it to what a renewal costs. A renewal is one write;
+on a device where a write is a network round trip serialised across the
+population, renewing every few seconds consumes the device's whole acceptance
+rate at sixty-four ranks and lengthens the very collective the ranks are waiting
+in. The lease MUST remain longer than the renewal interval by a comfortable
+factor, and a harness on such a transport MUST expect conviction of a dead machine
+to take on the order of the lease, and SHOULD provide an administrative
+`AMPI_Kill` for the operator who knows sooner.
+
 > **Rationale.** Omitting the first is catastrophic and not obvious. In an early
 > version, a rank waiting inside a barrier made no runtime calls, so the detector
 > declared it dead for the crime of waiting; every rank that arrived first was
@@ -1243,6 +1253,21 @@ events with their class.
 
 Tracing is unconditional and is part of the protocol, not an add-on.
 
+A device MAY *defer* the trace stream: buffer appended records and write them with
+its next state-changing commit, or on a bounded timer, or on close. The
+records MUST carry the time they were recorded, not the time they were written,
+and MUST be ordered and sequenced as if appended immediately; a device that
+defers MUST declare which streams it defers and MUST provide `flush`. Only a
+stream that nothing waits on may be deferred; the trace is the one such stream,
+and payload bodies, which are unreachable until a record names their handle,
+may travel with it.
+
+> **Rationale.** On the git device every append is a commit, and in the first
+> production runs trace appends were half the commits on the job branch — every
+> one a network round trip that displaced a collective join or a claim. Folding
+> them into the commit that would have happened anyway costs nothing the analysis
+> can see, provided the timestamps are the originals.
+
 > **Rationale.** HPC learned that a parallel program's behaviour is invisible from
 > any single process's output, which is why PMPI, SLOG-2, OTF2 and their viewers
 > exist. MPI's tooling interfaces are opt-in and out-of-band, which is reasonable
@@ -1317,7 +1342,10 @@ A conforming implementation MUST pass a conformance suite for its level, and the
 suite MUST be written against the public interface only.
 
 An implementation that provides more than one transport SHOULD run the same suite
-against each.
+against each. The reference implementation runs it against four: SQLite, a
+filesystem journal, memory, and a git branch, the last for machines that share
+nothing but a hosting service, on which a rejected non-fast-forward push is a
+lost compare-and-swap.
 
 > **Rationale.** An interface with one implementation is a library. What makes a
 > standard is that a program written against the document runs on more than one
@@ -1399,7 +1427,9 @@ Byzantine tolerance is acknowledged and out of scope.
 `AMPI_ERR_RUN_EXISTS`, `AMPI_ERR_VERSION`; identity: `AMPI_ERR_IDENTITY`,
 `AMPI_ERR_FENCED` (terminal); flow control: `AMPI_ERR_CTX_EXCEEDED`,
 `AMPI_ERR_CTX_CREDIT` (retryable), `AMPI_ERR_BUDGET`; progress and failure:
-`AMPI_ERR_TIMEOUT` (retryable), `AMPI_ERR_PROC_FAILED`,
+`AMPI_ERR_TIMEOUT` (retryable), `AMPI_ERR_NO_WORKER` (a published task that no
+executor claimed within its claim window: the rank's executor is gone, and the
+harness should fail the rank rather than hold its peers), `AMPI_ERR_PROC_FAILED`,
 `AMPI_ERR_PROC_FAILED_PENDING` (retryable), `AMPI_ERR_REVOKED`, `AMPI_ERR_LATE`,
 `AMPI_ERR_COLL_MISMATCH`, `AMPI_ERR_DEADLOCK`; shared state:
 `AMPI_ERR_CONFLICT` (retryable), `AMPI_ERR_LOCK_BUSY` (retryable),
