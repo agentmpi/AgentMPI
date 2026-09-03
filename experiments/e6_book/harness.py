@@ -337,7 +337,15 @@ class BookHarness:
         titles = {str(k): str(v) for k, v in (survey.get("chapter_titles") or {}).items()}
         if not conventions and not titles:
             return
-        lock = amp.win_lock(REGISTRY_WIN, "registry", ttl=120.0, timeout=self.cfg.phase_timeout_s)
+        have = self._cell(amp, REGISTRY_WIN, "registry")
+        if isinstance(have, dict) and rank in (have.get("writers") or []):
+            amp.trace("registry.replayed", rank=rank)
+            return
+        # The lease outlives a slow transport: sixteen writers replaying through
+        # this step at once on the git device put a read-modify-write well past
+        # the two minutes the first run allowed, and a lease that lapses after
+        # the write has landed is not a failure of the write.
+        lock = amp.win_lock(REGISTRY_WIN, "registry", ttl=600.0, timeout=self.cfg.phase_timeout_s)
         try:
             cur = amp.get(REGISTRY_WIN, "registry")
             value = (cur.get("value") if cur.get("present") else None) or \
@@ -352,7 +360,15 @@ class BookHarness:
             amp.put(REGISTRY_WIN, "registry", value, lock_token=lock["token"],
                     expect_version=cur.get("version") if cur.get("present") else None)
         finally:
-            amp.win_unlock(lock["lock_id"])
+            try:
+                amp.win_unlock(lock["lock_id"])
+            except AmpiError as exc:
+                if exc.cls_name != "AMPI_ERR_STALE_LEASE":
+                    raise
+                # The write either landed under a live lease or was rejected
+                # by its token; a lease that lapsed afterwards leaves nothing
+                # to release.
+                amp.trace("lock.lapsed", rank=rank, win=REGISTRY_WIN, lock=lock["lock_id"])
 
     def registry(self, amp: Ampi) -> dict[str, Any]:
         cells = self._cells(amp, REGISTRY_WIN, "registry")

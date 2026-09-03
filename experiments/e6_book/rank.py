@@ -356,7 +356,8 @@ def run_ranks(a: argparse.Namespace, ranks: list[int], *, fresh: bool) -> dict[s
     summary = {"name": a.name, "ranks": ranks, "ok": all(results.get(r, {}).get("ok") for r in ranks),
                "results": {str(r): {k: results.get(r, {}).get(k) for k in ("ok", "error", "seconds")}
                            for r in ranks}, "finished_at": time.time()}
-    (work / "done.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
+    if all(_finished(work / f"rank{r}.json") for r in ranks):
+        (work / "done.json").write_text(json.dumps(summary, indent=2, default=str), encoding="utf-8")
     print(json.dumps(summary, default=str), flush=True)
     return summary
 
@@ -446,6 +447,22 @@ def _same_session(a: str | None, b: str | None) -> bool:
     return a.split("_", 1)[-1] == b.split("_", 1)[-1]
 
 
+def _finished(marker: Path) -> bool:
+    """A rank is finished when it finalised, or when it was fenced or killed.
+
+    A rank whose thread died of anything else (a lapsed lock lease, a lost
+    executor, a transport error) is not finished: it is a rank to resume, and
+    the runtime lets it re-initialise and replay.
+    """
+    if not marker.exists():
+        return False
+    try:
+        rec = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return bool(rec.get("ok")) or rec.get("error_class") == "AMPI_ERR_FENCED"
+
+
 def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
     spec = launch_spec()
     if spec is None:
@@ -479,7 +496,7 @@ def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
             print(json.dumps({"autostart": "nothing to resume"}), flush=True)
             return None
         slot = json.loads(slot_file.read_text(encoding="utf-8"))
-        ranks = [r for r in slot.get("ranks") or [] if not (work / f"rank{r}.json").exists()]
+        ranks = [r for r in slot.get("ranks") or [] if not _finished(work / f"rank{r}.json")]
         if not ranks:
             print(json.dumps({"autostart": "every rank on this machine is finished"}), flush=True)
             return None
