@@ -193,6 +193,38 @@ delete branches (the hosting proxy this was written against refuses deletes) and
 does not compact, and its clock is the local wall clock, which is comparable
 across NTP-disciplined VMs and nowhere else.
 
+### Ranks as processes, and a job across many machines: `ampirun` and `gitd`
+
+Every production run above sixteen ranks that used an agent host as its executor
+spent its wall time waiting for an executor to exist: the host capped concurrent
+sessions at ten. `ampi/model.py` removes the host. A rank is an operating-system
+process; its executor is a chat-completions call with a small tool loop
+(`ampi/tools.py`: an encyclopaedia search, an article, a page fetch); its
+concurrency limit is the provider's. Contract violations are repaired in the same
+conversation, every call's tokens and cost land in the trace as `task.*` events,
+and the analysis reads them exactly as it reads the broker's claim/submit pair.
+
+`ampirun` (`ampi/launcher.py`) is the process manager MPI leaves unspecified: one
+process per rank with `AMPI_ROOT`/`AMPI_RANK` set, block-distributed over nodes,
+supervised, and restarted through the runtime's `respawn` so a successor gets a
+new epoch and re-enters its collectives (traced as `replayed`).
+
+```bash
+ampirun -np 64 --root work/job -- python my_rank_program.py                 # one machine
+ampirun -np 256 --nodes 8 --node 3 --device gitd --root work/job -- ...      # machine 3 of 8
+```
+
+`gitd` (`ampi/device/gitd.py`) is the git device behind a per-node daemon. The
+git device's mutations are pure functions of the state, so the daemon can apply
+every write its ranks issue within a window as one commit and one push — the
+intra-node aggregation every production MPI does before it touches the network.
+It passes the same conformance suite as the other four transports. `E7`
+(`experiments/e7_rawapi_book/`) is the experiment built on all three: the
+production book translation on raw-API ranks, from 16 processes on one machine
+to 256 over eight, with checkpointed results, injected executor deaths, an
+agent-evaluated arbitration spread over the population, and a locked amendment
+ledger. Its runs are under `runs/e7-rawapi-*`.
+
 ## Results, including the negative ones
 
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,

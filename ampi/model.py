@@ -174,10 +174,12 @@ class ChatResponse:
 class ModelError(Exception):
     """The endpoint could not produce a completion after every retry."""
 
-    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False):
+    def __init__(self, message: str, *, status: int | None = None, retryable: bool = False,
+                 retry_after: float | None = None):
         super().__init__(message)
         self.status = status
         self.retryable = retryable
+        self.retry_after = retry_after
 
 
 # ---------------------------------------------------------------------------
@@ -206,6 +208,7 @@ class ChatModel:
         base_url: str | None = None,
         timeout_s: float = 600.0,
         max_retries: int = 6,
+        rate_limit_patience_s: float = 1800.0,
         reasoning: dict[str, Any] | None = None,
         plugins: list[dict[str, Any]] | None = None,
         temperature: float | None = None,
@@ -219,6 +222,16 @@ class ChatModel:
         self.base_url = (base_url or os.environ.get(ENV_BASE_URL) or DEFAULT_BASE_URL).rstrip("/")
         self.timeout_s = timeout_s
         self.max_retries = max_retries
+        #: How long to keep waiting on a rate limit before giving the task up.
+        #: A 429 is not a failure of the task and must not become a failure of
+        #: the rank: the first p=16 production run lost six ranks to a
+        #: twenty-requests-a-minute cap because rate limits were retried like
+        #: transport faults, six times and then never.  A rank blocked on a
+        #: rate limit is exactly like a rank blocked in a collective --- alive,
+        #: waiting, and not to be convicted --- so the wait is bounded by
+        #: patience, not by a retry count.
+        self.rate_limit_patience_s = rate_limit_patience_s
+        self.rate_limited_s = 0.0
         self.reasoning = reasoning
         self.plugins = plugins
         self.temperature = temperature
@@ -270,7 +283,9 @@ class ChatModel:
         body.update(self.extra)
 
         last: ModelError | None = None
-        for attempt in range(self.max_retries + 1):
+        attempt = 0
+        limited_since: float | None = None
+        while True:
             started = time.time()
             try:
                 raw = self._post(body)
@@ -279,14 +294,28 @@ class ChatModel:
                 return resp
             except ModelError as exc:
                 last = exc
-                if not exc.retryable or attempt == self.max_retries:
+                if not exc.retryable:
                     raise
+                if exc.status == 429:
+                    # Wait it out, up to the patience budget, and count the wait.
+                    limited_since = limited_since or time.time()
+                    waited = time.time() - limited_since
+                    if waited >= self.rate_limit_patience_s:
+                        raise
+                    pause = min(60.0, exc.retry_after or (5.0 + waited / 10.0)) * random.uniform(0.8, 1.4)
+                    self.rate_limited_s += pause
+                    self.retries += 1
+                    time.sleep(pause)
+                    continue
+                if attempt >= self.max_retries:
+                    raise
+                attempt += 1
                 self.retries += 1
                 # Exponential backoff with jitter.  Two hundred ranks that all got
-                # a 429 at the same instant and all retry at the same instant get
-                # the same 429 again; the jitter is what separates them.
+                # a 503 at the same instant and all retry at the same instant get
+                # the same 503 again; the jitter is what separates them.
                 time.sleep(min(90.0, (2 ** attempt) * random.uniform(0.8, 1.6)))
-        raise last or ModelError("no attempts were made")
+        raise last or ModelError("no attempts were made")  # pragma: no cover
 
     def _post(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.transport is not None:
@@ -309,8 +338,13 @@ class ChatModel:
                 payload = r.read()
         except urllib.error.HTTPError as exc:
             text = exc.read().decode("utf-8", "replace")[:500]
+            after = exc.headers.get("Retry-After") if exc.headers else None
+            try:
+                retry_after = float(after) if after else None
+            except ValueError:
+                retry_after = None
             raise ModelError(f"HTTP {exc.code}: {text}", status=exc.code,
-                             retryable=exc.code in RETRY_STATUSES) from None
+                             retryable=exc.code in RETRY_STATUSES, retry_after=retry_after) from None
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
             raise ModelError(f"transport: {exc}", retryable=True) from None
         try:
@@ -672,6 +706,7 @@ class ModelExecutor:
             "tasks": self.tasks,
             "failures": self.failures,
             "retries": self.model.retries,
+            "rate_limited_s": round(self.model.rate_limited_s, 1),
             "usage": self.usage.to_dict(),
         }
 
