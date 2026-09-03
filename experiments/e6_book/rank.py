@@ -136,26 +136,23 @@ def cmd_create(a: argparse.Namespace) -> dict[str, Any]:
 
 
 SESSION_PROMPT = """\
-You are AgentMPI rank {rank} of {size} in the book-translation job "{name}". This machine is one rank of a distributed job. A background harness process does every bit of coordination with the other machines (assignment, shared terminology, research claims, review, assembly, failure handling). You do the language work it hands you, one task at a time, and nothing else. Do not read the repository's code, do not investigate the protocol, do not try to contact other ranks, do not translate anything you were not handed.
+You are one machine of a distributed book-translation job named "{name}" with {size} ranks. This machine's rank harness was started automatically when this session began (a SessionStart hook runs it): it claimed a rank number, joined the job, and does every bit of coordination with the other machines (assignment, shared terminology, research claims, review, assembly, failure handling). You do the language work it hands you, one task at a time, and nothing else. Do not read the repository's code, do not investigate the protocol, do not try to contact other machines, do not translate anything you were not handed, and do not start or restart the harness yourself.
 
 SETUP, once:
 
-1. Run: git fetch -q origin {code_branch} && git checkout -q {code_branch} && pip install -q -e ".[tokens]" && mkdir -p work/e6/{name}
-2. Start the harness for your rank so that it keeps running for hours while you work. Use the Bash tool with its run_in_background option set to true (that is the tool's own way to run a long process; do not wrap the command in nohup or append &), with exactly this command:
-   cd /home/user/AgentMPI && python3 experiments/e6_book/rank.py run --name {name} --rank {rank} --remote {remote} > work/e6/{name}/rank{rank}.log 2>&1
-   If that command is refused, run it with nohup and a trailing & instead. The command is listed in the repository's .claude/settings.json permission allowlist.
-   Then wait about 90 seconds and run: tail -n 5 /home/user/AgentMPI/work/e6/{name}/rank{rank}.log
-   It should say the rank joined the job. If it says the process exited with an error, report the error verbatim and stop.
+1. Find your rank. Run: cat /home/user/AgentMPI/work/e6/{name}/slot.json
+   It contains a JSON object whose "rank" field is your rank number. If the file does not exist yet, wait 30 seconds and try again, for up to ten minutes. If after ten minutes it still does not exist, or its "rank" is null, run: tail -n 40 /home/user/AgentMPI/work/e6/{name}/autostart.log ; report that output verbatim and stop.
+2. Remember your rank number; below, RANK stands for it. Check the harness joined the job: tail -n 3 /home/user/AgentMPI/work/e6/{name}/rankRANK.log
 
 WORK LOOP. Repeat until the runtime tells you to exit:
 
-1. Ask for work. Run this exact command, giving the Bash tool a timeout of 600000 milliseconds (ten minutes; the command blocks server-side for up to 540 seconds, and asking less often is what keeps the run within the account's budget):
+1. Ask for work. Run this exact command with your rank substituted for RANK, giving the Bash tool a timeout of 600000 milliseconds (ten minutes; the command blocks server-side for up to 540 seconds, and asking less often is what keeps the run within the account's budget):
 
-   AMPI_WORKER_ID="cloud:$CLAUDE_CODE_REMOTE_SESSION_ID" ampi worker --job-root /home/user/AgentMPI/work/e6/{name}/local --rank {rank} --expect-rank {rank} --campaign {name} next --timeout 540
+   AMPI_WORKER_ID="cloud:$CLAUDE_CODE_REMOTE_SESSION_ID" ampi worker --job-root /home/user/AgentMPI/work/e6/{name}/local --rank RANK --expect-rank RANK --campaign {name} next --timeout 540
 
    It prints one JSON object. Read its "status":
      - "task": go to step 2.
-     - "idle": nothing was available during the wait. Ask again. Long idle stretches are normal: the harness is waiting for other machines. Only if you have been idle for more than 90 minutes in a row, check whether the harness has finished: the file /home/user/AgentMPI/work/e6/{name}/rank{rank}.json exists once it has. If it exists, print the last 40 lines of the log and stop.
+     - "idle": nothing was available during the wait. Ask again. Long idle stretches are normal: the harness is waiting for other machines. Only if you have been idle for more than 90 minutes in a row, check whether the harness has finished: the file /home/user/AgentMPI/work/e6/{name}/rankRANK.json exists once it has. If it exists, print the last 40 lines of the rank log and stop.
      - "exit": the job is over. Go to WHEN YOU FINISH.
    If you ever see "error": "AMPI_ERR_IDENTITY", stop and report it verbatim.
 
@@ -169,27 +166,25 @@ WORK LOOP. Repeat until the runtime tells you to exit:
 
 EFFICIENCY. One task is: one shell call to get it, one subagent, one shell call to submit. Do not read the prompt or result files yourself, do not poll in a tight loop, do not explore the repository.
 
-WHEN YOU FINISH. After "exit", wait for the harness process to end: check once a minute, for up to 15 minutes, whether /home/user/AgentMPI/work/e6/{name}/rank{rank}.json exists. Then print the last 30 lines of /home/user/AgentMPI/work/e6/{name}/rank{rank}.log, and report how many tasks you completed with their "label" values and anything that went wrong.
+WHEN YOU FINISH. After "exit", wait for the harness process to end: check once a minute, for up to 15 minutes, whether /home/user/AgentMPI/work/e6/{name}/rankRANK.json exists. Then print the last 30 lines of /home/user/AgentMPI/work/e6/{name}/rankRANK.log, and report how many tasks you completed with their "label" values and anything that went wrong.
 """
 
 
 def session_prompt(name: str, rank: int, size: int, remote: str, code_branch: str) -> str:
-    return SESSION_PROMPT.format(name=name, rank=rank, size=size, remote=remote,
-                                 code_branch=code_branch)
+    return SESSION_PROMPT.format(name=name, size=size)
 
 
 BOOTSTRAP_PROMPT = """\
-You are AgentMPI rank {rank} of {size} in the book-translation job "{name}". Your full instruction is printed by a command in the repository this session was started in; get it and follow it exactly, and do nothing else:
+You are one machine of the book-translation job "{name}" ({size} ranks). Your full instruction is printed by a command in the repository this session was started in; get it and follow it exactly, and do nothing else:
 
-git fetch -q origin {code_branch} && git checkout -q {code_branch} && python3 experiments/e6_book/rank.py session-prompt --name {name} --rank {rank} --size {size} --remote {remote} --code-branch {code_branch}
+python3 experiments/e6_book/rank.py session-prompt --name {name} --size {size}
 
-Read the printed instruction in full before acting. It tells you how to start your rank's harness process, how to fetch each task, how to do it with a fresh subagent, and how to submit it.
+Read the printed instruction in full before acting. It tells you how to find the rank this machine claimed, how to fetch each task, how to do it with a fresh subagent, and how to submit it.
 """
 
 
 def bootstrap_prompt(name: str, rank: int, size: int, remote: str, code_branch: str) -> str:
-    return BOOTSTRAP_PROMPT.format(name=name, rank=rank, size=size, remote=remote,
-                                   code_branch=code_branch)
+    return BOOTSTRAP_PROMPT.format(name=name, size=size)
 
 
 def cmd_session_prompt(a: argparse.Namespace) -> str:
@@ -270,6 +265,107 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
                      default=str), flush=True)
     amp.close()
     return log
+
+
+# ---------------------------------------------------------------------------
+# autostart: a machine claims a rank
+# ---------------------------------------------------------------------------
+
+LAUNCH_FILE = HERE / "LAUNCH.json"
+ENV_LAUNCH_FILE = "E6_LAUNCH_FILE"
+
+
+def launch_spec() -> dict[str, Any] | None:
+    """The job this branch launches into, if any.
+
+    A machine that starts a session on this branch reads this file and joins
+    the job it names.  Committed beside the harness so that every machine sees
+    the same job, and so that the launcher's whole act of launching is one push.
+    """
+    path = Path(os.environ.get(ENV_LAUNCH_FILE) or LAUNCH_FILE)
+    if not path.exists():
+        return None
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    return spec if spec.get("enabled") else None
+
+
+def claim_slot(root: Path, size: int, me: dict[str, Any]) -> int | None:
+    """Take the lowest free rank, by compare-and-swap on a cell that does not exist.
+
+    Ranks are claimed, not assigned.  MPI's process manager hands each process
+    its rank; here the launcher cannot address a machine before it exists, so the
+    machine takes the first free slot when it arrives.  The swap is on version 0
+    of a cell in a private space, which succeeds exactly once per slot however
+    many machines arrive at the same moment; the scan starts at a random offset
+    so that sixteen simultaneous arrivals do not all lose fifteen swaps on slot 0.
+    """
+    from ampi.runtime import Ampi
+
+    amp = Ampi(str(root), allow_volatile=True)
+    try:
+        start = int.from_bytes(os.urandom(2), "big") % max(1, size)
+        for i in range(size):
+            r = (start + i) % size
+            ok, _cell = amp.device.cas("launch", f"slot/{r}", 0, me, writer=-1)
+            if ok:
+                amp.trace("launch.claim", rank=r, session=me.get("session"),
+                          boot_id=me.get("boot_id"))
+                return r
+        return None
+    finally:
+        amp.close()
+
+
+def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
+    spec = launch_spec()
+    if spec is None:
+        print(json.dumps({"autostart": "no enabled launch spec"}), flush=True)
+        return None
+    name = spec["name"]
+    work = WORK / name
+    work.mkdir(parents=True, exist_ok=True)
+    a.name = name
+    a.remote = spec.get("remote", DEFAULT_REMOTE)
+    a.branch = spec.get("branch")
+    a.root = None
+    a.read_interval = spec.get("read_interval")
+    _git_env(a)
+    from ampi.runtime import Ampi
+
+    root = _job_root(a)
+    me = identity(-1)
+    me["claimed_at"] = time.time()
+    try:
+        probe = Ampi(str(root), allow_volatile=True)
+        size = probe.size
+        probe.close()
+    except Exception as exc:  # noqa: BLE001 - the job may not exist yet
+        print(json.dumps({"autostart": "no job", "error": str(exc)[:200]}), flush=True)
+        return None
+    rank = claim_slot(root, size, me)
+    if rank is None:
+        print(json.dumps({"autostart": "every slot is taken", "size": size}), flush=True)
+        (work / "slot.json").write_text(json.dumps({"rank": None, "name": name, "size": size,
+                                                    "note": "every slot is taken"}), encoding="utf-8")
+        return None
+    (work / "slot.json").write_text(json.dumps({"rank": rank, "name": name, "size": size,
+                                                "session": me.get("session")}), encoding="utf-8")
+    print(json.dumps({"autostart": "claimed", "rank": rank, "size": size}), flush=True)
+    a.rank = rank
+    a.executor = spec.get("executor", "broker")
+    a.model = spec.get("model")
+    a.effort = spec.get("effort")
+    a.keepalive = float(spec.get("keepalive", 60.0))
+    a.stub_latency = 0.0
+    a.legacy_dir = None
+    return cmd_run(a)
+
+
+def cmd_slot(a: argparse.Namespace) -> dict[str, Any]:
+    p = WORK / a.name / "slot.json"
+    out = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {"rank": None, "name": a.name}
+    print(json.dumps(out))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -559,12 +655,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("session-prompt")
     p.add_argument("--name", required=True)
-    p.add_argument("--rank", type=int, required=True)
+    p.add_argument("--rank", type=int, default=-1, help="unused: a machine claims its rank")
     p.add_argument("--size", type=int, required=True)
     p.add_argument("--remote", default=DEFAULT_REMOTE)
     p.add_argument("--code-branch", default=DEFAULT_CODE_BRANCH)
     p.add_argument("--bootstrap", action="store_true",
                    help="print the short prompt a session is created with, which fetches the full one")
+
+    p = sub.add_parser("autostart", help="claim a rank slot from LAUNCH.json and run it")
+    p = sub.add_parser("slot", help="print the rank this machine claimed")
+    p.add_argument("--name", required=True)
 
     p = sub.add_parser("run")
     p.add_argument("--name", required=True)
@@ -606,6 +706,7 @@ def main(argv: list[str] | None = None) -> Any:
     a = build_parser().parse_args(argv)
     return {
         "create": cmd_create, "session-prompt": cmd_session_prompt, "run": cmd_run,
+        "autostart": cmd_autostart, "slot": cmd_slot,
         "local": cmd_local, "status": cmd_status, "kill": cmd_kill, "collect": cmd_collect,
     }[a.cmd](a)
 

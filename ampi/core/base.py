@@ -570,6 +570,11 @@ class RuntimeBase:
         """
         now = time.time()
         interval = getattr(self.device, "touch_interval_s", self._TOUCH_INTERVAL_S)
+        # A renewal must outlast the gap to the next one, with margin: a transport
+        # that renews every ten minutes cannot renew for three, or the lease lapses
+        # between renewals while the rank is doing exactly what it should.  This is
+        # how seven ranks of a sixteen-machine run were convicted for waiting.
+        renew_s = max(DEFAULT_LEASE_S, 3.0 * interval)
         if now - getattr(self, "_last_touch", 0.0) < interval:
             return
         self._last_touch = now
@@ -580,7 +585,7 @@ class RuntimeBase:
         if view.state in (STATE_RUNNING, STATE_SUSPECT):
             now = self.device.clock()
             view.last_seen = now
-            view.lease_until = max(view.lease_until, now + DEFAULT_LEASE_S)
+            view.lease_until = max(view.lease_until, now + renew_s)
             if view.state == STATE_SUSPECT:
                 view.state = STATE_RUNNING
                 view.suspect_since = None

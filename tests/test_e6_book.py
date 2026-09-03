@@ -286,7 +286,8 @@ def test_three_processes_complete_a_job_over_the_git_device(tmp_path, legacy):
 
 def test_session_prompt_mentions_no_protocol():
     text = session_prompt("job", 3, 16, "https://example.invalid/r", "main")
-    assert "rank 3 of 16" in text and "--rank 3 --expect-rank 3" in text
+    assert "16 ranks" in text and "--rank RANK --expect-rank RANK" in text
+    assert "slot.json" in text, "a machine learns its rank from the slot it claimed"
     # "fence" is deliberately absent from this list: the prompt forbids a
     # *markdown* fence around the JSON, which is not a protocol word.
     import re
