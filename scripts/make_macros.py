@@ -300,93 +300,57 @@ def e2_macros() -> None:
     put("eTwoExpected", s4["published_expected"])
 
 
-def e3_macros() -> None:
-    """The production translation series: one block of macros per scale.
+def e6_macros() -> None:
+    """The production series: one block of macros per scale, from the series table.
 
-    Reads the series table rather than each run's report, because the quantities
-    the paper cites about E3 are cross-scale by nature --- how coordination,
-    disagreement and achieved parallelism move as ``p`` goes 16, 32, 64 --- and
-    recomputing them per run would let the paper cite a figure the series plot
-    does not agree with.
+    Cross-scale by construction: the quantities the paper cites about E6 are how
+    coordination, disagreement, transport cost and achieved parallelism move as
+    p goes 16, 32, 64, and reading them from the one table the series figure is
+    drawn from means the prose cannot cite a number the figure disagrees with.
     """
-    rows = load(RUNS / "e3-series" / "series.json")
-    scales = (16, 32, 64)
-    keys = ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
-            "Conf", "Imbal", "MaxWait", "Blocked", "Work", "Incomplete")
-
-    def emit(prefix: str, p: int, row: Any) -> None:
-        if not row:
-            for key in keys:
-                put(f"{prefix}{key}{p}", None)
-            return
-        put(f"{prefix}Wall{p}", int(round(row["wall_s"])))
-        put(f"{prefix}WallH{p}", round(row["wall_s"] / 3600, 2), fmt=".2f")
-        put(f"{prefix}Tasks{p}", row["tasks"])
-        put(f"{prefix}Execs{p}", row["executors"])
-        put(f"{prefix}Coord{p}", round(row["coordination_share"] * 100, 1), fmt=".1f")
-        put(f"{prefix}Par{p}", round(row["achieved_parallelism"], 2), fmt=".2f")
-        put(f"{prefix}Eff{p}", round(row["parallel_efficiency"] * 100, 1), fmt=".1f")
-        put(f"{prefix}Conf{p}", row["conflicts"])
-        put(f"{prefix}Imbal{p}", round(row["imbalance"], 2), fmt=".2f")
-        put(f"{prefix}MaxWait{p}", int(round(row["max_single_wait_s"])))
-        put(f"{prefix}Blocked{p}", int(round(row["blocked_rank_s"])))
-        put(f"{prefix}Work{p}", int(round(row["work_rank_s"])))
-        put(f"{prefix}Incomplete{p}", row["incomplete"])
-
-    if not rows:
-        for p in scales:
-            emit("eThreeStub", p, None)
-            emit("eThreeReal", p, None)
-        for key in ("Researched", "Duplicated", "Saved", "Sources", "Starved"):
-            put(f"eThree{key}", None)
-        return
-
-    # Two series, kept apart on purpose.  The surrogate runs measure the protocol
-    # with the operator cost set to zero; the broker run measures the regime where
-    # an executor turn dominates everything else.  Averaging them, or letting one
-    # macro mean either, would produce a number that describes neither.
-    stub = {r["p"]: r for r in rows if r["executor"] != "broker"}
-    real = {r["p"]: r for r in rows if r["executor"] == "broker"}
-    for p in scales:
-        emit("eThreeStub", p, stub.get(p))
-        emit("eThreeReal", p, real.get(p))
-
-    # The research-sharing saving, which is the window's whole justification: the
-    # agenda is bounded and independent of p, so what a run avoids is every rank
-    # researching every contested term.
-    glossary = load(RUNS / "e3-real-p16" / "glossary.json")
-    if glossary:
-        researched = len(glossary)
-        put("eThreeResearched", researched)
-        put("eThreeSources", sum(len(v.get("sources") or []) for v in glossary.values()))
-        # What the window bought: without it every rank that met a term would have
-        # researched it, so the saving is the population minus the one rank that
-        # actually did the work.
-        biggest = max(real, default=16)
-        put("eThreeDuplicated", researched * biggest)
-        put("eThreeSaved", researched * (biggest - 1))
-    else:
-        for key in ("Researched", "Duplicated", "Saved", "Sources"):
-            put(f"eThree{key}", None)
-
-    metrics = load(RUNS / "e3-real-p16" / "analysis" / "metrics.json")
-    if metrics:
-        put("eThreeStarved", len(metrics.get("starved_tasks", [])))
-        # The enqueue-to-claim wait, which is a different quantity from the longest
-        # wait *inside* a collective and answers a different question: not "how long
-        # did coordination take" but "how long before anybody turned up".
-        put("eThreeClaimWait", int(round(metrics.get("max_claim_wait_s", 0))))
-        put("eThreeRequeued", (metrics.get("tasks") or {}).get("requeued", 0))
-        put("eThreeSubmitted", (metrics.get("tasks") or {}).get("submitted", 0))
-        # Work the population finished and the harness threw away, because it had
-        # already given up on the rank that asked for it.  The one measure of the
-        # three that says the population was capable and the configuration was not.
-        wasted = metrics.get("wasted_submissions") or []
-        put("eThreeWasted", len(wasted))
-        put("eThreeWastedRanks", len({w["rank"] for w in wasted}))
-    else:
-        for key in ("Starved", "ClaimWait", "Requeued", "Submitted", "Wasted", "WastedRanks"):
-            put(f"eThree{key}", None)
+    rows = load(RUNS / "e6-series" / "series.json") or []
+    by_p = {r["p"]: r for r in rows}
+    keys = ("Wall", "WallH", "Machines", "Tasks", "Work", "Blocked", "Coord", "Par", "Eff",
+            "Conf", "Commits", "CommitsPerRank", "Convicted", "Stolen", "Pages", "Expected",
+            "Sentences", "Researched", "LockWait", "ClaimsWon", "ClaimAttempts",
+            "TranslateMedian", "ResearchMedian", "SurveyMedian", "ReviewN", "ReviseN",
+            "ExecutorsLost")
+    for p in (4, 16, 32, 64):
+        r = by_p.get(p)
+        if not r:
+            for k in keys:
+                put(f"eSix{k}{p}", None)
+            continue
+        ts = r.get("task_stats") or {}
+        book = r.get("book") or {}
+        put(f"eSixWall{p}", int(round(r["wall_s"])))
+        put(f"eSixWallH{p}", round(r["wall_s"] / 3600, 2), fmt=".2f")
+        put(f"eSixMachines{p}", r.get("machines"))
+        put(f"eSixTasks{p}", r.get("tasks"))
+        put(f"eSixWork{p}", int(round(r["work_rank_s"])))
+        put(f"eSixBlocked{p}", int(round(r["blocked_rank_s"])))
+        put(f"eSixCoord{p}", round(100 * (r.get("coordination_share") or 0), 1), fmt=".1f")
+        put(f"eSixPar{p}", round(r.get("achieved_parallelism") or 0, 2), fmt=".2f")
+        put(f"eSixEff{p}", round(100 * (r.get("parallel_efficiency") or 0), 1), fmt=".1f")
+        put(f"eSixConf{p}", r.get("census_conflicts"))
+        put(f"eSixCommits{p}", r.get("commits"))
+        put(f"eSixCommitsPerRank{p}", round(r.get("commits_per_rank") or 0, 1), fmt=".1f")
+        put(f"eSixConvicted{p}", len(r.get("convicted") or []))
+        put(f"eSixStolen{p}", r.get("pages_stolen"))
+        put(f"eSixPages{p}", book.get("n_pages"))
+        put(f"eSixExpected{p}", book.get("expected"))
+        put(f"eSixSentences{p}", book.get("sentences"))
+        put(f"eSixResearched{p}", r.get("researched"))
+        put(f"eSixLockWait{p}", round(r.get("lock_wait_max_s") or 0, 1), fmt=".1f")
+        put(f"eSixClaimsWon{p}", r.get("claims_won"))
+        put(f"eSixClaimAttempts{p}", r.get("claim_attempts"))
+        put(f"eSixTranslateMedian{p}", int(round((ts.get("translate") or {}).get("median_s", 0))))
+        put(f"eSixResearchMedian{p}", int(round((ts.get("research") or {}).get("median_s", 0))))
+        put(f"eSixSurveyMedian{p}", int(round((ts.get("survey") or {}).get("median_s", 0))))
+        put(f"eSixReviewN{p}", (ts.get("review") or {}).get("n", 0))
+        put(f"eSixReviseN{p}", (ts.get("revise") or {}).get("n", 0))
+        put(f"eSixExecutorsLost{p}", r.get("executors_lost"))
+    put("eSixScales", len(rows))
 
 
 def suite_macros() -> None:
@@ -404,7 +368,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
-    e3_macros()
+    e6_macros()
     provenance_macros()
     suite_macros()
 
