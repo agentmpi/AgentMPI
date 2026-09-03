@@ -141,8 +141,9 @@ You are AgentMPI rank {rank} of {size} in the book-translation job "{name}". Thi
 SETUP, once:
 
 1. Run: git fetch -q origin {code_branch} && git checkout -q {code_branch} && pip install -q -e ".[tokens]" && mkdir -p work/e6/{name}
-2. Start the harness for your rank in the background with nohup so that it keeps running for hours while you work:
-   cd /home/user/AgentMPI && nohup python3 experiments/e6_book/rank.py run --name {name} --rank {rank} --remote {remote} > work/e6/{name}/rank{rank}.log 2>&1 &
+2. Start the harness for your rank so that it keeps running for hours while you work. Use the Bash tool with its run_in_background option set to true (that is the tool's own way to run a long process; do not wrap the command in nohup or append &), with exactly this command:
+   cd /home/user/AgentMPI && python3 experiments/e6_book/rank.py run --name {name} --rank {rank} --remote {remote} > work/e6/{name}/rank{rank}.log 2>&1
+   If that command is refused, run it with nohup and a trailing & instead. The command is listed in the repository's .claude/settings.json permission allowlist.
    Then wait about 90 seconds and run: tail -n 5 /home/user/AgentMPI/work/e6/{name}/rank{rank}.log
    It should say the rank joined the job. If it says the process exited with an error, report the error verbatim and stop.
 
