@@ -506,7 +506,23 @@ class RuntimeBase:
         view.state = STATE_FINALISED
         view.last_seen = self.device.clock()
         self._write_rank(view)
-        self.trace("finalize", rank=view.rank, note=note)
+        # The ledger goes into the trace at the one moment it is final.  Context is
+        # the scarce resource in this protocol, so a run whose trace does not
+        # record what each rank spent cannot answer the question the protocol
+        # exists to answer, and the ledger is gone once the session ends.
+        ledger = self.ledger()
+        self.trace(
+            "finalize",
+            rank=view.rank,
+            note=note,
+            state=view.state,
+            epoch=view.epoch,
+            used=ledger.used,
+            budget=ledger.budget,
+            high_water=ledger.peak,
+            releases=ledger.releases,
+            degradations=ledger.degradations,
+        )
         return {"rank": view.rank, "state": view.state}
 
     def heartbeat(self, *, extend: float = 0.0, note: str = "") -> dict[str, Any]:

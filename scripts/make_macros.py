@@ -300,6 +300,95 @@ def e2_macros() -> None:
     put("eTwoExpected", s4["published_expected"])
 
 
+def e3_macros() -> None:
+    """The production translation series: one block of macros per scale.
+
+    Reads the series table rather than each run's report, because the quantities
+    the paper cites about E3 are cross-scale by nature --- how coordination,
+    disagreement and achieved parallelism move as ``p`` goes 16, 32, 64 --- and
+    recomputing them per run would let the paper cite a figure the series plot
+    does not agree with.
+    """
+    rows = load(RUNS / "e3-series" / "series.json")
+    scales = (16, 32, 64)
+    keys = ("Wall", "WallH", "Tasks", "Execs", "Coord", "Par", "Eff",
+            "Conf", "Imbal", "MaxWait", "Blocked", "Work", "Incomplete")
+
+    def emit(prefix: str, p: int, row: Any) -> None:
+        if not row:
+            for key in keys:
+                put(f"{prefix}{key}{p}", None)
+            return
+        put(f"{prefix}Wall{p}", int(round(row["wall_s"])))
+        put(f"{prefix}WallH{p}", round(row["wall_s"] / 3600, 2), fmt=".2f")
+        put(f"{prefix}Tasks{p}", row["tasks"])
+        put(f"{prefix}Execs{p}", row["executors"])
+        put(f"{prefix}Coord{p}", round(row["coordination_share"] * 100, 1), fmt=".1f")
+        put(f"{prefix}Par{p}", round(row["achieved_parallelism"], 2), fmt=".2f")
+        put(f"{prefix}Eff{p}", round(row["parallel_efficiency"] * 100, 1), fmt=".1f")
+        put(f"{prefix}Conf{p}", row["conflicts"])
+        put(f"{prefix}Imbal{p}", round(row["imbalance"], 2), fmt=".2f")
+        put(f"{prefix}MaxWait{p}", int(round(row["max_single_wait_s"])))
+        put(f"{prefix}Blocked{p}", int(round(row["blocked_rank_s"])))
+        put(f"{prefix}Work{p}", int(round(row["work_rank_s"])))
+        put(f"{prefix}Incomplete{p}", row["incomplete"])
+
+    if not rows:
+        for p in scales:
+            emit("eThreeStub", p, None)
+            emit("eThreeReal", p, None)
+        for key in ("Researched", "Duplicated", "Saved", "Sources", "Starved"):
+            put(f"eThree{key}", None)
+        return
+
+    # Two series, kept apart on purpose.  The surrogate runs measure the protocol
+    # with the operator cost set to zero; the broker run measures the regime where
+    # an executor turn dominates everything else.  Averaging them, or letting one
+    # macro mean either, would produce a number that describes neither.
+    stub = {r["p"]: r for r in rows if r["executor"] != "broker"}
+    real = {r["p"]: r for r in rows if r["executor"] == "broker"}
+    for p in scales:
+        emit("eThreeStub", p, stub.get(p))
+        emit("eThreeReal", p, real.get(p))
+
+    # The research-sharing saving, which is the window's whole justification: the
+    # agenda is bounded and independent of p, so what a run avoids is every rank
+    # researching every contested term.
+    glossary = load(RUNS / "e3-real-p16" / "glossary.json")
+    if glossary:
+        researched = len(glossary)
+        put("eThreeResearched", researched)
+        put("eThreeSources", sum(len(v.get("sources") or []) for v in glossary.values()))
+        # What the window bought: without it every rank that met a term would have
+        # researched it, so the saving is the population minus the one rank that
+        # actually did the work.
+        biggest = max(real, default=16)
+        put("eThreeDuplicated", researched * biggest)
+        put("eThreeSaved", researched * (biggest - 1))
+    else:
+        for key in ("Researched", "Duplicated", "Saved", "Sources"):
+            put(f"eThree{key}", None)
+
+    metrics = load(RUNS / "e3-real-p16" / "analysis" / "metrics.json")
+    if metrics:
+        put("eThreeStarved", len(metrics.get("starved_tasks", [])))
+        # The enqueue-to-claim wait, which is a different quantity from the longest
+        # wait *inside* a collective and answers a different question: not "how long
+        # did coordination take" but "how long before anybody turned up".
+        put("eThreeClaimWait", int(round(metrics.get("max_claim_wait_s", 0))))
+        put("eThreeRequeued", (metrics.get("tasks") or {}).get("requeued", 0))
+        put("eThreeSubmitted", (metrics.get("tasks") or {}).get("submitted", 0))
+        # Work the population finished and the harness threw away, because it had
+        # already given up on the rank that asked for it.  The one measure of the
+        # three that says the population was capable and the configuration was not.
+        wasted = metrics.get("wasted_submissions") or []
+        put("eThreeWasted", len(wasted))
+        put("eThreeWastedRanks", len({w["rank"] for w in wasted}))
+    else:
+        for key in ("Starved", "ClaimWait", "Requeued", "Submitted", "Wasted", "WastedRanks"):
+            put(f"eThree{key}", None)
+
+
 def suite_macros() -> None:
     d = load(RESULTS / "suite.json")
     if not d:
@@ -315,6 +404,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
+    e3_macros()
     provenance_macros()
     suite_macros()
 

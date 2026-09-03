@@ -308,7 +308,7 @@ class CommMixin:
         exchange.
         """
         self.assert_identity()
-        self._join_collective(comm, label, "neighbor_allgather", payload=payload)
+        joined = self._join_collective(comm, label, "neighbor_allgather", payload=payload)
         nbrs = self.neighbours(comm)
         want = set(nbrs["in"]) | {self.comm_rank(comm)}
         members = self.comm_members(comm)
@@ -336,5 +336,8 @@ class CommMixin:
         from .payload import canonical
 
         charged, _ = self.charge(count_tokens(canonical(got)), what="neighbor_allgather")
-        self.trace("neighbor_allgather", rank=self.rank, label=label, degree=len(got))
+        self._coll_done(
+            "neighbor_allgather", joined, comm=comm, label=label,
+            degree=len(got), charged=charged,
+        )
         return {"label": label, "degree": len(got), "neighbours": got, "charged": charged}

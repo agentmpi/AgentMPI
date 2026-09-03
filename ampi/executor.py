@@ -358,7 +358,7 @@ class BrokerExecutor:
         except json.JSONDecodeError:
             value = raw
         contract = Contract.parse(rec.get("contract"))
-        violations = check_contract(value, contract, subs={"rank": rank})
+        violations = check_contract(value, contract, subs={"rank": rec["rank"]})
         if violations:
             amp.trace("broker.reject", rank=rank, aid=aid, violations=violations)
             raise err(
