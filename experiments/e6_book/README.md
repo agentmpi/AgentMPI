@@ -65,7 +65,7 @@ spans in the one log that survives the machine.
 Three things were changed in the runtime to make the git transport bearable at
 64 writers, and each is a measurement: trace appends are deferred and folded into
 the next commit (they were half the commits on the branch); a blocked rank renews
-its lease once a minute rather than every five seconds; and a reader whose fetches
+its lease every few minutes rather than every five seconds; and a reader whose fetches
 keep finding nothing backs off.
 
 ## Running the series

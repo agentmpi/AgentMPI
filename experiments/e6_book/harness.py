@@ -107,7 +107,7 @@ class Config:
     #: Seconds a published task may sit unclaimed before the rank concludes its
     #: executor is gone and fails itself.
     claim_wait_s: float = 1200.0
-    lease_s: float = 300.0
+    lease_s: float = 600.0
     quorum: float = 1.0
     barrier_policy: str = "proceed"
     research_cap: int = 48

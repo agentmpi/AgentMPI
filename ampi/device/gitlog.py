@@ -105,7 +105,7 @@ class GitDevice(Device):
         #: a local database and ruinous for a transport whose write is a network
         #: round trip serialised across the population; a minute renews a
         #: five-minute lease five times over.
-        self.touch_interval_s = float(os.environ.get(ENV_TOUCH_INTERVAL, "60"))
+        self.touch_interval_s = float(os.environ.get(ENV_TOUCH_INTERVAL, "150"))
         self.max_read_interval = float(os.environ.get(ENV_MAX_READ_INTERVAL, "10"))
         self._tlock = threading.RLock()
         self._depth = 0
