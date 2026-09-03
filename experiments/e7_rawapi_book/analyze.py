@@ -279,6 +279,8 @@ def macros(rows: list[dict[str, Any]], prefix: str) -> str:
         for k, v in vals.items():
             lines.append(f"\\newcommand{{\\{prefix}{k}{w}}}{{{v}}}")
     if rows:
+        body = table_rows(rows).strip().replace("\n", " ")
+        lines.append(f"\\newcommand{{\\{prefix}TableRows}}{{{body}}}")
         lines.append(f"\\newcommand{{\\{prefix}Scales}}{{{len(rows)}}}")
         lines.append(f"\\newcommand{{\\{prefix}Largest}}{{{max(r['p'] for r in rows)}}}")
         lines.append(f"\\newcommand{{\\{prefix}TotalCost}}{{{_tex_num(sum(r['cost_usd'] for r in rows), 2)}}}")
