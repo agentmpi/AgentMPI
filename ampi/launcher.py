@@ -277,6 +277,10 @@ def launch(
         supervisor.close()
         signal.signal(signal.SIGTERM, previous)
 
+    try:
+        record["device_stats"] = supervisor.device.stats()
+    except Exception as exc:  # noqa: BLE001
+        record["device_stats"] = {"error": str(exc)}
     record.update(
         finished_at=time.time(),
         wall_s=round(time.time() - record["started_at"], 3),
@@ -318,9 +322,14 @@ def export(root: str | Path, out_dir: str | Path, *, name: str = "") -> dict[str
                 states[str(r)] = amp._rankview(r).state  # noqa: SLF001 - the doctor's view
             except Exception:  # noqa: BLE001
                 states[str(r)] = "unknown"
+        try:
+            device_stats = amp.device.stats()
+        except Exception as exc:  # noqa: BLE001 - stats are evidence, not a requirement
+            device_stats = {"error": str(exc)}
         report = {
             "name": name, "job": amp.manifest.job_id, "size": amp.size,
-            "device": amp.device.name, "events": by_kind, "event_count": len(events),
+            "device": amp.device.name, "device_stats": device_stats,
+            "events": by_kind, "event_count": len(events),
             "rank_states": states, "trace": str(trace),
             "diagnosis": diagnose(amp),
         }
