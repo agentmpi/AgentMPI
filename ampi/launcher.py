@@ -176,6 +176,11 @@ def launch(
     # the predecessor's locks and marks it absent in open collectives.
     supervisor = Ampi(str(root), allow_volatile=True)
     record["job"] = supervisor.manifest.job_id
+    # The node announces itself in the job's own trace.  On a multi-node run the
+    # only durable place every node can reach is the device, and a launch
+    # record that stays on a machine about to be reclaimed is not evidence.
+    supervisor.trace("launch.node", node=node, nodes=nodes, ranks=mine, identity=me,
+                     device=device, created_here=should_create)
 
     base_env = dict(os.environ)
     base_env.update(env or {})
@@ -293,6 +298,15 @@ def launch(
         record["device_stats"] = supervisor.device.stats()
     except Exception as exc:  # noqa: BLE001
         record["device_stats"] = {"error": str(exc)}
+    with contextlib.suppress(Exception):
+        supervisor.trace(
+            "launch.exit", node=node, nodes=nodes, ranks=mine, identity=me,
+            exited=sum(1 for st in record["rank_states"].values() if st["state"] == "exited"),
+            failed=sum(1 for st in record["rank_states"].values() if st["state"] != "exited"),
+            restarts=sum(st["restarts"] for st in record["rank_states"].values()),
+            wall_s=round(time.time() - record["started_at"], 3), timed_out=timed_out,
+            device_stats=record["device_stats"],
+        )
     record.update(
         finished_at=time.time(),
         wall_s=round(time.time() - record["started_at"], 3),

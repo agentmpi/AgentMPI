@@ -138,6 +138,8 @@ STYLE: dict[str, Style] = {
     "win.unlock": _s("rma", "diamond", "#fdba74"),
     # -- lifecycle -------------------------------------------------------
     "job.create": _s("lifecycle", "diamond"),
+    "launch.node": _s("lifecycle", "diamond", "#94a3b8"),
+    "launch.exit": _s("lifecycle", "diamond", "#94a3b8"),
     "init": _s("lifecycle"),
     "init.heartbeat": _s("lifecycle"),
     "finalize": _s("lifecycle"),

@@ -39,6 +39,23 @@ def _load(run: str) -> dict[str, Any]:
     nodes = []
     for p in sorted(d.glob("launch/launch-node*.json")):
         nodes.append(json.loads(p.read_text(encoding="utf-8")))
+    # The trace is the authoritative record of which nodes took part: every
+    # launcher announces itself there, and a node whose machine is gone still
+    # left its identity in the job.
+    trace = d / "harness.trace.jsonl"
+    if trace.exists():
+        seen = {n.get("node") for n in nodes}
+        with open(trace, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("kind") == "launch.node" and e.get("node") not in seen:
+                    nodes.append({"node": e.get("node"), "nodes": e.get("nodes"),
+                                  "ranks": e.get("ranks"), "node_identity": e.get("identity") or {},
+                                  "from_trace": True})
+                    seen.add(e.get("node"))
     out["nodes"] = nodes
     return out
 
