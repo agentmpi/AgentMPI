@@ -1062,6 +1062,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
                   "model": cfg.model, "name": cfg.name},
             log_dir=work_dir / "launch", env=env, respawn=cfg.respawn,
             timeout_s=cfg.phase_timeout * 4, worker_prefix="e7", quiet=a.quiet,
+            create=False if getattr(a, "rejoin", False) else None,
         )
         if a.node == 0 and cfg.nodes > 1:
             _wait_for_population(job_root, cfg.size, cfg.phase_timeout)
@@ -1172,6 +1173,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--device", default="sqlite")
     p.add_argument("--nodes", type=int, default=1)
     p.add_argument("--node", type=int, default=0)
+    p.add_argument("--rejoin", action="store_true",
+                   help="node 0 re-enters an existing job instead of creating it (after a machine restart)")
     p.add_argument("--remote", default=None, help="git remote for the git device")
     p.add_argument("--branch", default=None, help="git branch for the git device")
     p.add_argument("--arm", default="full", choices=["full", "noglossary", "noresearch", "noseams"])
