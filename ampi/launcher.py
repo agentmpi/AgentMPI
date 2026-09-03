@@ -95,9 +95,9 @@ def _wait_for_job(root: Path, device: str, timeout: float) -> None:
         if device not in ("git", "gitd") and (root / "job.json").exists():
             return
         if device in ("git", "gitd"):
+            dev = None
             try:
                 dev = open_device(device, str(root))
-                dev.initialize()
                 # The world communicator is the last cell ``create`` writes, so
                 # its presence means every rank cell is there too.  Waiting for
                 # the manifest alone once admitted a node to a job whose ranks
@@ -106,6 +106,9 @@ def _wait_for_job(root: Path, device: str, timeout: float) -> None:
                     return
             except Exception:  # noqa: BLE001 - the branch may not exist yet
                 pass
+            finally:
+                if dev is not None:
+                    dev.close()
         if time.time() >= deadline:
             raise SystemExit(f"no job appeared at {root} within {timeout:.0f}s")
         time.sleep(2.0)
