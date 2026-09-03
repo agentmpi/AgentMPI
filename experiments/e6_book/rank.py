@@ -149,9 +149,9 @@ SETUP, once:
 
 WORK LOOP. Repeat until the runtime tells you to exit:
 
-1. Ask for work. Run this exact command (give the Bash tool a timeout of at least 150 seconds; the command blocks server-side for up to 110 seconds):
+1. Ask for work. Run this exact command, giving the Bash tool a timeout of 600000 milliseconds (ten minutes; the command blocks server-side for up to 540 seconds, and asking less often is what keeps the run within the account's budget):
 
-   AMPI_WORKER_ID="cloud:$CLAUDE_CODE_REMOTE_SESSION_ID" ampi worker --job-root /home/user/AgentMPI/work/e6/{name}/local --rank {rank} --expect-rank {rank} --campaign {name} next --timeout 110
+   AMPI_WORKER_ID="cloud:$CLAUDE_CODE_REMOTE_SESSION_ID" ampi worker --job-root /home/user/AgentMPI/work/e6/{name}/local --rank {rank} --expect-rank {rank} --campaign {name} next --timeout 540
 
    It prints one JSON object. Read its "status":
      - "task": go to step 2.
