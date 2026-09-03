@@ -185,10 +185,16 @@ python experiments/e5_multihost/rank.py collect --name x --remote $AMPI_GIT_REMO
 
 `E5` is the experiment that uses it: one rank per cloud VM, each launched as a
 Claude Code session, allgathering the kernel boot id that only its own machine can
-produce. A mutation is a network round trip and contention serialises at the
-remote, so a collective over `p` ranks costs on the order of `p` round trips plus
-retries; the cost model in the paper says whether that matters, and for an
-executor whose one step costs thirty seconds it does not. The device does not
+produce. `runs/e5-cloud-p32` is thirty-two ranks on thirty-two VMs: 32 distinct
+boot ids, sessions and containers in the allgather, four collectives closed by all
+32, the allreduce sum correct, and a median rank wall time of 35 minutes for 1131
+successful pushes against 13415 rejected ones. A mutation is a network round trip
+and contention serialises at the remote, so a collective over `p` ranks costs on
+the order of `p` round trips plus retries, which at `p=32` is eight to twelve
+minutes; the cost model in the paper says whether that matters, and for an
+executor whose one step costs thirty seconds it does not. The rejection ratio is
+the number to improve: per-rank append branches merged on read would remove most
+of it without touching the waist. The device does not
 delete branches (the hosting proxy this was written against refuses deletes) and
 does not compact, and its clock is the local wall clock, which is comparable
 across NTP-disciplined VMs and nowhere else.
