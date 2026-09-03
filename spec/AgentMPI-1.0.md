@@ -1405,6 +1405,20 @@ it when requesting the ranks of a job.
 > forty-two minutes for four collectives.  Measured with it: sixteen ranks on two
 > daemons made 470 operations in 98 pushes with no rank aware of the difference.
 
+A daemon's readers MUST NOT wait on the lock its writer holds for the duration
+of a push contest.  A reader that has a copy fetched within the device's read
+interval SHOULD be served from that copy without taking the lock; only a reader
+whose copy is stale takes it, to fetch.  The daemon SHOULD widen its batch
+window while its pushes are being rejected and relax it when they land.
+
+> **Rationale.** Measured at 128 ranks over four machines before this rule
+> existed: readers and the batching writer shared one lock, the writer
+> reacquired it the moment it released it, and with thirty polling readers an
+> individual reader could wait longer than its lease.  Fifty-seven live ranks,
+> all blocked in the same broadcast, were convicted for silence within twenty
+> minutes.  A lock is not a queue, and a rank that cannot complete a read cannot
+> renew the lease that would keep it alive.
+
 The runtime's lease renewal while blocked (S10.4) SHOULD be paced to the
 device's mutation cost: a poll loop that renews a lease every few seconds is
 correct on a shared filesystem and ruinous on a device whose every write is a

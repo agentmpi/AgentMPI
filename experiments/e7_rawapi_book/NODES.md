@@ -57,3 +57,38 @@ grouped by the daemon and paced by the model's own latency, a node's push rate
 stays near one every few seconds. The phase that matters is translation, where
 every rank is busy for several minutes per chunk; coordination cost shows up at
 the phase boundaries, which is where the trace analysis reports it.
+
+## What the first multi-node runs taught (operations)
+
+Learned on 3 September, running p = 128 over four sessions and p = 256 over
+eight; each cost an attempt.
+
+*Node 0 first, always.*  A joining node's launcher waits for the job's world
+communicator to appear on the branch and then starts its ranks.  It cannot tell
+a fresh job from the previous one on the same branch.  When a run has to be
+relaunched, stop node 0, then stop the other nodes, then start node 0 on the
+new job, and only then start the others; a joining node started before node 0
+recreates the job will join the old one.  If the old population cannot be
+stopped promptly, give the new job a new name (`--name e7-rawapi-p128b`): a new
+branch has no zombies, and a force push cannot win a race against a branch that
+is being pushed to every few seconds.
+
+*Killing by pattern kills the shell that types the pattern.*  `pkill -f
+"experiments.e7_rawapi_book.harness"` matches the `bash -c` that contains it;
+the shell dies first and the rest of the command never runs.  Use a pattern
+that cannot match its own text (`pkill -f "e7_rawapi_book[.]harness"`), or a
+script that filters on the interpreter.
+
+*The daemon's lock was the bottleneck, not the remote.*  Readers took the lock
+the writer holds for its whole push contest; at four nodes a reader could wait
+longer than a lease and be convicted alive.  Fixed in `ampi/device/gitlog.py`
+(`_snapshot`: readers take the lock only to fetch) and `ampi/device/gitd.py`
+(the batch window widens under rejection).  The evidence is
+`runs/e7-rawapi-p128-attempt1`.
+
+*A session that runs ranks should run nothing else.*  Interrupting a child
+session cancels the messages queued for it; a child in a long poll may not see
+a message for many minutes.  Messages to children should be idempotent, and
+the operator should verify from the device (which ranks renewed their leases in
+the last two minutes, grouped by node) rather than from the children's
+reports.
