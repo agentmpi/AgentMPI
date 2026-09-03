@@ -209,6 +209,25 @@ def stub_executor(languages: list[str]) -> FunctionExecutor:
     return FunctionExecutor(fn)
 
 
+def model_for_rank(spec: str, rank: int) -> str:
+    """The model a rank uses: one name, or one of a comma-separated pool by rank.
+
+    The pool exists because of a provider policy, not a research design: on the
+    account these runs used, every capable model was limited to twenty requests a
+    minute *per model*, so a population of sixty-four ranks on one model spends
+    its time queueing on the limit rather than translating.  Spreading the ranks
+    over a pool multiplies the aggregate limit by the pool's size.  It also makes
+    the population heterogeneous --- and the protocol, which never asks what an
+    executor is, does not notice, which is a claim this experiment now tests.
+    Rank ``r`` uses ``pool[r % len(pool)]`` at every scale, so the mix is the same
+    across the series and a segment's model is a function of its rank alone.
+    """
+    pool = [m.strip() for m in spec.split(",") if m.strip()]
+    if not pool:
+        raise ValueError("no model given")
+    return pool[rank % len(pool)]
+
+
 def model_executor(amp: Ampi, cfg: Config, log_dir: Path) -> Any:
     from ampi.model import ChatModel, ModelExecutor
     from ampi.tools import research_tools
@@ -217,12 +236,15 @@ def model_executor(amp: Ampi, cfg: Config, log_dir: Path) -> Any:
                  else {"effort": cfg.reasoning})
 
     def make(name: str, *, plugins: list[dict] | None = None) -> ChatModel:
-        return ChatModel(name, reasoning=reasoning, plugins=plugins, timeout_s=cfg.task_timeout)
+        return ChatModel(name, reasoning=reasoning, plugins=plugins, timeout_s=cfg.task_timeout,
+                         rate_limit_patience_s=cfg.task_timeout)
 
-    main = make(cfg.model)
-    research = make(cfg.research_model or cfg.model,
+    rank = amp.rank
+    mine = model_for_rank(cfg.model, rank)
+    main = make(mine)
+    research = make(model_for_rank(cfg.research_model, rank) if cfg.research_model else mine,
                     plugins=[{"id": "web", "max_results": 5}] if cfg.web else None)
-    arbiter = make(cfg.arbiter_model or cfg.model)
+    arbiter = make(model_for_rank(cfg.arbiter_model, rank) if cfg.arbiter_model else mine)
     tools = research_tools() if cfg.tools else []
     return ModelExecutor(
         amp, main, system=SYSTEM, max_attempts=cfg.max_attempts, log_dir=log_dir,
@@ -955,7 +977,8 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         (run_dir / "launch_plan.json").write_text(json.dumps({
             "experiment": "e7_rawapi_book", "name": cfg.name, "size": cfg.size, "nodes": cfg.nodes,
             "launch": a.launch, "device": cfg.device, "executor": cfg.executor,
-            "model": cfg.model, "research_model": cfg.research_model or cfg.model,
+            "model": cfg.model, "model_pool": [m.strip() for m in cfg.model.split(",") if m.strip()],
+            "research_model": cfg.research_model or cfg.model,
             "arbiter_model": cfg.arbiter_model or cfg.model, "reasoning": cfg.reasoning,
             "tools": cfg.tools, "web": cfg.web, "arm": cfg.arm, "languages": cfg.languages,
             "quorum": cfg.quorum, "barrier_policy": cfg.barrier_policy,
