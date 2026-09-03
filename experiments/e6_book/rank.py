@@ -345,10 +345,16 @@ def run_ranks(a: argparse.Namespace, ranks: list[int], *, fresh: bool) -> dict[s
     if local is not None:
         from ampi.executor import BrokerExecutor
 
-        try:
-            BrokerExecutor(local, campaign=a.name, work_dir=work / "broker").close()
-        except Exception as exc:  # noqa: BLE001 - closing is best effort
-            print(json.dumps({"close_failed": str(exc)}), flush=True)
+        if getattr(a, "leave_open", False):
+            # Another harness process on this machine still serves ranks
+            # through the same queue; closing the campaign would send its
+            # worker away.
+            print(json.dumps({"campaign": a.name, "left_open": True}), flush=True)
+        else:
+            try:
+                BrokerExecutor(local, campaign=a.name, work_dir=work / "broker").close()
+            except Exception as exc:  # noqa: BLE001 - closing is best effort
+                print(json.dumps({"close_failed": str(exc)}), flush=True)
         with open(work / "local.trace.jsonl", "w", encoding="utf-8") as fh:
             for e in local.events():
                 fh.write(json.dumps(e, default=str) + "\n")
@@ -845,6 +851,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--name", required=True)
     p.add_argument("--rank", required=True, help="a rank, or several comma-separated ranks")
     p.add_argument("--resume", action="store_true", help="keep the local queue; replay memoised work")
+    p.add_argument("--leave-open", action="store_true",
+                   help="do not close the local campaign at the end (another process still serves it)")
     p.add_argument("--executor", default="broker", choices=["broker", "claude", "stub"])
     p.add_argument("--model", default=None)
     p.add_argument("--effort", default=None)
