@@ -166,6 +166,33 @@ thirty-two sessions serving thirty-two ranks at once completed `E1` end to end
 (`runs/claude-scale-p32`); memory, not CPU, is what bounds the count on one VM,
 and the account's rate limit is what bounds it across VMs.
 
+### One job across many machines: the git device
+
+The three original transports need a shared filesystem. Cloud sandboxes have no
+such thing: each session is its own VM behind NAT, with no inbound port and an
+egress policy that admits a handful of hosts. What every sandbox *can* reach is a
+git hosting service, and a git ref is a compare-and-swap cell, so
+`ampi/device/gitlog.py` implements the six waist operations as "fetch, apply,
+commit, push, retry on rejection" over one JSON document on one branch. It passes
+the same conformance suite as the others, and nothing above the waist changed.
+
+```bash
+export AMPI_DEVICE=git AMPI_GIT_REMOTE=https://github.com/you/repo AMPI_GIT_BRANCH=ampi-jobs/x
+python experiments/e5_multihost/rank.py create --name x --size 32 --remote $AMPI_GIT_REMOTE   # once, anywhere
+python experiments/e5_multihost/rank.py run    --name x --rank 7 --remote $AMPI_GIT_REMOTE    # on machine 7
+python experiments/e5_multihost/rank.py collect --name x --remote $AMPI_GIT_REMOTE            # afterwards
+```
+
+`E5` is the experiment that uses it: one rank per cloud VM, each launched as a
+Claude Code session, allgathering the kernel boot id that only its own machine can
+produce. A mutation is a network round trip and contention serialises at the
+remote, so a collective over `p` ranks costs on the order of `p` round trips plus
+retries; the cost model in the paper says whether that matters, and for an
+executor whose one step costs thirty seconds it does not. The device does not
+delete branches (the hosting proxy this was written against refuses deletes) and
+does not compact, and its clock is the local wall clock, which is comparable
+across NTP-disciplined VMs and nowhere else.
+
 ## Results, including the negative ones
 
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,

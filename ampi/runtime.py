@@ -111,5 +111,5 @@ def conformance() -> dict[str, Any]:
             "byzantine_tolerance": "acknowledged and out of scope",
             "automatic_context_compaction": "a research question; the hook is Type_view",
         },
-        "devices": ["sqlite", "journal", "memory"],
+        "devices": ["sqlite", "journal", "memory", "git"],
     }

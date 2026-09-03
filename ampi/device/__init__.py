@@ -29,6 +29,7 @@ from .base import (
     open_device,
     register_device,
 )
+from .gitlog import GitDevice
 from .journal import JournalDevice
 from .memory import MemoryDevice
 from .sqlite import SqliteDevice
@@ -37,6 +38,7 @@ __all__ = [
     "Cell",
     "Device",
     "Ge",
+    "GitDevice",
     "Gt",
     "In",
     "IsNull",
