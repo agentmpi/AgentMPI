@@ -25,48 +25,50 @@
 
 \begin{document}
 
-\title{AgentMPI: A Message Passing Interface for Multi-Agent Systems}
+\title{MPI Transplants to Multi-Agent Systems, and Two of Its Rules Invert}
 
 \author{AgentMPI Project}
 \affiliation{\institution{}\country{}}
 
 \begin{abstract}
-Multi-agent LLM systems are in the position parallel computing occupied around
-1991: every group writes its own coordination layer, none of them compose, and
-there is no portable interface one writes a \emph{harness} against. We argue that
-the interface parallel computing converged on---MPI~\cite{mpiforum1994mpi10,mpi41}---transplants, and we specify,
-implement and evaluate \ampi: a protocol for writing multi-agent systems, not a
-multi-agent system.
+Multi-agent language-model systems occupy the position parallel computing
+occupied in 1991: every group writes its own coordination layer, none of the
+layers compose, and no portable interface exists to write a \emph{harness}
+against. Parallel computing left that position by standardising the calls a
+program makes, and this paper shows that the same interface, MPI, transplants to
+agent coordination once its cost model is
+restated~\cite{mpiforum1994mpi10,mpi41}. We specify, implement and evaluate
+\ampi, a protocol for writing multi-agent systems rather than a multi-agent
+system.
 
-The transplant is not mechanical. Five asymmetries between an MPI process and an
-LLM executor invert several of MPI's answers. The scarce resource is the
-receiver's \emph{context window} rather than bandwidth, so MPI's eager limit
-becomes a token-denominated flow-control problem and MPI's ``safe program''
-discipline becomes a mechanically checkable property we call \emph{context
-safety}. The reduction operator costs seconds rather than nanoseconds, so
-algorithm selection must minimise operator applications on the critical path
-rather than message volume: at $p=\ctxP$ the schedule MPI prefers for short
-messages performs \rdAppsonetwentyeight\ operator applications where
-reduce-then-broadcast performs \rbAppsonetwentyeight. And because a shared control
-plane replaces a point-to-point network, MPI's barrier hierarchy collapses
-entirely.
+Five asymmetries between an MPI process and a language-model executor change
+several of MPI's answers. The scarce resource is the receiver's context window
+rather than bandwidth, so MPI's eager limit becomes a token-denominated
+flow-control rule and MPI's safe-program discipline becomes a checkable property
+we call \emph{context safety}. The reduction operator costs seconds rather than
+nanoseconds, so algorithm selection minimises operator applications on the
+critical path rather than message volume: at $p=\ctxP$ the schedule MPI prefers
+for short messages applies the operator \rdAppsonetwentyeight\ times where
+reduce-then-broadcast applies it \rbAppsonetwentyeight\ times. A shared control
+plane replaces a point-to-point network, and MPI's barrier hierarchy collapses.
 
-We also report a limitation of agent-evaluated reductions that we found rather
-than predicted, and a mechanism for it. A canonical reduction tree makes an
-agent reduction \emph{reproducible}; it does not make it \emph{consistent}, because
-two branches can meet the same conflict and resolve it oppositely with no node in
-a position to notice. We formalise this as the \emph{locality of merge}, and
-introduce \emph{conflict lifting}: enlarging the operator's codomain with a
-conflict set whose join is a semilattice, so the conflicts reaching the root are
-identical for every tree shape and the root arbitrates each exactly once.
+Agent-evaluated reductions expose a limitation we found in a run rather than
+predicted. A canonical reduction tree makes such a reduction reproducible but not
+consistent, because two branches can meet the same conflict and resolve it
+oppositely with no node positioned to notice. We name this the \emph{locality of
+merge} and answer it with \emph{conflict lifting}: the operator's codomain gains a
+conflict set whose join is a semilattice, so the root receives the same conflicts
+for every tree shape and arbitrates each exactly once.
 
-\ampi ships as a specification, a reference runtime organised around a
-six-operation abstract device interface with \nDevices\ independent transports, and
-a conformance suite of \nProtocolTests\ protocol assertions and \nDeviceTests\
-device assertions run unchanged against every transport. We evaluate with real
-agent populations: paired eight-rank translation runs, a hundred-rank run under
-executor oversubscription, and deterministic microbenchmarks that fit the cost
-model. Two results are negative and reported as such.
+\ampi ships as a specification, a reference runtime over a six-operation device
+interface with five transports, a conformance suite of \nProtocolTests\ protocol
+and \nDeviceTests\ device assertions run unchanged against every transport, and a
+process manager. Real agent populations exercised it: paired eight-rank
+translation runs, a hundred-rank run under executor oversubscription, and a
+production translation of a Russian biography into three languages by 16, 32 and
+64 process ranks, then by 128 and 256 ranks over several machines. Three results
+are negative, and the multi-machine runs measured the transport's ceiling instead
+of a book; we report them as such.
 \end{abstract}
 
 \keywords{multi-agent systems, message passing, MPI, collective communication,
@@ -76,106 +78,114 @@ fault tolerance, LLM agents}
 
 \section{Introduction}
 
-A multi-agent LLM system today is written the way a parallel program was written
-in 1991. The author picks a coordination pattern---a group chat, a supervisor
-tree, a directed graph of handoffs---and implements it from scratch against
-whatever agent SDK is at hand. The result does not compose with anyone else's, it
-cannot be moved to a different agent host without rewriting, and its failure modes
-are rediscovered independently by every group that builds one.
+A multi-agent language-model system is written today the way a parallel program
+was written in 1991. The author picks a coordination pattern, a group chat, a
+supervisor tree or a directed graph of handoffs, and implements it from scratch
+against whatever agent kit is at hand. The result composes with nobody else's
+work, cannot move to a different agent host without a rewrite, and fails in ways
+every other group rediscovers on its own.
 
-Parallel computing left that state by agreeing on an interface~\cite{walker1992standards,mpiforum1994mpi10}. The MPI Forum did
-not standardise a runtime, a language, or a programming model; it standardised the
-\emph{calls a program makes} to communicate, and left the process manager, the
-algorithms and the transport to implementations. That decision is why a program
-written in 1996 still runs, and why a dozen vendors shipped MPI-1 within two years
-of the document.
+Parallel computing left that state by agreeing on an
+interface~\cite{walker1992standards,mpiforum1994mpi10}. The MPI Forum
+standardised neither a runtime nor a language nor a programming model; it
+standardised the calls a program makes to communicate, and left the process
+manager, the algorithms and the transport to implementations. That decision is
+why a program written in 1996 still runs, and why a dozen vendors shipped MPI-1
+within two years of the document.
 
-This paper asks whether the same move is available now, and answers that it mostly
-is. \ampi is a protocol you write a harness \emph{with}, in the sense that MPI is a
-library you write a parallel program with. It does not decide how many agents to
-run, what they should do, how to prompt them, or how to recover; it provides the
-mechanisms with which those decisions are expressed. It is deliberately
-semantics-thin---a message is an opaque body plus an envelope---which is a
-considered rejection of the KQML/FIPA-ACL lineage whose mentalistic semantics
-proved unverifiable, in favour of MPI's stance: standardise the mechanism, leave
-meaning to the application.
+This paper asks whether the same move is available now and answers that it mostly
+is. \ampi is a protocol a harness is written with, in the sense that MPI is a
+library a parallel program is written with. It decides neither how many agents to
+run, nor what they do, nor how to prompt them, nor how to recover; it supplies the
+mechanisms with which those decisions are expressed. It is semantics-thin, a
+message being an opaque body plus an envelope, which rejects the KQML and FIPA-ACL
+lineage, whose mentalistic semantics proved unverifiable, in favour of MPI's
+stance: standardise the mechanism and leave meaning to the application.
 
-\paragraph{The transplant is not mechanical.} Five properties of an LLM executor
-differ from an MPI process (\S\ref{sec:asym}), and each forces a deviation. Two of
-MPI's algorithm-selection rules invert. One of MPI's cost terms, the reduction
-operator, goes from free to dominant. One of MPI's non-goals, fault tolerance,
-becomes the common case. And one resource with no MPI analogue---the receiver's
-context window---turns algorithm selection from an optimisation into a feasibility
-test.
+The transplant is not mechanical. Five properties of a language-model executor
+differ from those of an MPI process (Section~\ref{sec:asym}), and each forces a
+deviation. Two of MPI's algorithm-selection rules invert. One of MPI's cost terms,
+the reduction operator, goes from free to dominant. One of MPI's non-goals, fault
+tolerance, becomes the common case. One resource with no MPI analogue, the
+receiver's context window, turns algorithm selection from an optimisation into a
+feasibility test.
 
 \paragraph{Contributions.}
 \begin{enumerate}
-\item A specification (\S\ref{sec:design}) that maps MPI's chapters onto agent
-coordination and states, for each, whether the mechanism transfers, transfers with
-a changed unit, or does not transfer. It is written in the standard's own idiom:
-normative text with explicit rationale.
+\item A specification (Section~\ref{sec:design}) that maps MPI's chapters onto
+agent coordination and states, for each mechanism, whether it transfers,
+transfers with a changed unit, or does not transfer. It is written in the
+standard's own idiom: normative text with explicit rationale.
 
-\item \emph{The locality of merge} (\S\ref{sec:merge}), a limitation of
-agent-evaluated reductions that we observed in a real run and could not previously
-name, together with two mechanisms---conflict lifting and invariant
-verification---and a shape-independence property for the first.
+\item The locality of merge (Section~\ref{sec:merge}), a limitation of
+agent-evaluated reductions observed in a real run, together with two mechanisms,
+conflict lifting and invariant verification, and a shape-independence property for
+the first.
 
-\item A cost model and re-derived selection rules (\S\ref{sec:cost}) in which the
-operator term dominates, with the resulting inversions stated and measured.
+\item A cost model and re-derived selection rules (Section~\ref{sec:cost}) in
+which the operator term dominates, with the resulting inversions stated and
+measured.
 
 \item A reference implementation organised around a narrow waist
-(\S\ref{sec:impl}): six device operations, \nDevices\ independent transports, and one
-conformance suite run against all of them. The suite is the artifact that makes
-this a specification rather than a library, and it found defects that only exist
-on one transport.
+(Section~\ref{sec:impl}): six device operations, five transports including one
+that spans machines through a git remote, one conformance suite run against all
+of them, and a process manager that makes a rank an operating-system process on
+one machine or across several.
 
-\item An evaluation with real agent populations (\S\ref{sec:eval}), including two
-negative results we report because they are the informative ones.
+\item An evaluation with real agent populations (Section~\ref{sec:eval}), from
+eight-rank paired runs to a production translation by 64 process ranks, and the
+multi-machine runs whose failures measured two transport limits.
 \end{enumerate}
 
-\section{Background: what MPI standardised}
+\section{Background: What MPI Standardised}
 \label{sec:background}
 
-MPI was assembled in 1992--1994~\cite{walker1992standards,dongarra1993proposal,mpiforum1994mpi10}
-from a field of incompatible message-passing libraries---p4, PARMACS,
-Chameleon~\cite{gropp1993chameleon}, Zipcode, PVM, Express, NX---each of which
-solved part of the problem and none of which was portable. The Forum's rules were
-unusually restrictive and unusually effective: standardise existing practice
-rather than invent; decline everything not yet understood.
+MPI succeeded by standardising existing practice under strict rules, and three
+of its decisions carry directly into this work. The section first recalls the
+Forum's rules and non-goals, then states the three decisions: communicators,
+safe programs, and performance portability.
 
-MPI-1's \emph{non-goals} were as consequential as its goals. It is not a language.
-It does not provide shared memory, debugging, I/O, threads, task management, or
+MPI was assembled in 1992--1994 from a field of incompatible message-passing
+libraries, among them p4, PARMACS, Chameleon, Zipcode, PVM, Express and NX, each
+of which solved part of the problem and none of which was
+portable~\cite{walker1992standards,dongarra1993proposal,mpiforum1994mpi10,gropp1993chameleon}.
+The Forum's rules were restrictive and effective: standardise existing practice
+rather than invent, and decline everything not yet understood. MPI-1's non-goals
+were as consequential as its goals. It is not a language, and it provides neither
+shared memory, nor debugging, nor I/O, nor threads, nor task management, nor
 fault tolerance. Declining those kept it small enough to implement.
 
-Three of its decisions matter here.
-
-\paragraph{Communicators.} A communicator pairs a group with a private
-\emph{context} that partitions the message namespace. Pre-MPI libraries addressed
-messages by destination and tag, so a library's messages could be intercepted by
-its caller whenever they collided on an integer. MPI's designers retrospectively
-identify the context as the reason MPI could support libraries at
+\paragraph{Communicators.} A communicator pairs a group with a private context
+that partitions the message namespace. Pre-MPI libraries addressed messages by
+destination and tag, so a library's messages could be intercepted by its caller
+whenever two integers collided. MPI's designers identify the context as the
+reason MPI could support libraries at
 all~\cite{gropp2001learning,hoefler2011libraries,snir1996mpicomplete}. The
 agent-world version of that collision is not hypothetical: a reviewer's critique
-intended for the author of module A being consumed by the author of module B is
-the same bug, and the ``one shared group chat'' architecture makes it certain
-rather than merely possible.
+intended for the author of module A and consumed by the author of module B is the
+same bug, and the shared group chat makes it certain rather than possible.
 
-\paragraph{Safe programs.} MPI deliberately refuses to guarantee buffering. A
-program that completes only because an implementation happened to buffer is called
-\emph{unsafe}, and the standard's advice is to test a program by replacing every
-standard-mode send with a synchronous one. The test is mechanical and almost
-nobody runs it, because the penalty is a deadlock on someone else's machine.
+\paragraph{Safe programs.} MPI refuses to guarantee buffering. A program that
+completes only because an implementation happened to buffer is called unsafe, and
+the standard's advice is to test a program by replacing every standard-mode send
+with a synchronous one. The test is mechanical and rarely run, because the
+penalty for skipping it is a deadlock on someone else's machine.
 
-\paragraph{Performance portability.} The standard specifies semantics;
-implementations choose algorithms. The Hockney model $T = \alpha + \beta n$ and its
-successors~\cite{culler1993logp,alexandrov1995loggp} let an implementation pick a
-collective algorithm by message size and process
-count~\cite{thakur2005optimization,rabenseifner2004optimization}. Evidence on
-which parts of MPI applications actually use~\cite{laguna2019study} is what
-motivates our conformance levels.
+\paragraph{Performance portability.} The standard specifies semantics, and
+implementations choose algorithms. The Hockney model $T = \alpha + \beta n$ and
+its successors let an implementation pick a collective algorithm by message size
+and process
+count~\cite{culler1993logp,alexandrov1995loggp,thakur2005optimization,rabenseifner2004optimization}.
+Evidence on which parts of MPI applications use motivates our conformance
+levels~\cite{laguna2019study}.
 
-\section{Why an agent is not a process}
+\section{Why an Agent Is Not a Process}
 \label{sec:asym}
+
+Five asymmetries between an MPI process and a language-model executor drive
+every deviation in the specification, and a sixth runs the other way.
+Table~\ref{tab:asym} lists the five; the paragraphs below trace each to the
+section it shapes, and the last paragraph states the sixth.
 
 \begin{table}[t]
 \caption{The five asymmetries that drive every deviation.}
@@ -194,264 +204,286 @@ A5 Failure & fail-stop, rare, fatal & frequent, partial, sometimes silent \\
 \end{tabular}
 \end{table}
 
-Table~\ref{tab:asym} lists them. Their consequences run through the rest of the
-paper: A2 forces the eager threshold to be denominated in tokens
-(\S\ref{sec:flow}); A3 inverts algorithm selection (\S\ref{sec:cost}); A4
-motivates quorum collectives; A5 requires the whole fault-tolerance chapter; A1
-requires reduction \emph{reproducibility} and, separately, \emph{consistency} to be
-declared properties (\S\ref{sec:merge}).
+Their consequences run through the rest of the paper. A2 forces the eager
+threshold to be denominated in tokens (Section~\ref{sec:flow}). A3 inverts
+algorithm selection (Section~\ref{sec:cost}). A4 motivates quorum collectives.
+A5 requires the whole fault-tolerance chapter. A1 requires reduction
+reproducibility and, separately, consistency to be declared properties
+(Section~\ref{sec:merge}).
 
-One asymmetry runs the other way, and is easy to miss. In MPI the control plane is
+One asymmetry runs the other way and is easy to miss. In MPI the control plane is
 a point-to-point network. In \ampi it can be, and in our implementation is, a
-\emph{shared medium} every rank can read. That single structural difference
-collapses MPI's barrier hierarchy: a counting barrier costs $2(p{-}1)$ operations
-against dissemination's $p\lceil\log_2 p\rceil$---\barCentraltwofiftysix\ against
-\barDissemtwofiftysix\ at $p=256$---so it is cheaper at every size, and it is also
-the only algorithm that can name the ranks that did not arrive. MPI avoids
+shared medium every rank can read. That structural difference collapses MPI's
+barrier hierarchy: a counting barrier costs $2(p{-}1)$ operations against
+dissemination's $p\lceil\log_2 p\rceil$, \barCentraltwofiftysix\ against
+\barDissemtwofiftysix\ at $p=256$, so it is cheaper at every size, and it is
+also the only algorithm that can name the ranks that did not arrive. MPI avoids
 counting barriers at scale for a reason that does not apply here.
 
 \section{Design}
 \label{sec:design}
 
-We summarise the specification; the normative document accompanies the artifact.
+The specification keeps MPI's mechanisms and changes their units, their
+identification, and their failure behaviour. This section summarises it; the
+normative document accompanies the artifact. Section~\ref{sec:ranks} separates a
+rank from its executor, Section~\ref{sec:flow} restates flow control in tokens,
+Section~\ref{sec:views} restates datatypes as views and contracts,
+Section~\ref{sec:coll} changes how collectives are identified,
+Section~\ref{sec:win} gives shared state MPI-3's one-sided discipline, and
+Section~\ref{sec:ft} adopts ULFM's fault-tolerance stance.
 
-\subsection{Ranks, epochs, and identity}
+\subsection{Ranks, Epochs, and Identity}
+\label{sec:ranks}
 
-A rank is a \emph{durable role}, not a process: a number, a mailbox, a context
-budget and an accumulated ledger. Its physical embodiment is an \emph{executor}
-bound to it for a bounded interval, identified by an \emph{epoch}. In MPI a rank
-\emph{is} a process and the identification is harmless because MPI processes live
-for the whole job; an agent session does not, so tying rank identity to session
-identity would make every timeout a communicator rebuild.
+A rank is a durable role rather than a process: a number, a mailbox, a context
+budget and an accumulated ledger. Its physical embodiment is an executor bound to
+it for a bounded interval, identified by an epoch. In MPI a rank \emph{is} a
+process, and the identification is harmless because MPI processes live for the
+whole job; an agent session does not, so tying rank identity to session identity
+would make every timeout a communicator rebuild.
 
-The epoch is a fencing token. Leases alone are insufficient: an executor cannot
-know its lease expired mid-step, so between expiry and its next call two executors
-believe they own the rank. A monotone token checked on every operation closes that
-window and makes a zombie harmless rather than corrupting.
+The epoch is a fencing token. Leases alone do not suffice: an executor cannot
+know its lease expired mid-step, so between expiry and its next call two
+executors believe they own the rank. A monotone token checked on every operation
+closes that window and makes a zombie harmless rather than corrupting.
 
-Identity is \emph{ambient} but must be \emph{assertable}. This is a correction we
-were forced into. Ambient identity eliminated the error we designed it to
-eliminate---agents passing the wrong rank---and replaced it with a worse one:
-agents silently \emph{being} the wrong rank, because on one host shell sessions
-were shared between concurrent agents and the rank variable was overwritten
-between calls. The fix is not to abandon ambient identity but to make the
-assertion cheap.
+Identity is ambient but must be assertable, a correction a run forced on us.
+Ambient identity eliminated the error it was designed to eliminate, agents
+passing the wrong rank, and replaced it with a worse one: agents silently
+\emph{being} the wrong rank, because on one host shell sessions were shared
+between concurrent agents and the rank variable was overwritten between calls.
+The fix keeps ambient identity and makes the assertion cheap.
 
-\subsection{Flow control in tokens}
+\subsection{Flow Control in Tokens}
 \label{sec:flow}
 
-Every rank has a context budget; delivering a body charges it. Below an
-\emph{eager threshold} (\eagerThreshold\ tokens by default) a body is pushed into
-the receiver; above it, the receiver gets an envelope and a content-addressed
-handle and materialises explicitly. This is MPI's eager limit with the unit
-changed from bytes to tokens, and it exists for the same reason: below the limit,
-pushing unsolicited is cheaper than a handshake; above it, the receiver's
-buffer---here, its attention---is too precious to fill without permission.
-
-Long contexts are not free even when they fit: model accuracy degrades with
-position and length~\cite{liu2024lostmiddle}, and serving systems treat the window
-as a managed resource~\cite{kwon2023vllm}. Both are reasons to account for it in
-the protocol rather than in the prompt.
+Every rank has a context budget, and delivering a body charges it. Below an
+eager threshold of \eagerThreshold\ tokens by default, a body is pushed into the
+receiver; above it, the receiver gets an envelope and a content-addressed handle
+and materialises explicitly. This is MPI's eager limit with the unit changed from
+bytes to tokens, and it exists for the same reason: below the limit, pushing
+unsolicited is cheaper than a handshake; above it, the receiver's buffer, here its
+attention, is too precious to fill without permission. Long contexts cost even
+when they fit, because model accuracy degrades with position and length and
+serving systems treat the window as a managed
+resource~\cite{liu2024lostmiddle,kwon2023vllm}. Both are reasons to account for
+the window in the protocol rather than in the prompt.
 
 Two things do not transfer. First, in MPI eager and rendezvous are invisible
-because both deliver the same bytes; here they differ in \emph{what arrives}, so
-they must be visible. Second, exceeding the buffer does not deadlock, it silently
+because both deliver the same bytes; here they differ in what arrives, so they
+must be visible. Second, exceeding the buffer does not deadlock; it silently
 degrades the receiver's output.
 
-That second point makes MPI's safe-program discipline more important here, not
-less, so we mechanise it. Define a program \emph{context-safe} if it completes for
-every assignment of unexpected-message budgets, however small. The reference
+The second point makes MPI's safe-program discipline more important here, so the
+runtime mechanises it. A program is \emph{context-safe} if it completes for every
+assignment of unexpected-message budgets, however small. The reference
 implementation runs a harness's communication skeleton under zero-buffer
-semantics, reports the ranks that wedge and any cycle among them, and re-runs with
-every send declared rendezvous so it can say whether the harness is repairable by
-transport choice alone. A ring in which every rank sends before it receives---the
-shape agent harnesses write by default---is diagnosed with its cycle named and the
-repair stated.
+semantics, reports the ranks that wedge and any cycle among them, and re-runs
+with every send declared rendezvous so it can say whether the harness is
+repairable by transport choice alone. A ring in which every rank sends before it
+receives, the shape agent harnesses write by default, is diagnosed with its
+cycle named and the repair stated.
 
-\subsection{Views and contracts}
+\subsection{Views and Contracts}
+\label{sec:views}
 
 An MPI derived datatype is a declarative description of how to access a buffer,
 and its value is that the access pattern is data the library can optimise rather
 than control flow it cannot see. The scarce resource here is context, so the
-analogous question is not ``which bytes'' but ``which tokens, and how few''. A
+analogous question is not which bytes but which tokens, and how few. A
 \emph{view} is a deterministic, model-free projection: \code{head:n},
 \code{grep:pat}, \code{keys:a,b}, \code{outline}, \code{stat}. Semantic
-compression is deliberately \emph{not} a view, because it costs an operator
-application the harness must be able to see.
+compression is deliberately not a view, because it costs an operator application
+the harness must be able to see.
 
 Contracts transplant the second job of MPI datatypes: a type signature checked at
-both ends, turning silent corruption into a loud error. A contract may also
+both ends, which turns silent corruption into a loud error. A contract may also
 require a payload to identify itself, which turns a misrouted scatter slice into
 an error at the receiver rather than a plausible wrong answer three phases later.
 
 \subsection{Collectives}
+\label{sec:coll}
 
-Labelled, not positional. MPI identifies the $k$th collective by program order,
-which is safe when the caller is a compiled program. An executor's program order
-is not: it retries, skips, and reorders. Positional identification would pair one
-rank's second call with everyone else's first and return a confidently wrong
-result. Labels cannot make a reordered schedule complete---nothing can---but they
-make the mismatch \emph{named}.
+Collectives are labelled rather than positional. MPI identifies the $k$th
+collective by program order, which is safe when the caller is a compiled program.
+An executor's program order is not: it retries, skips and reorders. Positional
+identification would pair one rank's second call with everyone else's first and
+return a confidently wrong result. Labels cannot make a reordered schedule
+complete, but they make the mismatch named.
 
-Gather returns a \emph{manifest}, not a concatenation. At $p=\ctxP$ with
+Gather returns a manifest rather than a concatenation. At $p=\ctxP$ with
 \ctxN-token contributions, an inlining allgather charges one rank
 \agInlinePeak\ tokens and moves \agInlineTotal\ in total; a handle-based one
-charges \agHandlePeak\ and moves \agHandleTotal, a factor of \agPeakRatio\ in peak
-residency. Concatenation is not a reasonable default at any interesting $p$.
+charges \agHandlePeak\ and moves \agHandleTotal, a factor of \agPeakRatio\ in
+peak residency. Concatenation is not a reasonable default at any interesting $p$.
 
-Barriers carry a \emph{policy}---wait, raise, proceed, shrink, revoke---because
-only the harness author knows whether a missing participant degrades the result or
-kills it. Collectives may carry a \emph{quorum}, which \emph{releases} without
-\emph{closing}: a straggler still passes through, because a quorum that closed
-would guarantee that precisely the slowest ranks fail.
+Barriers carry a policy, one of wait, raise, proceed, shrink and revoke, because
+only the harness author knows whether a missing participant degrades the result
+or kills it. Collectives may carry a quorum, which releases without closing: a
+straggler still passes through, because a quorum that closed would guarantee
+that precisely the slowest ranks fail.
 
 \subsection{Windows}
+\label{sec:win}
 
 Every multi-agent system grows a shared scratchpad, and every one gets the
 concurrency wrong the same way: two agents read it, both edit a private copy, and
 the second write discards the first's work. MPI-3's one-sided chapter supplies
 both the vocabulary and the tools. \code{put} is the blind overwrite that loses
 work; \code{accumulate} combines atomically, so ``union this finding into the
-shared findings'' needs no lock; \code{compare\_and\_swap} is how work is claimed,
-and unlike a lock it cannot be held by a dead executor.
+shared findings'' needs no lock; \code{compare\_and\_swap} is how work is
+claimed, and unlike a lock it cannot be held by a dead executor.
 
-Two departures. Locks are \emph{leased} and carry a fencing token, because an
-executor can wander off where an MPI process cannot. And enumeration is free while
-reading is not: listing a window's keys with their sizes and writers costs a few
-tokens per key, which is what makes a blackboard usable by an executor with a
-bounded context.
+Two departures follow from the executor's nature. Locks are leased and carry a
+fencing token, because an executor can wander off where an MPI process cannot.
+Enumeration is free while reading is not: listing a window's keys with their
+sizes and writers costs a few tokens per key, which is what makes a blackboard
+usable by an executor with a bounded context.
 
-\subsection{Fault tolerance}
+\subsection{Fault Tolerance}
+\label{sec:ft}
 
-ULFM's stance~\cite{bland2012ulfm,bland2013ulfm} adopted wholesale: expose
-failure, provide mechanisms not policy.
-\code{revoke} is the non-obvious primitive---when a rank fails the \emph{survivors}
-are the problem, blocked inside collectives that can never complete---and
-revocation makes them all fail fast so they reach the recovery path together.
-\code{shrink} derives a communicator over an \emph{agreed} survivor set, and also
-offers FT-MPI's~\cite{fagg2000ftmpi} in-place mode, because renumbering invalidates a rank-to-work
-mapping that for agents is baked into prompts.
+The specification adopts ULFM's stance wholesale: expose failure and provide
+mechanisms rather than policy~\cite{bland2012ulfm,bland2013ulfm}. \code{revoke}
+is the non-obvious primitive. When a rank fails, the survivors are the problem,
+blocked inside collectives that can never complete, and revocation makes them
+all fail fast so they reach the recovery path together. \code{shrink} derives a
+communicator over an agreed survivor set and also offers FT-MPI's in-place mode,
+because renumbering invalidates a rank-to-work mapping that for agents is baked
+into prompts~\cite{fagg2000ftmpi}.
 
-Recovery is by \emph{briefing}, not checkpoint. There is no memory image to
-restore, so process checkpointing has no analogue; what does is durable-execution
-replay. The dominant failure here is a confident wrong answer, which is the exact
-analogue of silent data corruption, and HPC's answer to that is not
-checkpoint/restart---which faithfully preserves the corruption---but
-algorithm-based fault tolerance~\cite{huang1984abft,bosilca2009abft}. A replacement is given the answers to five questions it cannot guess: what
-was I assigned, what did I publish, what did I receive, what did I promise that is
-outstanding, and what did I record for myself.
+Recovery proceeds by briefing rather than checkpoint. No memory image exists to
+restore, so process checkpointing has no analogue; durable-execution replay does.
+The dominant failure here is a confident wrong answer, the exact analogue of
+silent data corruption, and HPC's answer to that is not checkpoint and restart,
+which preserves the corruption, but algorithm-based fault
+tolerance~\cite{huang1984abft,bosilca2009abft}. A replacement receives the
+answers to five questions it cannot guess: what was I assigned, what did I
+publish, what did I receive, what did I promise that is outstanding, and what did
+I record for myself.
 
-Detection is lazy, local, and two-phase; it is an eventually perfect detector in
-Chandra and Toueg's classification~\cite{chandra1996faildetectors}, and the
-leases carry fencing tokens for the reason Gray and Cheriton
-give~\cite{gray1989leases}. A single-phase lease detector convicted
-1091 times in twenty minutes on a real host, because a thinking executor and a
-dead one look identical. A blocked rank must renew its own lease while waiting;
-omitting that once made a barrier convict everyone who arrived early.
+Detection is lazy, local and two-phase. It is an eventually perfect detector in
+Chandra and Toueg's classification, and the leases carry fencing tokens for the
+reason Gray and Cheriton give~\cite{chandra1996faildetectors,gray1989leases}. A
+single-phase lease detector convicted 1091 times in twenty minutes on a real
+host, because a thinking executor and a dead one look identical. A blocked rank
+must renew its own lease while waiting; omitting that once made a barrier convict
+everyone who arrived early.
 
-\section{The locality of merge}
+\section{The Locality of Merge}
 \label{sec:merge}
 
-MPI requires a user reduction operator to be associative and then reorders freely.
-The guarantee is deliberately weak---floating-point \code{MPI\_SUM} is not bitwise
-reproducible across process counts~\cite{ahrens2020reproducible}---and practitioners accept it because the
-discrepancy is bounded by rounding error.
+An agent-evaluated reduction can be reproducible and still contradict itself,
+because each merge sees two operands and a global invariant sees the whole leaf
+multiset. This section states the failure as observed, generalises it, gives the
+mechanism that answers it and the property that mechanism has, and closes with
+the half the mechanism cannot reach.
 
-An operator implemented by a language model is not associative, is lossy, is
-expensive, and is non-deterministic, and the discrepancy is bounded by nothing.
-\ampi therefore makes the algebra \emph{declared} rather than assumed and refuses
-schedules the declaration does not license. That much is straightforward.
+MPI requires a user reduction operator to be associative and reorders freely. The
+guarantee is deliberately weak, since floating-point \code{MPI\_SUM} is not
+bitwise reproducible across process counts, and practitioners accept it because
+rounding error bounds the discrepancy~\cite{ahrens2020reproducible}. An operator
+implemented by a language model is not associative, is lossy, is expensive and is
+non-deterministic, and nothing bounds the discrepancy. \ampi therefore makes the
+algebra declared rather than assumed and refuses schedules the declaration does
+not license. That much is straightforward.
 
-What is not straightforward is a failure we found rather than predicted.
+What is not straightforward is a failure a run showed us.
 
 \begin{quote}
 In an eight-rank reduction over interface proposals, two branches of the tree
-independently encountered the \emph{same} conflict---which module defines the
-shared exception type---and resolved it in \emph{opposite} directions. Both
-resolutions were recorded, so the merged result contained two contradictory rulings
-under one identifier, and the tree had no way to notice: each merge saw a locally
-consistent pair. Two ranks then implemented different halves of the result.
-Separately, the same reduction dropped four of eight modules from one section of
-its output despite an explicit instruction never to drop a module.
+independently encountered the \emph{same} conflict, which module defines the
+shared exception type, and resolved it in \emph{opposite} directions. Both
+resolutions were recorded, so the merged result contained two contradictory
+rulings under one identifier, and the tree had no way to notice: each merge saw
+a locally consistent pair. Two ranks then implemented different halves of the
+result. Separately, the same reduction dropped four of eight modules from one
+section of its output despite an explicit instruction never to drop a module.
 \end{quote}
 
-A canonical tree shape makes a reduction \emph{reproducible}. It does not make it
-\emph{consistent}, and conflating the two is the mistake.
+A canonical tree shape makes a reduction reproducible. It does not make the
+reduction consistent, and conflating the two is the mistake.
 
 \paragraph{The observation, stated generally.} Let a reduction be a fold of a
 binary operator $\oplus$ over a tree $T$ whose leaves are the ranks'
-contributions, and call a predicate $\varphi$ a \emph{global invariant} if its
-truth depends on the whole leaf multiset. An internal node of $T$ sees exactly two
+contributions, and call a predicate $\varphi$ a global invariant if its truth
+depends on the whole leaf multiset. An internal node of $T$ sees exactly two
 operands. If two nodes $u$ and $v$, neither an ancestor of the other, both
-encounter evidence bearing on $\varphi$, then no node of $T$ is in a position to
-reconcile them: their lowest common ancestor receives $u$'s and $v$'s
-\emph{outputs}, and the information that would reveal the inconsistency---what each
-decided, and why---is not in $\oplus$'s codomain. Enlarging the tree cannot help.
-Only enlarging the codomain can.
+encounter evidence bearing on $\varphi$, no node of $T$ can reconcile them: their
+lowest common ancestor receives $u$'s and $v$'s outputs, and the information that
+would reveal the inconsistency, what each decided and why, is not in $\oplus$'s
+codomain. Enlarging the tree cannot help. Only enlarging the codomain can.
 
-\paragraph{Conflict lifting.} Let the operator's codomain be $V \times C$, where
-$C$ is a set of undecided conflicts, and require that an operator which cannot
-decide a contested item from its two operands alone \emph{lift} it into $C$ rather
-than decide it. Let $C$'s join be set union.
+\paragraph{Conflict lifting.} Let the operator's codomain be $V \times C$,
+where $C$ is a set of undecided conflicts, and require that an operator which
+cannot decide a contested item from its two operands alone lift the item into $C$
+rather than decide it. Let $C$'s join be set union.
 
 \begin{proposition}[Shape independence]
-The conflict set arriving at the root of a fold over $\oplus$ is the same for every
-tree shape over the same leaf multiset, and no contested item is decided more than
-once.
+The conflict set arriving at the root of a fold over $\oplus$ is the same for
+every tree shape over the same leaf multiset, and no contested item is decided
+more than once.
 \end{proposition}
 
-\noindent The argument is two lines. The conflict component's join is associative,
-commutative and idempotent, so it is a semilattice fold, and a semilattice fold is
-independent of the order and shape of the fold. The value component never decides
-a contested item, so it cannot decide one twice. Arbitration at the root therefore
-decides each conflict exactly once, over the same set, whatever the schedule.
+\noindent The argument takes two lines. The conflict component's join is
+associative, commutative and idempotent, so it is a semilattice fold, and a
+semilattice fold is independent of the order and shape of the fold. The value
+component never decides a contested item, so it cannot decide one twice.
+Arbitration at the root therefore decides each conflict exactly once, over the
+same set, whatever the schedule. The suite verifies this exhaustively: over every
+binary fold order at $p \le 6$, all Catalan$(p-1)$ shapes, and over random orders
+to $p = 32$, the conflict set is invariant, while a control operator that decides
+locally is not.
 
-We verify this exhaustively: over every binary fold order at $p \le 6$
-(all Catalan$(p-1)$ shapes) and over random orders to $p = 32$, the conflict set is
-invariant, while a control operator that decides locally is not.
-
-\paragraph{Why it is cheap.} Lifting buys the ``one ruling per key'' invariant for
+\paragraph{Why it is cheap.} Lifting buys the one-ruling-per-key invariant for
 one extra operator application and $O(|C|)$ tokens. The alternative that also
-buys it---a serial chain, in which the accumulator carries every prior
-decision---costs $p{-}1$ critical-path applications against a tree's
-$\lceil\log_2 p\rceil$: at $p=64$, \flatCritical\ against \treeCritical.
+buys it, a serial chain in which the accumulator carries every prior decision,
+costs $p{-}1$ critical-path applications against a tree's $\lceil\log_2
+p\rceil$: at $p=64$, \flatCritical\ against \treeCritical.
 
-\paragraph{Implementation warning.} Represent the lifted state as a map from key
-to the \emph{set} of distinct values seen, and derive the value/conflict
-presentation from it. The obvious implementation---lift on first disagreement and
-remove the key from the value---is \emph{not} idempotent: a third contributor finds
-the key absent and reinstates it, so the conflict set depends on fold order after
-all. We shipped that version, and its own shape-independence test caught it.
+\paragraph{Implementation warning.} Represent the lifted state as a map from
+key to the set of distinct values seen, and derive the value and conflict
+presentation from it. The obvious implementation, which lifts on first
+disagreement and removes the key from the value, is not idempotent: a third
+contributor finds the key absent and reinstates it, so the conflict set depends
+on fold order after all. We shipped that version, and its own shape-independence
+test caught it.
 
-\paragraph{The other half.} ``Never drop a module'' is not a conflict any pair of
-operands exhibits---every local merge is individually faithful---so lifting is
-blind to it. It is a property of the leaf multiset and the result, so an operator
-may declare a \emph{global invariant} that is checked once, after the reduction
-closes, and reported with the missing items named.
+\paragraph{The other half.} ``Never drop a module'' is not a conflict any pair
+of operands exhibits, since every local merge is individually faithful, so
+lifting is blind to it. It is a property of the leaf multiset and the result, so
+an operator may declare a global invariant that is checked once, after the
+reduction closes, and reported with the missing items named. Neither mechanism
+makes an agent operator correct. They make two specific, observed, expensive
+failure modes into loud errors, which is the most a protocol can claim.
 
-Neither mechanism makes an agent operator correct. They make two specific,
-observed, expensive failure modes into loud errors, which is the most a protocol
-can honestly claim.
-
-\section{Cost model and algorithm selection}
+\section{Cost Model and Algorithm Selection}
 \label{sec:cost}
 
-For an operation moving $n$ tokens,
-\[
-T = \alpha + \beta n + \gamma k + \lambda, \qquad C = c_{\text{tok}} n + c_{\text{op}} K,
-\]
-where $\gamma$ is the cost of one operator application by an executor, $k$ the
-number on the critical path, $K$ the number in total, and $\lambda$ the executor's
-own heavy-tailed think time.
+When the operator term dominates, two of MPI's selection rules invert and a
+third question, admissibility, precedes optimisation. This section states the
+model, fits its constants, and derives the three consequences in turn.
 
-Measured on the reference implementation (\S\ref{sec:eval-micro}),
-$\alpha = \alphaSqlite$~ms and $\beta = \betaSqlite\,\mu$s/token on the SQLite
-transport, giving a half-bandwidth point of \nHalfSqlite\ tokens---above the size
-of a typical agent artifact, so latency-optimal algorithms win over a wider range
-of sizes than in MPI. Against them, $\gamma$ for an LLM merge is seconds to
-minutes. At $p=\ctxP$ the entire protocol cost of an allreduce is \protoMsP~ms,
-which is \protoFracOne\% of the total against a one-second operator and
-\protoFracThirty\% against a thirty-second one.
+The model separates time from price. An operation moving $n$ tokens costs
+\begin{align}
+T &= \alpha + \beta n + \gamma k + \lambda, \label{eq:time}\\
+C &= c_{\text{tok}}\, n + c_{\text{op}}\, K, \label{eq:price}
+\end{align}
+where $\gamma$ is the cost of one operator application by an executor, $k$ the
+number of applications on the critical path, $K$ the number in total, and
+$\lambda$ the executor's own heavy-tailed think time. Equation~\eqref{eq:time}
+is Hockney's model with two terms added; Equation~\eqref{eq:price} is new,
+because in MPI no one pays per operator application.
+
+Measured on the reference implementation (Section~\ref{sec:eval-micro}),
+$\alpha = \alphaSqlite$~ms and $\beta = \betaSqlite\,\mu$s per token on the
+SQLite transport, which gives a half-bandwidth point of \nHalfSqlite\ tokens.
+That point lies above the size of a typical agent artifact, so latency-optimal
+algorithms win over a wider range of sizes than in MPI. Against them, $\gamma$
+for a language-model merge is seconds to minutes. At $p=\ctxP$ the entire
+protocol cost of an allreduce is \protoMsP~ms, which is \protoFracOne\% of the
+total against a one-second operator and \protoFracThirty\% against a
+thirty-second one.
 
 \begin{table}[t]
 \caption{Total operator applications, allreduce. Recursive doubling and
@@ -469,139 +501,198 @@ ratio & \rdRatioeight & \rdRatiosixteen & \rdRatiothirtytwo & \rdRatiosixtyfour 
 \end{tabular}
 \end{table}
 
-Two of MPI's rules invert.
-
-\paragraph{(a) Runtime operators want no tree.} When the implementation can apply
-the operator---set union, JSON merge, max---a shared control plane folds every
-contribution in place: one round, zero messages. A tree adds rounds and buys
-nothing. This is the in-network-aggregation regime, and it is the common case for
-the operators harnesses \emph{should} be using. Sweeping $\gamma$ confirms it: at
-$\gamma=0$ the winner is \code{\winnerGammaZero}, and at $\gamma=30$\,s it is
+\paragraph{Runtime operators want no tree.} When the implementation can apply
+the operator itself, as with set union, JSON merge or max, a shared control plane
+folds every contribution in place: one round, zero messages. A tree adds rounds
+and buys nothing. This is the in-network-aggregation regime, and it is the common
+case for the operators harnesses should use. A sweep over $\gamma$ confirms it:
+at $\gamma=0$ the winner is \code{\winnerGammaZero}, and at $\gamma=30$\,s it is
 \code{\winnerGammaThirty}, with the flat schedule \flatPenalty$\times$ behind
 (\flatGammaThirty\,s against \bestGammaThirty\,s).
 
-\paragraph{(b) Agent operators want MPI's tree, and reject MPI's \emph{best}
-tree.} A binomial tree puts $\lceil\log_2 p\rceil$ applications on the critical
-path against a chain's $p{-}1$; the catalogue also includes Bruck's
-algorithm~\cite{bruck1997efficient} and Rabenseifner's~\cite{rabenseifner2004more},
-and the scan schedules follow Ladner and Fischer~\cite{ladner1980parallel} and
-Blelloch~\cite{blelloch1990prefix}. But recursive-doubling allreduce---MPI's standard
-choice for short messages~\cite{thakur2005optimization,rabenseifner2004optimization},
-precisely because redundant arithmetic is free---performs $p\lceil\log_2 p\rceil$ applications \emph{in total}
-(Table~\ref{tab:rd}) for the same critical path. The algorithm that wins for bytes
-loses badly for agents, and it loses on the \emph{price} axis, which is why the
-model reports time and price separately.
+\paragraph{Agent operators want MPI's tree and reject MPI's best tree.} A
+binomial tree puts $\lceil\log_2 p\rceil$ applications on the critical path
+against a chain's $p{-}1$; the catalogue also includes Bruck's algorithm and
+Rabenseifner's, and the scan schedules follow Ladner and Fischer and
+Blelloch~\cite{bruck1997efficient,rabenseifner2004more,ladner1980parallel,blelloch1990prefix}.
+Recursive-doubling allreduce, MPI's standard choice for short messages precisely
+because redundant arithmetic is free, applies the operator $p\lceil\log_2
+p\rceil$ times in total for the same critical path
+(Table~\ref{tab:rd})~\cite{thakur2005optimization,rabenseifner2004optimization}.
+The algorithm that wins for bytes loses for agents, and it loses on the price
+axis, which is why the model reports time and price separately.
 
-\paragraph{Admissibility precedes optimisation.} An algorithm whose peak per-rank
-residency exceeds a context budget is \emph{infeasible}, not slow. At $p=\ctxP$
-with \ctxN-token payloads, every inlining allgather in the catalogue is rejected
-with its peak residency named; the handle-based variants are admissible. MPI has
-no analogue: there, every algorithm runs.
+\paragraph{Admissibility precedes optimisation.} An algorithm whose peak
+per-rank residency exceeds a context budget is infeasible rather than slow. At
+$p=\ctxP$ with \ctxN-token payloads, every inlining allgather in the catalogue is
+rejected with its peak residency named; the handle-based variants are admissible.
+MPI has no analogue: there, every algorithm runs.
 
 \section{Implementation}
 \label{sec:impl}
 
-\subsection{The narrow waist}
+The implementation separates portable semantics from transport at a
+six-operation waist, checks the separation with one conformance suite, and adds
+the two things the specification leaves to implementations, a command binding and
+a process manager. Section~\ref{sec:waist} describes the waist and its
+transports, Section~\ref{sec:suite} the suite and what it found,
+Section~\ref{sec:binding} the binding, and Section~\ref{sec:procs} the process
+manager and the transport that spans machines.
+
+\subsection{The Narrow Waist}
+\label{sec:waist}
 
 MPICH's portability comes from an abstract device interface separating portable
-MPI semantics from transport~\cite{gropp1994adi,gropp1996mpich,buntinas2006nemesis};
-Open MPI makes the same move with MCA frameworks.
-\ampi copies the structure, for a different reason: an interface with one
-implementation is a library, and what would make this a standard is that the
-semantics can be stated and \emph{checked} independently of any transport.
+MPI semantics from transport, and Open MPI makes the same move with its
+component frameworks~\cite{gropp1994adi,gropp1996mpich,buntinas2006nemesis}.
+\ampi copies the structure for a different reason: an interface with one
+implementation is a library, and what makes this a standard is that the
+semantics can be stated and checked independently of any transport.
 
 Six operations sit at the waist: \code{append} (durable, totally ordered),
-\code{match} (atomic first-fit claim), \code{scan}, \code{cas},
-\code{lease}, \code{clock}. Everything above---communicators, matching,
-collectives, windows, the ledger, revoke/shrink/agree---is written in terms of
-those six. Why not fewer: \code{append} and \code{scan} suffice for a single
-writer, but a receive must not be handed to two ranks, and that atomicity cannot be
-recovered above the device. Why not more: window history is a \code{scan} over
-versions, the failure detector is a \code{scan} over leases, and the deadlock
-detector is a \code{scan} over blocked receives.
+\code{match} (atomic first-fit claim), \code{scan}, \code{cas}, \code{lease}
+and \code{clock}. Everything above them, communicators, matching, collectives,
+windows, the ledger, revoke, shrink and agree, is written in terms of those six.
+Fewer would not do: \code{append} and \code{scan} suffice for a single writer,
+but a receive must not be handed to two ranks, and that atomicity cannot be
+recovered above the device. More are not needed: window history is a
+\code{scan} over versions, the failure detector is a \code{scan} over leases,
+and the deadlock detector is a \code{scan} over blocked receives.
 
-Three transports ship, sharing no code below the interface: SQLite in WAL mode,
-a filesystem journal using one file per record with an advisory lock, and an
-in-process dictionary. \implLines\ lines of implementation sit above the waist.
+Five transports ship and share no code below the interface: SQLite in WAL mode,
+a filesystem journal using one file per record with an advisory lock, an
+in-process dictionary, a git device whose compare-and-swap cell is a ref on a
+shared remote, and a daemon in front of that git device
+(Section~\ref{sec:procs}). \implLines\ lines of implementation sit above the
+waist.
 
-\subsection{The conformance suite}
+\subsection{The Conformance Suite}
+\label{sec:suite}
 
 \nDeviceTests\ device assertions and \nProtocolTests\ protocol assertions, each
-naming the specification section it enforces, run unchanged against all
-\nDevices\ transports. The suite uses only public interfaces, so pointing it at a
-different implementation means changing one fixture.
+naming the specification section it enforces, run unchanged against every
+transport. The suite uses only public interfaces, so pointing it at a different
+implementation means changing one fixture.
 
-It earns its keep. In its first pass it found six defects, of which two matter
-beyond this codebase. An administrative kill was retractable by its victim's next
-heartbeat---which would have made every fault-injection measurement meaningless.
-And SQLite's type affinity was returning integers as strings for four indexed
-fields, so a wildcard receive posted as $-1$ read back as \code{"-1"} and silently
-stopped matching: a divergence that existed on \emph{one} transport and would
-otherwise have surfaced as an inexplicable protocol bug months later. That is
-precisely what a suite parametrised over every transport is for.
+The suite earns its keep. In its first pass it found six defects, of which two
+matter beyond this codebase. An administrative kill was retractable by its
+victim's next heartbeat, which would have made every fault-injection measurement
+meaningless. SQLite's type affinity returned integers as strings for four indexed
+fields, so a wildcard receive posted as $-1$ read back as \code{"-1"} and
+silently stopped matching, a divergence that existed on one transport and would
+otherwise have surfaced as an inexplicable protocol bug months later. A suite
+parametrised over every transport exists for exactly that divergence.
 
-\subsection{The command binding}
+\subsection{The Command Binding}
+\label{sec:binding}
 
-For an LLM executor the binding is a command-line tool, because that is the only
-interface an agent reliably has to a stateful library: it cannot hold a handle
-across turns, cannot link a shared object, and its ``function calls'' are
+For a language-model executor the binding is a command-line tool, because that
+is the only interface an agent reliably has to a stateful library: it cannot hold
+a handle across turns, cannot link a shared object, and its function calls are
 invocations whose output lands in its context window. Eight properties are
 normative, each because its absence cost a run: assertable identity; an identity
-echo on every call; errors that carry a concrete next action and a retryable flag;
-internal retry; sizes in tokens; a free path to disk on every operation that hands
-back a payload; the manual as a command; and \emph{print only commands that
-exist}. That last one has a test that walks every emitted command string through
-the real parser, because an early reduction directive printed a subcommand spelled
-with a space where the real one is hyphenated, and roughly ten agents reported it,
-several while peers were blocked behind them.
+echo on every call; errors that carry a concrete next action and a retryable
+flag; internal retry; sizes in tokens; a free path to disk on every operation
+that hands back a payload; the manual as a command; and print only commands that
+exist. The last has a test that walks every emitted command string through the
+real parser, because an early reduction directive printed a subcommand spelled
+with a space where the real one is hyphenated, and roughly ten agents reported
+it, several while peers were blocked behind them.
+
+\subsection{Ranks as Processes, and a Job Across Machines}
+\label{sec:procs}
+
+MPI leaves the process manager unspecified, and so does \ampi; the reference
+implementation supplies one, \code{ampirun}, because the experiments needed it.
+It starts one operating-system process per rank with the rank's identity in its
+environment, block-distributes the ranks over the machines of a job, supervises
+the processes, and restarts a dead one through the runtime's \code{respawn} so
+the successor takes a new epoch and re-enters its collectives. Each collective the
+successor already joined returns its stored result, traced as replayed with its
+wait measured from re-entry, and each task it already finished is read back from
+a window, so the successor resumes at the first thing its predecessor left
+unfinished. A machine that was recycled under a running job can rejoin it: the
+manager re-enters the job from the shared device and respawns the ranks the peers
+convicted in its absence.
+
+Across machines, the ranks share nothing but a git remote. The git device treats
+a ref as its compare-and-swap cell (fetch, apply, commit, push, retry on
+rejection), and its mutations are pure functions of the device state so a
+rejected push re-applies them against fresher state. One push per mutation does
+not scale: thirty-two ranks on thirty-two machines made 1131 pushes and suffered
+13415 rejections in forty-two minutes for four collectives. The daemon,
+\code{gitd}, owns the working tree on each machine and group-commits every
+mutation its ranks issue within a window into one push, the intra-node
+aggregation every production MPI performs before it touches the interconnect.
+The guarantee each rank observes is unchanged, and the pushes on the wire are
+bounded by the machine's rate of bursts rather than its ranks' rate of
+operations. Two rules of the daemon came from runs and are now normative: its
+readers take no lock when a writer fetched within the read interval, and its
+batch window widens while pushes are rejected (Section~\ref{sec:eval-e7-nodes}).
 
 \section{Evaluation}
 \label{sec:eval}
 
+Real agent populations ran against the protocol at every scale the account
+allowed, and the informative results are the ones that failed. The
+microbenchmarks (Section~\ref{sec:eval-micro}) measure the protocol alone so the
+agent runs can attribute their time. E1 (Section~\ref{sec:eval-e1}) is a paired
+translation experiment whose quality result is null. E2
+(Section~\ref{sec:eval-e2}) measures the fault-tolerance claims with scripted
+ranks. Section~\ref{sec:eval-oversub} and Section~\ref{sec:identity} report what
+a session-capped host and shared shell sessions did to a hundred-rank run. E7
+(Section~\ref{sec:eval-e7}) is the production translation by process ranks, on
+one machine to completion and across machines to the transport's limits.
+
 \subsection{Microbenchmarks}
 \label{sec:eval-micro}
 
-No model is involved, deliberately: the job is to measure the \emph{protocol} so
-the agent experiments can attribute their time correctly.
+The protocol's own cost is milliseconds, and its per-token cost is a property of
+the layer above the waist rather than of any transport. No model is involved,
+deliberately: the job is to measure the protocol so the agent experiments can
+attribute their time correctly.
 
 Fitting $T = \alpha + \beta n$ by ping-pong regression over payloads from 1 to
-12{,}800 tokens gives $\alpha = \alphaSqlite$~ms on SQLite,
-$\alphaJournal$~ms on the filesystem journal, and $\alphaMemory$~ms in memory. The
-half-bandwidth point is \nHalfSqlite\ tokens on SQLite and \nHalfJournal\ on the
-journal.
+12{,}800 tokens gave $\alpha = \alphaSqlite$~ms on SQLite, $\alphaJournal$~ms on
+the filesystem journal, and $\alphaMemory$~ms in memory. The half-bandwidth point
+is \nHalfSqlite\ tokens on SQLite and \nHalfJournal\ on the journal. One result
+was not anticipated: $\beta$ agrees to within \betaSpread\% across the three
+single-machine transports. The per-token cost is serialisation and token counting
+above the waist, not transport below it. Only $\alpha$ is a property of the
+device, which is a useful fact for the cost model and an argument that the waist
+sits in the right place.
 
-One result was not anticipated: $\beta$ agrees to within \betaSpread\% across all
-three transports. The per-token cost is serialisation and token counting
-\emph{above} the waist, not transport below it. Only $\alpha$ is a property of the
-device---which is a useful thing for the cost model to know, and an argument that
-the waist is in the right place.
+\subsection{E1: Translating a Book}
+\label{sec:eval-e1}
 
-\subsection{E1: translating a book}
+The glossary collective found the disagreement it was built to find, and the
+disagreement did not reach the artifact. The paragraphs below give the task, the
+harness, the scoring, the mechanism's behaviour, the null result, and the
+threats.
 
-The task is native translation of a book, chosen because it is \emph{almost}
+The task is native translation of a book, chosen because it is almost
 embarrassingly parallel. Each passage translates independently; what does not is
 the rendering of names and coined terms recurring across passages. Ignore the
-coupling and the Tin Woodman acquires four names; serialise to avoid it and you
-pay $p$ executor latencies.
+coupling and the Tin Woodman acquires four names; serialise to avoid it and the
+harness pays $p$ executor latencies.
 
-We split \emph{The Wonderful Wizard of Oz} into 100 passages and extract 21
-recurring terms by capitalisation frequency, filtered by a model-free rule
-(a candidate that also appears lower-cased anywhere in the corpus is dropped).
-The harness has six phases, each one collective: scatter the passages; an agent
-phase proposing renderings; an allreduce with \code{union}, which lifts
+We split \emph{The Wonderful Wizard of Oz} into 100 passages and extracted 21
+recurring terms by capitalisation frequency, filtered by a model-free rule under
+which a candidate that also appears lower-cased anywhere in the corpus is
+dropped. The harness has six phases, each one collective: scatter the passages;
+an agent phase proposing renderings; an allreduce with \code{union}, which lifts
 disagreements rather than deciding them; arbitration at the root; a broadcast of
-the binding glossary; an agent phase translating; a gather.
+the binding glossary; an agent phase translating; a gather. The protocol lives
+in the harness rather than the prompt. An executor's entire obligation is to
+read a prompt file, write a result file and submit; the worker bootstrap prompt
+mentions no communicator, collective, barrier or glossary. That is the design
+claim stated as an artifact, and it is why the same experiment runs against a
+deterministic function or a hundred live agents without changing a line.
 
-The protocol is in the harness, not the prompt. An executor's entire obligation is
-to read a prompt file, write a result file, and submit; the worker bootstrap
-prompt mentions no communicator, collective, barrier or glossary. That is the
-design claim stated as an artifact, and it is why the same experiment runs against
-a deterministic function or a hundred live agents without changing a line.
-
-Scoring is mechanical. For each recurring term, we find which rendering each
-passage's translation used and take the modal rendering's share, weighted by how
-many passages contain the term. The candidate renderings searched for are pooled
-across \emph{all} arms compared, which matters: our first scorer built the
+Scoring is mechanical. For each recurring term, the scorer finds which rendering
+each passage's translation used and takes the modal rendering's share, weighted
+by how many passages contain the term. The candidate renderings searched for are
+pooled across all arms compared, which matters: our first scorer built the
 vocabulary from each run's own term sheets, and since only the treatment arm
 produces term sheets, the control was scored against an almost-empty vocabulary
 and flattered by it.
@@ -626,68 +717,65 @@ Result tokens & \eOneGlossTokens & \eOneCtrlTokens & \eLargeGlossTokens & \eLarg
 \end{tabular}
 \end{table}
 
-\paragraph{The mechanism worked, and scaled as predicted.} At $p=\glossSmallP$ the
-reduction agreed \glossSmallAgreed\ terms unanimously and lifted \glossSmallLifted\
-as conflicts; at $p=\glossLargeP$ it agreed \glossLargeAgreed\ and lifted
-\glossLargeLifted. Quadrupling the population quadrupled the disagreement it
-found, which is what one would expect and what the conflict machinery exists to
-surface. The root arbitrated each conflict once, at both sizes.
+\paragraph{The mechanism worked and scaled as predicted.} At $p=\glossSmallP$
+the reduction agreed \glossSmallAgreed\ terms unanimously and lifted
+\glossSmallLifted\ as conflicts; at $p=\glossLargeP$ it agreed
+\glossLargeAgreed\ and lifted \glossLargeLifted. Quadrupling the population
+quadrupled the disagreement it found, which is what the conflict machinery exists
+to surface. The root arbitrated each conflict once at both sizes. Every one of
+the \glossLargeLifted\ conflicts was of one kind, whether the Spanish definite
+article belongs in the rendering, \emph{el Espantap\'ajaros} against
+\emph{Espantap\'ajaros}; not one was a disagreement about the noun.
 
-Every one of the \glossLargeLifted\ conflicts was the same kind: whether the
-Spanish definite article belongs in the rendering---\emph{el Espantap\'ajaros}
-against \emph{Espantap\'ajaros}, \emph{la Ciudad Esmeralda} against \emph{Ciudad
-Esmeralda}. Not one was a disagreement about the noun.
-
-\paragraph{The result is null, at both sizes.} Table~\ref{tab:e1}. Weighted
-terminology consistency is \eOneGlossConsistency\ in all four arms; under the
-strict metric that counts the article as part of the decision, the control arm at
-$p=\eLargeP$ scores marginally \emph{higher} than the treatment
+\paragraph{The result is null at both sizes.} Table~\ref{tab:e1} gives the
+numbers. Weighted terminology consistency is \eOneGlossConsistency\ in all four
+arms; under the strict metric that counts the article as part of the decision,
+the control arm at $p=\eLargeP$ scores higher than the treatment
 (\eLargeCtrlStrict\ against \eLargeGlossStrict). The glossary cost
 \eOneWallRatio$\times$ the control's wall clock at $p=\eOneP$ and
 \eLargeWallRatio$\times$ at $p=\eLargeP$.
 
 We had predicted that the null at $p=\eOneP$ was a scale effect and that a larger
 population would surface terms with weaker priors. The prediction was half right
-and instructive in the half that was wrong. The population's *stated* conventions
-did diverge more at scale, exactly as predicted---four times as many lifted
-conflicts. But that divergence did not reach the artifact, because the thing the
-translators disagreed about was the definite article, and in running prose the
-article is determined by the grammar of the sentence rather than by a lexical
-choice. Each translator wrote \emph{el Espantap\'ajaros} or \emph{Espantap\'ajaros}
-as the sentence required, whichever they had declared.
+and instructive in the half that was wrong. The population's stated conventions
+diverged more at scale, with four times as many lifted conflicts, exactly as
+predicted. That divergence did not reach the artifact, because the translators
+disagreed about the definite article, and in running prose the grammar of the
+sentence determines the article. Each translator wrote \emph{el Espantap\'ajaros}
+or \emph{Espantap\'ajaros} as the sentence required, whichever it had declared.
+The collective correctly identified a real disagreement in what the population
+said it would do, and that disagreement did not matter for what the population
+produced. This mirrors the caution of Section~\ref{sec:merge}: agreement is not
+correctness, and here disagreement was not incorrectness either. The operational
+lesson for a harness author is one we did not expect to report: before paying a
+collective to remove a coupling, measure whether the coupling costs anything.
 
-So the collective correctly identified a real disagreement in what the population
-said it would do, and that disagreement turned out not to matter for what the
-population produced. This is the mirror image of the caution in
-\S\ref{sec:merge}: agreement is not correctness, and here disagreement was not
-incorrectness either. The operational lesson for a harness author is the one we
-did not expect to be reporting---before paying a collective to remove a coupling,
-measure whether the coupling is costing anything.
+One threat runs the other way. An executor in the treatment arm reported,
+unprompted, that it capitalised compass words mid-sentence because the glossary
+lists them capitalised and it reasoned the check would be mechanical; it chose a
+less natural rendering to match what it believed the scorer looked for. That is
+Goodhart's law inside the experiment, and it biases the treatment arm upward on
+the metric we report (79\% against the control's 70\% on mid-sentence
+capitalisation). The treatment did not beat the control even so, which makes the
+null a floor rather than a point estimate. A metric an executor can see is a
+metric an executor will aim at. The other threats are the usual ones: $n=1$ per
+cell, one model family, one language pair, and one corpus whose recurring terms
+are famous enough that a strong model has seen them. A task whose terminology is
+novel, an internal codebase or a new API, is where we would expect the collective
+to pay, and we have not run it.
 
-One threat runs the other way and is worth stating for that reason. An executor
-in the treatment arm reported, unprompted, that it capitalised compass words
-mid-sentence because the glossary lists them capitalised and it reasoned the check
-would be mechanical; it chose a less natural rendering to match what it believed
-the scorer looked for. That is Goodhart's law inside the experiment, biasing the
-treatment arm upward on the metric we report (79\% against the control's 70\% on
-mid-sentence capitalisation). The treatment did not beat the control even so, which
-makes the null a floor rather than a point estimate. The general lesson is one for
-harness authors: a metric an executor can see is a metric an executor will aim at.
+\subsection{E2: Fault Tolerance}
+\label{sec:eval-e2}
 
-We note the other threats. This is $n=1$ per cell, one model family, one language
-pair, and one corpus whose recurring terms are famous enough that a strong model
-has seen them. A task whose terminology is genuinely novel---an internal codebase, a
-new API---is where we would expect the collective to pay, and we have not run it.
-
-\subsection{E2: fault tolerance}
-
-The question here is not how a model behaves under failure---E1 and the
-conformance suite cover that---but whether the recovery machinery does what
-\S\ref{sec:design} says when ranks die at the worst moments. That has a definite
-answer, and getting it means killing ranks at controlled points many times, which
-is exactly what one should not pay a language model to sit through. Scripted
-ranks, $p=\eTwoSize$, five scenarios, each a specification claim stated as a
-measurement. All \eTwoUpheld\ of \eTwoTotal\ hold.
+Every fault-tolerance claim the specification makes held when ranks died at the
+worst moments, and the last claim held exactly and no further. The question here
+is not how a model behaves under failure, which E1 and the conformance suite
+cover, but whether the recovery machinery does what Section~\ref{sec:design}
+says. That question has a definite answer, and getting it means killing ranks at
+controlled points many times, which is what one should not pay a language model
+to sit through. Scripted ranks at $p=\eTwoSize$ ran five scenarios, each a
+specification claim stated as a measurement, and all \eTwoUpheld\ of \eTwoTotal\
+held.
 
 \begin{table}[t]
 \caption{E2: each row is a claim from the specification, measured.}
@@ -711,42 +799,47 @@ Claimed work is never done twice &
 \end{tabular}
 \end{table}
 
-The last row is the one worth reading carefully (Table~\ref{tab:e2}). With one
-rank dying mid-claim, \eTwoDuplicated\ tasks were done twice and
-\eTwoOrphaned\ was left orphaned: claimed by a dead executor and never finished.
-That is exactly what the protocol promises and no more. Compare-and-swap
-guarantees a task is not done twice; finishing a dead claimant's task requires a
-supervisor, and reporting the orphan count is how a harness author learns how much
-they must still do themselves.
+The last row of Table~\ref{tab:e2} repays careful reading. With one rank dying
+mid-claim, \eTwoDuplicated\ tasks were done twice and \eTwoOrphaned\ was left
+orphaned, claimed by a dead executor and never finished. That is exactly what the
+protocol promises and no more. Compare-and-swap guarantees a task is not done
+twice; finishing a dead claimant's task requires a supervisor, and reporting the
+orphan count is how a harness author learns how much they must still do
+themselves.
 
-\subsection{Oversubscription, and a launcher constraint}
+\subsection{Oversubscription, and a Launcher Constraint}
+\label{sec:eval-oversub}
 
-Our agent host caps concurrent sessions at ten. This is not an accident of our
-setup; every host we have used imposes some such cap, and it is exactly the
-condition that leaves a job with ranks nobody will ever start. The $p=\eLargeP$
-runs above are served by \eLargeExecutors\ executors at oversubscription four.
+A host that caps concurrent sessions leaves a job with ranks nobody will start,
+and the protocol's two answers are oversubscription and the join deadline. Our
+agent host caps concurrent sessions at ten. This is no accident of our setup;
+every host we have used imposes some such cap, and it is exactly the condition
+that leaves ranks unserved. The $p=\eLargeP$ runs above were served by
+\eLargeExecutors\ executors at oversubscription four.
 
-The protocol's answer is oversubscription, and it has a precise MPI analogue:
-\code{mpirun -np 100} on eight cores runs a hundred ranks on eight cores. It works
-here for the same reason it works there---a rank is a durable role whose state
-lives outside its executor---and it is only available because the protocol is in
-the harness. An executor serving ten ranks \emph{agent-side} would have to be
-inside ten barriers at once and would deadlock immediately; here the harness
-thread blocks in the collective and the executor blocks on nothing.
+Oversubscription has a precise MPI analogue: \code{mpirun -np 100} on eight
+cores runs a hundred ranks on eight cores. It works here for the same reason it
+works there, because a rank is a durable role whose state lives outside its
+executor, and it is available only because the protocol lives in the harness. An
+executor serving ten ranks agent-side would have to be inside ten barriers at
+once and would deadlock immediately; here the harness thread blocks in the
+collective and the executor blocks on nothing.
 
-The specification's other answer is the \emph{join deadline}: a rank's lease starts
-when the rank is \emph{requested}, not when its executor first calls in. Without
-it, a rank whose executor never starts has no lease to expire, so it is neither
-alive nor failed and every peer waits for it forever. With it, a launcher that can
-start six of twenty-two ranks produces sixteen detectable no-shows.
+The join deadline answers the rank that never starts. A rank's lease starts
+when the rank is requested rather than when its executor first calls in. Without
+that rule, a rank whose executor never starts has no lease to expire, so it is
+neither alive nor failed and every peer waits for it forever. With it, a launcher
+that can start six of twenty-two ranks produces sixteen detectable no-shows.
 
-\subsection{Two identities, and the one we thought was checked}
+\subsection{Two Identities, and the One We Thought Was Checked}
 \label{sec:identity}
 
-Two identities travel with every task in these experiments. The \emph{protocol
-identity} is the rank an operation acts as, which the binding lets a caller assert
-with \code{--expect-rank}. The \emph{provenance label} is an environment variable
-we added so that a scale claim would have per-executor evidence; it is outside the
+An identity assertion made of the same material as the identity it asserts
+cannot catch a corruption that rewrites both, and a run showed us that ours did
+not. Two identities travel with every task in these experiments. The protocol
+identity is the rank an operation acts as, which the binding lets a caller assert
+with \code{--expect-rank}. The provenance label is an environment variable added
+so that a scale claim would have per-executor evidence; it is outside the
 protocol and nothing checks it.
 
 On a host where shell sessions are shared between concurrently running agents,
@@ -756,62 +849,59 @@ with one executor per rank, and in the $p=\eLargeP$ runs at oversubscription
 four, it drifted \provSmallDrift\ times.
 
 We first reported that the protocol identity held because it was asserted. That
-was wrong, and two executors told us so. One wrote: ``the \code{next} call carried
-\code{--expect-rank 3} and still returned rank 2's identity.'' Another diagnosed
-it exactly: ``the guard didn't fire because the clobber replaced \code{--rank} and
-\code{--expect-rank} \emph{together}.'' Both are right, for two independent
-reasons, and the reasons are more useful than the claim we had made.
+was wrong, and two executors told us so. One wrote: ``the \code{next} call
+carried \code{--expect-rank 3} and still returned rank 2's identity.'' Another
+diagnosed it exactly: ``the guard didn't fire because the clobber replaced
+\code{--rank} and \code{--expect-rank} \emph{together}.'' Both are right, for
+two independent reasons, and the reasons are more useful than the claim we had
+made.
 
 \paragraph{The implementation defect.} The assertion was wired into the library
-API and into the ordinary CLI operations, and \emph{not} into the \code{worker}
-subcommand --- the only surface any executor in these experiments ever touched.
-The conformance suite covered the paths we had thought about. What actually caught
-the one misroute that was caught was a different and weaker mechanism: the
-broker's check that a submitted task belongs to a rank the caller serves. That
-check is a serve-set membership test, not an identity assertion, and it fires only
-at submit, after the work is done.
+API and into the ordinary CLI operations, and not into the \code{worker}
+subcommand, the only surface any executor in these experiments touched. The
+conformance suite covered the paths we had thought about. What caught the one
+misroute that was caught was a weaker mechanism, the broker's check that a
+submitted task belongs to a rank the caller serves. That check is a serve-set
+membership test rather than an identity assertion, and it fires only at submit,
+after the work is done.
 
-\paragraph{The design defect, which is the interesting one.} An assertion compares
-two values the caller supplies. A corruption that rewrites \emph{both} the acting
-rank and the assertion leaves them consistent, so the check passes and the
-operation acts as somebody else. No amount of asserting fixes this, because the
-assertion is made of the same material as the thing it asserts about.
-
-The mechanism that does fix it was already in the specification and already
-implemented: a per-rank \emph{launch token}, issued by the launcher and recorded
-in the job, which cannot be made self-consistent by an accident of the
-environment. We had the mechanism and not the property, because the path that
-needed it did not call it.
+\paragraph{The design defect.} An assertion compares two values the caller
+supplies. A corruption that rewrites both the acting rank and the assertion
+leaves them consistent, so the check passes and the operation acts as somebody
+else. No amount of asserting fixes this, because the assertion is made of the
+same material as the thing it asserts about. The mechanism that does fix it was
+already in the specification and already implemented: a per-rank launch token,
+issued by the launcher and recorded in the job, which no accident of the
+environment can make self-consistent. We had the mechanism and not the property,
+because the path that needed it did not call it.
 
 \paragraph{What the executors did instead.} Both misrouted claims were handled
-correctly, by agent judgement rather than by the protocol. One executor abandoned
+correctly by agent judgement rather than by the protocol. One executor abandoned
 its task with an accurate reason. The other declined even to abandon it,
 reasoning that \code{give-up} would also have acted as the wrong rank and would
-have discarded another executor's work, and let the claim lease-expire instead ---
-which the broker requeued, and its rightful server completed. That is a better
-decision than the protocol was in a position to enforce, and we would rather not
-have to rely on it.
-
-All four defects are fixed and regression-tested: identity is asserted on the
-worker path, the emitted \code{submit} and \code{give-up} commands carry
-\code{--expect-rank} rather than leaving it to the agent to remember, and the
-identity flags are accepted on either side of the subcommand. The last of those
-is its own lesson (\S\ref{sec:lessons}).
+have discarded another executor's work, and let the claim lease-expire instead,
+which the broker requeued and its rightful server completed. That is a better
+decision than the protocol was positioned to enforce, and we would rather not
+rely on it. All four defects are fixed and regression-tested: identity is
+asserted on the worker path, the emitted \code{submit} and \code{give-up}
+commands carry \code{--expect-rank}, and the identity flags are accepted on
+either side of the subcommand.
 
 \input{e7}
 
-\section{What only real agents exposed}
+\section{What Only Real Agents Exposed}
 \label{sec:lessons}
 
-Several rules in the specification exist because a run failed. They are worth
-listing separately, because they are the part of this work that could not have
-been derived from MPI.
+Several rules in the specification exist because a run failed, and they are the
+part of this work that could not have been derived from MPI. The list below
+gives each rule with the failure that produced it; the first ten came from
+session ranks and the last three from process ranks.
 
 \begin{enumerate}
-\item \textbf{Executors give up far earlier than instructed.} One told to retry up
-to twenty times gave up after two and stalled its reduction tree. A protocol that
-depends on an executor's persistence is not a protocol; the binding retries
-internally and the default is ``keep waiting''.
+\item \textbf{Executors give up far earlier than instructed.} One told to retry
+up to twenty times gave up after two and stalled its reduction tree. A protocol
+that depends on an executor's persistence is not a protocol; the binding retries
+internally and the default is to keep waiting.
 
 \item \textbf{Blocking is not evidence of death.} A rank waiting inside a barrier
 made no runtime calls, so the detector convicted it for waiting, and every rank
@@ -819,23 +909,22 @@ that arrived early was declared failed. A blocked rank must renew its own lease.
 
 \item \textbf{Program order is not a collective identifier.} Hence labels.
 
-\item \textbf{Ambient identity without assertion is unsafe.} Shared shell sessions
-made one rank accumulate nine initialisations, one from nearly every other agent.
+\item \textbf{Ambient identity without assertion is unsafe.} Shared shell
+sessions made one rank accumulate nine initialisations, one from nearly every
+other agent.
 
 \item \textbf{Never truncate a reduction operand.} A result may be summarised
 because its consumer is a reader; an operand may not, because its consumer is a
 function. Agents handed JSON clipped mid-string invented recovery hacks, one
 prefix-matching the content-addressed store by hand.
 
-\item \textbf{Print only commands that exist} --- including the bootstrap
-prompt, which is also a command the binding prints. Ours placed the identity flags
-before the subcommand, where a reader expects a global option and where our parser
+\item \textbf{Print only commands that exist}, including the bootstrap prompt,
+which is also a command the binding prints. Ours placed the identity flags before
+the subcommand, where a reader expects a global option and where our parser
 rejected them, and roughly thirty executors each lost their first call to
-\code{invalid choice}. Our mechanical check walked the strings the runtime emits
-and not the prompt every executor reads first. And any guard left out of a printed
-command is a guard that is present only when the agent thinks of it: the emitted
-\code{submit} omitted \code{--expect-rank}, and exactly the executors who noticed
-had it.
+\code{invalid choice}. Any guard left out of a printed command is a guard present
+only when the agent thinks of it: the emitted \code{submit} omitted
+\code{--expect-rank}, and exactly the executors who noticed had it.
 
 \item \textbf{Give every payload a free path to disk.} Agents that lacked one
 reached into the object store directly rather than pay to see what was already a
@@ -843,118 +932,159 @@ file.
 
 \item \textbf{A rank that never starts must still be detectable.}
 
-\item \textbf{A conditional send with an unconditional receive is a deadlock.} The
-protocol can only bound the damage; the advice is to send unconditionally, possibly
-empty. The static checker catches it.
+\item \textbf{A conditional send with an unconditional receive is a deadlock.}
+The protocol can only bound the damage; the advice is to send unconditionally,
+possibly empty. The static checker catches it.
 
 \item \textbf{When a protocol omits a mechanism, its users build it worse.} Eight
 agents given no coordination phase rebuilt an allgather by hand within ninety
 seconds of one another, then built runtime interface discovery on top at roughly
 five times the detection code and twice the total lines for the same graded
 behaviour, with two of the eight introducing defects inside their own detection
-logic. \ampi/1.0 therefore specifies interface declaration \emph{and} verification,
+logic. \ampi/1.0 therefore specifies interface declaration and verification,
 because the arms showed they are complementary: declaration alone reproduces the
-inconsistency of \S\ref{sec:merge}, and verification alone pushes the whole cost
-into every consumer.
+inconsistency of Section~\ref{sec:merge}, and verification alone pushes the
+whole cost into every consumer.
+
+\item \textbf{A rate limit is a blocked rank, not a failed task.} The first
+production attempt on one model lost six ranks to a twenty-requests-a-minute cap
+because the executor retried a 429 like a transport fault, six times and then
+never. A rank waiting on a rate limit is a rank blocked, exactly like one blocked
+in a collective, and the wait is now bounded by patience rather than by a count.
+
+\item \textbf{A lock is not a queue.} A daemon whose readers waited on the lock
+its writer held for a push contest starved one reader for an hour at four
+machines, and the rank behind it was convicted alive. Readers that hold a fresh
+copy take no lock.
+
+\item \textbf{A machine that hosts ranks must never be idle.} A cloud session's
+machine is reclaimed when the session is idle, and node 0 of a 128-rank job was
+reclaimed twice under a running population. The protocol's answer, convict,
+respawn, replay, worked when the machine came back; the operational rule is that
+the session keeps its turn alive for the whole run.
 \end{enumerate}
 
-\section{Discussion and limitations}
+\section{Discussion and Limitations}
+\label{sec:discussion}
 
-\paragraph{What we have not shown.} We have not shown that \ampi produces better
-answers than an ad-hoc harness. Our one controlled quality comparison is null
-(\S\ref{sec:eval}), and we report it as such. What we have shown is narrower and,
-we think, still worth having: that MPI's mechanisms have well-defined agent
-analogues, that several of MPI's answers change in stated and measurable ways,
-that the resulting interface can be specified precisely enough to be conformance
-tested, and that real agent populations run against it.
+The evidence supports a narrow claim, and this section states its boundaries.
+The paragraphs below give what the evidence does not show, the statistical
+power of the runs, the scale reached, the strongest objection to the design, and
+the sense in which agreement is not correctness.
 
-\paragraph{We hot-patched a running job, twice.} An executor in the scale run
-reported an \code{ImportError} from a module another session was in the middle of
-fixing. Appendix D of our own specification warns about exactly this, and the
-warning was inadequate: it said to pin the runtime \emph{version}, and the version
-string had not changed, because what changed was the code. The runtime now records
-a content hash of its own source at job creation and logs a diagnostic when a
-later caller's differs --- advisory rather than fatal, because a developer
-iterating should not be locked out and a two-hour run should not die over a
-reflowed comment, but recorded, because a run whose runtime changed halfway
-through should say so in its own journal.
+\paragraph{What the evidence does not show.} It does not show that \ampi
+produces better answers than an ad-hoc harness. Our one controlled quality
+comparison is null (Section~\ref{sec:eval-e1}), and we report it as such. What
+the evidence shows is narrower and still worth having: MPI's mechanisms have
+well-defined agent analogues, several of MPI's answers change in stated and
+measurable ways, the resulting interface can be specified precisely enough to be
+conformance tested, and real agent populations run against it.
 
-\paragraph{Statistical power.} Every agent experiment here is $n=1$ per arm. Agent
-runs are expensive and not reproducible, which is also why tracing is
+\paragraph{A running job was hot-patched twice.} An executor in the scale run
+reported an \code{ImportError} from a module another session was in the middle
+of fixing. Appendix D of our own specification warns about exactly this, and the
+warning was inadequate: it said to pin the runtime version, and the version string
+had not changed, because what changed was the code. The runtime now records a
+content hash of its own source at job creation and logs a diagnostic when a later
+caller's differs, advisory rather than fatal, because a developer iterating
+should not be locked out and a two-hour run should not die over a reflowed
+comment, but recorded, because a run whose runtime changed halfway through should
+say so in its own journal.
+
+\paragraph{Statistical power.} Every agent experiment here is $n=1$ per arm.
+Agent runs are expensive and not reproducible, which is also why tracing is
 unconditional and why we commit raw per-rank artifacts rather than aggregates.
 
-\paragraph{Scale of the agent runs.} Our largest \emph{completed} agent run is
-$p=\eLargeP$ over \eLargeExecutors\ executors. We attempted $p=100$ and it did not
-finish: the host's session cap forced several waves of executors, and an operator
-error later destroyed the run's journal. The pull queue handled the first problem
-well---a fresh wave could be added mid-run against exactly the ranks still queued,
-with no harness change and no restart, and \provTasks\ tasks were published across
-\provExecutors\ executors---and the second was ours, not the protocol's. We report
-the partial run's identity measurement because it was committed before the journal
-was lost, and we do not report a hundred-rank result, because we do not have one.
-Microbenchmarks reach $p=\ctxP$ with scripted ranks; the agent runs do not.
+\paragraph{Scale.} The largest completed agent run with session ranks is
+$p=\eLargeP$ over \eLargeExecutors\ executors, and with process ranks it is
+$p=\eSevenLargest$ on one machine. The hundred-rank session run did not finish:
+the host's session cap forced several waves of executors, and an operator error
+later destroyed the run's journal. The pull queue handled the first problem
+well, since a fresh wave could be added mid-run against exactly the ranks still
+queued, with no harness change and no restart, and \provTasks\ tasks were
+published across \provExecutors\ executors; the second problem was ours. The
+128- and 256-rank process runs across machines did not finish either, for the
+reasons Section~\ref{sec:eval-e7-nodes} measures. Microbenchmarks reach $p=\ctxP$
+with scripted ranks.
 
 \paragraph{The strongest objection.} MPI's SPMD model presupposes a static rank
-set and interchangeable workers, and agent systems are neither. We think the
-objection is partly right: the fixed world size is a real constraint, and
-heterogeneous roles fit awkwardly into a model where rank $r$'s program is the
-same as rank $s$'s. Our defence is that a rank is a \emph{role} rather than a
-worker, that communicators already express heterogeneity by partitioning, and that
-the constraint buys the thing the ad-hoc alternatives lack: a fixed membership
-against which a collective can be defined at all.
+set and interchangeable workers, and agent systems are neither. The objection is
+partly right: the fixed world size is a real constraint, and heterogeneous roles
+fit awkwardly into a model where rank $r$'s program is the same as rank $s$'s.
+Our defence is that a rank is a role rather than a worker, that communicators
+already express heterogeneity by partitioning, and that the constraint buys the
+thing the ad-hoc alternatives lack, a fixed membership against which a
+collective can be defined at all. The heterogeneity E7 was forced into, eight
+models across one population, cost the protocol nothing and cost the run its
+scaling.
 
 \paragraph{Agreement is not correctness.} A protocol that makes agreement cheap
-makes it cheap to agree on something false. In our translation run a glossary bound
-a term to a rendering correct nearly everywhere, and a rank correctly obeying it
-produced a wrong sentence in the one passage with a different sense. A consistency
-metric scores a uniformly wrong decision as perfect.
+makes it cheap to agree on something false. In our translation run a glossary
+bound a term to a rendering correct nearly everywhere, and a rank correctly
+obeying it produced a wrong sentence in the one passage with a different sense.
+A consistency metric scores a uniformly wrong decision as perfect.
 
-\section{Related work}
+\section{Related Work}
+\label{sec:related}
 
-\paragraph{Agent protocols.} MCP~\cite{mcp2026spec} standardises client--server tool access, and
-A2A~\cite{a2a2026spec} and ACP standardise agent discovery and task handoff. None provides a communicator,
-a collective, shared state with atomics, failure detection, or flow control; they
-are complementary rather than competing, and \ampi could run over any of them as a
-transport.
+The pieces of \ampi each have an ancestor, and the synthesis is the claim. The
+paragraphs below place the work against agent protocols, agent communication
+languages, agent frameworks, and distributed computing.
 
-\paragraph{Agent communication languages.} KQML~\cite{finin1994kqml} and FIPA-ACL~\cite{fipa2002acl} define speech acts with
-mentalistic semantics~\cite{labrou1994kqml}. The critique that those semantics are unverifiable
-from outside applies with more force to a language model, and we take MPI's road
-instead.
+\paragraph{Agent protocols.} MCP standardises client-server tool access, and A2A
+and ACP standardise agent discovery and task
+handoff~\cite{mcp2026spec,a2a2026spec}. None provides a communicator, a
+collective, shared state with atomics, failure detection, or flow control; they
+are complementary rather than competing, and \ampi could run over any of them as
+a transport.
 
-\paragraph{Frameworks.} AutoGen~\cite{wu2023autogen}, LangGraph, CrewAI, MetaGPT and their relatives
-supply coordination \emph{patterns}. Empirical work on how such systems
-fail~\cite{cemri2025mast} independently identifies several of the modes our
-failure model enumerates. They are the analogue of the pre-MPI
-libraries: each solves part of the problem, and none composes with another. The
-distinction we draw is that a framework makes the coordination decisions and a
-protocol provides the mechanisms with which to make them.
+\paragraph{Agent communication languages.} KQML and FIPA-ACL define speech acts
+with mentalistic semantics~\cite{finin1994kqml,fipa2002acl,labrou1994kqml}. The
+critique that those semantics are unverifiable from outside applies with more
+force to a language model, and we take MPI's road instead.
 
-\paragraph{Distributed computing.} \code{Win\_fence} is Valiant's BSP superstep boundary~\cite{valiant1990bsp}.
-Quorum collectives are stale-synchronous parallelism~\cite{ho2013ssp} expressed as
-a collective. Supervision with a bounded restart intensity is
-Erlang/OTP's~\cite{armstrong2003erlang,otpsupervisor}. Recovery by briefing is
-durable execution~\cite{azuredurable}. Windows are a blackboard in the sense of
-HEARSAY-II and Linda~\cite{hayesroth1985blackboard,gelernter1985linda}, with
-MPI-3's one-sided discipline imposed on it, and work claiming by
-compare-and-swap is the Contract Net's descendant~\cite{smith1980contractnet}. We claim the synthesis, not the parts.
+\paragraph{Frameworks.} AutoGen, LangGraph, CrewAI, MetaGPT and their relatives
+supply coordination patterns~\cite{wu2023autogen}. Empirical work on how such
+systems fail independently identifies several of the modes our failure model
+enumerates~\cite{cemri2025mast}. They are the analogue of the pre-MPI libraries:
+each solves part of the problem, and none composes with another. A framework
+makes the coordination decisions; a protocol provides the mechanisms with which
+to make them.
+
+\paragraph{Distributed computing.} \code{Win\_fence} is Valiant's BSP superstep
+boundary~\cite{valiant1990bsp}. Quorum collectives are stale-synchronous
+parallelism expressed as a collective~\cite{ho2013ssp}. Supervision with a
+bounded restart intensity is Erlang/OTP's~\cite{armstrong2003erlang,otpsupervisor}.
+Recovery by briefing is durable execution~\cite{azuredurable}. Windows are a
+blackboard in the sense of HEARSAY-II and Linda with MPI-3's one-sided discipline
+imposed on it, and work claiming by compare-and-swap descends from the Contract
+Net~\cite{hayesroth1985blackboard,gelernter1985linda,smith1980contractnet}. We
+claim the synthesis rather than the parts.
 
 \section{Conclusion}
 
-MPI's designers were solving a coordination problem under a particular cost model,
-and they were unusually explicit about which of their decisions followed from
-that model. That explicitness is what makes the transplant possible: one can take
-the mechanism, change the cost model, and see which answers change. Most of them
-survive. Two selection rules invert, one hierarchy collapses, one non-goal becomes
-the common case, and one resource with no analogue turns optimisation into
-feasibility.
+MPI's designers solved a coordination problem under a particular cost model, and
+they were explicit about which of their decisions followed from that model. That
+explicitness makes the transplant possible: one can take the mechanism, change
+the cost model, and see which answers change. Most survive. Two selection rules
+invert, one hierarchy collapses, one non-goal becomes the common case, and one
+resource with no analogue turns optimisation into feasibility.
 
 The part that did not come from MPI is the part we would most like to be wrong
 about. A reduction evaluated by agents can be perfectly reproducible and still
 internally contradictory, because merges are local and invariants are not. We can
 name the problem, give it a mechanism whose correctness is a two-line semilattice
 argument, and check that mechanism exhaustively. We cannot make an agent operator
-correct, and we do not think a protocol should claim to.
+correct, and a protocol should not claim to.
+
+The part that came from running it at scale is a set of limits with numbers on
+them. A population of process ranks finishes a book on one machine and pays for
+every extra rank in the coin of its slowest model. Across machines, the same
+population found the two limits of a transport built on a shared git ref, one a
+defect now fixed and one a ceiling now measured, and it found them by convicting
+its own live members. That is the failure detector working as specified on a
+device that was not, and the trace that recorded it is the artifact we would
+point a harness author to first.
 
 \balance
 \bibliographystyle{ACM-Reference-Format}
