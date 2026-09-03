@@ -465,10 +465,22 @@ class BrokerExecutor:
 
     # -- campaign lifecycle -----------------------------------------------------
     def open(self) -> None:
-        self.amp.device.cas(
+        """Open the campaign, or reopen one that was closed.
+
+        A harness that resumes on a machine whose earlier ranks all finished
+        finds the campaign closed and its worker told to exit; reopening it is
+        what brings the worker back to the queue.
+        """
+        ok, cell = self.amp.device.cas(
             "campaign", self.campaign, None,
             {"state": "open", "opened_at": self.amp.device.clock()}, writer=-1,
         )
+        if not ok and cell is not None and (cell.value or {}).get("state") == "closed":
+            self.amp.device.cas(
+                "campaign", self.campaign, cell.version,
+                {"state": "open", "opened_at": self.amp.device.clock(), "reopened": True},
+                writer=-1,
+            )
 
     def close(self) -> dict[str, Any]:
         """Close the campaign so idle workers wind down.
