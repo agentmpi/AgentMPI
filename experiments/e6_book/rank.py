@@ -438,13 +438,21 @@ def write_next_script(work: Path, name: str, ranks: list[int]) -> Path:
     return path
 
 
+def _same_session(a: str | None, b: str | None) -> bool:
+    """Session ids appear as ``session_<id>`` in the API and ``cse_<id>`` in the
+    environment; compare the id."""
+    if not a or not b:
+        return False
+    return a.split("_", 1)[-1] == b.split("_", 1)[-1]
+
+
 def cmd_autostart(a: argparse.Namespace) -> dict[str, Any] | None:
     spec = launch_spec()
     if spec is None:
         print(json.dumps({"autostart": "no enabled launch spec"}), flush=True)
         return None
     me = identity(-1)
-    if spec.get("launcher_session") and me.get("session") == spec["launcher_session"]:
+    if spec.get("launcher_session") and _same_session(me.get("session"), spec["launcher_session"]):
         # The conversation that created the job also starts sessions on this
         # branch; it must not become a rank of its own experiment.
         print(json.dumps({"autostart": "this is the launcher's own session"}), flush=True)

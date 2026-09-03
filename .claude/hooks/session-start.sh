@@ -26,7 +26,7 @@ if ! python3 -c "import json,sys; s=json.load(open('$spec')); sys.exit(0 if s.ge
 fi
 name=$(python3 -c "import json; print(json.load(open('$spec'))['name'])")
 launcher=$(python3 -c "import json; print(json.load(open('$spec')).get('launcher_session') or '')")
-if [ -n "$launcher" ] && [ "${CLAUDE_CODE_REMOTE_SESSION_ID:-}" = "$launcher" ]; then
+if [ -n "$launcher" ] && [ "${CLAUDE_CODE_REMOTE_SESSION_ID#*_}" = "${launcher#*_}" ]; then
   exit 0  # the launcher's own conversation is not a rank
 fi
 work="work/e6/$name"
