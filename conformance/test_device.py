@@ -40,6 +40,15 @@ def dev(request, tmp_path):
 
 def test_append_returns_increasing_sequence_numbers(dev):
     seqs = [dev.append("event", {"rank": i, "kind": "test"}) for i in range(20)]
+    if "event" in dev.deferred_streams:
+        # A device may defer the trace stream: the records are buffered and
+        # written with its next commit.  The contract that survives deferral is
+        # that once flushed they carry increasing, unique sequence numbers in
+        # append order; the immediate return value is -1 by declaration.
+        assert set(seqs) == {-1}
+        assert dev.flush() == 20
+        seqs = [r["seq"] for r in dev.scan("event", {})]
+        assert [r["rank"] for r in dev.scan("event", {})] == list(range(20))
     assert seqs == sorted(seqs), "sequence numbers must increase"
     assert len(set(seqs)) == 20, "sequence numbers must be unique"
 

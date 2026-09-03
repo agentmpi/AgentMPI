@@ -46,6 +46,9 @@ from .payload import canonical, summarise
 
 __all__ = ["RmaMixin"]
 
+_LOCK_POLL_S = 0.1
+_LOCK_POLL_MAX_S = 5.0
+
 
 class RmaMixin:
     # -- window lifecycle ---------------------------------------------------
@@ -344,11 +347,19 @@ class RmaMixin:
     ) -> dict[str, Any]:
         self.assert_identity()
         space = self._require_win(win, comm)
-        deadline = time.time() + timeout
+        started = time.time()
+        deadline = started + timeout
+        # A failed acquisition is a device round trip, and on a transport where a
+        # round trip is a network fetch, p ranks spinning at ten attempts a second
+        # is a storm the remote sees and the harness does not.  Back off like the
+        # other blocking loops do: the lock is held for an executor step, so the
+        # cost of polling coarsely is a fraction of what the holder is spending.
+        wait = _LOCK_POLL_S
         while True:
             lease = self.device.lease(space, key, holder=self.rank, mode=mode, ttl=ttl)
             if lease is not None:
-                self.trace("win.lock", rank=self.rank, win=win, key=key, token=lease.token)
+                self.trace("win.lock", rank=self.rank, win=win, key=key, token=lease.token,
+                           waited_s=round(time.time() - started, 3))
                 return {"win": win, "key": key, "lock_id": lease.lock_id, "token": lease.token,
                         "expires_at": lease.expires_at, "mode": mode}
             held = [lk for lk in self.device.leases(space) if lk.key == key]
@@ -364,7 +375,8 @@ class RmaMixin:
                     expires_at=holder.expires_at if holder else None,
                 )
             self.touch()
-            time.sleep(0.1)
+            time.sleep(wait)
+            wait = min(_LOCK_POLL_MAX_S, wait * 1.6)
 
     def win_unlock(self, lock_id: str) -> dict[str, Any]:
         ok = self.device.release(lock_id, self.rank)

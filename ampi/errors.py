@@ -205,6 +205,11 @@ ERROR_CLASSES: dict[str, _Class] = dict(
             retryable=True,
         ),
         _c(
+            "AMPI_ERR_NO_WORKER",
+            "a published task was not claimed by any executor within its claim window",
+            "The rank's executor is gone. Fail the rank so its peers stop waiting for it.",
+        ),
+        _c(
             "AMPI_ERR_PROC_FAILED",
             "a peer required to complete this operation has failed",
             "Run 'ampi failed', then 'ampi ack' and re-issue, or shrink.",

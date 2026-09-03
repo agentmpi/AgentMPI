@@ -569,7 +569,8 @@ class RuntimeBase:
         are very different write volumes and only the first is required.
         """
         now = time.time()
-        if now - getattr(self, "_last_touch", 0.0) < self._TOUCH_INTERVAL_S:
+        interval = getattr(self.device, "touch_interval_s", self._TOUCH_INTERVAL_S)
+        if now - getattr(self, "_last_touch", 0.0) < interval:
             return
         self._last_touch = now
         try:
@@ -701,6 +702,12 @@ class RuntimeBase:
         """
         from .context import MIN_DEGRADE_TOKENS, degrade_allowance, degrade_spec
 
+        if tokens <= 0:
+            # Nothing to account for, so nothing to write.  On a transport where
+            # every write is a network round trip, the ledger update behind a
+            # zero-token delivery (a body saved to disk, an empty manifest) was
+            # costing more than the delivery.
+            return 0, ""
         view = self._rankview()
         ledger = Ledger.from_dict(view.ctx)
         spec = ""
@@ -768,19 +775,27 @@ class RuntimeBase:
             return raw
 
     # -- tracing -----------------------------------------------------------
-    def trace(self, _kind: str, /, **fields: Any) -> None:
+    def trace(self, _kind: str, /, *, _at: float | None = None, **fields: Any) -> None:
         """Append an event.  Unconditional, and part of the protocol.
 
         MPI's tooling interfaces are opt-in and out-of-band, which is reasonable
         when a run can be repeated cheaply.  An agent run cannot: it is expensive
         and it is not reproducible, so a bug that was not traced is a bug that
         cannot be investigated.
+
+        ``_at`` stamps the event with a time other than now.  It exists for one
+        purpose: an event that happened on another device --- a broker claim on a
+        machine-local queue --- is mirrored into this job's trace after the fact,
+        and an analysis that reconstructs work spans from claim and submission
+        times needs the times the work actually spanned, not the time the mirror
+        was written.
         """
         try:
             job = self._manifest.job_id if self._manifest else ""
         except AmpiError:  # pragma: no cover - during creation
             job = ""
-        rec = {"kind": _kind, "run": job, "ts": self.device.clock()}
+        rec = {"kind": _kind, "run": job,
+               "ts": self.device.clock() if _at is None else float(_at)}
         # Field names that collide with the event's own columns are prefixed
         # rather than dropped, because a silently missing trace field is a debugging
         # session nobody can have.

@@ -59,6 +59,8 @@ __all__ = ["GitDevice"]
 ENV_REMOTE = "AMPI_GIT_REMOTE"
 ENV_BRANCH = "AMPI_GIT_BRANCH"
 ENV_READ_INTERVAL = "AMPI_GIT_READ_INTERVAL"
+ENV_MAX_READ_INTERVAL = "AMPI_GIT_MAX_READ_INTERVAL"
+ENV_TOUCH_INTERVAL = "AMPI_GIT_TOUCH_INTERVAL"
 STATE_FILE = "state.json"
 CONFIG_FILE = "git.json"
 GIT_IDENTITY = ["-c", "user.name=ampi", "-c", "user.email=ampi@agentmpi.invalid",
@@ -78,6 +80,7 @@ def _cell_key(space: str, key: str) -> str:
 class GitDevice(Device):
     name = "git"
     durable = True
+    deferred_streams = frozenset({"event"})
 
     def __init__(
         self,
@@ -95,6 +98,15 @@ class GitDevice(Device):
         self.read_interval = (read_interval if read_interval is not None
                               else float(os.environ.get(ENV_READ_INTERVAL, "0.5")))
         self._last_fetch = 0.0
+        self._idle_fetches = 0
+        self._pending: list[tuple[str, dict[str, Any]]] = []
+        self._pending_since: float | None = None
+        #: A blocked rank renews its lease this often.  Five seconds is right for
+        #: a local database and ruinous for a transport whose write is a network
+        #: round trip serialised across the population; a minute renews a
+        #: five-minute lease five times over.
+        self.touch_interval_s = float(os.environ.get(ENV_TOUCH_INTERVAL, "60"))
+        self.max_read_interval = float(os.environ.get(ENV_MAX_READ_INTERVAL, "10"))
         self._tlock = threading.RLock()
         self._depth = 0
         self._counter = itertools.count()
@@ -181,7 +193,9 @@ class GitDevice(Device):
                 self._git("reset", "-q", "--hard", f"origin/{self.branch}")
 
     def close(self) -> None:
-        pass
+        with self._locked():
+            if self._pending:
+                self.flush()
 
     def wipe(self) -> None:
         with self._locked():
@@ -217,8 +231,16 @@ class GitDevice(Device):
         ``read_interval`` seconds reads the copy it has.  Writers always fetch,
         because a stale base is exactly what the remote will reject.
         """
-        if not fresh and time.time() - self._last_fetch < self.read_interval:
-            return self._read_state()
+        if not fresh:
+            # Readers back off while nothing changes.  A rank blocked in a
+            # barrier polls once a second, and sixty-four of them fetching the
+            # remote every half second is a load the remote notices; a reader
+            # whose last few fetches found nothing new can afford to wait longer,
+            # and a reader whose fetch found a change goes back to the base rate.
+            interval = min(self.read_interval * (1.5 ** self._idle_fetches),
+                           self.max_read_interval)
+            if time.time() - self._last_fetch < interval:
+                return self._read_state()
         self.fetches += 1
         self._last_fetch = time.time()
         r = subprocess.run(["git", *GIT_IDENTITY, "fetch", "-q", "origin", self.branch],
@@ -228,6 +250,9 @@ class GitDevice(Device):
             remote = self._git("rev-parse", f"origin/{self.branch}")
             if local != remote:
                 self._git("reset", "-q", "--hard", f"origin/{self.branch}")
+                self._idle_fetches = 0
+            else:
+                self._idle_fetches += 1
         return self._read_state()
 
     def _read_state(self) -> dict[str, Any]:
@@ -251,6 +276,9 @@ class GitDevice(Device):
         with self._locked():
             for attempt in range(self._max_retries):
                 state = self._sync()
+                pending = list(self._pending)
+                for stream, rec in pending:
+                    self._append_to(state, stream, rec)
                 result = fn(state)
                 self._write_state(state)
                 self._git("add", "-A")
@@ -263,6 +291,9 @@ class GitDevice(Device):
                                    cwd=str(self.root), capture_output=True, text=True)
                 if r.returncode == 0:
                     self.pushes += 1
+                    if pending:
+                        self._pending = self._pending[len(pending):]
+                        self._pending_since = time.time() if self._pending else None
                     return result
                 self.rejections += 1
                 # Lost the race: somebody else's commit landed first.  The winner's
@@ -273,19 +304,61 @@ class GitDevice(Device):
                 time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 10)))
             raise RuntimeError(f"git device: push of {label!r} rejected {self._max_retries} times")
 
+    # -- deferred trace appends ------------------------------------------------
+    #: Events are the one stream nothing waits for.  A trace record commutes with
+    #: every other mutation and is read only by the analysis, so it is buffered
+    #: and folded into the next commit this device makes for any other reason,
+    #: or flushed on its own once the buffer is old or long.  On the run that
+    #: motivated this, trace appends were half the commits on the branch and
+    #: every one of them was a network round trip.
+    FLUSH_AFTER_S = 30.0
+    FLUSH_AT = 16
+
+    def _drain_pending(self, state: dict[str, Any]) -> None:
+        for stream, rec in self._pending:
+            self._append_to(state, stream, rec)
+        self._pending = []
+        self._pending_since = None
+
+    def _append_to(self, state: dict[str, Any], stream: str, record: dict[str, Any]) -> int:
+        state["counter"] += 1
+        seq = state["counter"]
+        rec = dict(record)
+        rec["seq"] = seq
+        rec.setdefault("ts", self.clock())
+        for f in STREAMS[stream]:
+            rec.setdefault(f, None)
+        state["streams"].setdefault(stream, []).append(rec)
+        return seq
+
+    def flush(self) -> int:
+        """Commit any buffered trace records now.  Returns how many were written."""
+        with self._locked():
+            n = len(self._pending)
+            if not n:
+                return 0
+            self._mutate(lambda state: None, "flush events")
+            return n
+
+    def _maybe_flush(self) -> None:
+        if self._pending and self._pending_since is not None and \
+                time.time() - self._pending_since > self.FLUSH_AFTER_S:
+            self.flush()
+
     # -- 1-3. streams --------------------------------------------------------
     def append(self, stream: str, record: dict[str, Any]) -> int:
-        def fn(state: dict[str, Any]) -> int:
-            state["counter"] += 1
-            seq = state["counter"]
-            rec = dict(record)
-            rec["seq"] = seq
-            rec.setdefault("ts", self.clock())
-            for f in STREAMS[stream]:
-                rec.setdefault(f, None)
-            state["streams"].setdefault(stream, []).append(rec)
-            return seq
-        return self._mutate(fn, f"append {stream}")
+        if stream == "event":
+            with self._locked():
+                rec = dict(record)
+                rec.setdefault("ts", self.clock())
+                self._pending.append((stream, rec))
+                if self._pending_since is None:
+                    self._pending_since = time.time()
+                if len(self._pending) >= self.FLUSH_AT:
+                    self.flush()
+            return -1
+        return self._mutate(lambda state: self._append_to(state, stream, record),
+                            f"append {stream}")
 
     def match(
         self,
@@ -314,6 +387,10 @@ class GitDevice(Device):
         limit: int | None = None,
     ) -> list[dict[str, Any]]:
         with self._locked():
+            if stream == "event" and self._pending:
+                self.flush()
+            else:
+                self._maybe_flush()
             state = self._sync(fresh=False)
         rows = [dict(r) for r in sorted(state["streams"].get(stream, []),
                                         key=lambda r: r.get(order_by) or 0, reverse=descending)
@@ -448,4 +525,5 @@ class GitDevice(Device):
             self.root / ".git").exists() else ""
         return {"device": self.name, "durable": True, "remote": self._remote,
                 "branch": self.branch, "head": head, "pushes": self.pushes,
-                "rejections": self.rejections, "fetches": self.fetches}
+                "rejections": self.rejections, "fetches": self.fetches,
+                "pending_events": len(self._pending)}

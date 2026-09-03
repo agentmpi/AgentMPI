@@ -164,6 +164,10 @@ class BrokerExecutor:
         work_dir: str | Path,
         timeout_s: float = 3600.0,
         claim_ttl_s: float = 900.0,
+        claim_wait_s: float | None = None,
+        trace_to: Any = None,
+        keepalive: Callable[[], Any] | None = None,
+        keepalive_every_s: float = 60.0,
     ) -> None:
         self.amp = amp
         self.campaign = campaign
@@ -171,6 +175,26 @@ class BrokerExecutor:
         self.dir.mkdir(parents=True, exist_ok=True)
         self.timeout_s = timeout_s
         self.claim_ttl_s = claim_ttl_s
+        #: How long a published task may sit unclaimed before the harness is told
+        #: that no executor is serving the rank.  Distinct from ``timeout_s``: a
+        #: task that was claimed and is being worked on is alive however long it
+        #: takes, whereas a task nobody has picked up is the signature of an
+        #: executor that has died or never started, and the rank waiting for it is
+        #: holding a whole population at its next collective.
+        self.claim_wait_s = claim_wait_s
+        #: A second job whose trace receives a copy of this queue's events.  The
+        #: queue is often machine-local (a rank on a cloud VM publishes to a SQLite
+        #: queue its own session serves) while the job the analysis reads is on a
+        #: shared transport; mirroring keeps the work spans in the one trace that
+        #: survives the machine.
+        self.trace_to = trace_to
+        #: Called while blocked, at most once per ``keepalive_every_s``.  The
+        #: harness passes its rank's heartbeat, so that a rank waiting on a long
+        #: executor step renews a short lease many times rather than extending a
+        #: long one once --- and a rank whose machine dies mid-step is convicted
+        #: within minutes instead of after the whole step's worth of lease.
+        self.keepalive = keepalive
+        self.keepalive_every_s = keepalive_every_s
 
     # -- harness side --------------------------------------------------------
     def invoke(self, task: Task) -> Any:
@@ -196,21 +220,45 @@ class BrokerExecutor:
                 "queued_at": self.amp.device.clock(),
             },
         )
-        self.amp.trace("broker.publish", rank=task.rank, label=task.label, aid=aid,
-                       prompt_tokens=count_tokens(task.prompt))
+        prompt_tokens = count_tokens(task.prompt)
+        self._trace("broker.publish", rank=task.rank, label=task.label, aid=aid,
+                    prompt_tokens=prompt_tokens)
+        claim_ttl = float(task.meta.get("claim_ttl_s") or self.claim_ttl_s)
+        claim_wait = task.meta.get("claim_wait_s", self.claim_wait_s)
 
-        deadline = time.time() + self.timeout_s
+        published = time.time()
+        deadline = published + self.timeout_s
+        last_alive = published
+        mirrored_claim = False
         wait = 0.2
         while True:
             rows = self.amp.device.scan("task", {"aid": aid}, limit=1)
             rec = rows[0] if rows else {}
+            if self.trace_to is not None and rec.get("state") in ("claimed", "done") \
+                    and not mirrored_claim:
+                # The claim is mirrored as soon as it is seen rather than at
+                # completion, so a rank whose task is in flight shows as busy in a
+                # live view of the shared trace.
+                self.trace_to.trace("broker.claim", _at=rec.get("claimed_at"), rank=task.rank,
+                                    aid=aid, label=task.label,
+                                    worker=rec.get("worker_id") or None)
+                mirrored_claim = True
             if rec.get("state") == "done":
+                if self.trace_to is not None:
+                    self.trace_to.trace(
+                        "broker.submit", _at=rec.get("done_at"), rank=task.rank, aid=aid,
+                        label=task.label, tokens=rec.get("result_tokens"),
+                        rejects=rec.get("rejects") or None,
+                        worker=rec.get("worker_id") or None,
+                    )
                 raw = Path(rec["result_file"]).read_text(encoding="utf-8")
                 try:
                     return json.loads(raw)
                 except json.JSONDecodeError:
                     return raw
             if rec.get("state") == "abandoned":
+                self._trace("broker.giveup", rank=task.rank, aid=aid, label=task.label,
+                            reason=rec.get("reason", ""), mirror_only=True)
                 raise err(
                     "AMPI_ERR_OP_FAILED",
                     f"worker for rank {task.rank} gave up on {task.label!r}: "
@@ -222,10 +270,27 @@ class BrokerExecutor:
             # commonest way a harness silently stops making progress.
             if (
                 rec.get("state") == "claimed"
-                and self.amp.device.clock() - rec.get("claimed_at", 0) > self.claim_ttl_s
+                and self.amp.device.clock() - rec.get("claimed_at", 0) > claim_ttl
             ):
                 self.amp.device.update("task", rec["seq"], {"state": "queued", "requeued": True})
-                self.amp.trace("broker.requeue", rank=task.rank, aid=aid)
+                self._trace("broker.requeue", rank=task.rank, aid=aid, label=task.label)
+                mirrored_claim = False
+            if (
+                claim_wait is not None
+                and rec.get("state") in ("queued", None)
+                and time.time() - published > float(claim_wait)
+            ):
+                self._trace("broker.unclaimed", rank=task.rank, aid=aid, label=task.label,
+                            waited_s=round(time.time() - published, 1))
+                raise err(
+                    "AMPI_ERR_NO_WORKER",
+                    f"no executor claimed {task.label!r} for rank {task.rank} within "
+                    f"{float(claim_wait):.0f}s",
+                    hint="The rank's executor has died or never started. The harness "
+                    "should treat the rank as failed rather than hold its peers.",
+                    aid=aid,
+                    state=rec.get("state", "missing"),
+                )
             if time.time() >= deadline:
                 raise err(
                     "AMPI_ERR_TIMEOUT",
@@ -235,8 +300,18 @@ class BrokerExecutor:
                     aid=aid,
                     state=rec.get("state", "missing"),
                 )
+            if self.keepalive is not None and time.time() - last_alive >= self.keepalive_every_s:
+                self.keepalive()
+                last_alive = time.time()
             time.sleep(wait)
             wait = min(2.0, wait * 1.4)
+
+    def _trace(self, kind: str, *, mirror_only: bool = False, **fields: Any) -> None:
+        """Record on the queue's job and, when configured, on the shared job."""
+        if not mirror_only:
+            self.amp.trace(kind, **fields)
+        if self.trace_to is not None:
+            self.trace_to.trace(kind, **fields)
 
     # -- worker side ----------------------------------------------------------
     @staticmethod
@@ -360,6 +435,7 @@ class BrokerExecutor:
         contract = Contract.parse(rec.get("contract"))
         violations = check_contract(value, contract, subs={"rank": rec["rank"]})
         if violations:
+            amp.device.update("task", rec["seq"], {"rejects": int(rec.get("rejects") or 0) + 1})
             amp.trace("broker.reject", rank=rank, aid=aid, violations=violations)
             raise err(
                 "AMPI_ERR_TYPE",

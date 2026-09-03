@@ -284,6 +284,16 @@ class Device(abc.ABC):
     is a fresh process invoking the binding.
     """
 
+    #: Streams whose ``append`` a device may defer: the record is buffered and
+    #: written with the device's next commit, ``append`` returns ``-1`` rather
+    #: than a sequence number, and ``flush`` writes what is pending.  Only a
+    #: stream nothing waits for --- the trace --- may be declared here.
+    deferred_streams: frozenset[str] = frozenset()
+
+    def flush(self) -> int:
+        """Write any deferred records.  Returns how many were written."""
+        return 0
+
     #: Short stable name, used in traces and by ``AMPI_DEVICE``.
     name: str = "abstract"
     #: Whether the device survives process exit.  ``memory`` does not.
