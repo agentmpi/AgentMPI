@@ -77,7 +77,8 @@ them.
                              tools/                 sealing a run, collecting the suite
                            runs/                    committed evidence: launch plans, traces,
                                                     per-rank reports, analyses; no book text
-                           paper/                   the paper; every number is a macro that
+                           paper/                   the paper, written to paper/WRITING_GUIDE.md;
+                                                    every number is a macro that
                              tools/                 paper/tools/ generates from runs/
 ```
 
