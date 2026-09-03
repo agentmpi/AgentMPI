@@ -277,7 +277,10 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
     # degraded to a summary string, and the rank crashed on it.
     amp.ctx_release()
     my_segment = segments[rank]
-    bodies = out_dir / "bodies"
+    # Per rank: two ranks receiving the same broadcast at the same instant must
+    # not share a file, or one of them reads the other's half-written copy.  A
+    # rank crashed on exactly that before the directory was per rank.
+    bodies = out_dir / "bodies" / f"r{rank}"
     bodies.mkdir(parents=True, exist_ok=True)
 
     def take(res: dict[str, Any], label: str) -> Any:
