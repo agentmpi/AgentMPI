@@ -300,6 +300,25 @@ def e2_macros() -> None:
     put("eTwoExpected", s4["published_expected"])
 
 
+def e5_macros() -> None:
+    """One job across many machines: the git device measured at two and thirty-two VMs."""
+    for p in (2, 32):
+        r = load(RUNS / f"e5-cloud-p{p}" / "report.json")
+        if not r:
+            for k in ("Machines", "Pushes", "Rejections", "Commits", "WallMedian", "WallMax"):
+                put(f"eFive{k}{p}", None)
+            continue
+        walls = sorted(float(v) for v in (r.get("wall_s_by_rank") or {}).values())
+        put(f"eFiveMachines{p}", r.get("distinct_machines"))
+        put(f"eFivePushes{p}", r.get("pushes_total"))
+        put(f"eFiveRejections{p}", r.get("rejections_total"))
+        put(f"eFiveCommits{p}", r.get("commits_on_branch"))
+        put(f"eFiveWallMedian{p}", int(round(walls[len(walls) // 2] / 60)) if walls else None)
+        put(f"eFiveWallMax{p}", int(round(walls[-1] / 60)) if walls else None)
+        if p == 32 and r.get("pushes_total"):
+            put("eFiveRejectRatio", round(r["rejections_total"] / r["pushes_total"], 1), fmt=".1f")
+
+
 def e6_macros() -> None:
     """The production series: one block of macros per scale, from the series table.
 
@@ -368,6 +387,7 @@ def main() -> None:
     e0_macros()
     e1_macros()
     e2_macros()
+    e5_macros()
     e6_macros()
     provenance_macros()
     suite_macros()
