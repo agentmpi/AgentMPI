@@ -3,6 +3,10 @@
 from __future__ import annotations
 
 import os
+
+# A conformance run opens hundreds of short-lived roots; a gitd daemon that
+# lingered five minutes per root would outlive the suite many times over.
+os.environ.setdefault("AMPI_GITD_IDLE_S", "3")
 from typing import Any
 
 import ampi.device  # noqa: F401  (registers the bundled devices)

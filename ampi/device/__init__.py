@@ -29,6 +29,7 @@ from .base import (
     open_device,
     register_device,
 )
+from .gitd import GitdDevice
 from .gitlog import GitDevice
 from .journal import JournalDevice
 from .memory import MemoryDevice
@@ -39,6 +40,7 @@ __all__ = [
     "Device",
     "Ge",
     "GitDevice",
+    "GitdDevice",
     "Gt",
     "In",
     "IsNull",

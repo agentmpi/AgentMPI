@@ -60,7 +60,7 @@ def findings(a: Analysis) -> list[dict[str, str]]:
         )
 
     par = a.concurrency
-    if a.has_broker and a.world_size and par.achieved_parallelism < LOW_PARALLELISM * a.world_size:
+    if a.has_work_spans and a.world_size and par.achieved_parallelism < LOW_PARALLELISM * a.world_size:
         add(
             "warn",
             f"achieved parallelism was {par.achieved_parallelism:.2f}x on {a.world_size} ranks "
@@ -93,7 +93,7 @@ def findings(a: Analysis) -> list[dict[str, str]]:
     if degraded:
         add("note", f"{degraded} payload(s) were degraded to a view to fit a context budget")
 
-    if a.imbalance > 1.5 and a.has_broker:
+    if a.imbalance > 1.5 and a.has_work_spans:
         add(
             "warn",
             f"load imbalance {a.imbalance:.2f}: the busiest rank worked "
@@ -160,10 +160,10 @@ def findings(a: Analysis) -> list[dict[str, str]]:
             f"{a.conflicts_lifted} conflict(s) were lifted by reductions rather than "
             "silently resolved by whichever branch merged last",
         )
-    if not a.has_broker:
+    if not a.has_work_spans:
         add(
             "note",
-            "no broker executor: occupancy is reconstructed from task spans that do not exist, "
+            "no executor spans: occupancy is reconstructed from task spans that do not exist, "
             "so concurrency figures describe the instrumentation, not agent behaviour",
         )
     if not out:

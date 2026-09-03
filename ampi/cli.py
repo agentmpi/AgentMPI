@@ -194,7 +194,7 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("new", help="create a job")
     p.add_argument("--root", required=True)
     p.add_argument("--size", type=int, required=True)
-    p.add_argument("--device", default="sqlite", choices=["sqlite", "journal", "memory", "git"])
+    p.add_argument("--device", default="sqlite", choices=["sqlite", "journal", "memory", "git", "gitd"])
     p.add_argument("--ctx-budget", type=int, default=None)
     p.add_argument("--eager-threshold", type=int, default=None)
     p.add_argument("--force", action="store_true")

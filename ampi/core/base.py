@@ -228,6 +228,33 @@ class RuntimeBase:
         self.device.cas("job", "manifest", None, manifest.to_dict(), writer=-1)
 
         now = self.device.clock()
+        # A device that can pipeline (the git daemon) turns the per-rank writes
+        # below into a few group commits; the others get a no-op envelope.
+        import contextlib
+
+        pipeline = getattr(self.device, "pipeline", contextlib.nullcontext)
+        with pipeline():
+            self._request_ranks(size, now, join_deadline_s, roles, ctx_budget, unexpected_budget)
+
+        self.device.cas(
+            "comm",
+            "world",
+            None,
+            {"name": "world", "members": list(range(size)), "gen": 0, "state": "live", "parent": ""},
+            writer=-1,
+        )
+        self._manifest = manifest
+        self._rank = None
+        self._expect_rank = None
+        self._expect_job = None
+        self._token = None
+        self._checked_identity = True
+        self.trace("job.create", size=size, device=device, job_id=job_id)
+        return self
+
+    def _request_ranks(self, size: int, now: float, join_deadline_s: float,
+                       roles: dict[int, str] | None, ctx_budget: int,
+                       unexpected_budget: int) -> None:
         for r in range(size):
             self.device.cas(
                 "rank",
@@ -251,22 +278,6 @@ class RuntimeBase:
             # executor passing the wrong rank (rare) and an executor silently
             # *being* the wrong rank (common, and much worse).
             self.device.cas("token", str(r), None, uuid.uuid4().hex[:16], writer=-1)
-
-        self.device.cas(
-            "comm",
-            "world",
-            None,
-            {"name": "world", "members": list(range(size)), "gen": 0, "state": "live", "parent": ""},
-            writer=-1,
-        )
-        self._manifest = manifest
-        self._rank = None
-        self._expect_rank = None
-        self._expect_job = None
-        self._token = None
-        self._checked_identity = True
-        self.trace("job.create", size=size, device=device, job_id=job_id)
-        return self
 
     @property
     def manifest(self) -> JobManifest:

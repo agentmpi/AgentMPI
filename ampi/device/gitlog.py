@@ -54,7 +54,8 @@ from typing import Any
 
 from .base import STREAMS, Cell, Device, Lease, Predicate, matches, register_device
 
-__all__ = ["GitDevice"]
+__all__ = ["GitDevice", "apply_op", "apply_append", "apply_match", "apply_update",
+           "apply_cas", "apply_lease", "apply_release", "apply_put_object"]
 
 ENV_REMOTE = "AMPI_GIT_REMOTE"
 ENV_BRANCH = "AMPI_GIT_BRANCH"
@@ -72,6 +73,111 @@ def _empty_state() -> dict[str, Any]:
 
 def _cell_key(space: str, key: str) -> str:
     return f"{space}\t{key}"
+
+
+# --------------------------------------------------------------------------
+# State transitions, as pure functions
+# --------------------------------------------------------------------------
+# Each mutating operation is a function of (state, arguments, clock) with no other
+# input, so that a rejected push can re-run it against fresher state and --- the
+# reason they are module-level rather than closures --- so that the per-node
+# daemon (:mod:`ampi.device.gitd`) can apply a whole batch of them in one commit.
+
+
+def apply_append(state: dict[str, Any], stream: str, record: dict[str, Any], now: float) -> int:
+    state["counter"] += 1
+    seq = state["counter"]
+    rec = dict(record)
+    rec["seq"] = seq
+    rec.setdefault("ts", now)
+    for f in STREAMS[stream]:
+        rec.setdefault(f, None)
+    state["streams"].setdefault(stream, []).append(rec)
+    return seq
+
+
+def apply_match(state: dict[str, Any], stream: str, predicate: Predicate,
+                update: dict[str, Any], order_by: str = "seq") -> dict[str, Any] | None:
+    for rec in sorted(state["streams"].get(stream, []), key=lambda r: r.get(order_by) or 0):
+        if matches(rec, predicate):
+            rec.update(update)
+            return dict(rec)
+    return None
+
+
+def apply_update(state: dict[str, Any], stream: str, seq: int, fields: dict[str, Any]) -> bool:
+    for rec in state["streams"].get(stream, []):
+        if rec.get("seq") == seq:
+            rec.update(fields)
+            return True
+    return False
+
+
+def apply_cas(state: dict[str, Any], space: str, key: str, expect_version: int | None,
+              value: Any, writer: int, epoch: int, meta: dict[str, Any] | None,
+              now: float) -> tuple[bool, dict[str, Any]]:
+    versions = state["cells"].setdefault(_cell_key(space, key), [])
+    current = versions[-1]["version"] if versions else 0
+    if expect_version is not None and expect_version != current:
+        return False, (dict(versions[-1]) if versions
+                       else Cell(space, key, 0, None, -1, 0, now, {}).to_dict())
+    cell = Cell(space, key, current + 1, value, writer, epoch, now, meta or {})
+    versions.append(cell.to_dict())
+    return True, cell.to_dict()
+
+
+def apply_lease(state: dict[str, Any], space: str, key: str, holder: int, mode: str,
+                ttl: float, now: float) -> dict[str, Any] | None:
+    locks = state["locks"]
+    for lid in [lid for lid, lk in locks.items() if lk["expires_at"] <= now]:
+        del locks[lid]
+    held = [lk for lk in locks.values() if lk["space"] == space and lk["key"] == key]
+    if held and (mode == "exclusive" or any(h["mode"] == "exclusive" for h in held)):
+        if len(held) == 1 and held[0]["holder"] == holder and held[0]["mode"] == mode:
+            held[0]["expires_at"] = now + ttl
+            return dict(held[0])
+        return None
+    fk = _cell_key(space, key)
+    token = state["fence"].get(fk, 0) + 1
+    state["fence"][fk] = token
+    lease = Lease(uuid.uuid4().hex[:16], space, key, holder, mode, token, now + ttl, now)
+    locks[lease.lock_id] = lease.to_dict()
+    return lease.to_dict()
+
+
+def apply_release(state: dict[str, Any], lock_id: str, holder: int) -> bool:
+    lk = state["locks"].get(lock_id)
+    if lk is None or lk["holder"] != holder:
+        return False
+    del state["locks"][lock_id]
+    return True
+
+
+def apply_put_object(state: dict[str, Any], digest: str, body: str) -> None:
+    state["obj"][digest] = body
+
+
+def apply_op(state: dict[str, Any], op: str, args: dict[str, Any], now: float) -> Any:
+    """Dispatch one serialised mutation; the daemon's batch is a list of these."""
+    if op == "append":
+        return apply_append(state, args["stream"], args["record"], now)
+    if op == "match":
+        return apply_match(state, args["stream"], args["predicate"], args["update"],
+                           args.get("order_by", "seq"))
+    if op == "update":
+        return apply_update(state, args["stream"], args["seq"], args["fields"])
+    if op == "cas":
+        return apply_cas(state, args["space"], args["key"], args.get("expect_version"),
+                         args.get("value"), args["writer"], args.get("epoch", 0),
+                         args.get("meta"), now)
+    if op == "lease":
+        return apply_lease(state, args["space"], args["key"], args["holder"],
+                           args.get("mode", "exclusive"), args["ttl"], now)
+    if op == "release":
+        return apply_release(state, args["lock_id"], args["holder"])
+    if op == "put_object":
+        return apply_put_object(state, args["digest"], args["body"])
+    raise ValueError(f"unknown mutation {op!r}")
 
 
 @register_device
@@ -275,17 +381,8 @@ class GitDevice(Device):
 
     # -- 1-3. streams --------------------------------------------------------
     def append(self, stream: str, record: dict[str, Any]) -> int:
-        def fn(state: dict[str, Any]) -> int:
-            state["counter"] += 1
-            seq = state["counter"]
-            rec = dict(record)
-            rec["seq"] = seq
-            rec.setdefault("ts", self.clock())
-            for f in STREAMS[stream]:
-                rec.setdefault(f, None)
-            state["streams"].setdefault(stream, []).append(rec)
-            return seq
-        return self._mutate(fn, f"append {stream}")
+        return self._mutate(lambda st: apply_append(st, stream, record, self.clock()),
+                            f"append {stream}")
 
     def match(
         self,
@@ -295,14 +392,8 @@ class GitDevice(Device):
         *,
         order_by: str = "seq",
     ) -> dict[str, Any] | None:
-        def fn(state: dict[str, Any]) -> dict[str, Any] | None:
-            for rec in sorted(state["streams"].get(stream, []),
-                              key=lambda r: r.get(order_by) or 0):
-                if matches(rec, predicate):
-                    rec.update(update)
-                    return dict(rec)
-            return None
-        return self._mutate(fn, f"match {stream}")
+        return self._mutate(lambda st: apply_match(st, stream, predicate, update, order_by),
+                            f"match {stream}")
 
     def scan(
         self,
@@ -321,13 +412,7 @@ class GitDevice(Device):
         return rows[:limit] if limit is not None else rows
 
     def update(self, stream: str, seq: int, fields: dict[str, Any]) -> bool:
-        def fn(state: dict[str, Any]) -> bool:
-            for rec in state["streams"].get(stream, []):
-                if rec.get("seq") == seq:
-                    rec.update(fields)
-                    return True
-            return False
-        return self._mutate(fn, f"update {stream}")
+        return self._mutate(lambda st: apply_update(st, stream, seq, fields), f"update {stream}")
 
     # -- 4. cells ------------------------------------------------------------
     @staticmethod
@@ -358,16 +443,11 @@ class GitDevice(Device):
         epoch: int = 0,
         meta: dict[str, Any] | None = None,
     ) -> tuple[bool, Cell]:
-        def fn(state: dict[str, Any]) -> tuple[bool, Cell]:
-            versions = state["cells"].setdefault(_cell_key(space, key), [])
-            current = versions[-1]["version"] if versions else 0
-            if expect_version is not None and expect_version != current:
-                return False, (self._cell(versions[-1]) if versions
-                               else Cell(space, key, 0, None, -1, 0, self.clock(), {}))
-            cell = Cell(space, key, current + 1, value, writer, epoch, self.clock(), meta or {})
-            versions.append(cell.to_dict())
-            return True, cell
-        return self._mutate(fn, f"cas {space}/{key}")
+        ok, cell = self._mutate(
+            lambda st: apply_cas(st, space, key, expect_version, value, writer, epoch, meta,
+                                 self.clock()),
+            f"cas {space}/{key}")
+        return ok, self._cell(cell)
 
     def keys(self, space: str, *, prefix: str = "") -> list[Cell]:
         with self._locked():
@@ -391,33 +471,13 @@ class GitDevice(Device):
     def lease(
         self, space: str, key: str, *, holder: int, mode: str = "exclusive", ttl: float
     ) -> Lease | None:
-        def fn(state: dict[str, Any]) -> Lease | None:
-            now = self.clock()
-            locks = state["locks"]
-            for lid in [lid for lid, lk in locks.items() if lk["expires_at"] <= now]:
-                del locks[lid]
-            held = [lk for lk in locks.values() if lk["space"] == space and lk["key"] == key]
-            if held and (mode == "exclusive" or any(h["mode"] == "exclusive" for h in held)):
-                if len(held) == 1 and held[0]["holder"] == holder and held[0]["mode"] == mode:
-                    held[0]["expires_at"] = now + ttl
-                    return Lease(**held[0])
-                return None
-            fk = _cell_key(space, key)
-            token = state["fence"].get(fk, 0) + 1
-            state["fence"][fk] = token
-            lease = Lease(uuid.uuid4().hex[:16], space, key, holder, mode, token, now + ttl, now)
-            locks[lease.lock_id] = lease.to_dict()
-            return lease
-        return self._mutate(fn, f"lease {space}/{key}")
+        got = self._mutate(
+            lambda st: apply_lease(st, space, key, holder, mode, ttl, self.clock()),
+            f"lease {space}/{key}")
+        return Lease(**got) if got else None
 
     def release(self, lock_id: str, holder: int) -> bool:
-        def fn(state: dict[str, Any]) -> bool:
-            lk = state["locks"].get(lock_id)
-            if lk is None or lk["holder"] != holder:
-                return False
-            del state["locks"][lock_id]
-            return True
-        return self._mutate(fn, f"release {lock_id}")
+        return self._mutate(lambda st: apply_release(st, lock_id, holder), f"release {lock_id}")
 
     def leases(self, space: str = "", *, include_expired: bool = False) -> list[Lease]:
         with self._locked():
@@ -433,9 +493,7 @@ class GitDevice(Device):
 
     # -- object store --------------------------------------------------------
     def put_object(self, digest: str, body: str) -> None:
-        def fn(state: dict[str, Any]) -> None:
-            state["obj"][digest] = body
-        self._mutate(fn, f"put {digest[:12]}")
+        self._mutate(lambda st: apply_put_object(st, digest, body), f"put {digest[:12]}")
 
     def get_object(self, digest: str) -> str | None:
         with self._locked():

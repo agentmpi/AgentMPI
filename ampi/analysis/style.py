@@ -102,6 +102,10 @@ STYLE: dict[str, Style] = {
     "broker.claim": _s("work", "bar"),
     "broker.submit": _s("work", "tick", "#60a5fa"),
     "broker.publish": _s("lifecycle", "tick"),
+    # A model executor's task is claim and submit in one process.
+    "task.start": _s("work", "bar"),
+    "task.done": _s("work", "tick", "#60a5fa"),
+    "task.tool": _s("work", "tick", "#93c5fd"),
     # -- collectives ----------------------------------------------------
     "coll.join": _s("collective", "tick", "#065f46"),
     "barrier": _s("collective", "diamond"),
@@ -155,6 +159,8 @@ STYLE: dict[str, Style] = {
     "failure.convict": _s("trouble", "diamond"),
     "failure.kill": _s("trouble", "diamond"),
     "broker.reject": _s("trouble", "diamond", "#f87171"),
+    "task.retry": _s("trouble", "diamond", "#f87171"),
+    "task.fail": _s("trouble", "diamond"),
     "broker.giveup": _s("trouble", "diamond"),
     "ctx.stall": _s("trouble", "diamond", "#fb7185"),
     "ctx.degrade": _s("trouble", "diamond", "#fda4af"),

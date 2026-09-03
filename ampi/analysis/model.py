@@ -134,6 +134,17 @@ class RankProfile:
     executors: set[str] = field(default_factory=set)
     task_latencies: list[float] = field(default_factory=list)
     kinds: Counter = field(default_factory=Counter)
+    #: Model-executor accounting, from ``task.done`` events.  A raw API executor
+    #: reports the exact size of every prompt it was sent, so these are measured
+    #: rather than estimated: the prompt *is* the executor's whole context.
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    reasoning_tokens: int = 0
+    cost_usd: float = 0.0
+    tool_calls: int = 0
+    n_repairs: int = 0
+    #: Collectives this rank re-entered after a restart, found already closed.
+    n_replays: int = 0
 
     @property
     def lifetime_s(self) -> float:
@@ -172,6 +183,13 @@ class RankProfile:
             "occupancy": round(self.occupancy, 4),
             "n_tasks": self.n_tasks,
             "n_collectives": self.n_collectives,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "reasoning_tokens": self.reasoning_tokens,
+            "cost_usd": round(self.cost_usd, 6),
+            "tool_calls": self.tool_calls,
+            "n_repairs": self.n_repairs,
+            "n_replays": self.n_replays,
             "sent": self.sent,
             "recv": self.recv,
             "tokens_sent": self.tokens_sent,
@@ -620,7 +638,7 @@ class Analysis:
                 failed_at.setdefault(rank, e["ts"])
         out = []
         for e in self.events:
-            if e["kind"] != "broker.submit":
+            if e["kind"] not in ("broker.submit", "task.done"):
                 continue
             rank = int(e.get("rank", -1))
             when = failed_at.get(rank)
@@ -643,9 +661,47 @@ class Analysis:
         """
         return self.kind_counts.get("broker.claim", 0) > 0
 
+    @property
+    def has_work_spans(self) -> bool:
+        """Is occupancy observable at all: a broker claim/submit pair, or a model
+        executor's ``task.start``/``task.done`` pair, both of which bound the
+        interval a rank spent inside its executor."""
+        return self.has_broker or self.kind_counts.get("task.start", 0) > 0
+
+    @property
+    def total_cost_usd(self) -> float:
+        return sum(p.cost_usd for p in self.ranks.values())
+
+    @property
+    def total_prompt_tokens(self) -> int:
+        return sum(p.prompt_tokens for p in self.ranks.values())
+
+    @property
+    def total_completion_tokens(self) -> int:
+        return sum(p.completion_tokens for p in self.ranks.values())
+
+    @property
+    def total_reasoning_tokens(self) -> int:
+        return sum(p.reasoning_tokens for p in self.ranks.values())
+
+    @property
+    def total_tool_calls(self) -> int:
+        return sum(p.tool_calls for p in self.ranks.values())
+
+    @property
+    def total_repairs(self) -> int:
+        return sum(p.n_repairs for p in self.ranks.values())
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "name": self.name,
+            "has_work_spans": self.has_work_spans,
+            "total_cost_usd": round(self.total_cost_usd, 4),
+            "total_prompt_tokens": self.total_prompt_tokens,
+            "total_completion_tokens": self.total_completion_tokens,
+            "total_reasoning_tokens": self.total_reasoning_tokens,
+            "total_tool_calls": self.total_tool_calls,
+            "total_repairs": self.total_repairs,
             "job": self.job,
             "world_size": self.world_size,
             "n_ranks_seen": self.n_ranks_seen,
@@ -786,7 +842,7 @@ def _cost_invocation(inv: CollectiveInvocation) -> None:
 def _group_collectives(events: list[Event], t0: float, joins: dict[tuple[str, str, int], list[float]]) -> list[CollectiveInvocation]:
     by_key: dict[tuple[str, str], list[Event]] = defaultdict(list)
     for e in events:
-        if st.is_collective(e["kind"]):
+        if st.is_collective(e["kind"]) and not e.get("replayed"):
             by_key[(e["kind"], str(e.get("label") or ""))].append(e)
 
     out: list[CollectiveInvocation] = []
@@ -982,8 +1038,51 @@ def analyse(events: list[Event], *, name: str = "", meta: dict[str, Any] | None 
             p.n_requeues += 1
         elif kind == "broker.giveup":
             tasks["abandoned"] += 1
+        # A model executor is claim and submit in one process: the start/done pair
+        # bounds the same interval the broker's claim/submit pair does, and is
+        # counted identically so a run staffed by raw API processes and a run
+        # staffed by agent sessions are measured with one ruler.
+        elif kind == "task.start":
+            tasks["published"] += 1
+            tasks["claimed"] += 1
+            aid = str(e.get("aid") or "")
+            open_claims[aid] = (rank, ts - t0, str(e.get("label") or ""))
+            if e.get("worker"):
+                p.executors.add(str(e["worker"]))
+                executors[str(e["worker"])] += 1
+        elif kind == "task.done":
+            tasks["submitted"] += 1
+            claim = open_claims.pop(str(e.get("aid") or ""), None)
+            if claim is not None:
+                crank, start, clabel = claim
+                end = ts - t0
+                work_spans.append((crank, start, end, clabel))
+                cp = prof(crank)
+                cp.busy_s += end - start
+                cp.n_tasks += 1
+                cp.task_latencies.append(end - start)
+            p.prompt_tokens += int(e.get("prompt_tokens") or 0)
+            p.completion_tokens += int(e.get("completion_tokens") or 0)
+            p.reasoning_tokens += int(e.get("reasoning_tokens") or 0)
+            p.cost_usd += float(e.get("cost_usd") or 0.0)
+            p.tool_calls += int(e.get("tool_calls") or 0)
+        elif kind == "task.retry":
+            tasks["rejected"] += 1
+            p.n_rejects += 1
+            p.n_repairs += 1
+        elif kind == "task.fail":
+            tasks["abandoned"] += 1
+            open_claims.pop(str(e.get("aid") or ""), None)
+            p.cost_usd += float(e.get("cost_usd") or 0.0)
+            p.prompt_tokens += int(e.get("prompt_tokens") or 0)
+            p.completion_tokens += int(e.get("completion_tokens") or 0)
 
         if st.is_collective(kind):
+            if e.get("replayed"):
+                # A restarted rank re-entering a closed collective: not blocked,
+                # not a participant a second time.
+                p.n_replays += 1
+                continue
             p.n_collectives += 1
             p.blocked_s += float(e.get("waited_s") or 0.0)
 

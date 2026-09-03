@@ -148,7 +148,7 @@ class TraceSource:
 #: Instants worth drawing per rank.  Work spans are drawn as bars from ``spans``
 #: and ``coll.join`` is omitted: it fires once per rank per collective and would
 #: bury the failures under a wall of ticks that carries no extra information.
-_SKIP = {"broker.claim", "broker.submit", "coll.join"}
+_SKIP = {"broker.claim", "broker.submit", "task.start", "task.done", "coll.join"}
 _MAX_INSTANTS = 8000
 
 

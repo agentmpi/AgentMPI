@@ -103,6 +103,14 @@ class CollectiveMixin:
             if payload is not None and not rec.get("handle"):
                 self.device.update("coll", rec["seq"], {"handle": handle, "tokens": tokens})
                 rec["handle"], rec["tokens"] = handle, tokens
+            # A re-entry: the same rank, in a later process or a retried command,
+            # arriving at a collective it already joined.  Its wait is measured
+            # from *this* arrival, not from the original one, and the completion
+            # is marked as a replay so an analysis does not read a restarted
+            # rank's instant re-entry into a long-closed barrier as hours of
+            # blocking --- or as a second invocation of the same collective.
+            rec["replayed"] = True
+            rec["reentered_at"] = self.device.clock()
             return rec
 
         rec = {
@@ -151,7 +159,10 @@ class CollectiveMixin:
         """
         waited = None
         if rec is not None and rec.get("joined_at") is not None:
-            waited = round(max(0.0, self.device.clock() - float(rec["joined_at"])), 4)
+            since = float(rec.get("reentered_at") or rec["joined_at"])
+        waited = round(max(0.0, self.device.clock() - since), 4)
+        if rec.get("replayed"):
+            fields = {**fields, "replayed": True}
         try:
             size = len(self.comm_members(comm))
         except AmpiError:  # pragma: no cover - a revoked communicator mid-teardown

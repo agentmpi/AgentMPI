@@ -132,7 +132,7 @@ def timeline(a: Analysis, out: Path, *, max_ticks: int = 6000) -> Path | None:
         if rank not in index or drawn > max_ticks:
             continue
         kind = e["kind"]
-        if kind in ("broker.claim", "broker.submit", "coll.join"):
+        if kind in ("broker.claim", "broker.submit", "task.start", "task.done", "coll.join"):
             continue
         style = st.style_for(kind)
         roles_present.add(style.role)
