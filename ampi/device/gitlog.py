@@ -308,8 +308,20 @@ class GitDevice(Device):
             self._git("add", "-A")
             subprocess.run(["git", *GIT_IDENTITY, "commit", "-q", "-m", "ampi: wipe"],
                            cwd=str(self.root), capture_output=True)
-            self._git("push", "-q", "--force", "origin", self.branch)
-            self.pushes += 1
+            # A force push races with the other machines' ordinary pushes to the
+            # same branch: the remote refuses to move a ref that changed while it
+            # was being updated ("cannot lock ref").  The wipe wins by trying again.
+            for attempt in range(20):
+                r = subprocess.run(["git", *GIT_IDENTITY, "push", "-q", "--force", "origin",
+                                    self.branch], cwd=str(self.root), capture_output=True,
+                                   text=True)
+                if r.returncode == 0:
+                    self.pushes += 1
+                    return
+                self.rejections += 1
+                time.sleep(random.uniform(0.5, 2.0))
+            raise RuntimeError(f"git push --force of {self.branch} rejected 20 times: "
+                               f"{r.stderr.strip()[-300:]}")
 
     @contextmanager
     def transaction(self) -> Iterator[None]:
