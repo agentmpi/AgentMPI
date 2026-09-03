@@ -65,7 +65,7 @@ def _phase_seconds(metrics: dict[str, Any]) -> dict[str, float]:
     out: dict[str, float] = {}
     for ph in metrics.get("phases", []) or []:
         name = str(ph.get("name") or ph.get("label") or "?")
-        span = float(ph.get("span_s") or ph.get("seconds") or
+        span = float(ph.get("duration_s") or ph.get("span_s") or
                      (float(ph.get("t_end", 0)) - float(ph.get("t_start", 0))))
         out[name] = round(out.get(name, 0.0) + span, 1)
     return out
@@ -132,6 +132,10 @@ def row_of(run: dict[str, Any]) -> dict[str, Any]:
         "amendment_clashes": int(ev.get("amendment_clashes") or 0),
         "phase_s": _phase_seconds(m),
         "task_rank_s": _task_seconds(m),
+        "replays": sum(int(pr.get("n_replays") or 0) for pr in
+                       (m.get("ranks") or {}).values()) if isinstance(m.get("ranks"), dict) else 0,
+        "max_wait_s": max((float(c.get("max_wait_s") or 0) for c in m.get("collectives") or []),
+                          default=0.0),
     }
 
 
@@ -279,12 +283,109 @@ def macros(rows: list[dict[str, Any]], prefix: str) -> str:
         for k, v in vals.items():
             lines.append(f"\\newcommand{{\\{prefix}{k}{w}}}{{{v}}}")
     if rows:
+        replays = sum(r.get("replays", 0) for r in rows)
+        lines.append(f"\\newcommand{{\\{prefix}ReplaysNote}}{{{replays} collective re-entries traced as replays across the series}}")
+        multi = [r for r in rows if r["nodes"] > 1]
+        if multi:
+            parts = []
+            for r in multi:
+                parts.append(
+                    f"at $p={r['p']}$ over {r['nodes']} machines ({r['machines_seen']} distinct kernel boot "
+                    f"ids in the trace) the run took {r['wall_s'] / 60:.1f} minutes, its slowest "
+                    f"collective participant waited {r['max_wait_s']:.0f}~s, coverage was "
+                    f"{100 * r['coverage']:.1f}\\%, and the population spent \\${r['cost_usd']:.2f}")
+            note = "; ".join(parts) + "."
+        else:
+            note = "The multi-node runs had not completed when this build was made."
+        lines.append(f"\\newcommand{{\\{prefix}MultiNodeNote}}{{{note}}}")
         body = table_rows(rows).strip().replace("\n", " ")
         lines.append(f"\\newcommand{{\\{prefix}TableRows}}{{{body}}}")
         lines.append(f"\\newcommand{{\\{prefix}Scales}}{{{len(rows)}}}")
         lines.append(f"\\newcommand{{\\{prefix}Largest}}{{{max(r['p'] for r in rows)}}}")
         lines.append(f"\\newcommand{{\\{prefix}TotalCost}}{{{_tex_num(sum(r['cost_usd'] for r in rows), 2)}}}")
     return "\n".join(lines) + "\n"
+
+
+def model_stats(names: list[str]) -> list[dict[str, Any]]:
+    """Per-model latency, tokens and cost for translation chunks, pooled across runs.
+
+    The pool was a provider policy, not a design; but once every task carries the
+    model that served it, the trace answers a question the experiment did not
+    set out to ask --- which executor was the straggler, and what it cost.
+    """
+    import statistics
+
+    by_model: dict[str, dict[str, list[float]]] = {}
+    for name in names:
+        trace = RUNS / name / "harness.trace.jsonl"
+        if not trace.exists():
+            continue
+        with open(trace, encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    e = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if e.get("kind") not in ("task.done", "task.fail", "task.retry"):
+                    continue
+                m = str(e.get("model") or "?")
+                slot = by_model.setdefault(m, {"translate_s": [], "survey_s": [], "research_s": [],
+                                               "seam_s": [], "cost": [], "prompt": [],
+                                               "completion": [], "fails": [], "retries": [],
+                                               "tasks": []})
+                if e["kind"] == "task.fail":
+                    slot["fails"].append(1)
+                    continue
+                if e["kind"] == "task.retry":
+                    slot["retries"].append(1)
+                    continue
+                fam = str(e.get("label", "")).split(":")[0]
+                if f"{fam}_s" in slot:
+                    slot[f"{fam}_s"].append(float(e.get("seconds") or 0))
+                slot["tasks"].append(1)
+                slot["cost"].append(float(e.get("cost_usd") or 0))
+                slot["prompt"].append(int(e.get("prompt_tokens") or 0))
+                slot["completion"].append(int(e.get("completion_tokens") or 0))
+    out = []
+    for m, slot in sorted(by_model.items()):
+        med = lambda xs: round(statistics.median(xs), 1) if xs else None  # noqa: E731
+        out.append({
+            "model": m, "tasks": len(slot["tasks"]), "fails": len(slot["fails"]),
+            "retries": len(slot["retries"]),
+            "translate_median_s": med(slot["translate_s"]),
+            "translate_p90_s": (round(sorted(slot["translate_s"])[int(0.9 * (len(slot["translate_s"]) - 1))], 1)
+                                if slot["translate_s"] else None),
+            "survey_median_s": med(slot["survey_s"]), "research_median_s": med(slot["research_s"]),
+            "seam_median_s": med(slot["seam_s"]),
+            "cost_usd": round(sum(slot["cost"]), 2),
+            "cost_per_task": round(sum(slot["cost"]) / max(1, len(slot["tasks"])), 4),
+            "completion_tokens": sum(slot["completion"]), "prompt_tokens": sum(slot["prompt"]),
+        })
+    return out
+
+
+def render_models(stats: list[dict[str, Any]], out: Path) -> Path:
+    import matplotlib
+
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    stats = [s for s in stats if s["translate_median_s"] is not None]
+    stats.sort(key=lambda s: s["translate_median_s"])
+    fig, ax = plt.subplots(figsize=(6.2, 3.4))
+    names = [s["model"].split("/", 1)[-1] for s in stats]
+    ax.barh(names, [s["translate_median_s"] for s in stats], color="#3b82f6", label="median")
+    ax.barh(names, [s["translate_p90_s"] - s["translate_median_s"] for s in stats],
+            left=[s["translate_median_s"] for s in stats], color="#93c5fd", label="to p90")
+    ax.set_xlabel("seconds per translation chunk (~1100 source tokens)")
+    ax.set_title("the executors are not interchangeable")
+    ax.legend(frameon=False, fontsize=8)
+    fig.tight_layout()
+    p = out / "latency_by_model.pdf"
+    fig.savefig(p)
+    fig.savefig(p.with_suffix(".png"), dpi=160)
+    plt.close(fig)
+    return p
 
 
 def table_rows(rows: list[dict[str, Any]]) -> str:
@@ -314,6 +415,16 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     (out / "generated.tex").write_text(macros(rows, a.tex_prefix), encoding="utf-8")
     (out / "table_rows.tex").write_text(table_rows(rows), encoding="utf-8")
     written = [] if a.no_figures else render_series(rows, out)
+    stats = model_stats(names)
+    (out / "models.json").write_text(json.dumps(stats, indent=2), encoding="utf-8")
+    if stats and not a.no_figures:
+        written.append(render_models(stats, out))
+    mtable = ["| model | tasks | fails | repairs | translate chunk median / p90 (s) | spend | $/task |",
+              "|---|---|---|---|---|---|---|"]
+    for st in sorted(stats, key=lambda x: -(x["translate_median_s"] or 0)):
+        mtable.append(f"| {st['model']} | {st['tasks']} | {st['fails']} | {st['retries']} | "
+                      f"{st['translate_median_s']} / {st['translate_p90_s']} | ${st['cost_usd']:.2f} | "
+                      f"${st['cost_per_task']:.3f} |")
     table = ["| p | nodes | wall (min) | tasks | repairs | restarts | coord. share | efficiency | "
              "cost ($) | coverage | conflicts |", "|---|---|---|---|---|---|---|---|---|---|---|"]
     for r in rows:
@@ -323,8 +434,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
                      f"{100 * r['coverage']:.1f}% | {r['conflicts_lifted']} |")
     (out / "README.md").write_text(
         "# E7 across scales\n\nGenerated by `experiments/e7_rawapi_book/analyze.py` from "
-        f"{', '.join(names)}.\n\n" + "\n".join(table) + "\n", encoding="utf-8")
+        f"{', '.join(names)}.\n\n" + "\n".join(table) + "\n\n## By model\n\n" + "\n".join(mtable) + "\n",
+        encoding="utf-8")
     print("\n".join(table))
+    print("\n".join(mtable))
     return {"rows": rows, "figures": [str(p) for p in written]}
 
 
