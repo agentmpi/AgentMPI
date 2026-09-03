@@ -54,8 +54,9 @@ while pushes are rejected and relaxes when they land, so a daemon losing the
 push contest pushes less often with more in each push.  Tests:
 `tests/test_gitd.py::test_readers_do_not_wait_for_a_busy_writer`,
 `test_clients_survive_a_daemon_that_dies_mid_call`,
-`test_batch_window_widens_under_rejection`.  The runs `e7-rawapi-p128` and
-`e7-rawapi-p256` were relaunched on the fixed daemon.
+`test_batch_window_widens_under_rejection`.  The later attempts are
+`e7-rawapi-p256-attempt1` (eight machines: the writers saturate), `e7-rawapi-p128-attempt2`
+and `e7-rawapi-p256-attempt2` (four machines each: healthy until the account's usage freeze).
 
 ## Files
 

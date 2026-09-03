@@ -220,13 +220,25 @@ every write its ranks issue within a window as one commit and one push — the
 intra-node aggregation every production MPI does before it touches the network.
 It passes the same conformance suite as the other four transports. `E7`
 (`experiments/e7_rawapi_book/`) is the experiment built on all three: the
-production book translation on raw-API ranks, from 16 processes on one machine
-to 256 over eight, with checkpointed results, injected executor deaths, an
-agent-evaluated arbitration spread over the population, and a locked amendment
-ledger. Its runs are under `runs/e7-rawapi-*`.
+production book translation on raw-API ranks: 16, 32 and 64 processes on one
+machine to completion, then 128 over four machines and 256 over eight and four,
+with checkpointed results, injected executor deaths, an agent-evaluated
+arbitration spread over the population, and a locked amendment ledger. Its runs
+are under `runs/e7-rawapi-*`; the multi-node attempts are kept as evidence with
+what each one found (`runs/e7-rawapi-p128-attempt1` and after).
 
 ## Results, including the negative ones
 
+* **E7 across machines.** 16/32/64 raw-API process ranks on one machine
+  finished the book (98.5%, 95.5%, 96.0% of 1232 paragraphs; 51, 40, 38 min;
+  $7.61, $9.40, $11.06); adding ranks bought little wall time because the run
+  ends when its slowest model ends. Across machines the population found two
+  transport limits: the daemon's readers starved behind its writer's lock (57
+  live ranks convicted at p=128; fixed, spec S15.2), and eight daemons on one
+  git ref land one push in ten (p=256 over eight machines). Four machines stay
+  inside the ceiling; a recycled node rejoined a 128-rank job and respawned its
+  ranks while the others waited. Both four-machine runs were then killed by an
+  account-wide usage freeze. `runs/e7-rawapi-*`.
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,
   half-bandwidth point 1521 tokens. β agrees within 2% across all three
   transports, because the per-token cost is serialisation above the waist rather

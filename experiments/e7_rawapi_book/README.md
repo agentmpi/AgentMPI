@@ -30,10 +30,16 @@ python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p16 --size 16 
 python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p32-die --size 32 --executor model \
     --die-fraction 0.1 --die-phase translate --respawn 1
 
-# 256 ranks over eight machines: run this on each, with --node 0..7.  Node 0
-# creates the job; the others join it through the git device.
+# 256 ranks over four machines (64 processes each): run this on each, with
+# --node 0..3.  Node 0 creates the job and must start first; the others join it
+# through the gitd daemon.  Four machines is inside the transport's ceiling and
+# eight is not (see NODES.md and runs/e7-rawapi-p256-attempt1).
 python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p256 --size 256 --executor model \
-    --device git --remote https://github.com/agentmpi/AgentMPI --nodes 8 --node $K
+    --device gitd --remote https://github.com/agentmpi/AgentMPI --nodes 4 --node $K
+# a node whose machine was recycled re-enters the same job (its convicted ranks
+# are respawned with fresh epochs):
+python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p256 --size 256 --executor model \
+    --device gitd --remote https://github.com/agentmpi/AgentMPI --nodes 4 --node 0 --rejoin
 ```
 
 The driver writes `runs/<name>/config.json` and the partition, then runs
