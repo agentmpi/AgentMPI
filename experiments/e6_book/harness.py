@@ -323,7 +323,11 @@ class BookHarness:
             for page, title in titles.items():
                 value["chapter_titles"].setdefault(page, title)
             value["writers"].append(rank)
-            amp.put(REGISTRY_WIN, "registry", value, lock_token=lock["token"])
+            # Conditional on the version just read: under the lock nobody else can
+            # have written, so a mismatch would mean the lease was broken, and the
+            # write is then rejected rather than recorded as a stale overwrite.
+            amp.put(REGISTRY_WIN, "registry", value, lock_token=lock["token"],
+                    expect_version=cur.get("version") if cur.get("present") else None)
         finally:
             amp.win_unlock(lock["lock_id"])
 
