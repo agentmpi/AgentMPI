@@ -219,7 +219,10 @@ def launch(
     def _terminate(signum: int, _frame: Any) -> None:
         raise KeyboardInterrupt(f"signal {signum}")
 
-    previous = signal.signal(signal.SIGTERM, _terminate)
+    try:
+        previous = signal.signal(signal.SIGTERM, _terminate)
+    except ValueError:  # not the main thread: a test driving two nodes at once
+        previous = None
     try:
         while procs:
             for rank, p in list(procs.items()):
@@ -251,6 +254,14 @@ def launch(
                     start(rank)
                 else:
                     st["state"] = "failed"
+                    # Tell the runtime now.  Otherwise the peers blocked in a
+                    # collective with this rank wait for its lease to expire ---
+                    # fifteen minutes in a production run --- to learn what the
+                    # process table already knows.
+                    try:
+                        supervisor.kill(rank, reason=f"process exited {code}")
+                    except Exception as exc:  # noqa: BLE001 - already finalised, or gone
+                        st["kill_refused"] = str(exc)
                     if not quiet:
                         print(f"[ampirun] rank {rank} exited {code}", file=sys.stderr)
             launch_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
@@ -275,7 +286,8 @@ def launch(
             for fh in fhs:
                 fh.close()
         supervisor.close()
-        signal.signal(signal.SIGTERM, previous)
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
 
     try:
         record["device_stats"] = supervisor.device.stats()

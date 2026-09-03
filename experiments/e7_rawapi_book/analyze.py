@@ -268,6 +268,18 @@ def macros(rows: list[dict[str, Any]], prefix: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def table_rows(rows: list[dict[str, Any]]) -> str:
+    """The body of the paper's cross-scale table, one line per run."""
+    out = []
+    for r in rows:
+        out.append(
+            f"{r['p']} & {r['nodes']} & {r['wall_s'] / 60:.1f} & {r['tasks']} & {r['restarts']} & "
+            f"{100 * r['coordination_share']:.1f}\\% & {100 * r['parallel_efficiency']:.1f}\\% & "
+            f"{r['cost_usd']:.2f} & {100 * r['coverage']:.1f}\\% \\\\"
+        )
+    return "\n".join(out) + "\n"
+
+
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap = argparse.ArgumentParser(description="E7 cross-scale analysis")
     ap.add_argument("--runs", required=True, help="comma-separated run names under runs/")
@@ -281,6 +293,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     rows = series(names)
     (out / "series.json").write_text(json.dumps(rows, indent=2), encoding="utf-8")
     (out / "generated.tex").write_text(macros(rows, a.tex_prefix), encoding="utf-8")
+    (out / "table_rows.tex").write_text(table_rows(rows), encoding="utf-8")
     written = [] if a.no_figures else render_series(rows, out)
     table = ["| p | nodes | wall (min) | tasks | repairs | restarts | coord. share | efficiency | "
              "cost ($) | coverage | conflicts |", "|---|---|---|---|---|---|---|---|---|---|---|"]

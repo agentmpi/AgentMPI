@@ -217,10 +217,14 @@ class GitDaemon:
             return [("error", f"{type(exc).__name__}: {exc}")] * len(batch)
         return results
 
-    def mutate(self, op: str, args: dict[str, Any]) -> Any:
+    def enqueue(self, op: str, args: dict[str, Any]) -> tuple[threading.Event, list[Any]]:
         ev = threading.Event()
         slot: list[Any] = []
         self._q.put((op, args, ev, slot))
+        return ev, slot
+
+    def mutate(self, op: str, args: dict[str, Any]) -> Any:
+        ev, slot = self.enqueue(op, args)
         ev.wait()
         status, value = slot[0]
         if status == "error":
@@ -279,23 +283,61 @@ class GitDaemon:
         daemon = self
 
         class Handler(socketserver.StreamRequestHandler):
+            """One connection: requests are read as fast as they arrive, and
+            replies are written in request order by a responder thread.
+
+            A mutation is *enqueued* here and answered when its batch lands,
+            so a client that pipelines sends the daemon a burst rather than a
+            trickle --- the whole point of group commit.  Reads are answered at
+            once but still go through the responder so order is preserved."""
+
             def handle(self) -> None:
                 with daemon._clients_lock:
                     daemon._clients += 1
+                pending: queue.Queue[tuple[threading.Event, list[Any], Any] | None] = queue.Queue()
+
+                def respond() -> None:
+                    while True:
+                        item = pending.get()
+                        if item is None:
+                            return
+                        ev, slot, rid = item
+                        ev.wait()
+                        status, value = slot[0] if slot else ("error", "no result")
+                        out = ({"id": rid, "ok": True, "result": value} if status == "ok"
+                               else {"id": rid, "ok": False, "error": value})
+                        try:
+                            self.wfile.write((json.dumps(out, default=str) + "\n").encode("utf-8"))
+                            self.wfile.flush()
+                        except OSError:
+                            return
+
+                responder = threading.Thread(target=respond, daemon=True)
+                responder.start()
                 try:
                     for line in self.rfile:
+                        rid = None
                         try:
                             req = json.loads(line)
-                            out = {"id": req.get("id"), "ok": True,
-                                   "result": daemon.handle(req["op"], req.get("args") or {})}
+                            rid = req.get("id")
+                            op, args = req["op"], req.get("args") or {}
+                            daemon._last_activity = time.time()
+                            if op in MUTATIONS:
+                                if op == "match":
+                                    args = {**args, "predicate": decode_predicate(args["predicate"])}
+                                ev, slot = daemon.enqueue(op, args)
+                            else:
+                                ev, slot = threading.Event(), [("ok", daemon.handle(op, args))]
+                                ev.set()
                         except Exception as exc:  # noqa: BLE001 - reported to the client
-                            out = {"id": None, "ok": False,
-                                   "error": f"{type(exc).__name__}: {exc}"}
-                        self.wfile.write((json.dumps(out, default=str) + "\n").encode("utf-8"))
-                        self.wfile.flush()
+                            ev, slot = threading.Event(), [("error", f"{type(exc).__name__}: {exc}")]
+                            ev.set()
+                        pending.put((ev, slot, rid))
                         if daemon._stop.is_set():
                             break
                 finally:
+                    pending.put(None)
+                    responder.join(timeout=30)
                     with daemon._clients_lock:
                         daemon._clients -= 1
                     daemon._last_activity = time.time()
@@ -354,7 +396,9 @@ class GitdDevice(Device):
         self.connect_timeout = connect_timeout
         self._sock: socket.socket | None = None
         self._rfile: Any = None
-        self._lock = threading.Lock()
+        # Reentrant: a call that must first initialise the connection runs the
+        # staleness check, which is itself a call.
+        self._lock = threading.RLock()
         self._ids = 0
         self.calls = 0
         self._pipelined: list[str] | None = None

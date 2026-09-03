@@ -460,6 +460,12 @@ def extract_json(text: str) -> Any:
         except json.JSONDecodeError:
             pass
     dec = json.JSONDecoder()
+    if text[0] in "{[":
+        # The reply *is* the object and it did not parse: it is truncated or
+        # malformed.  Scanning inward would return the first complete nested
+        # object --- one paragraph of a cut-off translation --- which satisfies
+        # nothing and misleads every repair that follows.  Found in production.
+        raise ValueError("the JSON object is truncated or malformed")
     for opener in ("{", "["):
         start = text.find(opener)
         while start != -1:
@@ -495,7 +501,7 @@ class ModelExecutor:
         system: str = "",
         max_steps: int = 8,
         max_attempts: int = 3,
-        max_tokens: int | None = None,
+        max_tokens: int | None = 24_000,
         max_prompt_tokens: int = 60_000,
         worker_id: str | None = None,
         log_dir: str | Path | None = None,
@@ -563,8 +569,8 @@ class ModelExecutor:
         while attempts < self.max_attempts:
             attempts += 1
             try:
-                text, used = self._converse(model, messages, specs, by_name, task,
-                                            json_mode=json_wanted and not specs)
+                text, used, finish = self._converse(model, messages, specs, by_name, task,
+                                                    json_mode=json_wanted and not specs)
             except ModelError as exc:
                 last_error = str(exc)
                 usage.add(used_from(exc))
@@ -576,12 +582,18 @@ class ModelExecutor:
             else:
                 try:
                     value = extract_json(text)
+                    if finish == "length":
+                        raise ValueError("the reply was cut off at the output limit")
                 except ValueError as exc:
                     last_error = f"the reply was not a JSON object ({exc})"
                     messages.append({"role": "assistant", "content": text})
-                    messages.append({"role": "user", "content": (
-                        f"Your reply could not be parsed: {exc}. Reply again with ONLY the "
-                        "JSON object requested, no prose and no markdown fence.")})
+                    fix = ("Your reply was cut off before the JSON object was complete. Reply "
+                           "again with the whole object, and write it as compactly as the "
+                           "task allows (no extra whitespace, no commentary)."
+                           if finish == "length" else
+                           f"Your reply could not be parsed: {exc}. Reply again with ONLY the "
+                           "JSON object requested, no prose and no markdown fence.")
+                    messages.append({"role": "user", "content": fix})
                     self.amp.trace("task.retry", rank=task.rank, aid=task.aid, label=task.label,
                                    attempt=attempts, violations=[last_error])
                     continue
@@ -632,7 +644,7 @@ class ModelExecutor:
         task: Task,
         *,
         json_mode: bool,
-    ) -> tuple[str, Usage]:
+    ) -> tuple[str, Usage, str]:
         """Run the tool loop until the model answers in prose; return the answer."""
         used = Usage()
         nudged = False
@@ -658,7 +670,7 @@ class ModelExecutor:
             )
             used.add(resp.usage)
             if not resp.tool_calls:
-                return resp.content, used
+                return resp.content, used, resp.finish_reason
             if exhausted:  # a tool call after the tools were withdrawn: refuse it
                 messages.append(resp.message)
                 for call in resp.tool_calls:

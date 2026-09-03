@@ -108,7 +108,7 @@ GLOSSARY_CAP = 160
 #: Within a rank the chunks are a prefix computation --- each sees the previous
 #: chunk's last rendering --- which is the sequential dependence translation
 #: really has, kept inside the rank where it costs nothing to honour.
-TRANSLATE_CHUNK_TOKENS = 1600
+TRANSLATE_CHUNK_TOKENS = 1100
 
 
 # ---------------------------------------------------------------------------
@@ -269,7 +269,31 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
     report["epoch"] = epoch
     if epoch > 1:
         report["recovered"] = True
+    # A process rank composes every prompt from files: its executor's context is
+    # empty at the start of every call.  The ledger is released accordingly ---
+    # here, so a successor does not inherit its predecessor's spend, and after
+    # every task.  Without this a respawned rank that replayed its broadcasts
+    # exhausted the ledger it had inherited, its glossary broadcast came back
+    # degraded to a summary string, and the rank crashed on it.
+    amp.ctx_release()
     my_segment = segments[rank]
+    bodies = out_dir / "bodies"
+    bodies.mkdir(parents=True, exist_ok=True)
+
+    def take(res: dict[str, Any], label: str) -> Any:
+        """A broadcast or window body, read from the file the runtime wrote.
+
+        ``out=`` charges nothing: what enters a model's context is decided when
+        the prompt is composed, not when the harness reads shared state.
+        """
+        path = res.get("saved_to")
+        if not path:
+            return res.get("body", res.get("value"))
+        return json.loads(Path(path).read_text(encoding="utf-8"))
+
+    def bcast_in(label: str) -> Any:
+        return take(amp.bcast(label, root=0, timeout=cfg.phase_timeout,
+                              out=str(bodies / f"{label}.json")), label)
 
     def phase(name: str) -> None:
         amp.memo("phase", name)
@@ -305,10 +329,10 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         stored before the rank moves on.
         """
         key = f"r{rank}/{label}"
-        saved = amp.get(MEMO_WIN, key)
+        saved = amp.get(MEMO_WIN, key, out=str(bodies / f"memo-{label.replace(':', '_')}.json"))
         if saved.get("present"):
             amp.trace("task.replay", rank=rank, label=label)
-            return saved["value"]
+            return take(saved, label)
         amp.heartbeat(extend=cfg.task_timeout)
         value: Any = None
         problems: list[str] = []
@@ -324,6 +348,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
             amp.trace("task.invalid", rank=rank, label=label, attempt=attempt + 1,
                       problems=problems[:5])
         amp.put(MEMO_WIN, key, value)
+        amp.ctx_release()
         return value
 
     # -- 0. commission ------------------------------------------------------
@@ -342,8 +367,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
     if rank == 0:
         amp.bcast("commission", payload=commission, root=0, timeout=cfg.phase_timeout)
     else:
-        commission = amp.bcast("commission", root=0, timeout=cfg.phase_timeout,
-                               materialize=True)["body"]
+        commission = bcast_in("commission")
 
     # -- 1. scatter -----------------------------------------------------------
     slices = [{"rank": i, **s} for i, s in enumerate(segments)] if rank == 0 else None
@@ -379,8 +403,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
             if rank == 0:
                 amp.bcast(f"{label}-settled", payload=value, root=0, timeout=cfg.phase_timeout)
                 return value
-            return amp.bcast(f"{label}-settled", root=0, timeout=cfg.phase_timeout,
-                             materialize=True)["body"]
+            return bcast_in(f"{label}-settled")
         keys = sorted(conflicts)
         batches = [keys[i:i + ARBITRATION_BATCH] for i in range(0, len(keys), ARBITRATION_BATCH)]
         mine = [b for j, b in enumerate(batches) if j % size == rank]
@@ -412,8 +435,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
             value = amp.op_arbitrate(label, rulings=merged)["value"]
             amp.bcast(f"{label}-settled", payload=value, root=0, timeout=cfg.phase_timeout)
             return value
-        return amp.bcast(f"{label}-settled", root=0, timeout=cfg.phase_timeout,
-                         materialize=True)["body"]
+        return bcast_in(f"{label}-settled")
 
     if cfg.arm != "noglossary":
         # -- 3. the census, with conflicts lifted -----------------------------
@@ -430,8 +452,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
                                 cap=cfg.research_cap)
             amp.bcast("agenda", payload=agenda, root=0, timeout=cfg.phase_timeout)
         else:
-            agenda = amp.bcast("agenda", root=0, timeout=cfg.phase_timeout,
-                               materialize=True)["body"]
+            agenda = bcast_in("agenda")
         amp.barrier("agenda-ready", quorum=cfg.quorum, timeout=cfg.phase_timeout,
                     policy=cfg.barrier_policy)
 
