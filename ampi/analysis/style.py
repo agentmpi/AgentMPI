@@ -162,6 +162,7 @@ STYLE: dict[str, Style] = {
     "failure.kill": _s("trouble", "diamond"),
     "broker.reject": _s("trouble", "diamond", "#f87171"),
     "task.retry": _s("trouble", "diamond", "#f87171"),
+    "task.fallback": _s("recovery", "diamond", "#c4b5fd"),
     "task.fail": _s("trouble", "diamond"),
     "broker.giveup": _s("trouble", "diamond"),
     "ctx.stall": _s("trouble", "diamond", "#fb7185"),

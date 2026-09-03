@@ -126,6 +126,7 @@ class Config:
     research_model: str = ""
     arbiter_model: str = ""
     reasoning: str = "low"
+    fallback_model: str = "deepseek/deepseek-v4-pro-0813"
     tools: bool = True
     web: bool = False
     device: str = "sqlite"
@@ -245,10 +246,11 @@ def model_executor(amp: Ampi, cfg: Config, log_dir: Path) -> Any:
     research = make(model_for_rank(cfg.research_model, rank) if cfg.research_model else mine,
                     plugins=[{"id": "web", "max_results": 5}] if cfg.web else None)
     arbiter = make(model_for_rank(cfg.arbiter_model, rank) if cfg.arbiter_model else mine)
+    fallback = make(cfg.fallback_model) if cfg.fallback_model else None
     tools = research_tools() if cfg.tools else []
     return ModelExecutor(
         amp, main, system=SYSTEM, max_attempts=cfg.max_attempts, log_dir=log_dir,
-        models={"research": research, "arbitrate": arbiter},
+        models={"research": research, "arbitrate": arbiter}, fallback=fallback,
         tools_for=lambda task: tools if task.label.startswith("research") else [],
         max_steps=5, max_prompt_tokens=40_000,
     )
@@ -972,7 +974,8 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     cfg = Config(
         name=a.name, size=a.size, languages=[c for c in a.languages.split(",") if c],
         executor=a.executor, model=a.model, research_model=a.research_model,
-        arbiter_model=a.arbiter_model, reasoning=a.reasoning, tools=not a.no_tools, web=a.web,
+        arbiter_model=a.arbiter_model, reasoning=a.reasoning, fallback_model=a.fallback_model,
+        tools=not a.no_tools, web=a.web,
         device=a.device, arm=a.arm, task_timeout=a.task_timeout, phase_timeout=a.phase_timeout,
         quorum=a.quorum, barrier_policy=a.barrier_policy, research_budget=a.research_budget,
         research_cap=a.research_cap, algorithm=a.algorithm, die_fraction=a.die_fraction,
@@ -1004,6 +1007,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
             "model": cfg.model, "model_pool": [m.strip() for m in cfg.model.split(",") if m.strip()],
             "research_model": cfg.research_model or cfg.model,
             "arbiter_model": cfg.arbiter_model or cfg.model, "reasoning": cfg.reasoning,
+            "fallback_model": cfg.fallback_model,
             "tools": cfg.tools, "web": cfg.web, "arm": cfg.arm, "languages": cfg.languages,
             "quorum": cfg.quorum, "barrier_policy": cfg.barrier_policy,
             "die_fraction": cfg.die_fraction, "die_phase": cfg.die_phase, "respawn": cfg.respawn,
@@ -1159,6 +1163,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--research-model", default="")
     p.add_argument("--arbiter-model", default="")
     p.add_argument("--reasoning", default="low", help="none|low|medium|high")
+    p.add_argument("--fallback-model", default="deepseek/deepseek-v4-pro-0813",
+                   help="a second model tried from a fresh conversation when the first fails "
+                        "its attempts; empty to disable")
     p.add_argument("--no-tools", action="store_true", help="research without the tool loop")
     p.add_argument("--web", action="store_true", help="research with the provider's web plugin")
     p.add_argument("--launch", default="processes", choices=["processes", "threads"])

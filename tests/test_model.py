@@ -229,3 +229,16 @@ def test_ranks_of_node_is_a_block_distribution():
     assert sorted(sum((ranks_of_node(257, 8, k) for k in range(8)), [])) == list(range(257))
     with pytest.raises(ValueError):
         ranks_of_node(4, 2, 2)
+
+
+def test_a_failing_model_falls_back_to_another(job):
+    amp = _amp(job)
+    bad = Script([_reply("{ broken", model="bad/model")] * 2)
+    good = Script([_reply('{"rank": 0, "ok": true}', model="good/model")])
+    ex = ModelExecutor(amp, ChatModel("bad/model", transport=bad, api_key="k"), max_attempts=2,
+                       fallback=ChatModel("good/model", transport=good, api_key="k"))
+    out = ex.invoke(Task(aid="f1", rank=0, label="t", prompt="p",
+                         contract=Contract.parse({"kind": "json", "expect": {"rank": "{rank}"}})))
+    assert out == {"rank": 0, "ok": True} and ex.fallbacks == 1
+    kinds = [e["kind"] for e in amp.events()]
+    assert "task.fail" in kinds and "task.fallback" in kinds and kinds.count("task.done") == 1

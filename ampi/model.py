@@ -62,7 +62,7 @@ from pathlib import Path
 from typing import Any
 
 from .core.payload import canonical, check_contract
-from .errors import err
+from .errors import AmpiError, err
 from .executor import Task
 from .tokens import count_tokens
 
@@ -508,6 +508,7 @@ class ModelExecutor:
         models: dict[str, ChatModel] | None = None,
         tools_for: Callable[[Task], list[Tool] | None] | None = None,
         json_mode: bool = True,
+        fallback: ChatModel | None = None,
     ) -> None:
         self.amp = amp
         self.model = model
@@ -530,9 +531,17 @@ class ModelExecutor:
         self.models = models or {}
         self.tools_for = tools_for
         self.json_mode = json_mode
+        #: A second model to try, from a fresh conversation, when the first has
+        #: exhausted its attempts without producing a conforming result.  A
+        #: heterogeneous population can afford this and a homogeneous one cannot:
+        #: in production one model degenerated into thousands of blank lines
+        #: mid-object on the same paragraphs three times running, and repairing
+        #: in-conversation only reproduced the degeneration.
+        self.fallback = fallback
         self.usage = Usage()
         self.tasks = 0
         self.failures = 0
+        self.fallbacks = 0
 
     def model_for(self, task: Task) -> ChatModel:
         for prefix, m in self.models.items():
@@ -542,7 +551,17 @@ class ModelExecutor:
 
     # -- the loop --------------------------------------------------------------
     def invoke(self, task: Task) -> Any:
-        model = self.model_for(task)
+        try:
+            return self._invoke(task, self.model_for(task))
+        except AmpiError:
+            if self.fallback is None or self.fallback.model == self.model_for(task).model:
+                raise
+            self.fallbacks += 1
+            self.amp.trace("task.fallback", rank=task.rank, aid=task.aid, label=task.label,
+                           model=self.fallback.model)
+            return self._invoke(task, self.fallback)
+
+    def _invoke(self, task: Task, model: ChatModel) -> Any:
         tools = self.tools_for(task) if self.tools_for else self.tools
         tools = list(tools or [])
         by_name = {t.name: t for t in tools}
@@ -717,6 +736,7 @@ class ModelExecutor:
             "model": self.model.describe(),
             "tasks": self.tasks,
             "failures": self.failures,
+            "fallbacks": self.fallbacks,
             "retries": self.model.retries,
             "rate_limited_s": round(self.model.rate_limited_s, 1),
             "usage": self.usage.to_dict(),
