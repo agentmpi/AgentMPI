@@ -41,7 +41,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-import matplotlib
+try:
+    import matplotlib
+except ImportError as exc:  # pragma: no cover - depends on the installation
+    raise ImportError(
+        "the figures need matplotlib: install the analysis extra, "
+        "pip install 'agentmpi[analysis]'") from exc
 
 matplotlib.use("Agg")
 

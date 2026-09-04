@@ -266,3 +266,65 @@ def test_analysis_is_device_independent(tmp_path):
     assert a.world_size == b.world_size
     assert {(c.op, c.label) for c in a.collectives} == {(c.op, c.label) for c in b.collectives}
     assert a.conflicts_lifted == b.conflicts_lifted
+
+
+def test_a_retry_that_waits_for_peers_is_not_a_replay(tmp_path):
+    """Only re-entry into a collective that had already released is a replay."""
+    import threading
+
+    from ampi.errors import AmpiError
+    from ampi.runtime import Ampi
+
+    root = tmp_path / "job"
+    Ampi.create(str(root), 2, device="sqlite", force=True).close()
+    a0, a1 = Ampi(str(root), rank=0), Ampi(str(root), rank=1)
+    a0.init()
+    a1.init()
+    try:
+        with pytest.raises(AmpiError):
+            a0.barrier("gate", timeout=0.3)          # nobody else has arrived
+        t = threading.Thread(target=lambda: a1.barrier("gate", timeout=30))
+        t.start()
+        a0.barrier("gate", timeout=30)               # the retry: it waits for rank 1
+        t.join()
+        mine = [e for e in a0.events() if e["kind"] == "barrier" and e["rank"] == 0]
+        assert len(mine) == 1 and not mine[0].get("replayed")
+        a0.barrier("gate", timeout=30)               # a re-entry into a closed collective
+        mine = [e for e in a0.events() if e["kind"] == "barrier" and e["rank"] == 0]
+        assert len(mine) == 2 and mine[1].get("replayed") is True
+        a = analyse(a0.events(), name="unit")
+        gates = [c for c in a.collectives if c.label == "gate"]
+        assert len(gates) == 1 and gates[0].complete
+    finally:
+        a0.close()
+        a1.close()
+
+
+def test_collectives_on_different_communicators_are_not_merged(tmp_path):
+    """The same kind and label on two communicators are two invocations."""
+    from ampi.runtime import Ampi
+
+    root = tmp_path / "job"
+    Ampi.create(str(root), 4, device="sqlite", force=True).close()
+    amps = [Ampi(str(root), rank=r) for r in range(4)]
+    for a in amps:
+        a.init()
+    try:
+        import threading
+
+        def go(a: Ampi) -> None:
+            name = "lo" if a.rank < 2 else "hi"
+            a.comm_create(name, [0, 1] if a.rank < 2 else [2, 3])
+            a.barrier("sync", comm=name, timeout=30)
+
+        ts = [threading.Thread(target=go, args=(a,)) for a in amps]
+        for t in ts:
+            t.start()
+        for t in ts:
+            t.join()
+        an = analyse(amps[0].events(), name="unit")
+        syncs = [c for c in an.collectives if c.label == "sync"]
+        assert len(syncs) == 2 and all(c.n_participants == 2 and c.complete for c in syncs)
+    finally:
+        for a in amps:
+            a.close()

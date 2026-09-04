@@ -206,3 +206,29 @@ def test_batch_window_widens_under_rejection(tmp_path, monkeypatch):
     finally:
         d._stop.set()
         worker.join(2)
+
+
+def test_a_request_resent_after_an_ambiguous_reply_is_applied_once(tmp_path, monkeypatch):
+    """The daemon remembers (client, id): a resend gets the first outcome, not a second row."""
+    import json
+    import socket
+
+    monkeypatch.setenv("AMPI_GITD_IDLE_S", "30")
+    root = tmp_path / "job"
+    dev = GitdDevice(root)
+    dev.initialize()
+    try:
+        s = socket.socket(socket.AF_UNIX)
+        s.connect(dev.sock_path)
+        f = s.makefile("rb")
+        req = json.dumps({"id": 7, "client": "c-test", "op": "append",
+                          "args": {"stream": "event", "record": {"kind": "t", "rank": 0, "run": "r"}}})
+        s.sendall((req + "\n").encode())
+        first = json.loads(f.readline())
+        s.sendall((req + "\n").encode())          # the client never saw `first`; it resends
+        second = json.loads(f.readline())
+        assert first["ok"] and second["ok"] and first["result"] == second["result"]
+        assert len(dev.scan("event", {"kind": "t"})) == 1
+        s.close()
+    finally:
+        dev.shutdown_daemon()

@@ -1419,6 +1419,13 @@ window while its pushes are being rejected and relax it when they land.
 > minutes.  A lock is not a queue, and a rank that cannot complete a read cannot
 > renew the lease that would keep it alive.
 
+A daemon's client that loses its connection after sending a mutation cannot
+know whether the mutation landed.  The daemon MUST therefore treat a resent
+request carrying the same client token and request id as the same request and
+return the recorded outcome rather than apply it again; a daemon that has
+restarted may have forgotten the table, and an implementation SHOULD say so in
+its documentation rather than claim exactly-once across restarts.
+
 The runtime's lease renewal while blocked (S10.4) SHOULD be paced to the
 device's mutation cost: a poll loop that renews a lease every few seconds is
 correct on a shared filesystem and ruinous on a device whose every write is a

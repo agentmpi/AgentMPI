@@ -51,6 +51,8 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -84,6 +86,10 @@ DEFAULT_BATCH_S = 0.25
 MAX_BATCH_S = 4.0
 DEFAULT_READ_INTERVAL = 2.0
 MAX_BATCH = 2000
+#: Replies the daemon remembers so a client that resends a request after an
+#: ambiguous reply (the connection closed after the batch landed) gets the
+#: original outcome instead of a second application.
+RECENT_REPLIES = 8192
 MUTATIONS = frozenset({"append", "match", "update", "cas", "lease", "release", "put_object"})
 _PLACEHOLDER = object()
 
@@ -182,6 +188,12 @@ class GitDaemon:
         self.batches = 0
         self.batched_ops = 0
         self.largest_batch = 0
+        # (client token, request id) -> outcome, for mutations.  A client whose
+        # connection died between the commit and the reply resends the same
+        # request; without this the daemon would apply it twice.  The window that
+        # remains is a daemon restart, which forgets the table.
+        self._recent: OrderedDict[tuple[str, int], tuple[str, Any]] = OrderedDict()
+        self._recent_lock = threading.Lock()
 
     # -- writes ------------------------------------------------------------------
     def _worker(self) -> None:
@@ -227,6 +239,20 @@ class GitDaemon:
         except Exception as exc:  # noqa: BLE001 - every waiter must learn the outcome
             return [("error", f"{type(exc).__name__}: {exc}")] * len(batch)
         return results
+
+    def recall(self, key: tuple[str, int] | None) -> tuple[str, Any] | None:
+        if key is None:
+            return None
+        with self._recent_lock:
+            return self._recent.get(key)
+
+    def remember(self, key: tuple[str, int] | None, outcome: tuple[str, Any]) -> None:
+        if key is None:
+            return
+        with self._recent_lock:
+            self._recent[key] = outcome
+            while len(self._recent) > RECENT_REPLIES:
+                self._recent.popitem(last=False)
 
     def enqueue(self, op: str, args: dict[str, Any]) -> tuple[threading.Event, list[Any]]:
         ev = threading.Event()
@@ -306,16 +332,17 @@ class GitDaemon:
             def handle(self) -> None:
                 with daemon._clients_lock:
                     daemon._clients += 1
-                pending: queue.Queue[tuple[threading.Event, list[Any], Any] | None] = queue.Queue()
+                pending: queue.Queue[tuple[threading.Event, list[Any], Any, Any] | None] = queue.Queue()
 
                 def respond() -> None:
                     while True:
                         item = pending.get()
                         if item is None:
                             return
-                        ev, slot, rid = item
+                        ev, slot, rid, key = item
                         ev.wait()
                         status, value = slot[0] if slot else ("error", "no result")
+                        daemon.remember(key, (status, value))
                         out = ({"id": rid, "ok": True, "result": value} if status == "ok"
                                else {"id": rid, "ok": False, "error": value})
                         try:
@@ -329,22 +356,32 @@ class GitDaemon:
                 try:
                     for line in self.rfile:
                         rid = None
+                        key = None
                         try:
                             req = json.loads(line)
                             rid = req.get("id")
                             op, args = req["op"], req.get("args") or {}
                             daemon._last_activity = time.time()
                             if op in MUTATIONS:
-                                if op == "match":
-                                    args = {**args, "predicate": decode_predicate(args["predicate"])}
-                                ev, slot = daemon.enqueue(op, args)
+                                if req.get("client") is not None and rid is not None:
+                                    key = (str(req["client"]), int(rid))
+                                seen = daemon.recall(key)
+                                if seen is not None:
+                                    ev, slot = threading.Event(), [seen]
+                                    ev.set()
+                                    key = None
+                                else:
+                                    if op == "match":
+                                        args = {**args,
+                                                "predicate": decode_predicate(args["predicate"])}
+                                    ev, slot = daemon.enqueue(op, args)
                             else:
                                 ev, slot = threading.Event(), [("ok", daemon.handle(op, args))]
                                 ev.set()
                         except Exception as exc:  # noqa: BLE001 - reported to the client
                             ev, slot = threading.Event(), [("error", f"{type(exc).__name__}: {exc}")]
                             ev.set()
-                        pending.put((ev, slot, rid))
+                        pending.put((ev, slot, rid, key))
                         if daemon._stop.is_set():
                             break
                 finally:
@@ -412,6 +449,9 @@ class GitdDevice(Device):
         # staleness check, which is itself a call.
         self._lock = threading.RLock()
         self._ids = 0
+        # Identifies this client's request stream to the daemon, so a request
+        # resent after an ambiguous reply is recognised rather than re-applied.
+        self._client = uuid.uuid4().hex
         self.calls = 0
         self._pipelined: list[str] | None = None
 
@@ -543,7 +583,8 @@ class GitdDevice(Device):
             if self._sock is None:
                 self.initialize()
             self._ids += 1
-            line = json.dumps({"id": self._ids, "op": op, "args": args}, default=list) + "\n"
+            line = json.dumps({"id": self._ids, "client": self._client, "op": op, "args": args},
+                              default=list) + "\n"
             if self._pipelined is not None and op in MUTATIONS:
                 assert self._sock is not None
                 self._sock.sendall(line.encode("utf-8"))

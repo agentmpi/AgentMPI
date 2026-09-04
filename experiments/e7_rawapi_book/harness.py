@@ -1025,6 +1025,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     started = time.time()
     segments = [s.payload() for s in corpus.segments]
     launch_record: dict[str, Any] = {}
+    population_complete = True
     if a.launch == "threads":
         h = Harness(root=str(job_root), size=cfg.size, device=cfg.device, force=True,
                     ctx_budget=cfg.ctx_budget,
@@ -1065,27 +1066,41 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
             create=False if getattr(a, "rejoin", False) else None,
         )
         if a.node == 0 and cfg.nodes > 1:
-            _wait_for_population(job_root, cfg.size, cfg.phase_timeout)
+            population_complete = _wait_for_population(job_root, cfg.size, cfg.phase_timeout)
         if a.node == 0:
             export(job_root, run_dir, name=cfg.name)
 
     summary: dict[str, Any] = {"name": cfg.name, "size": cfg.size, "node": a.node,
-                               "wall_s": round(time.time() - started, 2)}
+                               "wall_s": round(time.time() - started, 2),
+                               "population_complete": population_complete}
+    if not population_complete:
+        # The other nodes' ranks are still running (or unreachable) after the
+        # phase timeout.  What follows is a snapshot, and it must say so: the
+        # report carries the flag, the process exits non-zero, and nothing here
+        # is to be sealed as a completed run.
+        summary["population_wait_expired_s"] = cfg.phase_timeout
+        print(f"[e7] population wait expired after {cfg.phase_timeout:.0f}s; exporting a "
+              "SNAPSHOT of an unfinished population", file=sys.stderr)
     if a.node == 0:
         amp = Ampi(str(job_root), allow_volatile=True)
         try:
             summary["book"] = assemble(amp, cfg.languages, work_dir / "out")
             summary["evidence"] = promote_evidence(amp, run_dir, cfg.languages)
             summary["rank_states"] = _rank_states(amp)
+            summary["_recovered_ranks"] = sum(1 for r in range(amp.size) if _epoch(amp, r) > 1)
         finally:
             amp.close()
         summary["launch"] = {k: v for k, v in launch_record.items()
                              if k not in ("events", "command", "node_identity")}
+        # Rank reports on disk are this machine's only; the population's numbers
+        # come from the device, which every node wrote.
         reports = _collect_reports(work_dir / "out")
-        summary["ranks_reported"] = len(reports)
+        summary["ranks_reported_here"] = len(reports)
+        summary["ranks_finalised"] = sum(
+            1 for s in summary.get("rank_states", {}).values() if s == "finalised")
         summary["spend_total_usd"] = max((r.get("spend_total_usd", 0) for r in reports), default=0)
-        summary["recovered_ranks"] = sum(1 for r in reports if r.get("recovered"))
-        summary["units_missing"] = sum(r.get("units_missing", 0) for r in reports)
+        summary["recovered_ranks"] = summary.pop("_recovered_ranks", 0)
+        summary["units_missing"] = int((summary.get("book") or {}).get("missing", 0))
         (run_dir / "report.json").write_text(json.dumps(summary, indent=2, default=str),
                                              encoding="utf-8")
         _sample(work_dir / "out", run_dir, cfg.languages)
@@ -1093,17 +1108,26 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
     return summary
 
 
-def _wait_for_population(job_root: Path, size: int, timeout: float) -> None:
+def _wait_for_population(job_root: Path, size: int, timeout: float) -> bool:
+    """Wait for every rank to reach a terminal state; ``False`` if the wait expired."""
     amp = Ampi(str(job_root), allow_volatile=True)
     deadline = time.time() + timeout
     try:
         while time.time() < deadline:
             states = _rank_states(amp)
             if all(s in ("finalised", "failed", "fenced") for s in states.values()):
-                return
+                return True
             time.sleep(10)
+        return False
     finally:
         amp.close()
+
+
+def _epoch(amp: Ampi, rank: int) -> int:
+    try:
+        return int(amp._rankview(rank).epoch)  # noqa: SLF001 - the driver's view
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def _rank_states(amp: Ampi) -> dict[str, str]:
@@ -1206,7 +1230,10 @@ def main(argv: list[str] | None = None) -> Any:
     a = build_parser().parse_args(argv)
     if a.cmd == "rank":
         return cmd_rank(a)
-    return cmd_run(a)
+    out = cmd_run(a)
+    if isinstance(out, dict) and out.get("population_complete") is False:
+        return 3
+    return out
 
 
 if __name__ == "__main__":

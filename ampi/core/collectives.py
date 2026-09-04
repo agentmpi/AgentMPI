@@ -105,11 +105,11 @@ class CollectiveMixin:
                 rec["handle"], rec["tokens"] = handle, tokens
             # A re-entry: the same rank, in a later process or a retried command,
             # arriving at a collective it already joined.  Its wait is measured
-            # from *this* arrival, not from the original one, and the completion
-            # is marked as a replay so an analysis does not read a restarted
-            # rank's instant re-entry into a long-closed barrier as hours of
-            # blocking --- or as a second invocation of the same collective.
-            rec["replayed"] = True
+            # from *this* arrival, not from the original one.  Whether the
+            # completion is a *replay* is decided when it completes: only if the
+            # collective had already released before the rank came back.  A rank
+            # retrying an active timeout while its peers are still arriving is a
+            # participant, and its completion counts.
             rec["reentered_at"] = self.device.clock()
             return rec
 
@@ -161,8 +161,23 @@ class CollectiveMixin:
         if rec is not None and rec.get("joined_at") is not None:
             since = float(rec.get("reentered_at") or rec["joined_at"])
         waited = round(max(0.0, self.device.clock() - since), 4)
-        if rec.get("replayed"):
-            fields = {**fields, "replayed": True}
+        if rec is not None and rec.get("reentered_at") is not None:
+            # A replay is a re-entry into a collective that had closed before the
+            # rank came back, which is the case exactly when every arrival predates
+            # the re-entry.  An analysis must not read a restarted rank's instant
+            # re-entry into a long-closed barrier as hours of blocking, or as a
+            # second invocation; nor must it drop the completion of a rank whose
+            # retried call waited for peers that arrived after it.
+            try:
+                arrivals = self.device.scan(
+                    "coll", {"comm": self.comm_context(comm), "label": label,
+                             "run": self.manifest.job_id})
+                last_arrival = max((float(a.get("joined_at") or 0) for a in arrivals),
+                                   default=0.0)
+            except AmpiError:  # pragma: no cover - a communicator mid-teardown
+                last_arrival = 0.0
+            if last_arrival <= float(rec["reentered_at"]):
+                fields = {**fields, "replayed": True}
         try:
             size = len(self.comm_members(comm))
         except AmpiError:  # pragma: no cover - a revoked communicator mid-teardown
@@ -640,10 +655,22 @@ class CollectiveMixin:
         )
 
         if operator.evaluator == "agent":
-            return self._agent_reduce(
+            out = self._agent_reduce(
                 comm, label, operator, arrived, dropped, decision, root=root,
                 everyone=everyone, timeout=timeout, operand_budget=operand_budget,
             )
+            # A merge directive is not a completion: the caller still owes an
+            # operator application.  The stored result is, and without this the
+            # agent-evaluated reductions --- the expensive ones --- were missing
+            # from the trace's collective record entirely.
+            if out.get("status") == "done":
+                self._coll_done(
+                    kind, joined, comm=comm, label=label, root=root, op=op,
+                    algorithm=decision.chosen, rule=decision.rule,
+                    contributors=len(arrived), dropped=dropped,
+                    conflicts=len(out.get("conflicts") or {}) or None,
+                )
+            return out
 
         values = [self.get_body(p["handle"]) for p in arrived if p.get("handle")]
         folded = fold(

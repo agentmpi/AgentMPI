@@ -841,13 +841,15 @@ def _cost_invocation(inv: CollectiveInvocation) -> None:
 
 
 def _group_collectives(events: list[Event], t0: float, joins: dict[tuple[str, str, int], list[float]]) -> list[CollectiveInvocation]:
-    by_key: dict[tuple[str, str], list[Event]] = defaultdict(list)
+    # Two communicators may legally run the same kind under the same label; the
+    # context keeps their completions apart.
+    by_key: dict[tuple[str, str, str], list[Event]] = defaultdict(list)
     for e in events:
         if st.is_collective(e["kind"]) and not e.get("replayed"):
-            by_key[(e["kind"], str(e.get("label") or ""))].append(e)
+            by_key[(e["kind"], str(e.get("label") or ""), str(e.get("comm") or ""))].append(e)
 
     out: list[CollectiveInvocation] = []
-    for (op, label), group in by_key.items():
+    for (op, label, _comm), group in by_key.items():
         group.sort(key=lambda e: (e["ts"], e.get("seq", 0)))
         current: list[Event] = []
         seen: set[int] = set()

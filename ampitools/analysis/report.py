@@ -397,7 +397,10 @@ def write_all(
     fmt: str = "pdf",
 ) -> dict[str, Path]:
     """Write metrics, figures, report and macros for one run into ``outdir``."""
-    from .figures import render_all
+    try:
+        from .figures import render_all
+    except ImportError:  # matplotlib is an extra; the report is still worth writing
+        render_all = None
 
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
@@ -407,7 +410,7 @@ def write_all(
     metrics.write_text(json.dumps(a.to_dict(), indent=2, default=str), encoding="utf-8")
     written["metrics"] = metrics
 
-    figs = render_all(a, out / "figures", fmt=fmt)
+    figs = render_all(a, out / "figures", fmt=fmt) if render_all is not None else {}
     written.update({f"figure:{k}": v for k, v in figs.items()})
 
     report = out / "report.md"
