@@ -55,6 +55,7 @@ from typing import Any
 
 from ampi import Ampi
 from ampi.constants import PROC_NULL
+from ampi.core.context import Ledger
 from ampi.core.payload import Contract
 from ampi.errors import AmpiError
 from ampi.executor import Task, new_aid
@@ -884,7 +885,23 @@ def run_one(amp: Ampi, rank: int, harness: BookHarness, *, lease_s: float,
     started = time.time()
     out: dict[str, Any] = {"rank": rank, "ok": False}
     try:
-        amp.init(lease_s=lease_s)
+        joined = amp.init(lease_s=lease_s)
+        if joined.get("already_running") or joined.get("recovery") is not None:
+            # A restart.  The ledger models an executor's transcript, and this
+            # process has a new one: the replay that follows re-delivers every
+            # collective body the rank ever received, and charging those again
+            # would degrade a rank that spent its budget honestly in its first
+            # life into string views its program cannot use.  The release is
+            # traced with what the previous life had used, so the measurement
+            # loses nothing.
+            view = amp._rankview()
+            ledger = Ledger.from_dict(view.ctx)
+            spent = ledger.used
+            ledger.release(spent)
+            view.ctx = ledger.to_dict()
+            amp._write_rank(view)
+            amp.trace("ctx.release", rank=rank, tokens=spent, why="restart",
+                      epoch=joined.get("epoch"))
         if identity:
             amp.trace("rank.identity", rank=rank, **identity)
         value = harness.rank_main(amp, rank)
