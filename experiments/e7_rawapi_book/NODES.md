@@ -110,3 +110,22 @@ never become a mutation.  To see what a rank is doing, dump its stack
 (`python -m ampitools.calls work/e7/<name>/job --rank 24 --calls
 work/e7/<name>/calls`); silence on the provider's side with ranks alive means
 the ranks are in the transport, and the trace says where.
+
+*A frozen population comes back with `rejoin`, at the price of a replay.*  The
+account's usage limit stopped all four sessions of the 128-rank job at 09:48
+on 5 September, two minutes short of the final reduction, with every task done
+and $13.64 spent; the containers were reclaimed and every rank process died,
+but the job lived on the branch.  An hour later each node ran
+`node.sh <name> 128 4 <k> rejoin`: the launcher re-attached the ranks whose
+rows still said `running`, and the ranks that peers had by then convicted were
+respawned with fresh epochs.  Every returning rank replays its program from the
+start --- collectives return their stored results, tasks whose results are in
+the window are skipped (`task.replay`) --- but each replayed operation is still
+a device round trip, and this program has some three hundred of them, so a
+node's replay took about an hour at four machines.  Nothing was re-translated
+and the API spend did not move.  Two things to know before relying on it: a
+replaying rank's context ledger is charged for every replayed delivery, so the
+harness must release at phase boundaries or the runtime will degrade a body the
+harness needs whole (the second defect this run found, fixed in the translate
+phase); and the sessions hosting the nodes are the population's single point of
+failure, so keep a run's nodes on an account nothing else is drawing from.
