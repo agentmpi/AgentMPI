@@ -683,7 +683,13 @@ class RuntimeBase:
     def _convict(self, view: RankView, kind: str, expect: int | None = None) -> None:
         view.state = STATE_FAILED
         view.failure_kind = kind
-        self._write_rank(view, expect=expect)
+        if not self._write_rank(view, expect=expect) and expect is not None:
+            # A peer convicted this rank first (or the rank renewed its lease in
+            # the meantime).  One conviction is one record: at p=256 every rank
+            # polling a collective convicted the same seven victims, ninety-two
+            # times for one of them, and the fail stream and the trace carried
+            # each attempt as a mutation of its own.
+            return
         self.device.append("fail", {"rank": view.rank, "kind": kind, "state": "unacked", "run": self.manifest.job_id})
         self.trace("failure.convict", rank=view.rank, kind=kind, epoch=view.epoch)
 
