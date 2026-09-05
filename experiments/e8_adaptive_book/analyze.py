@@ -40,6 +40,7 @@ def per_rank(ev: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         "pages": [], "stolen": 0, "seams": 0, "model_s": 0.0, "wait_s": 0.0, "waits": 0,
         "blocked_s": 0.0, "calls": 0, "cost_usd": 0.0, "reclaimed": 0, "spans": []})
     starts: dict[str, dict[str, Any]] = {}
+    done_by: dict[str, int] = {}
     for e in ev:
         r = e.get("rank")
         if not isinstance(r, int):
@@ -47,16 +48,25 @@ def per_rank(ev: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
                 r = int(r)
             except (TypeError, ValueError):
                 continue
+        if r < 0:
+            continue
         k = e["kind"]
         row = ranks[r]
-        if k == "pool.claim":
+        if k == "pool.done":
+            # Who finished an item is the fact; a claim may have been resumed
+            # by a later process of the same rank, or reclaimed by another.
             item = str(e.get("item", ""))
+            if item in done_by:
+                continue
+            done_by[item] = r
             if item.startswith("p"):
                 row["pages"].append(int(item[1:]))
-                if not e.get("preferred"):
-                    row["stolen"] += 1
             elif item.startswith("s"):
                 row["seams"] += 1
+        elif k == "pool.claim":
+            item = str(e.get("item", ""))
+            if item.startswith("p") and not e.get("preferred"):
+                row["stolen"] += 1
             if e.get("reclaimed"):
                 row["reclaimed"] += 1
         elif k == "pool.wait":
@@ -73,7 +83,10 @@ def per_rank(ev: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
             row["calls"] += 1
             row["cost_usd"] += float(e.get("cost_usd") or 0)
         elif k in ("allreduce", "bcast", "gather", "barrier", "scatter", "exscan", "reduce"):
-            row["blocked_s"] += float(e.get("waited_s") or 0)
+            # A replayed completion reports the wait since the original join, which
+            # is the life of the population, not time this process spent blocked.
+            if not e.get("replayed"):
+                row["blocked_s"] += float(e.get("waited_s") or 0)
     for row in ranks.values():
         row["pages"].sort()
         row["model_s"] = round(row["model_s"], 1)
@@ -81,6 +94,29 @@ def per_rank(ev: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
         row["blocked_s"] = round(row["blocked_s"], 1)
         row["cost_usd"] = round(row["cost_usd"], 4)
     return dict(sorted(ranks.items()))
+
+
+def device_latency(ev: list[dict[str, Any]], ranks_per_node: int) -> dict[str, Any]:
+    """Seconds from a page's translation finishing to its pool.done, by node.
+
+    Between the two a rank does a handful of synchronous device writes and no
+    model call, so the gap is what the machine's transport costs per page.
+    """
+    ends: dict[tuple[int, str], float] = {}
+    gaps: dict[int, list[float]] = defaultdict(list)
+    for e in ev:
+        if e["kind"] == "task.done" and str(e.get("label", "")).startswith("translate:p"):
+            ends[(int(e["rank"]), e["label"].split(":")[1])] = e["ts"]
+        elif e["kind"] == "pool.done" and str(e.get("item", "")).startswith("p"):
+            key = (int(e["rank"]), e["item"])
+            if key in ends:
+                gaps[int(e["rank"]) // max(1, ranks_per_node)].append(e["ts"] - ends.pop(key))
+    out = {}
+    for node, g in sorted(gaps.items()):
+        g.sort()
+        out[f"node{node}"] = {"pages": len(g), "median_s": round(g[len(g) // 2], 1),
+                              "p90_s": round(g[int(len(g) * 0.9)], 1)}
+    return out
 
 
 def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]]) -> dict[str, Any]:
@@ -110,6 +146,7 @@ def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]
         "seams": sum(r["seams"] for r in ranks.values()),
         "cost_usd": round(sum(r["cost_usd"] for r in ranks.values()), 2),
         "calls": sum(r["calls"] for r in ranks.values()),
+        "device_latency": device_latency(ev, max(1, n // 2)),
     }
 
 
@@ -168,7 +205,10 @@ def render(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
              f"| busy share / idle share | {s['busy_share'] * 100:.1f}% / {s['idle_share'] * 100:.1f}% |",
              f"| pages per rank (min / mean / max) | {s['pages_per_rank']['min']} / {s['pages_per_rank']['mean']} / {s['pages_per_rank']['max']} |",
              f"| pages stolen / items reclaimed / seams | {s['stolen']} / {s['reclaimed']} / {s['seams']} |",
-             f"| model exchanges / spend | {s['calls']} / ${s['cost_usd']} |", ""]
+             f"| model exchanges / spend | {s['calls']} / ${s['cost_usd']} |",
+             "| transport per page, by node (median / p90 s from translation done to pool done) | "
+             + "; ".join(f"{k}: {v['median_s']} / {v['p90_s']} ({v['pages']} pages)"
+                         for k, v in s["device_latency"].items()) + " |", ""]
     if vs:
         lines += [f"### Against {vs['name']}", "",
                   "| | E7 (phases) | E8 (pool) |", "|---|---|---|",

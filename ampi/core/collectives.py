@@ -138,6 +138,7 @@ class CollectiveMixin:
         *,
         comm: str,
         label: str,
+        since: float | None = None,
         **fields: Any,
     ) -> None:
         """Record a collective's completion with the fields an analysis needs.
@@ -158,10 +159,10 @@ class CollectiveMixin:
         because no single rank can observe it.
         """
         waited = None
-        if rec is not None and rec.get("joined_at") is not None:
+        if since is None and rec is not None and rec.get("joined_at") is not None:
             since = float(rec.get("reentered_at") or rec["joined_at"])
-        waited = round(max(0.0, self.device.clock() - since), 4)
-        if rec is not None and rec.get("reentered_at") is not None:
+        waited = round(max(0.0, self.device.clock() - float(since or self.device.clock())), 4)
+        if since is None and rec is not None and rec.get("reentered_at") is not None:
             # A replay is a re-entry into a collective that had closed before the
             # rank came back, which is the case exactly when every arrival predates
             # the re-entry.  An analysis must not read a restarted rank's instant
@@ -432,6 +433,7 @@ class CollectiveMixin:
 
     def coll_wait(self, request: str, *, timeout: float = DEFAULT_TIMEOUT_S, **kw: Any) -> dict[str, Any]:
         comm, label = self._coll_request(request)
+        started = self.device.clock()
         mine = next((p for p in self._participants(comm, label) if p["rank"] == self.rank), None)
         if mine is None:
             raise err("AMPI_ERR_REQUEST", f"rank {self.rank} never joined {label!r}", label=label)
@@ -443,8 +445,11 @@ class CollectiveMixin:
         assert rec is not None
         out_rec = self._take(rec, materialize=kw.get("materialize", False), view=kw.get("view", ""),
                              out=kw.get("out", ""), extra={"label": label, "root": mine.get("root")})
+        # The wait is measured from this call, not from the arrival: a member of a
+        # nonblocking broadcast was working, not blocked, in between.
         self._coll_done("bcast", mine, comm=comm, label=label, root=mine.get("root"),
-                        tokens=rec.get("tokens", 0), charged=out_rec.get("charged", 0),
+                        since=started, tokens=rec.get("tokens", 0),
+                        charged=out_rec.get("charged", 0),
                         materialized=bool(out_rec.get("body") is not None), nonblocking=True)
         out_rec["request"] = request
         return out_rec
