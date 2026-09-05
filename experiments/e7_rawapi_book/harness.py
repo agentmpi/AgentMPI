@@ -720,12 +720,15 @@ def _my_order(agenda: list[dict[str, Any]], rank: int, size: int) -> list[dict[s
 
 
 def _read_findings(amp: Ampi) -> dict[str, Any]:
+    """Every research finding, read uncharged.
+
+    The findings are host-side state: what a model sees of them is decided when
+    its prompt is composed (``_relevant_glossary``), and that is where the
+    context is charged.  Charging here as well was what killed a replaying root
+    at the research fence with six tokens left in its ledger.
+    """
     out: dict[str, Any] = {}
-    for item in amp.win_ls(RESEARCH_WIN, prefix="finding/")["items"]:
-        cell = amp.get(RESEARCH_WIN, item["key"])
-        if not cell.get("present"):
-            continue
-        body = cell.get("value") or {}
+    for body in _win_values(amp, RESEARCH_WIN, prefix="finding/").values():
         if isinstance(body, dict) and body.get("term"):
             out[body["term"]] = body
     return out

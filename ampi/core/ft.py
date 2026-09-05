@@ -45,6 +45,7 @@ from ..constants import (
     STATE_REQUESTED,
 )
 from ..errors import err
+from .context import Ledger
 from .payload import summarise
 
 #: A memo note is a phase name or a short progress line, not a payload.  Bounding
@@ -242,6 +243,13 @@ class FaultMixin:
         view.state = STATE_REQUESTED
         view.restarts += 1
         view.suspect_since = None
+        # A successor is a new executor with an empty context.  It inherits the
+        # budget, not the predecessor's consumption: the root of the first
+        # completed 128-rank run was respawned with 184,000 of its 200,000
+        # tokens already spent by a process that no longer existed, and died on
+        # its first delivery.
+        old = Ledger.from_dict(view.ctx)
+        view.ctx = Ledger(budget=old.budget, unexpected_budget=old.unexpected_budget).to_dict()
         now = self.device.clock()
         view.last_seen = now
         view.join_deadline = now + 600

@@ -294,3 +294,20 @@ def test_a_read_charges_the_ledger_without_writing_the_rank_row(job, monkeypatch
     ranks[1].heartbeat()
     assert ranks[0].ledger(1).unexpected_used == 17
     assert ranks[0].ledger(1).used == ranks[1].ledger().used
+
+
+def test_a_successor_starts_with_an_empty_ledger(job):
+    """A respawned rank is a new executor: it inherits the budget, not the
+    predecessor's consumption."""
+    ranks = job(2, device="memory", ctx_budget=5000)
+    ranks[0].send(1, "word " * 400, tag=1)
+    ranks[1].recv(0, tag=1, timeout=2, materialize=True)
+    used = ranks[1].ledger().used
+    assert used > 0
+    ranks[1].heartbeat()                       # flush the local charge to the row
+    assert ranks[0].ledger(1).used == used
+    ranks[0].kill(1, reason="test")
+    out = ranks[0].respawn(1)
+    assert out["epoch"] == 2
+    led = ranks[0].ledger(1)
+    assert led.used == 0 and led.peak == 0 and led.budget == 5000
