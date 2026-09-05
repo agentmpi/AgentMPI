@@ -709,6 +709,12 @@ class ModelExecutor:
                 json_mode=want_json,
             )
             used.add(resp.usage)
+            # A rank inside a long tool loop makes no runtime call, and a lease
+            # renews only on runtime calls: three research tasks at p=256 ran
+            # past the 1800-second lease behind a rate-limited encyclopaedia and
+            # were convicted alive.  Working is not evidence of death either.
+            with contextlib.suppress(Exception):
+                self.amp.touch()
             self.amp.trace(
                 "task.call", rank=task.rank, aid=task.aid, label=task.label,
                 model=model.model, step=step, messages=len(messages),

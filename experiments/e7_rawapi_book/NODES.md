@@ -129,3 +129,11 @@ harness must release at phase boundaries or the runtime will degrade a body the
 harness needs whole (the second defect this run found, fixed in the translate
 phase); and the sessions hosting the nodes are the population's single point of
 failure, so keep a run's nodes on an account nothing else is drawing from.
+
+*A rank at work is silent too.*  At p = 256 three research ranks ran their tool
+loops for more than the 1800-second lease --- each encyclopaedia call waiting out
+the rate limit a population of researchers provokes --- made no runtime call
+meanwhile, and were convicted alive by peers waiting at the glossary reduction.
+The executor now renews the lease between model rounds (`ampitools/model.py`);
+the lease should still be longer than the task timeout, since a task may make a
+single call that long.
