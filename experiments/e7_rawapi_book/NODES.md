@@ -155,3 +155,17 @@ twelve victims, each a mutation (a conviction is now one record).  The runtime
 should read the rank table once per poll, not once per member, and the daemon
 should keep the state parsed rather than re-reading it; both are the next
 transport work.
+
+*Two daemons on one ref are a contest, and the faster loop wins every round.*
+E8's first launch (sixteen ranks over two machines) stalled node 0 for ten
+minutes with no failure anywhere: its eight ranks sat in `readinto` waiting for
+their daemon to acknowledge a trace append, and the daemon sat in a fetch-commit-
+push loop losing every push to node 1, whose eight translators were pushing
+traces back to back.  The loser's backoff grew with every defeat and the winner
+never paused, so the loser's fetch-commit-push never fitted in a gap.  Two fixes
+in the device (`ampi/device/gitlog.py`, `gitd.py`): a writer waits
+`AMPI_GIT_PUSH_GAP_S` (0.75 s) after a successful push before its next, and a
+loser retries soon with a little jitter; and trace appends are acknowledged when
+queued rather than when pushed (spec S13 allows it and requires saying so), so a
+rank's program never waits on its own evidence.  Both nodes were restarted with
+`rejoin`; a rank re-entering its pool loop resumes the item it holds.
