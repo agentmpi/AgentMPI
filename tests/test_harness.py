@@ -418,3 +418,14 @@ def test_lease_renewal_keeps_the_length_the_rank_asked_for(tmp_path):
         assert a._rankview().lease_until - a.device.clock() > 600  # noqa: SLF001
     finally:
         a.close()
+
+
+def test_a_rank_row_from_a_newer_runtime_still_parses():
+    """Rolling upgrades: a field this version does not know is not a crash."""
+    from ampi.core.base import RankView
+
+    row = {"rank": 3, "state": "running", "epoch": 1, "lease_until": 1.0, "join_deadline": 2.0,
+           "last_seen": 0.5, "role": "x", "restarts": 0, "failure_kind": "", "ctx": None,
+           "suspect_since": None, "lease_s": 900.0, "field_from_the_future": {"a": 1}}
+    view = RankView.from_row(row)
+    assert view.rank == 3 and view.lease_s == 900.0 and not hasattr(view, "field_from_the_future")

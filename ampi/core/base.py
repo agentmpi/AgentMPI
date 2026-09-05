@@ -108,6 +108,19 @@ class RankView:
         d["ctx"] = self.ctx or {}
         return d
 
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> RankView:
+        """Parse a rank row, ignoring fields this version does not know.
+
+        A job is upgraded one process at a time: a respawned rank runs newer code
+        than its peers.  A row written by a newer runtime carried a field an older
+        one had never heard of, and seventy-five ranks on three machines died
+        parsing it in the middle of a production run.  Unknown fields are the
+        newer version's business; the older one reads what it understands.
+        """
+        known = {f for f in cls.__dataclass_fields__}  # type: ignore[attr-defined]
+        return cls(**{k: v for k, v in row.items() if k in known})
+
 
 class RuntimeBase:
     """Shared state and identity handling for every AgentMPI operation."""
@@ -414,7 +427,7 @@ class RuntimeBase:
         cell = self.device.read("rank", str(r))
         if cell is None:
             raise err("AMPI_ERR_RANK", f"no such rank {r}", rank=r)
-        return RankView(**cell.value)
+        return RankView.from_row(cell.value)
 
     def _write_rank(self, view: RankView, *, expect: int | None = None) -> bool:
         ok, _ = self.device.cas("rank", str(view.rank), expect, view.to_dict(), writer=view.rank)
@@ -622,7 +635,7 @@ class RuntimeBase:
             full = self.device.read("rank", cell.key)
             if full is None:
                 continue
-            view = RankView(**full.value)
+            view = RankView.from_row(full.value)
             if view.state in (STATE_FAILED, STATE_FENCED, STATE_FINALISED):
                 if view.state == STATE_FAILED:
                     failed.append(view)
