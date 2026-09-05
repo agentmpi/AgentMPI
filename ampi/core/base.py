@@ -590,6 +590,27 @@ class RuntimeBase:
                 view.state = STATE_RUNNING
                 view.suspect_since = None
             self._write_rank(view)
+        elif view.state == STATE_FAILED and view.failure_kind == "lease_expired":
+            # Convicted for silence, yet here it is, making a call.  A lapsed lease
+            # is the one conviction the runtime lets a rank overrule, because it
+            # is the one the detector cannot distinguish from a slow transport:
+            # at sixty-four writers on one git branch a rank's renewals lost the
+            # push race for longer than its lease, its peers convicted it, and it
+            # kept working for hours as a ghost whose writes landed but whose
+            # collectives had been closed without it.  Re-admission is a new
+            # epoch, like a restart, so that nothing it did as a ghost is
+            # mistaken for the work of the rank its peers now see.
+            now = self.device.clock()
+            previous = view.epoch
+            view.epoch += 1
+            view.state = STATE_RUNNING
+            view.failure_kind = ""
+            view.suspect_since = None
+            view.last_seen = now
+            view.lease_until = now + renew_s
+            self._write_rank(view)
+            self.trace("failure.readmit", rank=view.rank, epoch=view.epoch,
+                       previous_epoch=previous, kind="lease_expired")
 
     # -- failure detection -------------------------------------------------
     def detect_failures(self, *, confirm_s: float = CONFIRM_S) -> list[RankView]:
