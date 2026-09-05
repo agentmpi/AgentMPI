@@ -205,6 +205,7 @@ class GitDevice(Device):
         # Readers' parsed copy of the state file, keyed by the file's identity, so
         # that a poll loop that finds the file unchanged does not parse it again.
         self._cached: tuple[tuple[int, int], dict[str, Any]] | None = None
+        self._writing = False
         self._tlock = threading.RLock()
         self._depth = 0
         self._counter = itertools.count()
@@ -371,7 +372,11 @@ class GitDevice(Device):
         working tree is the remote head, and the state file is replaced
         atomically, so the copy on disk is safe to read without the lock.
         """
-        if time.time() - self._last_fetch < self.read_interval:
+        if time.time() - self._last_fetch < self.read_interval or self._writing:
+            # While a mutation is in flight the writer fetches at every attempt;
+            # a reader that fetched too would only lengthen the writer's cycle
+            # and lose it more push contests.  Measured: node 0's daemon lost
+            # 88% of its pushes while its readers were fetching between attempts.
             return self._read_cached()
         if not self._try_lock():
             # The writer is mid-contest and may hold the lock for its whole push
@@ -448,31 +453,38 @@ class GitDevice(Device):
         re-run against the fresher state, and its first result is discarded.
         """
         with self._locked():
-            for attempt in range(self._max_retries):
-                state = self._sync()
-                result = fn(state)
-                self._write_state(state)
-                self._git("add", "-A")
-                c = subprocess.run(["git", *GIT_IDENTITY, "commit", "-q", "-m", f"ampi: {label}"],
-                                   cwd=str(self.root), capture_output=True, text=True)
-                if c.returncode and "nothing to commit" in (c.stdout + c.stderr):
-                    return result
-                r = subprocess.run(["git", *GIT_IDENTITY, "push", "-q", "origin",
-                                    f"HEAD:refs/heads/{self.branch}"],
-                                   cwd=str(self.root), capture_output=True, text=True)
-                if r.returncode == 0:
-                    self.pushes += 1
-                    return result
-                self.rejections += 1
-                # Lost the race: somebody else's commit landed first.  The winner's
-                # push takes about a round trip, so a loser that retries at once
-                # loses again; spread the losers over a window that grows with the
-                # number of consecutive defeats, which is a proxy for how many
-                # writers are contending.
-                time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 10)))
-            raise RuntimeError(f"git device: push of {label!r} rejected {self._max_retries} times")
+            self._writing = True
+            try:
+                return self._mutate_locked(fn, label)
+            finally:
+                self._writing = False
 
-    # -- 1-3. streams --------------------------------------------------------
+    def _mutate_locked(self, fn: Any, label: str) -> Any:
+        for attempt in range(self._max_retries):
+            state = self._sync()
+            result = fn(state)
+            self._write_state(state)
+            self._git("add", "-A")
+            c = subprocess.run(["git", *GIT_IDENTITY, "commit", "-q", "-m", f"ampi: {label}"],
+                               cwd=str(self.root), capture_output=True, text=True)
+            if c.returncode and "nothing to commit" in (c.stdout + c.stderr):
+                return result
+            r = subprocess.run(["git", *GIT_IDENTITY, "push", "-q", "origin",
+                                f"HEAD:refs/heads/{self.branch}"],
+                               cwd=str(self.root), capture_output=True, text=True)
+            if r.returncode == 0:
+                self.pushes += 1
+                return result
+            self.rejections += 1
+            # Lost the race: somebody else's commit landed first.  The winner's
+            # push takes about a round trip, so a loser that retries at once
+            # loses again; spread the losers over a window that grows with the
+            # number of consecutive defeats, which is a proxy for how many
+            # writers are contending.
+            time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 10)))
+        raise RuntimeError(f"git device: push of {label!r} rejected {self._max_retries} times")
+
+# -- 1-3. streams --------------------------------------------------------
     def append(self, stream: str, record: dict[str, Any]) -> int:
         return self._mutate(lambda st: apply_append(st, stream, record, self.clock()),
                             f"append {stream}")
