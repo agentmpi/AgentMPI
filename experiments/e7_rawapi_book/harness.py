@@ -60,6 +60,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -528,6 +529,12 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
 
     # -- 7. translate --------------------------------------------------------------
     phase("translate")
+    # A translation is a fresh model call: nothing delivered so far is in its
+    # context.  Releasing here matters most to a rank replaying its program
+    # after a respawn, whose ledger has been charged for every replayed delivery
+    # and would otherwise reach its budget inside the translate phase and hand
+    # the harness degraded bodies.
+    amp.ctx_release()
     maybe_die("translate")
     relevant = _relevant_glossary(glossary, segment["units"], set(findings) if
                                   cfg.arm != "noglossary" else set())
@@ -824,8 +831,20 @@ def _record_amendments(amp: Ampi, rank: int, chapters: list[str], new_terms: dic
             amp.trace("amend.skipped", rank=rank, chapter=chapter, error=exc.cls_name)
             continue
         try:
-            cell = amp.get(AMEND_WIN, chapter)
-            ledger = dict(cell.get("value") or {}) if cell.get("present") else {}
+            # Read the chapter's ledger without charging: it is the harness's
+            # bookkeeping, not something a model will read, and a degraded body
+            # here is unusable (a rank whose ledger was near its budget once
+            # received a string with an elision marker and died on it).
+            with tempfile.NamedTemporaryFile("r", suffix=".json", delete=False) as fh:
+                path = fh.name
+            try:
+                cell = amp.get(AMEND_WIN, chapter, out=path)
+                ledger = {}
+                if cell.get("present"):
+                    body = json.loads(Path(path).read_text(encoding="utf-8"))
+                    ledger = dict(body) if isinstance(body, dict) else {}
+            finally:
+                Path(path).unlink(missing_ok=True)
             for term, rendering in clean.items():
                 prev = ledger.get(term)
                 if prev is None:
