@@ -34,7 +34,12 @@ from typing import Any
 
 from .model import Tool
 
-__all__ = ["fetch_url", "wiki_search", "wiki_page", "research_tools", "TOOLS"]
+try:  # the per-host throttle needs an advisory lock; not every platform has one
+    import fcntl
+except ImportError:  # pragma: no cover - Windows
+    fcntl = None  # type: ignore[assignment]
+
+__all__ = ["fetch_url", "wiki_search", "wiki_page", "research_tools", "TOOLS", "iri_to_uri"]
 
 ENV_CACHE = "AMPI_TOOL_CACHE"
 USER_AGENT = "AgentMPI/1.0 (research tool; https://github.com/agentmpi/AgentMPI)"
@@ -43,6 +48,11 @@ _MAIN = re.compile(r'(<main[\s>]|id="mw-content-text"|<article[\s>])', re.I)
 _TAGS = re.compile(r"<[^>]+>")
 _WS = re.compile(r"[ \t\r\f\v]+")
 _NL = re.compile(r"\n{3,}")
+#: Minimum gap between two requests to the same host from this machine.  Every
+#: rank on a node is a separate process; the gap is kept in a lock file so the
+#: whole node, not each process, stays under the host's rate limit.
+MIN_GAP_S = float(os.environ.get("AMPI_TOOL_MIN_GAP_S", "0.7"))
+MAX_RETRY_AFTER_S = 30.0
 
 
 def _cache_dir() -> Path:
@@ -67,17 +77,74 @@ def _cached(key: str, fn: Any) -> str:
     return text
 
 
-def _get(url: str, *, timeout: float = 30.0, tries: int = 4) -> bytes:
+def iri_to_uri(url: str) -> str:
+    """Percent-encode an IRI so ``urllib`` will send it.
+
+    Models write URLs the way people do --- ``https://ru.wikipedia.org/wiki/Дуров``
+    --- and ``http.client`` refuses anything outside ASCII.  In the first 128-rank
+    run every such fetch failed with a ``UnicodeEncodeError`` and the rank fell
+    back to a search that was itself being rate-limited.  Characters that are
+    already percent-encoded are left alone, so a URL the model encoded itself is
+    not encoded twice.
+    """
+    parts = urllib.parse.urlsplit(url)
+    host = parts.hostname or ""
+    with contextlib.suppress(UnicodeError):
+        host = host.encode("idna").decode("ascii")
+    netloc = host
+    if parts.port:
+        netloc += f":{parts.port}"
+    if parts.username:
+        cred = parts.username + (f":{parts.password}" if parts.password else "")
+        netloc = f"{cred}@{netloc}"
+    safe = "-._~:/?#[]@!$&'()*+,;=%"
+    return urllib.parse.urlunsplit((
+        parts.scheme,
+        netloc,
+        urllib.parse.quote(parts.path, safe=safe),
+        urllib.parse.quote(parts.query, safe=safe),
+        urllib.parse.quote(parts.fragment, safe=safe),
+    ))
+
+
+def _throttle(host: str) -> None:
+    """Hold this process until ``MIN_GAP_S`` has passed since the last request the
+    machine made to ``host``.  The clock is the lock file's mtime; the lock keeps
+    two ranks from reading it at once and both concluding the gap is theirs."""
+    if MIN_GAP_S <= 0 or fcntl is None:
+        return
+    path = _cache_dir() / f".gap-{re.sub(r'[^a-z0-9.-]', '_', host.lower())}"
+    try:
+        with open(path, "a+") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX)
+            try:
+                wait = MIN_GAP_S - (time.time() - os.fstat(fh.fileno()).st_mtime)
+                if 0 < wait <= MIN_GAP_S:
+                    time.sleep(wait)
+                os.utime(fh.fileno())
+            finally:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+    except OSError:  # a read-only or missing cache dir must not break the tool
+        return
+
+
+def _get(url: str, *, timeout: float = 30.0, tries: int = 5) -> bytes:
     """GET with a retry on 429/5xx.
 
     Wikimedia rate-limits by source address, and every rank in a sandbox fleet
     leaves through the same egress, so a burst of research from a population looks
-    to the encyclopaedia like one very busy client.  The backoff is what keeps a
-    transient refusal from becoming a wrong translation.
+    to the encyclopaedia like one very busy client.  Three things keep a transient
+    refusal from becoming a wrong translation: the per-host gap in ``_throttle``,
+    a ``Retry-After`` header honoured when the host sends one, and a backoff that
+    grows with each refusal.
     """
+    url = iri_to_uri(url)
+    host = urllib.parse.urlsplit(url).hostname or ""
     req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
     last: Exception | None = None
     for attempt in range(tries):
+        _throttle(host)
+        delay = 1.5 * (attempt + 1) + random.uniform(0.0, 1.0)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:  # noqa: S310 - the URL is the tool's input
                 return r.read()
@@ -85,11 +152,16 @@ def _get(url: str, *, timeout: float = 30.0, tries: int = 4) -> bytes:
             last = exc
             if exc.code not in (429, 500, 502, 503, 504) or attempt == tries - 1:
                 raise
+            retry_after = exc.headers.get("Retry-After") if exc.headers else None
+            if retry_after and str(retry_after).strip().isdigit():
+                delay = max(delay, min(float(retry_after), MAX_RETRY_AFTER_S))
+            elif exc.code == 429:
+                delay = min(2.0 * delay, MAX_RETRY_AFTER_S)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             last = exc
             if attempt == tries - 1:
                 raise
-        time.sleep(1.5 * (attempt + 1) + random.uniform(0.0, 1.0))
+        time.sleep(delay)
     raise last  # pragma: no cover - unreachable
 
 

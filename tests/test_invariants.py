@@ -253,3 +253,44 @@ def test_invariant_the_same_program_gives_the_same_result_on_every_device(job, d
     assert len(values) == 1
     assert conflicts == {("shared",)}
     assert out[0]["fold_depth"] >= 1
+
+
+def test_a_read_charges_the_ledger_without_writing_the_rank_row(job, monkeypatch):
+    """Reads must not become device mutations.
+
+    Every delivery charges the ledger, and the ledger lives in the rank row; but
+    the row is written when something *else* writes it, not once per read.  On
+    the git device each row write is a group commit, and a rank reading many
+    cells in a row was paying one commit per cell.
+    """
+    ranks = job(2, device="memory")
+    ranks[0].win_create("w")
+    for i in range(6):
+        ranks[0].put("w", f"k{i}", {"body": "word " * 40})
+    before = ranks[1].ledger().used
+    writes: list[str] = []
+    real_cas = ranks[1].device.cas
+
+    def counting_cas(space, key, *a, **kw):
+        if space == "rank":
+            writes.append(key)
+        return real_cas(space, key, *a, **kw)
+
+    monkeypatch.setattr(ranks[1].device, "cas", counting_cas)
+    for i in range(6):
+        ranks[1].get("w", f"k{i}")
+    charged = ranks[1].ledger().used - before
+    assert charged > 0                       # the ledger was charged, locally
+    assert writes == []                      # and no rank row was written for it
+    # a peer reading the row from the device sees the old ledger until a flush
+    assert ranks[0].ledger(1).used == before
+    ranks[1].heartbeat()                     # any own-row write carries the charge
+    assert writes == ["1"]
+    assert ranks[0].ledger(1).used == before + charged
+    assert ranks[1].ledger().used == before + charged
+    # eager credit a sender reserved in the row survives the receiver's flush
+    ranks[1].get("w", "k0")
+    ranks[0]._reserve_eager(1, 17)
+    ranks[1].heartbeat()
+    assert ranks[0].ledger(1).unexpected_used == 17
+    assert ranks[0].ledger(1).used == ranks[1].ledger().used

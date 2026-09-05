@@ -126,7 +126,26 @@ def test_tool_loop_executes_tools_and_feeds_results_back(job):
     assert "tools" in script.requests[0] and "response_format" not in script.requests[0]
     done = next(e for e in amp.events() if e["kind"] == "task.done")
     assert done["tool_calls"] == 2 and done["calls"] == 3
-    assert sum(1 for e in amp.events() if e["kind"] == "task.tool") == 2
+    assert done["finish_reason"] == "stop" and done["messages"] == 5
+    assert len(done["result_sha"]) == 12
+    tools = [e for e in amp.events() if e["kind"] == "task.tool"]
+    assert len(tools) == 2
+    # the trace carries what was asked of each tool and whether it answered
+    assert tools[0]["tool"] == "lookup" and "гопник" in tools[0]["args"] and tools[0]["ok"]
+    assert tools[1]["tool"] == "missing" and not tools[1]["ok"]
+    assert tools[1]["error"].startswith("error: no tool named")
+    # one task.call per request, with the shape of the exchange but none of its text
+    rounds = [e for e in amp.events() if e["kind"] == "task.call"]
+    assert [r["step"] for r in rounds] == [0, 1, 2]
+    assert rounds[0]["tool_calls"] == ["lookup"] and rounds[1]["tool_calls"] == ["missing"]
+    assert rounds[2]["tool_calls"] == [] and rounds[2]["finish_reason"] == "stop"
+    assert rounds[0]["messages"] == 1 and rounds[2]["messages"] == 5
+    assert rounds[0]["tools_offered"] == 1 and rounds[2]["response_chars"] > 0
+    assert len(rounds[0]["prompt_sha"]) == 12 and "prompt" not in rounds[0]
+    assert all(v != "research" for v in rounds[0].values())  # no prompt text in the trace
+    assert rounds[0]["prompt_sha"] != rounds[1]["prompt_sha"]
+    start = next(e for e in amp.events() if e["kind"] == "task.start")
+    assert len(start["prompt_sha"]) == 12
 
 
 def test_contract_violation_is_repaired_in_conversation(job):

@@ -155,6 +155,9 @@ class RuntimeBase:
         self._expect_job = expect_job
         self._token = token
         self._checked_identity = False
+        #: Ledger fields charged locally but not yet written to the rank row.
+        #: See :meth:`charge`.
+        self._ctx_pending: dict[str, Any] | None = None
 
     @staticmethod
     def _peek_device(root: str) -> str | None:
@@ -422,15 +425,35 @@ class RuntimeBase:
                 )
         self._checked_identity = True
 
+    #: The ledger fields a rank owns.  ``unexpected_used`` is not among them: a
+    #: *sender* reserves eager credit in the receiver's row, so the receiver's
+    #: pending charges must not overwrite it.
+    _CTX_OWNED = ("budget", "used", "releases", "degradations", "peak")
+    _ctx_pending: dict[str, Any] | None = None  # class default: some paths skip __init__
+
     def _rankview(self, r: int | None = None) -> RankView:
         r = self.rank if r is None else r
         cell = self.device.read("rank", str(r))
         if cell is None:
             raise err("AMPI_ERR_RANK", f"no such rank {r}", rank=r)
-        return RankView.from_row(cell.value)
+        view = RankView.from_row(cell.value)
+        if self._ctx_pending is not None and r == self._rank:
+            view.ctx = self._overlay_ctx(view.ctx)
+        return view
+
+    def _overlay_ctx(self, ctx: dict[str, Any] | None) -> dict[str, Any]:
+        merged = dict(ctx or {})
+        assert self._ctx_pending is not None
+        merged.update({k: self._ctx_pending[k] for k in self._CTX_OWNED if k in self._ctx_pending})
+        return merged
 
     def _write_rank(self, view: RankView, *, expect: int | None = None) -> bool:
+        own = self._ctx_pending is not None and view.rank == self._rank
+        if own:
+            view.ctx = self._overlay_ctx(view.ctx)
         ok, _ = self.device.cas("rank", str(view.rank), expect, view.to_dict(), writer=view.rank)
+        if ok and own:
+            self._ctx_pending = None
         return ok
 
     def _fence_check(self, view: RankView | None = None) -> RankView:
@@ -765,7 +788,16 @@ class RuntimeBase:
         ledger.used += tokens
         ledger.peak = max(ledger.peak, ledger.used)
         view.ctx = ledger.to_dict()
-        self._write_rank(view)
+        # The charge is local until the row is next written for another reason
+        # --- a lease renewal, a collective arrival, a release.  Writing it here
+        # made every *read* a device mutation: at 128 ranks over the git device
+        # a rank reading forty-eight research findings spent ten minutes in
+        # forty-eight group commits, and the whole population with it.  A
+        # degradation is written at once, because a peer deciding how much to
+        # send should see it.
+        self._ctx_pending = view.ctx
+        if spec:
+            self._write_rank(view)
         return tokens, spec
 
     def ctx_release(self, tokens: int | None = None) -> dict[str, Any]:

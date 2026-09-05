@@ -88,3 +88,27 @@ example, for comparison; `analysis/` is `ampi analyze`'s output.
 The book — source, partition, per-call prompts and replies, per-rank drafts and
 the assembled translation in four files — lives under `work/e7/<name>/`, which
 is untracked. See `DATA_POLICY.md`.
+
+## Reviewing what a rank said to its model
+
+The trace carries the shape of every conversation without its text: a
+`task.start`/`task.done` pair per task, a `task.call` per request to the
+provider (message count, prompt size and digest, tokens, cost, finish reason,
+the tools it asked for) and a `task.tool` per tool the model used (its
+arguments and whether it answered or failed). Fold them back into conversations
+with
+
+```bash
+python -m ampitools.calls runs/e7-rawapi-p128/harness.trace.jsonl --summary
+python -m ampitools.calls runs/e7-rawapi-p128/harness.trace.jsonl --rank 24
+python -m ampitools.calls runs/e7-rawapi-p128/harness.trace.jsonl --label research --json
+```
+
+On the machine that ran the rank, `work/e7/<name>/calls/<aid>.{prompt.md,
+messages.jsonl,result.json}` hold the verbatim exchange; pass `--calls
+work/e7/<name>/calls` and the tool locates them by task id and checks their
+digests against the trace. The research tools throttle themselves to one request
+per host every `AMPI_TOOL_MIN_GAP_S` seconds (default 0.7) across all ranks on a
+node, honour `Retry-After`, and percent-encode the URLs a model writes in
+Cyrillic; the first 128-rank run showed both failure modes in the trace
+(`HTTP Error 429` and `UnicodeEncodeError`) before either was fixed.

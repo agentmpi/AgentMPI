@@ -106,6 +106,7 @@ STYLE: dict[str, Style] = {
     "task.start": _s("work", "bar"),
     "task.done": _s("work", "tick", "#60a5fa"),
     "task.tool": _s("work", "tick", "#93c5fd"),
+    "task.call": _s("work", "tick", "#bfdbfe"),
     # -- collectives ----------------------------------------------------
     "coll.join": _s("collective", "tick", "#065f46"),
     "barrier": _s("collective", "diamond"),

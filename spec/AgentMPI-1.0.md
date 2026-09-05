@@ -429,6 +429,20 @@ view instead of the body and report that it did so. Implementations SHOULD
 degrade, because an agent that receives a truncated message can continue while one
 that receives an error usually cannot.
 
+The ledger is the rank's own. An implementation MUST charge it on every delivery
+but MUST NOT turn the charge into a device mutation: a read that persists its
+charge is a write, and on a device where a write is a round trip (S15.2) a rank
+reading forty-eight cells pays forty-eight round trips while the population
+waits. The charged ledger SHOULD travel with the next write of the rank's row that
+happens for another reason — a lease renewal, a collective arrival, a release —
+and a **degradation** SHOULD be written at once, because a peer deciding how much
+to send is entitled to see it.
+
+> *Where this comes from.* At 128 ranks over four machines the runtime wrote the
+> rank row on every read; after the research fence the whole population spent
+> half an hour between the fence and the next reduction with no model call in
+> flight and no failure anywhere, blocked in the transport one charge at a time.
+
 ### S6.2 The eager threshold
 
 Let `E` be the implementation's **eager threshold** in tokens.

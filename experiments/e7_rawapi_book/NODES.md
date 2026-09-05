@@ -92,3 +92,21 @@ a message for many minutes.  Messages to children should be idempotent, and
 the operator should verify from the device (which ranks renewed their leases in
 the last two minutes, grouped by node) rather than from the children's
 reports.
+
+*Every read was a write.*  Learned on 5 September at p = 128 over four nodes.
+After the research fence each rank reads the forty-eight findings from the
+window, and the runtime charged its context ledger for each and wrote the rank
+row to persist the charge — one group commit per read, a dozen seconds each at
+four nodes, forty-eight of them per rank and the whole population waiting in
+step: half an hour between the fence and the glossary reduction with no API
+call in flight and no failure anywhere.  The provider's dashboard showed the
+spend stop; the trace showed 128 ranks blocked in `charge`.  Fixed in
+`ampi/core/base.py`: a charge is local until the row is next written for another
+reason (a lease renewal, a collective arrival, a release); only a degradation is
+written at once, because a peer deciding how much to send should see it.  The
+rule is the one `spec/AgentMPI-1.0.md` S15.2 states for the device: a read must
+never become a mutation.  To see what a rank is doing, dump its stack
+(`py-spy dump --pid`) and read its conversations from the trace
+(`python -m ampitools.calls work/e7/<name>/job --rank 24 --calls
+work/e7/<name>/calls`); silence on the provider's side with ranks alive means
+the ranks are in the transport, and the trace says where.

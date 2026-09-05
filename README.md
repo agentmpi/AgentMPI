@@ -70,7 +70,8 @@ them.
                              model.py, tools.py     replay and broker executors; the raw-API
                              launcher.py            executor with its tool loop; ampirun,
                              doctor.py              the process manager; the diagnosis;
-                             analysis/              trace analysis, figures and the viewer
+                             calls.py               what each rank said to its model, from
+                             analysis/              the trace; trace analysis, figures, viewer
 
 4. The experiments         experiments/             E0 microbenchmarks, E1 and E2 (session
    and analysis                                     ranks), E5 (machines), E7 (process ranks)
@@ -226,8 +227,15 @@ sessions at ten. `ampitools/model.py` removes the host. A rank is an operating-s
 process; its executor is a chat-completions call with a small tool loop
 (`ampitools/tools.py`: an encyclopaedia search, an article, a page fetch); its
 concurrency limit is the provider's. Contract violations are repaired in the same
-conversation, every call's tokens and cost land in the trace as `task.*` events,
-and the analysis reads them exactly as it reads the broker's claim/submit pair.
+conversation, and every exchange lands in the trace as `task.*` events: one
+`task.call` per request to the provider (message count, prompt size and digest,
+tokens, cost, finish reason, the tools it asked for) and one `task.tool` per tool
+it used (arguments, outcome), with none of the text — the prompts quote a
+copyrighted book and the trace is committed. `python -m ampitools.calls
+<trace> --rank 24` folds them back into conversations for review, and checks
+the digests against the verbatim logs when the machine that ran the rank is at
+hand. The analysis reads the same events exactly as it reads the broker's
+claim/submit pair.
 
 `ampirun` (`ampitools/launcher.py`) is the process manager MPI leaves unspecified: one
 process per rank with `AMPI_ROOT`/`AMPI_RANK` set, block-distributed over nodes,

@@ -37,17 +37,31 @@ about the contract as much as about the model.
 The executor emits four trace events, and the analysis package reads them exactly
 as it reads the broker's ``claim``/``submit`` pair:
 
-    task.start   rank, aid, label, worker, model
-    task.tool    rank, aid, tool, seconds, chars
+    task.start   rank, aid, label, worker, model, prompt_tokens_est, prompt_sha
+    task.call    rank, aid, label, model, step, messages, prompt_chars, prompt_sha,
+                 tools_offered, json_mode, prompt_tokens, completion_tokens,
+                 reasoning_tokens, cached_tokens, cost_usd, seconds, finish_reason,
+                 response_chars, response_sha, tool_calls (names)
+    task.tool    rank, aid, tool, args, seconds, chars, ok, error
     task.retry   rank, aid, label, attempt, violations
     task.done    rank, aid, label, worker, model, attempts, calls, tool_calls,
                  prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens,
-                 cost_usd, seconds, result_tokens
+                 cost_usd, seconds, result_tokens, result_sha, finish_reason, messages
     task.fail    rank, aid, label, error, attempts
+
+``task.call`` is one event per request to the provider: what was sent (as a size
+and a digest, never the text --- the prompts quote copyrighted sources and the
+trace is committed), what came back, and what it cost.  Together with
+``task.tool`` it lets a reviewer reconstruct the shape of every conversation a
+rank had --- how many rounds, which tools, which of them failed, where the model
+stopped --- from the trace alone; the verbatim exchange stays in the per-call log
+under the executor's ``log_dir`` on the machine that made it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
 import os
 import random
@@ -571,7 +585,8 @@ class ModelExecutor:
 
         self.amp.trace("task.start", rank=task.rank, aid=task.aid, label=task.label,
                        worker=self.worker_id, model=model.model,
-                       prompt_tokens_est=count_tokens(task.prompt))
+                       prompt_tokens_est=count_tokens(task.prompt),
+                       prompt_sha=digest(task.prompt))
         if self.log_dir:
             (self.log_dir / f"{task.aid}.prompt.md").write_text(task.prompt, encoding="utf-8")
 
@@ -585,6 +600,7 @@ class ModelExecutor:
         attempts = 0
         steps = 0
         last_error = ""
+        finish = ""
         value: Any = None
         while attempts < self.max_attempts:
             attempts += 1
@@ -638,7 +654,8 @@ class ModelExecutor:
             self.failures += 1
             self.amp.trace("task.fail", rank=task.rank, aid=task.aid, label=task.label,
                            worker=self.worker_id, error=last_error[:300], attempts=attempts,
-                           seconds=round(seconds, 3), **_usage_fields(usage))
+                           seconds=round(seconds, 3), messages=len(messages),
+                           **_usage_fields(usage))
             raise err(
                 "AMPI_ERR_OP_FAILED",
                 f"executor could not complete {task.label!r} for rank {task.rank}: {last_error}",
@@ -651,8 +668,9 @@ class ModelExecutor:
                 json.dumps(value, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
         self.amp.trace("task.done", rank=task.rank, aid=task.aid, label=task.label,
                        worker=self.worker_id, model=model.model, attempts=attempts,
-                       result_tokens=result_tokens, seconds=round(seconds, 3),
-                       **_usage_fields(usage))
+                       result_tokens=result_tokens, result_sha=digest(canonical(value)),
+                       finish_reason=finish, messages=len(messages),
+                       seconds=round(seconds, 3), **_usage_fields(usage))
         return value
 
     def _converse(
@@ -680,15 +698,28 @@ class ModelExecutor:
                     "the JSON object now from what you have found; where something is "
                     "unsettled, say so in the relevant field rather than searching again.")})
                 nudged = True
+            want_json = json_mode or (exhausted and task.contract is not None
+                                      and task.contract.kind == "json")
+            sent = canonical(messages)
             resp = model.complete(
                 messages,
                 tools=None if exhausted else specs,
                 tool_choice=None,
                 max_tokens=self.max_tokens,
-                json_mode=json_mode or (exhausted and task.contract is not None
-                                        and task.contract.kind == "json"),
+                json_mode=want_json,
             )
             used.add(resp.usage)
+            self.amp.trace(
+                "task.call", rank=task.rank, aid=task.aid, label=task.label,
+                model=model.model, step=step, messages=len(messages),
+                prompt_chars=len(sent), prompt_sha=digest(sent),
+                tools_offered=0 if exhausted or not specs else len(specs),
+                json_mode=bool(want_json), finish_reason=resp.finish_reason,
+                response_chars=len(resp.content or ""),
+                response_sha=digest(resp.content or ""),
+                tool_calls=[str((c.get("function") or {}).get("name") or "")
+                            for c in resp.tool_calls],
+                **_usage_fields(resp.usage, tools=False))
             if not resp.tool_calls:
                 return resp.content, used, resp.finish_reason
             if exhausted:  # a tool call after the tools were withdrawn: refuse it
@@ -706,8 +737,11 @@ class ModelExecutor:
                 t0 = time.time()
                 out = tool.run(fn.get("arguments")) if tool else f"error: no tool named {name!r}"
                 used.tool_calls += 1
+                failed = out.startswith("error:")
                 self.amp.trace("task.tool", rank=task.rank, aid=task.aid, tool=name,
-                               seconds=round(time.time() - t0, 3), chars=len(out))
+                               args=_brief(fn.get("arguments"), 160),
+                               seconds=round(time.time() - t0, 3), chars=len(out),
+                               ok=not failed, error=_brief(out, 160) if failed else None)
                 messages.append({"role": "tool", "tool_call_id": call.get("id") or name,
                                  "name": name, "content": out})
         raise ModelError("the tool loop did not terminate")
@@ -749,9 +783,35 @@ def used_from(exc: ModelError) -> Usage:
     return Usage(calls=0)
 
 
-def _usage_fields(usage: Usage) -> dict[str, Any]:
+def _usage_fields(usage: Usage, *, tools: bool = True) -> dict[str, Any]:
     """Usage as trace fields.  ``seconds`` is the task's wall time and belongs to
-    the event; the endpoint's own time goes under ``api_seconds``."""
+    the event; the endpoint's own time goes under ``api_seconds``.  A single
+    exchange (``task.call``) reports the tool calls it *requested* under its own
+    field and ``calls`` is always one, so both are dropped there."""
     d = usage.to_dict()
     d["api_seconds"] = d.pop("seconds")
+    if not tools:
+        d.pop("tool_calls", None)
+        d.pop("calls", None)
     return d
+
+
+def digest(text: Any) -> str:
+    """Twelve hex digits of SHA-256: enough to match a trace event to the verbatim
+    exchange in the executor's log without carrying any of the text."""
+    if not isinstance(text, str):
+        text = canonical(text)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:12]
+
+
+def _brief(value: Any, limit: int) -> str:
+    """A one-line, bounded rendering of a tool argument or error for the trace."""
+    if value is None:
+        return ""
+    if isinstance(value, str) and value[:1] in "{[":
+        # arguments arrive as a JSON string, often with \uXXXX escapes; show the text
+        with contextlib.suppress(ValueError):
+            value = json.loads(value)
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[: limit - 1] + "\u2026"
