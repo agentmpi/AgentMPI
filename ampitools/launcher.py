@@ -176,12 +176,16 @@ def launch(
     # the predecessor's locks and marks it absent in open collectives.
     supervisor = Ampi(str(root), allow_volatile=True)
     record["job"] = supervisor.manifest.job_id
+    finished: set[int] = set()
     if not should_create:
         # Rejoining a job this node's processes left --- a machine that was
         # recycled under a running population.  A rank the peers have already
         # convicted needs a new epoch before its process can take the identity;
         # a rank still inside its lease is simply resumed.  The machine's death
         # is not the rank's fault, so it does not spend the rank's own budget.
+        # A rank that already finalised has nothing left to do: starting a
+        # process for it replays its whole program to reach the same end (an
+        # hour at 128 ranks over four machines, for nothing).
         for r in mine:
             try:
                 state = supervisor._rankview(r).state  # noqa: SLF001 - the supervisor's view
@@ -190,6 +194,9 @@ def launch(
             if state == "failed":
                 spawned = supervisor.respawn(r, max_restarts=respawn + 1)
                 record["rank_states"][str(r)]["rejoined_epoch"] = spawned["epoch"]
+            elif state == "finalised":
+                finished.add(r)
+                record["rank_states"][str(r)].update(state="finalised", skipped="already finalised")
     # The node announces itself in the job's own trace.  On a multi-node run the
     # only durable place every node can reach is the device, and a launch
     # record that stays on a machine about to be reclaimed is not evidence.
@@ -224,6 +231,8 @@ def launch(
             print(f"[ampirun] node {node}: rank {rank} pid {p.pid} started", file=sys.stderr)
 
     for r in mine:
+        if r in finished:
+            continue
         start(r)
         if stagger_s:
             time.sleep(stagger_s)
