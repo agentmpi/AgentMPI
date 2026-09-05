@@ -164,6 +164,7 @@ def test_clients_survive_a_daemon_that_dies_mid_call(tmp_path, monkeypatch):
     dev = GitdDevice(root)
     dev.initialize()
     dev.append("event", {"kind": "t", "rank": 0, "run": "r"})
+    dev.append("rank", {"rank": 0, "run": "r"})     # lands the trace before the poll starts
     pid = dev._call("hello")["pid"]
     results: list[Any] = []
 
