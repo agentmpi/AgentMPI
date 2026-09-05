@@ -78,6 +78,13 @@ def seal(name: str, *, work_dir: Path | None = None) -> dict[str, Any]:
     rank_reports = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(ranks_dir.glob("*.json"))]
     nodes = [json.loads(p.read_text(encoding="utf-8")) for p in sorted(launch_dir.glob("*.json"))]
     machines = {n.get("node_identity", {}).get("boot_id") for n in nodes} - {None}
+    # The launch records on disk are this machine's; the other nodes announced
+    # themselves in the trace, which every node could reach.
+    for e in _events(trace):
+        if e.get("kind") == "launch.node":
+            ident = e.get("identity") or {}
+            machines.add(ident.get("boot_id") or ident.get("hostname") or f"node{e.get('node')}")
+    machines -= {None}
     by_model: Counter = Counter()
     cost_by_model: dict[str, float] = {}
     for e in _events(trace):
