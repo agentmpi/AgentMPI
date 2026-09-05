@@ -96,7 +96,8 @@ def seal(name: str, *, work_dir: Path | None = None) -> dict[str, Any]:
     lines = [
         f"# {name}",
         "",
-        f"E7 production run: *{plan.get('size')}* ranks over *{plan.get('nodes', 1)}* node(s) "
+        f"{str(plan.get('experiment', 'e7')).split('_')[0].upper()} production run: "
+        f"*{plan.get('size')}* ranks over *{plan.get('nodes', 1)}* node(s) "
         f"({len(machines)} distinct machine(s) recorded), device `{plan.get('device')}`, "
         f"executor `{plan.get('executor')}`, reasoning `{plan.get('reasoning')}`.",
         "",
