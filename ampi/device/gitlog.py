@@ -373,8 +373,45 @@ class GitDevice(Device):
         """
         if time.time() - self._last_fetch < self.read_interval:
             return self._read_cached()
-        with self._locked():
+        if not self._try_lock():
+            # The writer is mid-contest and may hold the lock for its whole push
+            # loop, tens of seconds under contention.  A poll is not worth that
+            # wait: the copy on disk is at most one attempt old.  Measured before
+            # this branch existed: single reads of 22 s at 128 ranks over four
+            # machines, and a loop of a hundred reads that took half an hour.
+            return self._read_cached()
+        try:
             return self._sync(fresh=False)
+        finally:
+            self._unlock()
+
+    def _try_lock(self) -> bool:
+        """Take the writer's lock without waiting; ``False`` if someone holds it."""
+        if not self._tlock.acquire(blocking=False):
+            return False
+        if self._depth:
+            self._depth += 1
+            return True
+        self.root.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.root.parent / f".{self.root.name}.ampi-git.lock", "w")  # noqa: SIM115
+        try:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            fh.close()
+            self._tlock.release()
+            return False
+        self._depth = 1
+        self._lock_fh = fh
+        return True
+
+    def _unlock(self) -> None:
+        self._depth -= 1
+        if self._depth == 0:
+            fh = self.__dict__.pop("_lock_fh", None)
+            if fh is not None:
+                fcntl.flock(fh, fcntl.LOCK_UN)
+                fh.close()
+        self._tlock.release()
 
     def _read_cached(self) -> dict[str, Any]:
         p = self.root / STATE_FILE

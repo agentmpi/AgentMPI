@@ -137,6 +137,11 @@ def test_readers_do_not_wait_for_a_busy_writer(tmp_path):
     t0 = time.time()
     rows = dev.scan("event", {"kind": "t"})
     assert time.time() - t0 < 0.5 and len(rows) == 1
+    # even a reader whose copy is stale does not wait for the writer's lock
+    dev._last_fetch = 0.0
+    t0 = time.time()
+    rows = dev.scan("event", {"kind": "t"})
+    assert time.time() - t0 < 0.5 and len(rows) == 1
     # the parsed copy is reused while the file is unchanged, and refreshed when it is not
     assert dev._cached is not None
     dev.append("event", {"kind": "t", "rank": 1, "run": "r"})
