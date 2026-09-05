@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import threading
 from typing import Any
 
@@ -237,3 +238,26 @@ def test_a_request_resent_after_an_ambiguous_reply_is_applied_once(tmp_path, mon
         s.close()
     finally:
         dev.shutdown_daemon()
+
+
+def test_maintenance_packs_loose_objects(tmp_path):
+    from ampi.device.gitlog import GitDevice
+
+    dev = GitDevice(tmp_path / "job", read_interval=30.0)
+    dev.initialize()
+    for i in range(6):
+        dev.append("event", {"kind": "t", "rank": i, "run": "r"})
+
+    def loose() -> int:
+        out = subprocess.run(["git", "count-objects"], cwd=str(dev.root),
+                             capture_output=True, text=True).stdout
+        return int(out.split()[0])
+
+    before = loose()
+    assert before > 0
+    result = dev.maintain()
+    assert result["ok"], result
+    assert loose() < before                      # packed, and the loose copies removed
+    assert len(dev.scan("event", {"kind": "t"})) == 6   # nothing lost
+    dev.append("event", {"kind": "t", "rank": 99, "run": "r"})   # the device still works
+    assert len(dev.scan("event", {"kind": "t"})) == 7

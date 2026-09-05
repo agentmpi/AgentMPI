@@ -20,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -28,14 +30,46 @@ ROOT = HERE.parent.parent
 RUNS = ROOT / "runs"
 
 
+def _windowed_metrics(d: Path, window: dict[str, Any]) -> dict[str, Any]:
+    """Metrics of the trace up to ``window["until_ts"]``, computed once and kept.
+
+    A run that was frozen and brought back measures two things: the production
+    run up to the freeze, and the recovery after it.  ``window.json`` in the run
+    directory names the boundary and why; the series reports the run's numbers
+    from the trace before it and carries the full wall alongside, so neither
+    period is hidden in the other.
+    """
+    out_dir = d / "analysis_window"
+    metrics = out_dir / "metrics.json"
+    if not metrics.exists():
+        until = float(window["until_ts"])
+        trace = d / "harness.trace.jsonl"
+        cut = d / "harness.trace.window.jsonl"
+        with open(trace, encoding="utf-8") as src, open(cut, "w", encoding="utf-8") as dst:
+            for line in src:
+                try:
+                    if float(json.loads(line).get("ts", 0)) <= until:
+                        dst.write(line)
+                except (json.JSONDecodeError, ValueError):
+                    continue
+        subprocess.run([sys.executable, "-m", "ampi.cli", "analyze", "--trace", str(cut),
+                        "--name", d.name + "-window", "--out", str(out_dir), "--format", "png",
+                        "--json"], check=True, capture_output=True, text=True)
+        cut.unlink(missing_ok=True)
+    return json.loads(metrics.read_text(encoding="utf-8"))
+
+
 def _load(run: str) -> dict[str, Any]:
     d = RUNS / run
     out: dict[str, Any] = {"name": run}
     for key, fn in (("metrics", "analysis/metrics.json"), ("report", "report.json"),
                     ("plan", "launch_plan.json"), ("config", "config.json"),
-                    ("harness", "harness.json")):
+                    ("harness", "harness.json"), ("window", "window.json")):
         p = d / fn
         out[key] = json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    if out["window"]:
+        out["metrics_full"] = out["metrics"]
+        out["metrics"] = _windowed_metrics(d, out["window"])
     nodes = []
     for p in sorted(d.glob("launch/launch-node*.json")):
         nodes.append(json.loads(p.read_text(encoding="utf-8")))
@@ -93,8 +127,11 @@ def row_of(run: dict[str, Any]) -> dict[str, Any]:
     nodes = run["nodes"]
     machines = {n.get("node_identity", {}).get("boot_id") for n in nodes} - {None}
     cost = float(m.get("total_cost_usd") or r.get("spend_total_usd") or 0.0)
+    full = run.get("metrics_full") or {}
     return {
         "run": run["name"],
+        "window": (run.get("window") or {}).get("reason", ""),
+        "wall_total_s": round(float(full.get("wall_s") or 0.0), 1) if full else None,
         "p": int(m.get("world_size") or plan.get("size") or 0),
         "nodes": int(plan.get("nodes") or len(nodes) or 1),
         "machines_seen": len(machines),
