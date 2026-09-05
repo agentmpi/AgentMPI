@@ -273,7 +273,7 @@ def test_trace_appends_are_acknowledged_before_they_land(tmp_path, monkeypatch):
     dev = GitdDevice(root)
     dev.initialize()
     try:
-        assert dev.append("event", {"kind": "t", "rank": 0, "run": "r"}) == 0
+        dev.append_nowait("event", {"kind": "t", "rank": 0, "run": "r"})
         dev.append("rank", {"rank": 0, "run": "r"})          # a synchronous write lands after it
         rows = dev.scan("event", {"kind": "t"})
         assert len(rows) == 1

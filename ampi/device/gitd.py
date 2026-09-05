@@ -655,12 +655,12 @@ class GitdDevice(Device):
 
     # -- streams -----------------------------------------------------------------
     def append(self, stream: str, record: dict[str, Any]) -> int:
-        if stream == "event":
-            # Traces are acknowledged before they are pushed (see the handler).
-            got = self._call("append", stream=stream, record=record, nowait=True)
-            return 0 if got is _PLACEHOLDER else int(got)
         got = self._call("append", stream=stream, record=record)
         return 0 if got is _PLACEHOLDER else int(got)
+
+    def append_nowait(self, stream: str, record: dict[str, Any]) -> None:
+        # Acknowledged when queued, pushed in the next batch (see the handler).
+        self._call("append", stream=stream, record=record, nowait=True)
 
     def match(self, stream: str, predicate: Predicate, update: dict[str, Any], *,
               order_by: str = "seq") -> dict[str, Any] | None:

@@ -858,7 +858,7 @@ class RuntimeBase:
                 continue
             rec["arg_" + k if k in ("kind", "run", "ts", "seq") else k] = v
         rec.setdefault("rank", self._rank if self._rank is not None else -1)
-        self.device.append("event", rec)
+        self.device.append_nowait("event", rec)
 
     def events(self, *, kind: str | None = None, rank: int | None = None, limit: int | None = None):
         pred: dict[str, Any] = {}

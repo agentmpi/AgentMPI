@@ -351,6 +351,11 @@ class GitDevice(Device):
             local = self._git("rev-parse", "HEAD", check=False)
             remote = self._git("rev-parse", f"origin/{self.branch}")
             if local != remote:
+                # Someone else's commit landed since this writer last looked:
+                # another machine is writing, and this one yields to it for a
+                # while (see _push_gap).
+                if remote != getattr(self, "_last_pushed_head", None):
+                    self._contended_at = time.time()
                 self._git("reset", "-q", "--hard", f"origin/{self.branch}")
         return self._read_state()
 
@@ -486,19 +491,29 @@ class GitDevice(Device):
             finally:
                 self._writing = False
 
-    #: Seconds a writer waits after a successful push before its next one.  Two
-    #: daemons on one ref are a contest the faster loop wins every round: at
-    #: sixteen ranks over two machines, the machine with eight translators
-    #: pushing traces back to back starved the other for ten minutes, because
-    #: the loser's backoff grew with every defeat and the winner's never did.
-    #: Pacing the winner leaves a window the loser's fetch-commit-push fits in.
-    PUSH_GAP_S = float(os.environ.get("AMPI_GIT_PUSH_GAP_S", "0.75"))
+    #: Seconds a writer waits after a successful push before its next one, when
+    #: it is alone (``PUSH_GAP_S``) and when it has seen another machine's commits
+    #: land within the last ``CONTENDED_S`` seconds (``PUSH_GAP_CONTENDED_S``).
+    #: Two daemons on one ref are a contest the faster loop wins every round: at
+    #: sixteen ranks over two machines the machine with eight translators pushing
+    #: back to back starved the other for ten minutes, and a fixed pause of less
+    #: than the loser's fetch-commit-push (about two seconds through a hosted
+    #: remote) still left it losing four pushes in five.  A writer that sees
+    #: someone else writing yields long enough for that someone to land.
+    PUSH_GAP_S = float(os.environ.get("AMPI_GIT_PUSH_GAP_S", "0.25"))
+    PUSH_GAP_CONTENDED_S = float(os.environ.get("AMPI_GIT_PUSH_GAP_CONTENDED_S", "2.5"))
+    CONTENDED_S = 15.0
+
+    def _push_gap(self) -> float:
+        contended = time.time() - getattr(self, "_contended_at", 0.0) < self.CONTENDED_S
+        return self.PUSH_GAP_CONTENDED_S if contended else self.PUSH_GAP_S
 
     def _mutate_locked(self, fn: Any, label: str) -> Any:
         for _attempt in range(self._max_retries):
             since = time.time() - getattr(self, "_last_push", 0.0)
-            if since < self.PUSH_GAP_S:
-                time.sleep(self.PUSH_GAP_S - since)
+            gap = self._push_gap()
+            if since < gap:
+                time.sleep(gap - since)
             state = self._sync()
             result = fn(state)
             self._write_state(state)
@@ -513,8 +528,10 @@ class GitDevice(Device):
             if r.returncode == 0:
                 self.pushes += 1
                 self._last_push = time.time()
+                self._last_pushed_head = self._git("rev-parse", "HEAD", check=False)
                 return result
             self.rejections += 1
+            self._contended_at = time.time()
             # Lost the race: somebody else's commit landed first.  Retry soon,
             # with a little jitter so two losers do not collide again; the
             # winner's pacing above, not the loser's backoff, is what makes the

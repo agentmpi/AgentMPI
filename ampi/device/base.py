@@ -316,6 +316,16 @@ class Device(abc.ABC):
         what the non-overtaking rule (S6.1) is defined against.
         """
 
+    def append_nowait(self, stream: str, record: dict[str, Any]) -> None:
+        """Append without waiting for durability: for trace events (spec S13).
+
+        A device MAY acknowledge before the record lands, provided every other
+        operation's acknowledgement still implies durability and the record
+        lands before any later synchronous write from the same client.  The
+        default is the durable append.
+        """
+        self.append(stream, record)
+
     # -- 2. match ----------------------------------------------------------
     @abc.abstractmethod
     def match(
