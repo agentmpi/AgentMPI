@@ -280,6 +280,20 @@ class BrokerExecutor:
                 and rec.get("state") in ("queued", None)
                 and time.time() - published > float(claim_wait)
             ):
+                # Unclaimed for the whole window.  Before concluding that the
+                # executor is dead, ask whether it is merely busy: an executor
+                # that serves several ranks through one queue claims their tasks
+                # in turn, and a task queued behind three others is waiting on
+                # supply, not on a corpse.  If anything in this campaign was
+                # claimed during the window, the executor is alive; wait another
+                # window rather than fail a rank whose peers would then have to
+                # steal work an executor was about to do.  Only a queue in which
+                # nothing at all moved is the signature of a dead executor.
+                if self._executor_alive_since(published):
+                    self._trace("broker.busy", rank=task.rank, aid=aid, label=task.label,
+                                waited_s=round(time.time() - published, 1))
+                    published = time.time()
+                    continue
                 self._trace("broker.unclaimed", rank=task.rank, aid=aid, label=task.label,
                             waited_s=round(time.time() - published, 1))
                 raise err(
@@ -305,6 +319,21 @@ class BrokerExecutor:
                 last_alive = time.time()
             time.sleep(wait)
             wait = min(2.0, wait * 1.4)
+
+    def _executor_alive_since(self, since: float) -> bool:
+        """Did any executor claim any task of this campaign after ``since``?
+
+        Liveness is a property of the queue, not of one task: a claim on any
+        rank's task proves an executor is serving this queue.  ``claimed_at`` is
+        device clock; ``since`` is wall clock from the same host, close enough
+        for a window measured in minutes.
+        """
+        rows = self.amp.device.scan("task", {"campaign": self.campaign})
+        return any(
+            float(r.get("claimed_at") or 0) > since
+            for r in rows
+            if r.get("state") in ("claimed", "done")
+        )
 
     def _trace(self, kind: str, *, mirror_only: bool = False, **fields: Any) -> None:
         """Record on the queue's job and, when configured, on the shared job."""
