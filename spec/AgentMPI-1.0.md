@@ -1366,6 +1366,14 @@ replayed completion as a second invocation or as blocked time.
 
 ---
 
+An implementation MAY acknowledge a trace append before it is durable, provided
+every other operation's acknowledgement implies durability. A rank's program
+never depends on a trace record; a rank blocked on its own trace while its
+transport lost a race is a stall the trace exists to explain, not to cause.
+What may be lost is the last window of events before a transport's death, and
+an implementation that takes this liberty MUST say so.
+
+
 ## S14. Bindings and conformance
 
 ### S14.1 The command binding

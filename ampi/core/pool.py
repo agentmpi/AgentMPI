@@ -137,7 +137,12 @@ class PoolMixin:
         holder = claim.get("claimed_by")
         if holder is None:
             return True
-        if int(holder) == self.rank and int(claim.get("epoch", 0)) == int(self._rankview().epoch):
+        try:
+            me = self.rank
+        except Exception:  # noqa: BLE001 - a rank-less observer (the driver) is nobody's holder
+            me = None
+        if me is not None and int(holder) == me and \
+                int(claim.get("epoch", 0)) == int(self._rankview().epoch):
             return False
         try:
             view = self._rankview(int(holder))
@@ -179,6 +184,17 @@ class PoolMixin:
             if not open_:
                 self._trace_wait(name, started, drained=True)
                 return {"pool": name, "item": None, "drained": True, "open": 0}
+            # An item this rank already holds and has not finished is its next
+            # item: a rank re-entering its loop (a resumed process, a replayed
+            # program) continues what it claimed rather than leaving it claimed
+            # forever and taking another.
+            for spec in open_:
+                claim = v["claims"].get(spec["id"])
+                if claim is not None and int(claim.get("claimed_by", -1)) == self.rank:
+                    self.trace("pool.resume", rank=self.rank, pool=name, item=spec["id"],
+                               epoch=claim.get("epoch"))
+                    return {"pool": name, "item": spec, "reclaimed": False, "resumed": True,
+                            "waited_s": 0.0}
             ready = [s for s in open_ if all(d in v["done"] for d in s["deps"])]
             ready.sort(key=lambda s: (s["priority"], 0 if prefer and s["group"] == prefer else 1,
                                       s["id"]))

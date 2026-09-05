@@ -486,8 +486,19 @@ class GitDevice(Device):
             finally:
                 self._writing = False
 
+    #: Seconds a writer waits after a successful push before its next one.  Two
+    #: daemons on one ref are a contest the faster loop wins every round: at
+    #: sixteen ranks over two machines, the machine with eight translators
+    #: pushing traces back to back starved the other for ten minutes, because
+    #: the loser's backoff grew with every defeat and the winner's never did.
+    #: Pacing the winner leaves a window the loser's fetch-commit-push fits in.
+    PUSH_GAP_S = float(os.environ.get("AMPI_GIT_PUSH_GAP_S", "0.75"))
+
     def _mutate_locked(self, fn: Any, label: str) -> Any:
-        for attempt in range(self._max_retries):
+        for _attempt in range(self._max_retries):
+            since = time.time() - getattr(self, "_last_push", 0.0)
+            if since < self.PUSH_GAP_S:
+                time.sleep(self.PUSH_GAP_S - since)
             state = self._sync()
             result = fn(state)
             self._write_state(state)
@@ -501,14 +512,15 @@ class GitDevice(Device):
                                cwd=str(self.root), capture_output=True, text=True)
             if r.returncode == 0:
                 self.pushes += 1
+                self._last_push = time.time()
                 return result
             self.rejections += 1
-            # Lost the race: somebody else's commit landed first.  The winner's
-            # push takes about a round trip, so a loser that retries at once
-            # loses again; spread the losers over a window that grows with the
-            # number of consecutive defeats, which is a proxy for how many
-            # writers are contending.
-            time.sleep(random.uniform(0.1, 0.5 * min(attempt + 1, 10)))
+            # Lost the race: somebody else's commit landed first.  Retry soon,
+            # with a little jitter so two losers do not collide again; the
+            # winner's pacing above, not the loser's backoff, is what makes the
+            # contest fair.  A backoff that grew with consecutive defeats made
+            # the loser lose more.
+            time.sleep(random.uniform(0.05, 0.4))
         raise RuntimeError(f"git device: push of {label!r} rejected {self._max_retries} times")
 
 # -- 1-3. streams --------------------------------------------------------

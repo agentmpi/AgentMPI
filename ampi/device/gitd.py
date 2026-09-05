@@ -195,6 +195,7 @@ class GitDaemon:
         self._recent: OrderedDict[tuple[str, int], tuple[str, Any]] = OrderedDict()
         self._recent_lock = threading.Lock()
         self._maint: threading.Thread | None = None
+        self.async_ops = 0
         self.maintenance: list[dict[str, Any]] = []
 
     # -- writes ------------------------------------------------------------------
@@ -322,6 +323,7 @@ class GitDaemon:
         if op == "stats":
             return {**d.stats(), "daemon": {"pid": os.getpid(), "clients": self._clients,
                                             "batches": self.batches, "batched_ops": self.batched_ops,
+                                            "async_ops": self.async_ops,
                                             "largest_batch": self.largest_batch,
                                             "batch_window_s": self.batch_window,
                                             "base_window_s": self.base_window}}
@@ -383,7 +385,19 @@ class GitDaemon:
                             rid = req.get("id")
                             op, args = req["op"], req.get("args") or {}
                             daemon._last_activity = time.time()
-                            if op in MUTATIONS:
+                            if op in MUTATIONS and args.pop("nowait", False):
+                                # A trace event: appended in the next batch, and
+                                # acknowledged now.  The rank's program does not
+                                # depend on a trace record's sequence number, and
+                                # a rank blocked on its own trace while its
+                                # daemon lost push races was the shape of a ten
+                                # minute stall.  What is lost if the daemon dies
+                                # first is the last window of events.
+                                daemon.enqueue(op, args)
+                                daemon.async_ops += 1
+                                ev, slot = threading.Event(), [("ok", 0)]
+                                ev.set()
+                            elif op in MUTATIONS:
                                 if req.get("client") is not None and rid is not None:
                                     key = (str(req["client"]), int(rid))
                                 seen = daemon.recall(key)
@@ -641,6 +655,10 @@ class GitdDevice(Device):
 
     # -- streams -----------------------------------------------------------------
     def append(self, stream: str, record: dict[str, Any]) -> int:
+        if stream == "event":
+            # Traces are acknowledged before they are pushed (see the handler).
+            got = self._call("append", stream=stream, record=record, nowait=True)
+            return 0 if got is _PLACEHOLDER else int(got)
         got = self._call("append", stream=stream, record=record)
         return 0 if got is _PLACEHOLDER else int(got)
 

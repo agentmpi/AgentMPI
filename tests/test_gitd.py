@@ -50,6 +50,9 @@ def test_concurrent_writers_are_group_committed(tmp_path, monkeypatch):
         for t in threads:
             t.join()
         assert not errors
+        # Trace appends are acknowledged before they land; a synchronous write
+        # queued after them is acknowledged only once the batch carrying them is.
+        dev.append("rank", {"rank": 99, "run": "r"})
         rows = dev.scan("event", {"kind": "t"})
         assert len(rows) == 30 and len({r["seq"] for r in rows}) == 30
         stats = dev.stats()["daemon"]
@@ -261,3 +264,18 @@ def test_maintenance_packs_loose_objects(tmp_path):
     assert len(dev.scan("event", {"kind": "t"})) == 6   # nothing lost
     dev.append("event", {"kind": "t", "rank": 99, "run": "r"})   # the device still works
     assert len(dev.scan("event", {"kind": "t"})) == 7
+
+
+def test_trace_appends_are_acknowledged_before_they_land(tmp_path, monkeypatch):
+    monkeypatch.setenv("AMPI_GITD_IDLE_S", "5")
+    root = tmp_path / "job"
+    dev = GitdDevice(root)
+    dev.initialize()
+    try:
+        assert dev.append("event", {"kind": "t", "rank": 0, "run": "r"}) == 0
+        dev.append("rank", {"rank": 0, "run": "r"})          # a synchronous write lands after it
+        rows = dev.scan("event", {"kind": "t"})
+        assert len(rows) == 1
+        assert dev.stats()["daemon"]["async_ops"] == 1
+    finally:
+        dev.shutdown_daemon()

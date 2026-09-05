@@ -1160,3 +1160,16 @@ def test_s7_4_ibcast_root_returns_before_its_receivers_arrive(job):
     assert out[1]["body"] == "x"
     kinds = [e["kind"] for e in ranks[0].events()]
     assert kinds.count("ibcast") >= 4 and "bcast" in kinds
+
+
+def test_s9_5_pool_returns_a_rank_its_own_unfinished_claim(job):
+    """S9.5: a resumed or replayed rank continues the item it holds."""
+    ranks = job(2)
+    for r in ranks:
+        r.pool_create("w", [{"id": "a"}, {"id": "b"}])
+    first = ranks[0].pool_next("w")
+    again = ranks[0].pool_next("w")
+    assert first["item"]["id"] == again["item"]["id"] and again.get("resumed")
+    assert ranks[1].pool_next("w")["item"]["id"] != first["item"]["id"]
+    ranks[0].pool_done("w", first["item"]["id"])
+    assert ranks[0].pool_next("w")["item"] is None       # b is held by rank 1, a is done
