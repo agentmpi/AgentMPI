@@ -604,11 +604,16 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         json.dumps(draft, indent=1, ensure_ascii=False), encoding="utf-8")
 
     usage = executor.stats().get("usage", {}) if hasattr(executor, "stats") else {}
+    amp.ctx_release()   # the model's work is over; what follows is bookkeeping
     spend = amp.allreduce("spend", payload=float(usage.get("cost_usd", 0.0)), op="sum",
                           quorum=cfg.quorum, timeout=cfg.phase_timeout)
     report["spend_total_usd"] = round(float(spend.get("value") or 0.0), 4)
     report["usage"] = usage
 
+    # The manifest is the root's report, not anything a model reads, so the root
+    # takes the handles and reads the bodies uncharged.  Materialising 128 of them
+    # into a ledger that a replay had already filled is what killed the root of
+    # the first completed 128-rank run, two operations before finalize.
     got = amp.gather("assemble",
                      payload={"rank": rank, "segment": segment["index"], "pages": segment["pages"],
                               "units": len(units), "offset": report["paragraph_offset"],
@@ -616,10 +621,17 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
                                                  ("prompt_tokens", "completion_tokens",
                                                   "cost_usd", "calls", "tool_calls")}},
                      root=0, quorum=cfg.quorum, timeout=cfg.phase_timeout,
-                     materialize=(rank == 0))
+                     materialize=False)
     if rank == 0:
         report["contributors"] = got.get("contributors")
-        report["manifest"] = [b["body"] for b in got.get("bodies", [])]
+        manifest = []
+        for b in got.get("bodies", []):
+            body = b.get("body")
+            if body is None and b.get("handle"):
+                body = amp.get_body(b["handle"])
+            if body is not None:
+                manifest.append(body)
+        report["manifest"] = manifest
     phase("done")
     amp.finalize(note="e7 done")
     return report
