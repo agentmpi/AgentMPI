@@ -29,6 +29,7 @@ from .core.comm import CommMixin
 from .core.ft import FaultMixin
 from .core.iface import IfaceMixin
 from .core.p2p import P2PMixin
+from .core.pool import PoolMixin
 from .core.rma import RmaMixin
 
 __all__ = ["Ampi", "conformance"]
@@ -39,6 +40,7 @@ class Ampi(
     CollectiveMixin,
     CommMixin,
     RmaMixin,
+    PoolMixin,
     FaultMixin,
     IfaceMixin,
     RuntimeBase,

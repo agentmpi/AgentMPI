@@ -1056,3 +1056,107 @@ def test_appendix_d_the_runtime_is_pinned_by_content_not_by_version(job):
     changed = fresh.events(kind="runtime.changed")
     assert changed, "a runtime edited under a live job must be recorded"
     assert changed[0]["pinned"] == "0000000000000000"
+
+
+# S9.5 -- work pools
+# ==========================================================================
+
+
+def test_s9_5_pool_admits_one_claimant_per_item_and_drains(job):
+    """S9.5: exclusivity, then termination."""
+    ranks = job(4)
+    for r in ranks:
+        r.pool_create("work", [{"id": f"t{i}", "group": f"b{i % 4}"} for i in range(6)])
+    got = parallel(ranks, lambda r: r.pool_next("work", prefer=f"b{r.rank}"))
+    ids = [g["item"]["id"] for g in got]
+    assert len(set(ids)) == 4 and all(g["item"]["group"] == f"b{r}" for r, g in enumerate(got))
+    for r, g in zip(ranks, got, strict=True):
+        r.pool_done("work", g["item"]["id"], result={"by": r.rank})
+    status = ranks[0].pool_status("work")
+    assert status["done"] == 4 and status["open"] == 2 and not status["drained"]
+    rest = [ranks[0].pool_next("work"), ranks[1].pool_next("work")]
+    assert {g["item"]["id"] for g in rest} == set(f"t{i}" for i in range(6)) - set(ids)
+    assert ranks[2].pool_next("work")["item"] is None
+    for r, g in zip(ranks[:2], rest, strict=True):
+        r.pool_done("work", g["item"]["id"])
+    drained = parallel(ranks, lambda r: r.pool_wait_drained("work", timeout=10))
+    assert all(d["drained"] for d in drained)
+    kinds = [e["kind"] for e in ranks[0].events() if e["kind"].startswith("pool.")]
+    assert kinds.count("pool.claim") == 6 and "pool.drained" in kinds
+
+
+def test_s9_5_pool_gates_an_item_on_its_dependencies(job):
+    """S9.5: an item is claimable only when every dependency is done."""
+    ranks = job(2)
+    for r in ranks:
+        r.pool_create("book", [{"id": "p1"}, {"id": "p2"}])
+    a, b = ranks[0].pool_next("book"), ranks[1].pool_next("book")
+    assert {a["item"]["id"], b["item"]["id"]} == {"p1", "p2"}
+    added = parallel(ranks, lambda r: r.pool_add("book", {"id": "seam", "deps": ["p1", "p2"],
+                                                            "priority": 1}))
+    assert sum(1 for x in added if x["added"]) == 1        # both proposed it, one cell
+    ranks[0].pool_done("book", a["item"]["id"])
+    assert ranks[0].pool_next("book")["item"] is None        # p2 still open: seam not ready
+    ranks[1].pool_done("book", b["item"]["id"])
+    got = ranks[0].pool_next("book")
+    assert got["item"]["id"] == "seam"
+    ranks[0].pool_done("book", "seam")
+    assert ranks[1].pool_status("book")["drained"]
+
+
+def test_s9_5_pool_reclaims_from_a_convicted_holder(job):
+    """S9.5 with S10: a dead holder's item goes back into the pool, traced as a reclaim."""
+    ranks = job(3)
+    for r in ranks:
+        r.pool_create("work", [{"id": "only"}])
+    assert ranks[2].pool_next("work")["item"]["id"] == "only"
+    assert ranks[0].pool_next("work")["item"] is None          # held by a live rank
+    ranks[0].fence_rank(2)                       # an administrative kill
+    got = ranks[1].pool_next("work")
+    assert got["item"]["id"] == "only" and got["reclaimed"]
+    assert any(e["kind"] == "pool.reclaim" and e["from_rank"] == 2 for e in ranks[1].events())
+
+
+def test_s9_5_pool_wait_returns_when_work_appears(job):
+    ranks = job(2)
+    for r in ranks:
+        r.pool_create("w", [{"id": "a"}, {"id": "b", "deps": ["a"]}])
+    first = ranks[0].pool_next("w")
+    assert first["item"]["id"] == "a"
+
+    def waiter(r):
+        return r.pool_next("w", wait=True, timeout=20)
+
+    def finisher(r):
+        import time as _t
+        _t.sleep(1.5)
+        r.pool_done("w", "a")
+        return {"item": {"id": "a"}}
+
+    got = parallel(ranks, lambda r: waiter(r) if r.rank == 1 else finisher(r))
+    assert got[1]["item"]["id"] == "b" and got[1]["waited_s"] >= 1.0
+    assert any(e["kind"] == "pool.wait" for e in ranks[1].events())
+
+
+# S7.4 -- nonblocking collectives
+# ==========================================================================
+
+
+def test_s7_4_ibcast_root_returns_before_its_receivers_arrive(job):
+    ranks = job(3)
+    req = ranks[0].ibcast("news", payload={"v": 1})
+    assert req["complete"] and ranks[0].wait(req["request"])["complete"]
+    # the root has gone on; a receiver arriving later still gets the body
+    r1 = ranks[1].ibcast("news")
+    assert not r1["complete"]
+    assert ranks[1].test(r1["request"])["complete"]
+    got = ranks[1].wait(r1["request"], materialize=True)
+    assert got["body"] == {"v": 1}
+    # a receiver that arrives before the root publishes waits for it
+    r2 = ranks[2].ibcast("later")
+    assert not ranks[2].test(r2["request"])["complete"]
+    out = parallel(ranks[:1] + ranks[2:], lambda r: (
+        r.ibcast("later", payload="x") if r.rank == 0 else r.wait(r2["request"], materialize=True)))
+    assert out[1]["body"] == "x"
+    kinds = [e["kind"] for e in ranks[0].events()]
+    assert kinds.count("ibcast") >= 4 and "bcast" in kinds

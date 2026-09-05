@@ -377,6 +377,78 @@ class CollectiveMixin:
         )
         return out_rec
 
+    # -- nonblocking (S7.4) ----------------------------------------------------
+    def ibcast(
+        self,
+        label: str,
+        *,
+        payload: Any = None,
+        root: int = 0,
+        comm: str = "world",
+    ) -> dict[str, Any]:
+        """Broadcast without waiting: MPI_Ibcast.
+
+        The root deposits its body and returns; its request is complete on
+        return, since the body is immutable and nothing the root does next can
+        disturb it.  A member registers its arrival and returns a request that
+        ``test`` completes when the root has published and ``wait`` delivers
+        with the same view and ledger rules as ``bcast``.  What this buys is a
+        root that goes on to its own work instead of waiting for the slowest of
+        its receivers to arrive, and receivers that fetch the body when they
+        need it rather than where the program order put the call.
+        """
+        self.assert_identity()
+        me = self.comm_rank(comm)
+        if me == root:
+            if payload is None:
+                raise err("AMPI_ERR_ARG", "the root of a broadcast must supply a payload")
+            self._join_collective(comm, label, "bcast", payload=payload, root=root)
+        else:
+            self._join_collective(comm, label, "bcast", root=root)
+        request = f"c|{comm}|{label}"
+        self.trace("ibcast", rank=self.rank, label=label, root=root, comm=comm,
+                   is_root=me == root)
+        return {"request": request, "label": label, "root": root, "comm": comm,
+                "complete": me == root}
+
+    def _coll_request(self, request: str) -> tuple[str, str]:
+        parts = request.split("|", 2)
+        if len(parts) != 3 or parts[0] != "c":
+            raise err("AMPI_ERR_REQUEST", f"not a collective request: {request!r}")
+        return parts[1], parts[2]
+
+    def _coll_root_record(self, comm: str, label: str) -> dict[str, Any] | None:
+        parts = self._participants(comm, label)
+        root_rec = next((p for p in parts if p.get("root") is not None), None)
+        if root_rec is None:
+            return None
+        world_root = self.comm_members(comm)[int(root_rec["root"])]
+        return next((p for p in parts if p["rank"] == world_root and p.get("handle")), None)
+
+    def coll_test(self, request: str) -> dict[str, Any]:
+        comm, label = self._coll_request(request)
+        rec = self._coll_root_record(comm, label)
+        return {"complete": rec is not None, "request": request, "label": label}
+
+    def coll_wait(self, request: str, *, timeout: float = DEFAULT_TIMEOUT_S, **kw: Any) -> dict[str, Any]:
+        comm, label = self._coll_request(request)
+        mine = next((p for p in self._participants(comm, label) if p["rank"] == self.rank), None)
+        if mine is None:
+            raise err("AMPI_ERR_REQUEST", f"rank {self.rank} never joined {label!r}", label=label)
+        if mine.get("root") is not None and self.comm_members(comm)[int(mine["root"])] == self.rank:
+            return {"complete": True, "request": request, "label": label, "root": True}
+        self._await(lambda: self._coll_root_record(comm, label) is not None, timeout=timeout,
+                    what=f"the root of broadcast {label!r} to publish")
+        rec = self._coll_root_record(comm, label)
+        assert rec is not None
+        out_rec = self._take(rec, materialize=kw.get("materialize", False), view=kw.get("view", ""),
+                             out=kw.get("out", ""), extra={"label": label, "root": mine.get("root")})
+        self._coll_done("bcast", mine, comm=comm, label=label, root=mine.get("root"),
+                        tokens=rec.get("tokens", 0), charged=out_rec.get("charged", 0),
+                        materialized=bool(out_rec.get("body") is not None), nonblocking=True)
+        out_rec["request"] = request
+        return out_rec
+
     def scatter(
         self,
         label: str,

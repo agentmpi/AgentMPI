@@ -618,10 +618,27 @@ enqueue a second message.
 
 ### S7.4 Nonblocking operations and durable receives
 
-`AMPI_Isend`, `AMPI_Irecv`, `AMPI_Wait`, `AMPI_Test`, `AMPI_Cancel`.
+`AMPI_Isend`, `AMPI_Irecv`, `AMPI_Wait`, `AMPI_Test`, `AMPI_Cancel`, `AMPI_Ibcast`.
 
 Posted receives MUST be **durable**: an executor may post receives, be replaced,
 and have its successor complete them.
+
+**Nonblocking collectives.** `AMPI_Ibcast(label, payload?, root)` returns a
+request. At the root the body is deposited and the request is complete on
+return. At a member, `AMPI_Test` reports whether the root has published and
+`AMPI_Wait` delivers the body under the same view and ledger rules as
+`AMPI_Bcast`. A rank MAY hold several outstanding requests, and a member MAY
+arrive before or after the root. The completed delivery is traced as the
+blocking form is, marked nonblocking.
+
+> **Rationale.** A blocking broadcast holds its root until a quorum of receivers
+> has arrived, and in a population whose ranks finish at different times the root
+> is usually the one with work waiting. Measured at 128 ranks, the root of the
+> settled glossary waited for its slowest receiver while its own segment sat
+> untranslated. The nonblocking form lets a rank publish and go, and lets a
+> receiver fetch where it needs the body rather than where program order put the
+> call. Only `Ibcast` is required in 1.0: it is the one a population uses to
+> publish a decision, and the others follow the same construction when needed.
 
 ### S7.5 Probing
 
@@ -1003,6 +1020,41 @@ before the population may begin claiming.
 > of writes on a transport where every write is a network round trip; measured
 > at 128 ranks over four machines, forty-eight such writes held the rest of the
 > population at a barrier for most of an hour.
+
+### S9.5 Work pools
+
+A **pool** is a bag of work items over a window, and an implementation MUST
+provide it: `AMPI_Pool_create(name, seeds)`, `AMPI_Pool_add(name, item)`,
+`AMPI_Pool_next(name, prefer?, wait?)`, `AMPI_Pool_done(name, id, result?)`,
+`AMPI_Pool_release(name, id)`, `AMPI_Pool_status(name)`,
+`AMPI_Pool_wait_drained(name)`.
+
+An item has an `id`, a list of dependency ids, a priority and a group. Members
+MUST pass the same seeds to `Pool_create`, as they pass the same group to
+`Comm_create`; seeds are not written. Items added afterwards are written once,
+idempotently, so two members proposing the same item make one.
+
+`Pool_next` MUST return an item that is not done, whose dependencies are all
+done, and that no live holder has claimed, choosing by priority, then the
+caller's preferred group, then id; it MUST claim by compare-and-swap so that
+exactly one caller receives each item. A claim held by a rank the failure
+detector has convicted, or by an earlier epoch of a rank that has since been
+replaced, MUST be reclaimable, and the take-over MUST be traced as a reclaim
+distinct from a claim. With `wait`, the call blocks under the progress
+obligations of S10.4 until an item is available or the pool is drained, and
+the time spent MUST be traced. A pool is **drained** when every known item is
+done; `Pool_wait_drained` is the population's termination condition.
+
+> **Rationale.** Every bag-of-tasks program on shared state gets one of four
+> things wrong on its own: two workers take the same item, a dead worker keeps
+> its item, an item runs before its inputs exist, or nobody can say when the job
+> is finished. None of the four has anything of the application in it, so all
+> four belong to the runtime. The pool is what lets a harness replace a sequence
+> of barriers with a population that is never idle while work exists, and the
+> traced wait is how the harness author learns how much idleness the pool did
+> not remove. The cost is deliberate: one enumeration of keys, uncharged because
+> it is the runtime's bookkeeping and not a model's reading, and one conditional
+> write per claim.
 
 ## S10. Fault tolerance
 
@@ -1503,6 +1555,8 @@ network round trip.
 | — | **`Heartbeat(extend)`** | no MPI analogue |
 | — | **conflict lifting and invariant verification** | no MPI analogue |
 | — | **interface declaration and verification** | no MPI analogue |
+| `MPI_Ibcast` | `AMPI_Ibcast` (S7.4): the root's request completes on return |
+| Work queue / bag of tasks (no MPI analogue) | `AMPI_Pool_*` (S9.5): claim by compare-and-swap, dependency gating, reclaim from a dead holder, termination |
 
 ## Appendix B. Deliberate omissions in 1.0
 

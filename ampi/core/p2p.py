@@ -522,6 +522,8 @@ class P2PMixin:
         return {"request": reqid, "src": world_src, "tag": tag_i, "comm": comm}
 
     def test(self, request: str) -> dict[str, Any]:
+        if request.startswith("c|"):
+            return self.coll_test(request)  # type: ignore[attr-defined]
         entries = self.device.scan("recvq", {"reqid": request}, limit=1)
         if not entries:
             raise err("AMPI_ERR_REQUEST", f"no such request {request!r}")
@@ -534,6 +536,8 @@ class P2PMixin:
         return {"complete": bool(matched), "request": request}
 
     def wait(self, request: str, *, timeout: float = DEFAULT_TIMEOUT_S, **kw: Any) -> dict[str, Any]:
+        if request.startswith("c|"):
+            return self.coll_wait(request, timeout=timeout, **kw)  # type: ignore[attr-defined]
         entries = self.device.scan("recvq", {"reqid": request}, limit=1)
         if not entries:
             raise err("AMPI_ERR_REQUEST", f"no such request {request!r}")

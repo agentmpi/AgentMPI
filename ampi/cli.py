@@ -272,6 +272,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label", required=True)
     p.add_argument("--root", type=int, default=0)
 
+    p = sub.add_parser("ibcast", help="root publishes without waiting; members get a request")
+    _common(p); _payload(p)
+    p.add_argument("--label", required=True)
+    p.add_argument("--root", type=int, default=0)
+
+    p = sub.add_parser("pool", help="a bag of work items: claim, dependency, reclaim, termination")
+    _common(p); _wait(p)
+    psub = p.add_subparsers(dest="poolcmd", required=True)
+    q = psub.add_parser("create"); q.add_argument("name"); q.add_argument("--seeds", default="[]",
+                                                                        help="JSON list of items")
+    q = psub.add_parser("add"); q.add_argument("name"); q.add_argument("item", help="JSON item")
+    q = psub.add_parser("next"); q.add_argument("name"); q.add_argument("--prefer", default="")
+    q.add_argument("--block", action="store_true", help="wait until an item is available")
+    q = psub.add_parser("done"); q.add_argument("name"); q.add_argument("id")
+    q.add_argument("--result", default=None, help="JSON")
+    q = psub.add_parser("release"); q.add_argument("name"); q.add_argument("id")
+    q.add_argument("--reason", default="")
+    q = psub.add_parser("status"); q.add_argument("name")
+    q = psub.add_parser("drain"); q.add_argument("name")
+
     p = sub.add_parser("scatter", help="root distributes one slice per rank")
     _common(p); _wait(p); _payload(p); _take(p)
     p.add_argument("--label", required=True)
@@ -792,6 +812,27 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
                                        timeout=a.timeout, materialize=a.materialize,
                                        view=a.view), amp.rank, job)
 
+    if cmd == "ibcast":
+        return (amp.ibcast(a.label, payload=_payload_of(a), root=a.root, comm=a.comm),
+                amp.rank, job)
+    if cmd == "pool":
+        w = a.poolcmd
+        if w == "create":
+            return amp.pool_create(a.name, json.loads(a.seeds), comm=a.comm), amp.rank, job
+        if w == "add":
+            return amp.pool_add(a.name, json.loads(a.item)), amp.rank, job
+        if w == "next":
+            return (amp.pool_next(a.name, prefer=a.prefer, wait=a.block, timeout=a.timeout),
+                    amp.rank, job)
+        if w == "done":
+            return (amp.pool_done(a.name, a.id, json.loads(a.result) if a.result else None),
+                    amp.rank, job)
+        if w == "release":
+            return amp.pool_release(a.name, a.id, reason=a.reason), amp.rank, job
+        if w == "status":
+            return amp.pool_status(a.name), amp.rank, job
+        if w == "drain":
+            return amp.pool_wait_drained(a.name, timeout=a.timeout), amp.rank, job
     if cmd == "win":
         w = a.wincmd
         if w == "list":
