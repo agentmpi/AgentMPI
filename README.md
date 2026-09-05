@@ -222,6 +222,19 @@ python experiments/e6_book/rank.py session-prompt --name e6-book-p16 --rank 7 --
 python experiments/e6_book/rank.py collect --name e6-book-p16                    # evidence, book, analysis
 ```
 
+The `p=16` run is in `runs/e6-book-p16/`: all 64 pages of Part One in three
+languages, 3201 sentences, none missing. It survived the failure the protocol
+cannot detect --- the account's usage limit froze all sixteen sessions at once,
+three separate times, for 27 of its 32 wall-clock hours --- because every task
+result is memoised and replayed on resume: the `SessionStart` hook restarts a
+paused machine's harness, the rank program re-runs from the top, skips the work
+it already did, and passes back through collectives it already completed. Two
+machines never came back; their ranks were convicted and the survivors stole
+their pages, so the book still assembled complete from fourteen of sixteen
+ranks. The `p=32` and `p=64` runs wait for a window in which the usage limit is
+not the binding constraint; the launcher (a committed `LAUNCH.json`, the hook,
+several ranks per machine) is in place and needs only the sessions.
+
 ## Results, including the negative ones
 
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,

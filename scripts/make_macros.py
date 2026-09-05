@@ -329,7 +329,7 @@ def e6_macros() -> None:
     """
     rows = load(RUNS / "e6-series" / "series.json") or []
     by_p = {r["p"]: r for r in rows}
-    keys = ("Wall", "WallH", "Machines", "Tasks", "Work", "Blocked", "Coord", "Par", "Eff",
+    keys = ("Wall", "WallH", "ActiveWallH", "FrozenH", "Freezes", "ActivePar", "Machines", "Tasks", "Work", "Blocked", "Coord", "Par", "Eff",
             "Conf", "Commits", "CommitsPerRank", "Convicted", "Stolen", "Pages", "Expected",
             "Sentences", "Researched", "LockWait", "ClaimsWon", "ClaimAttempts",
             "TranslateMedian", "ResearchMedian", "SurveyMedian", "ReviewN", "ReviseN",
@@ -344,6 +344,10 @@ def e6_macros() -> None:
         book = r.get("book") or {}
         put(f"eSixWall{p}", int(round(r["wall_s"])))
         put(f"eSixWallH{p}", round(r["wall_s"] / 3600, 2), fmt=".2f")
+        put(f"eSixActiveWallH{p}", round(r.get("active_wall_s", r["wall_s"]) / 3600, 2), fmt=".2f")
+        put(f"eSixFrozenH{p}", round(r.get("frozen_h") or 0, 2), fmt=".2f")
+        put(f"eSixFreezes{p}", r.get("n_freezes") or 0)
+        put(f"eSixActivePar{p}", round(r.get("active_parallelism") or 0, 2), fmt=".2f")
         put(f"eSixMachines{p}", r.get("machines"))
         put(f"eSixTasks{p}", r.get("tasks"))
         put(f"eSixWork{p}", int(round(r["work_rank_s"])))

@@ -30,6 +30,11 @@ HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent.parent
 RUNS = ROOT / "runs"
 
+#: A silence longer than this in the event stream is a population-wide pause
+#: (an account usage-limit freeze), not a slow step: no collective or agent
+#: task in this harness runs anywhere near twenty minutes.
+_FREEZE_GAP_S = 1200.0
+
 PHASES = ("launch", "survey", "census", "research", "glossary", "translate", "review",
           "seams", "assemble", "done")
 AGENT_LABELS = ("survey", "arbitrate", "research", "translate", "fix", "review", "revise", "seam")
@@ -67,6 +72,20 @@ def summarise_run(name: str) -> dict[str, Any] | None:
     t0 = events[0]["ts"]
     wall = events[-1]["ts"] - t0
     p = report.get("size") or (plan or {}).get("size")
+
+    # Freeze accounting.  When the account hits a usage limit every session is
+    # paused at once, and the harness processes do not survive it: the whole
+    # population stops writing for hours, then the resume machinery brings it
+    # back.  A gap in the event stream longer than any single collective or
+    # agent step could explain is such a pause; subtracting the gaps gives the
+    # active wall time, which is what the per-task costs actually accrued in.
+    # The span is kept too, because the fact that a production run took a day of
+    # wall clock to do five hours of work is itself a finding.
+    ts = sorted(e["ts"] for e in events)
+    freezes = [{"start": round(a, 1), "end": round(b, 1), "hours": round((b - a) / 3600, 2)}
+               for a, b in zip(ts, ts[1:]) if b - a > _FREEZE_GAP_S]
+    frozen_s = sum(f["end"] - f["start"] for f in freezes)
+    active_wall = wall - frozen_s
 
     # Agent work, from the mirrored broker spans.
     claims: dict[str, dict[str, Any]] = {}
@@ -136,6 +155,8 @@ def summarise_run(name: str) -> dict[str, Any] | None:
     book = report.get("book") or {}
     row = {
         "name": name, "p": p, "wall_s": round(wall, 1), "wall_h": round(wall / 3600, 2),
+        "active_wall_s": round(active_wall, 1), "active_wall_h": round(active_wall / 3600, 2),
+        "freezes": freezes, "n_freezes": len(freezes), "frozen_h": round(frozen_s / 3600, 2),
         "machines": machines,
         "ranks_finalised": (report.get("rank_states") or {}).get("finalised", 0),
         "ranks_failed": (report.get("rank_states") or {}).get("failed", 0),
@@ -145,6 +166,11 @@ def summarise_run(name: str) -> dict[str, Any] | None:
         "coordination_share": round(blocked / (p * wall), 4) if p and wall else None,
         "achieved_parallelism": round(work_s / wall, 2) if wall else None,
         "parallel_efficiency": round(work_s / (p * wall), 4) if p and wall else None,
+        # On active wall the blocked total still spans the freezes, so it is not
+        # recomputed; achieved parallelism on active wall is the honest figure
+        # for how much of the work overlapped while the machines were awake.
+        "active_parallelism": round(work_s / active_wall, 2) if active_wall > 0 else None,
+        "active_efficiency": round(work_s / (p * active_wall), 4) if p and active_wall > 0 else None,
         "worst_collectives": [{"label": k, "rank_s": round(s, 1), "max_wait_s": round(m, 1)}
                               for s, k, m in worst],
         "phases": phases,
