@@ -33,7 +33,13 @@ python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p32-die --size
 # 256 ranks over four machines (64 processes each): run this on each, with
 # --node 0..3.  Node 0 creates the job and must start first; the others join it
 # through the gitd daemon.  Four machines is inside the transport's ceiling and
-# eight is not (see NODES.md and runs/e7-rawapi-p256-attempt1).
+# eight is not (see NODES.md and runs/e7-rawapi-p256-attempt1).  node.sh is the
+# one-command form every production node used: the standard flags and model
+# pool, the driver detached, its log under work/e7/:
+bash experiments/e7_rawapi_book/node.sh e7-rawapi-p256 256 4 $K
+# ... and with a fifth argument the node re-enters a job that already exists on
+# the branch (the machine was recycled, or every session was frozen at once):
+bash experiments/e7_rawapi_book/node.sh e7-rawapi-p256 256 4 $K rejoin
 python -m experiments.e7_rawapi_book.harness run --name e7-rawapi-p256 --size 256 --executor model \
     --device gitd --remote https://github.com/agentmpi/AgentMPI --nodes 4 --node $K
 # a node whose machine was recycled re-enters the same job (its convicted ranks
