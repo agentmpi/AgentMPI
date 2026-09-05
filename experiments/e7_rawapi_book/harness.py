@@ -294,7 +294,13 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         path = res.get("saved_to")
         if not path:
             return res.get("body", res.get("value"))
-        return json.loads(Path(path).read_text(encoding="utf-8"))
+        text = Path(path).read_text(encoding="utf-8")
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"{label}: the delivered body is not JSON ({exc}); a body with an elision "
+                "marker was degraded by a ledger somewhere upstream") from exc
 
     def bcast_in(label: str) -> Any:
         return take(amp.bcast(label, root=0, timeout=cfg.phase_timeout,
@@ -405,6 +411,12 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         conflicts = lifted.get("conflicts") or {}
         if not conflicts:
             value = lifted.get("value", {})
+            if rank == 0 and (lifted.get("degraded_to") or not isinstance(value, dict)):
+                # The returned value is what the ledger let through; the stored
+                # result is the whole thing.  A degraded view is a string with
+                # elisions, and broadcasting it once poisoned every rank's copy
+                # of the binding glossary at p = 128.
+                value = amp.get_body(lifted["handle"])
             if rank == 0:
                 amp.bcast(f"{label}-settled", payload=value, root=0, timeout=cfg.phase_timeout)
                 return value
@@ -445,6 +457,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
     if cfg.arm != "noglossary":
         # -- 3. the census, with conflicts lifted -----------------------------
         phase("census")
+        amp.ctx_release()   # the reductions' bodies must not compete with the ledger's leftovers
         census = amp.allreduce(
             "census", payload={t: terms[t]["proposed"] for t in terms}, op="union",
             algorithm=cfg.algorithm, quorum=cfg.quorum, timeout=cfg.phase_timeout,
@@ -497,6 +510,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         for term, f in findings.items():
             if isinstance(f.get("rendering"), dict):
                 mine[term] = f["rendering"]
+        amp.ctx_release()
         merged = amp.allreduce("glossary", payload=mine, op="union", algorithm=cfg.algorithm,
                                quorum=cfg.quorum, timeout=cfg.phase_timeout)
         report["glossary_conflicts"] = len(merged.get("conflicts") or {})
