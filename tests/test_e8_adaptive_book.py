@@ -48,7 +48,7 @@ def test_stub_population_drains_the_pool_and_covers_the_book(tmp_path):
     trace = (tmp_path / "run" / "harness.trace.jsonl").read_text(encoding="utf-8")
     ev = [json.loads(line) for line in trace.splitlines() if line.strip()]
     kinds = {e["kind"] for e in ev}
-    assert {"pool.create", "pool.claim", "pool.done", "pool.add", "pool.drained", "ibcast",
+    assert {"pool.create", "pool.claim", "pool.done", "pool.add", "pool.wait", "ibcast",
             "win.accumulate"} <= kinds
     claims = [e for e in ev if e["kind"] == "pool.claim"]
     assert len(claims) == summary["pool"]["items"]
