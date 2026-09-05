@@ -981,6 +981,15 @@ not observe.
 
 ---
 
+A claim (S9) MUST treat an absent cell as unclaimed: whichever executor first
+swaps the absent cell for its claim record wins, and no cell needs to be posted
+before the population may begin claiming.
+
+> **Rationale.** Posting one cell per work item from the root is a serial chain
+> of writes on a transport where every write is a network round trip; measured
+> at 128 ranks over four machines, forty-eight such writes held the rest of the
+> population at a barrier for most of an hour.
+
 ## S10. Fault tolerance
 
 ### S10.1 The failure model

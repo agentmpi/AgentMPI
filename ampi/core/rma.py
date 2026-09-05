@@ -253,9 +253,17 @@ class RmaMixin:
                 "current": new.value if ok else self.device.read(space, key).value}
 
     def claim(self, win: str, key: str, *, comm: str = "world", note: str = "") -> dict[str, Any]:
-        """Claim an unclaimed work item.  Sugar over compare-and-swap."""
+        """Claim an unclaimed work item.  Sugar over compare-and-swap.
+
+        An absent cell counts as unclaimed, so nobody has to post a cell per item
+        before the population may claim them: at 128 ranks over four machines,
+        posting forty-eight cells one push at a time from the root held everyone
+        else at a barrier for most of an hour.
+        """
+        space = self._require_win(win, comm)
+        expect = None if self.device.read(space, key) is None else "unclaimed"
         got = self.compare_and_swap(
-            win, key, "unclaimed", {"claimed_by": self.rank, "at": self.device.clock(), "note": note},
+            win, key, expect, {"claimed_by": self.rank, "at": self.device.clock(), "note": note},
             comm=comm,
         )
         return {"win": win, "key": key, "claimed": got["swapped"], "holder": got.get("current")}

@@ -399,3 +399,22 @@ def test_every_command_in_the_worker_prompt_parses(tmp_path):
         parser.parse_args(shlex.split(expanded))
         checked += 1
     assert checked >= 1, "the prompt no longer contains an invocation to check"
+
+
+def test_lease_renewal_keeps_the_length_the_rank_asked_for(tmp_path):
+    """A rank that asked for a long lease is not shrunk to the default by its next touch."""
+    from ampi.runtime import Ampi
+
+    root = tmp_path / "job"
+    Ampi.create(str(root), 1, device="sqlite", force=True).close()
+    a = Ampi(str(root), rank=0)
+    a.init(lease_s=900.0)
+    try:
+        a._last_touch = 0.0  # noqa: SLF001 - defeat the rate limit for the test
+        a.touch()
+        view = a._rankview()  # noqa: SLF001
+        assert view.lease_until - a.device.clock() > 600
+        a.heartbeat()
+        assert a._rankview().lease_until - a.device.clock() > 600  # noqa: SLF001
+    finally:
+        a.close()

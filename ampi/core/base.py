@@ -98,6 +98,10 @@ class RankView:
     failure_kind: str = ""
     ctx: dict[str, Any] | None = None
     suspect_since: float | None = None
+    #: The lease length this rank asked for at init.  Renewals use it: a lease
+    #: renewed to the default 180 s on a transport whose batch lands every minute
+    #: or two is a rank convicted for waiting, whatever it asked for.
+    lease_s: float = DEFAULT_LEASE_S
 
     def to_dict(self) -> dict[str, Any]:
         d = dict(self.__dict__)
@@ -466,6 +470,7 @@ class RuntimeBase:
 
         if view.state == STATE_RUNNING and not reinit:
             view.last_seen = now
+            view.lease_s = lease_s
             view.lease_until = now + lease_s
             self._write_rank(view)
             self.trace("init.heartbeat", rank=view.rank, epoch=view.epoch)
@@ -485,6 +490,7 @@ class RuntimeBase:
 
         view.state = STATE_RUNNING
         view.last_seen = now
+        view.lease_s = lease_s
         view.lease_until = now + lease_s
         view.suspect_since = None
         view.failure_kind = ""
@@ -549,7 +555,7 @@ class RuntimeBase:
         view = self._fence_check()
         now = self.device.clock()
         view.last_seen = now
-        view.lease_until = now + max(DEFAULT_LEASE_S, extend)
+        view.lease_until = now + max(view.lease_s or DEFAULT_LEASE_S, extend)
         if view.state == STATE_SUSPECT:
             # Retraction.  Without it, a heavy-tailed executor is convicted for
             # the crime of thinking, and the job cascades.
@@ -591,7 +597,7 @@ class RuntimeBase:
         if view.state in (STATE_RUNNING, STATE_SUSPECT):
             now = self.device.clock()
             view.last_seen = now
-            view.lease_until = max(view.lease_until, now + DEFAULT_LEASE_S)
+            view.lease_until = max(view.lease_until, now + (view.lease_s or DEFAULT_LEASE_S))
             if view.state == STATE_SUSPECT:
                 view.state = STATE_RUNNING
                 view.suspect_since = None

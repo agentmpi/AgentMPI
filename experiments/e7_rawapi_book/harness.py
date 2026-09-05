@@ -466,10 +466,10 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, segments: list[dict[str, Any]],
         if cfg.arm != "noresearch":
             phase("research")
             amp.win_create(RESEARCH_WIN)
-            if rank == 0:
-                for item in agenda:
-                    if not amp.get(RESEARCH_WIN, f"claim/{item['key']}").get("present"):
-                        amp.put(RESEARCH_WIN, f"claim/{item['key']}", "unclaimed")
+            # A claim is a compare-and-swap from absence, so no cell needs posting
+            # first.  The root used to post one "unclaimed" cell per agenda item,
+            # one push at a time, while 127 ranks waited at the barrier below: on a
+            # four-machine git transport that was forty-eight serial pushes.
             amp.barrier("agenda-posted", quorum=cfg.quorum, timeout=cfg.phase_timeout,
                         policy=cfg.barrier_policy)
             done = 0
