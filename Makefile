@@ -21,8 +21,8 @@ bib:
 
 paper: macros bib
 	cd paper && pdflatex -interaction=nonstopmode main.tex >/dev/null && \
-	  bibtex main >/dev/null 2>&1 || true; \
-	  cd paper && pdflatex -interaction=nonstopmode main.tex >/dev/null && \
+	  (bibtex main >/dev/null 2>&1 || true) && \
+	  pdflatex -interaction=nonstopmode main.tex >/dev/null && \
 	  pdflatex -interaction=nonstopmode main.tex >/dev/null && \
 	  pdfinfo main.pdf | grep -i pages
 
