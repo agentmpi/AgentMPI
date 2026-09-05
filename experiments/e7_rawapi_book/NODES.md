@@ -137,3 +137,21 @@ meanwhile, and were convicted alive by peers waiting at the glossary reduction.
 The executor now renews the lease between model rounds (`ampitools/model.py`);
 the lease should still be longer than the task timeout, since a task may make a
 single call that long.
+
+*At p = 256 the population's polling is the load.*  The 256-rank run over four
+machines finished in 232 minutes for $23, against 137 minutes for the same book
+at p = 128, and the difference was not the models: translation took 21 minutes
+and the seams 46, as at every scale.  It was the collectives at the ends of the
+run.  A rank waiting in a collective polls: it reads every member's row to see
+who has failed and reads the participant list, so a poll costs p reads and a
+population polling costs p² of them, all through one daemon per machine that is
+also parsing a 38 MB state file on every commit.  Node 0's daemon ran at 85% of
+a core with 64 clients; the exscan-and-barrier between glossary and translation
+took 34 minutes and the spend reduction and manifest gather at the end took 40.
+Twelve ranks whose research or seam task ran longer than the 1800 s lease were
+convicted alive (the executor now renews the lease between model rounds), and
+every polling rank convicted each of them again --- 355 conviction records for
+twelve victims, each a mutation (a conviction is now one record).  The runtime
+should read the rank table once per poll, not once per member, and the daemon
+should keep the state parsed rather than re-reading it; both are the next
+transport work.

@@ -254,7 +254,7 @@ intra-node aggregation every production MPI does before it touches the network.
 It passes the same conformance suite as the other four transports. `E7`
 (`experiments/e7_rawapi_book/`) is the experiment built on all three: the
 production book translation on raw-API ranks: 16, 32 and 64 processes on one
-machine and 128 over four machines to completion, then 256 over four, with
+machine, then 128 and 256 over four machines, all to completion, with
 checkpointed results, injected executor deaths, an agent-evaluated arbitration
 spread over the population, and a locked amendment ledger. Its runs are under
 `runs/e7-rawapi-*`; the multi-node attempts that did not finish are kept as
@@ -279,8 +279,13 @@ account.
   device write, forty-six minutes of silence at the research fence (fixed, spec
   S6.1). The completed run was then frozen whole by an account-wide usage limit
   two minutes short of its last reduction, and came back from the branch by
-  `rejoin`, finding three more defects in the replays. `runs/e7-rawapi-p128`,
-  `runs/e7-rawapi-p128-attempt1..5`.
+  `rejoin`, finding three more defects in the replays. 256 ranks over the same
+  four machines then finished the book in 232 min for $23.38 at 99.0%
+  coverage, with model time unchanged and coordination at 72% of rank-time:
+  the runtime's collective polling (p² row reads a round through one daemon a
+  machine) is the cost that grows, and it is named with its fixes in
+  `experiments/e7_rawapi_book/NODES.md`. `runs/e7-rawapi-p128`,
+  `runs/e7-rawapi-p256`, `runs/e7-rawapi-p128-attempt1..5`.
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,
   half-bandwidth point 1521 tokens. β agrees within 2% across all three
   transports, because the per-token cost is serialisation above the waist rather
