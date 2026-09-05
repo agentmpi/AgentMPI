@@ -38,6 +38,7 @@ without a network.
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import itertools
 import json
@@ -352,6 +353,32 @@ class GitDevice(Device):
             if local != remote:
                 self._git("reset", "-q", "--hard", f"origin/{self.branch}")
         return self._read_state()
+
+    #: Pack the repository every this many successful pushes.  Every commit stores
+    #: the whole state file as a loose object (a few megabytes zlib-compressed);
+    #: packed, consecutive versions are deltas of a few kilobytes.  The 128-rank
+    #: run's device history reached 14 GB unpacked and filled node 0's disk two
+    #: operations before the root finalised.
+    MAINTAIN_EVERY = 200
+
+    def maintain(self) -> dict[str, Any]:
+        """Pack loose objects into a delta-compressed pack and drop what they
+        replaced.  Safe beside a concurrent commit: ``repack -d`` removes only
+        loose objects it has just written into the new pack."""
+        started = time.time()
+        r = subprocess.run(["git", *GIT_IDENTITY, "repack", "-d", "-q"], cwd=str(self.root),
+                           capture_output=True, text=True)
+        # An interrupted pack leaves tmp_pack_* files that nothing removes.
+        stale = 0
+        pack_dir = self.root / ".git" / "objects" / "pack"
+        if pack_dir.exists():
+            for tmp in pack_dir.glob("tmp_*"):
+                with contextlib.suppress(OSError):
+                    if time.time() - tmp.stat().st_mtime > 1800:
+                        tmp.unlink()
+                        stale += 1
+        return {"ok": r.returncode == 0, "seconds": round(time.time() - started, 2),
+                "stale_removed": stale, "error": (r.stderr or "").strip()[:200]}
 
     def _read_state(self) -> dict[str, Any]:
         p = self.root / STATE_FILE

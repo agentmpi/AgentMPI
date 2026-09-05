@@ -194,6 +194,8 @@ class GitDaemon:
         # remains is a daemon restart, which forgets the table.
         self._recent: OrderedDict[tuple[str, int], tuple[str, Any]] = OrderedDict()
         self._recent_lock = threading.Lock()
+        self._maint: threading.Thread | None = None
+        self.maintenance: list[dict[str, Any]] = []
 
     # -- writes ------------------------------------------------------------------
     def _worker(self) -> None:
@@ -238,7 +240,26 @@ class GitDaemon:
             self.dev._mutate(fn, f"batch of {len(batch)}")  # noqa: SLF001 - the CAS loop
         except Exception as exc:  # noqa: BLE001 - every waiter must learn the outcome
             return [("error", f"{type(exc).__name__}: {exc}")] * len(batch)
+        self._maybe_maintain()
         return results
+
+    def _maybe_maintain(self) -> None:
+        """Pack the repository every ``MAINTAIN_EVERY`` pushes, off the commit path."""
+        every = getattr(self.dev, "MAINTAIN_EVERY", 0)
+        if not every or self.dev.pushes == 0 or self.dev.pushes % every:
+            return
+        if self._maint and self._maint.is_alive():
+            return
+
+        def run() -> None:
+            try:
+                self.maintenance.append(self.dev.maintain())
+            except Exception as exc:  # noqa: BLE001 - maintenance must never take the daemon down
+                self.maintenance.append({"ok": False, "error": f"{type(exc).__name__}: {exc}"})
+            del self.maintenance[:-8]
+
+        self._maint = threading.Thread(target=run, name="gitd-maintain", daemon=True)
+        self._maint.start()
 
     def recall(self, key: tuple[str, int] | None) -> tuple[str, Any] | None:
         if key is None:
