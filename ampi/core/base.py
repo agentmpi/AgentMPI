@@ -861,6 +861,10 @@ class RuntimeBase:
         self.device.append_nowait("event", rec)
 
     def events(self, *, kind: str | None = None, rank: int | None = None, limit: int | None = None):
+        # A device may acknowledge a trace append before it lands (S13); reading
+        # the trace lands what this rank wrote, so a program that traces and then
+        # reads sees its own evidence.
+        self.device.flush()
         pred: dict[str, Any] = {}
         if kind is not None:
             pred["kind"] = kind

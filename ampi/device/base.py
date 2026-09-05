@@ -320,11 +320,16 @@ class Device(abc.ABC):
         """Append without waiting for durability: for trace events (spec S13).
 
         A device MAY acknowledge before the record lands, provided every other
-        operation's acknowledgement still implies durability and the record
-        lands before any later synchronous write from the same client.  The
-        default is the durable append.
+        operation's acknowledgement still implies durability, the record lands
+        before any later synchronous write from the same client, and ``flush``
+        makes it readable.  The default is the durable append.
         """
         self.append(stream, record)
+
+    def flush(self) -> None:
+        """Land everything this client appended without waiting.  A no-op for a
+        device whose appends are always durable."""
+        return None
 
     # -- 2. match ----------------------------------------------------------
     @abc.abstractmethod

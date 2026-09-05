@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 import random
@@ -360,8 +361,13 @@ class ChatModel:
                 retry_after = None
             raise ModelError(f"HTTP {exc.code}: {text}", status=exc.code,
                              retryable=exc.code in RETRY_STATUSES, retry_after=retry_after) from None
-        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as exc:
-            raise ModelError(f"transport: {exc}", retryable=True) from None
+        except (urllib.error.URLError, TimeoutError, ConnectionError, OSError,
+                http.client.HTTPException) as exc:
+            # HTTPException is not an OSError: a provider that closes a chunked
+            # response early raises IncompleteRead, which escaped this handler
+            # and killed eight rank processes mid-translation.  Every failure to
+            # read a reply is a transport fault and is retried.
+            raise ModelError(f"transport: {type(exc).__name__}: {exc}", retryable=True) from None
         try:
             return json.loads(payload)
         except json.JSONDecodeError:

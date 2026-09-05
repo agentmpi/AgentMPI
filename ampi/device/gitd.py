@@ -90,7 +90,8 @@ MAX_BATCH = 2000
 #: ambiguous reply (the connection closed after the batch landed) gets the
 #: original outcome instead of a second application.
 RECENT_REPLIES = 8192
-MUTATIONS = frozenset({"append", "match", "update", "cas", "lease", "release", "put_object"})
+MUTATIONS = frozenset({"append", "match", "update", "cas", "lease", "release", "put_object",
+                       "noop"})
 _PLACEHOLDER = object()
 
 
@@ -235,7 +236,10 @@ class GitDaemon:
 
         def fn(state: dict[str, Any]) -> None:
             for i, (op, args, _ev, _slot) in enumerate(batch):
-                results[i] = ("ok", apply_op(state, op, args, self.dev.clock()))
+                # A flush rides the queue behind the appends it waits for and
+                # changes nothing; a batch of nothing else commits nothing.
+                results[i] = ("ok", None if op == "noop"
+                              else apply_op(state, op, args, self.dev.clock()))
 
         try:
             self.dev._mutate(fn, f"batch of {len(batch)}")  # noqa: SLF001 - the CAS loop
@@ -661,6 +665,17 @@ class GitdDevice(Device):
     def append_nowait(self, stream: str, record: dict[str, Any]) -> None:
         # Acknowledged when queued, pushed in the next batch (see the handler).
         self._call("append", stream=stream, record=record, nowait=True)
+        self._unflushed = True
+
+    def flush(self) -> None:
+        """Wait for the appends this client did not wait for.
+
+        The daemon's queue is ordered, so an operation that changes nothing and
+        is waited for lands behind them.
+        """
+        if getattr(self, "_unflushed", False):
+            self._unflushed = False
+            self._call("noop")
 
     def match(self, stream: str, predicate: Predicate, update: dict[str, Any], *,
               order_by: str = "seq") -> dict[str, Any] | None:
