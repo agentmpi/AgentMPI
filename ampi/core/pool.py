@@ -48,6 +48,9 @@ def normalise_item(item: dict[str, Any] | str) -> dict[str, Any]:
     return {
         "id": str(item["id"]),
         "deps": [str(d) for d in (item.get("deps") or [])],
+        # Ascending, as ``nice``: an item of priority 0 is claimed before one of
+        # priority 1, so a harness expresses "only when nothing better is left"
+        # with a larger number.
         "priority": int(item.get("priority", 0)),
         "group": str(item.get("group", "")),
         "payload": item.get("payload"),
@@ -168,7 +171,8 @@ class PoolMixin:
         """Claim the next available item, or report why there is none.
 
         Available: not done, not held by a live holder, every dependency done.
-        Order: priority, then the caller's preferred group, then id.  With
+        Order: ascending priority (as ``nice``: 0 is claimed before 1), then the
+        caller's preferred group, then id.  With
         ``wait`` the call blocks, discharging a blocked rank's obligations, until
         an item is available or the pool is drained; the time spent is traced as
         ``pool.wait`` because it is the idle time the pool exists to remove.

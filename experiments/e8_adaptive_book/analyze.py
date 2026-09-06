@@ -65,7 +65,10 @@ def per_rank(ev: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
                 row["seams"] += 1
         elif k == "pool.claim":
             item = str(e.get("item", ""))
-            if item.startswith("p") and not e.get("preferred"):
+            # Stolen means "not from my home block".  The claim's ``preferred``
+            # flag is a different thing: a rank whose block is finished prefers
+            # the fullest block, and claiming from that is preferred but stolen.
+            if item.startswith("p") and e.get("group") != f"b{r}":
                 row["stolen"] += 1
             if e.get("reclaimed"):
                 row["reclaimed"] += 1
@@ -111,11 +114,14 @@ def device_latency(ev: list[dict[str, Any]], ranks_per_node: int) -> dict[str, A
             key = (int(e["rank"]), e["item"])
             if key in ends:
                 gaps[int(e["rank"]) // max(1, ranks_per_node)].append(e["ts"] - ends.pop(key))
-    out = {}
+    out: dict[str, Any] = {}
+    total = 0.0
     for node, g in sorted(gaps.items()):
         g.sort()
+        total += sum(g)
         out[f"node{node}"] = {"pages": len(g), "median_s": round(g[len(g) // 2], 1),
                               "p90_s": round(g[int(len(g) * 0.9)], 1)}
+    out["total_rank_h"] = round(total / 3600, 2)
     return out
 
 
@@ -186,9 +192,10 @@ def timeline(ranks: dict[int, dict[str, Any]], t0: float, out: Path) -> Path | N
     ax.set_ylabel("rank")
     ax.set_xlabel("minutes since launch")
     ax.invert_yaxis()
-    for fam, c in colours.items():
-        ax.barh([], [], color=c, label=fam)
-    ax.legend(frameon=False, ncol=4, fontsize=8, loc="lower right")
+    # An empty bar carries no colour into the legend; a proxy patch does.
+    from matplotlib.patches import Patch
+    ax.legend(handles=[Patch(facecolor=c, label=fam) for fam, c in colours.items()],
+              frameon=False, ncol=4, fontsize=8, loc="lower right")
     ax.set_title("E8: model calls per rank; gaps are waiting")
     fig.tight_layout()
     p = out / "timeline.png"
@@ -208,7 +215,9 @@ def render(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
              f"| model exchanges / spend | {s['calls']} / ${s['cost_usd']} |",
              "| transport per page, by node (median / p90 s from translation done to pool done) | "
              + "; ".join(f"{k}: {v['median_s']} / {v['p90_s']} ({v['pages']} pages)"
-                         for k, v in s["device_latency"].items()) + " |", ""]
+                         for k, v in s["device_latency"].items()
+                         if isinstance(v, dict))
+             + f"; {s['device_latency'].get('total_rank_h', 0)} rank-hours in total |", ""]
     if vs:
         lines += [f"### Against {vs['name']}", "",
                   "| | E7 (phases) | E8 (pool) |", "|---|---|---|",
@@ -225,10 +234,62 @@ def render(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
     return "\n".join(lines) + "\n"
 
 
+def _tex(x: float, dp: int = 1) -> str:
+    t = f"{x:,.{dp}f}"
+    return t.replace(",", "{,}")
+
+
+def macros(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[str, Any]],
+           book: dict[str, Any]) -> str:
+    """One macro per quantity, named ``\\eEight<Quantity>``; the paper types none of them."""
+    pages = [len(r["pages"]) for r in ranks.values()] or [0]
+    lat = s.get("device_latency") or {}
+    vals = {
+        "Ranks": str(s["ranks"]),
+        "Wall": _tex(s["wall_min"], 1),
+        "Bootstrap": _tex(s["bootstrap_min"], 1),
+        "PoolMin": _tex(s["pool_min"], 1),
+        "Tail": _tex(s["tail_min"], 1),
+        "ModelH": _tex(s["model_rank_h"], 2),
+        "WaitH": _tex(s["wait_rank_h"], 2),
+        "BlockedH": _tex(s["blocked_rank_h"], 2),
+        "IdleShare": _tex(100 * s["idle_share"], 1),
+        "BusyShare": _tex(100 * s["busy_share"], 1),
+        "PagesMin": str(min(pages)),
+        "PagesMax": str(max(pages)),
+        "PagesMean": _tex(sum(pages) / max(1, len(pages)), 1),
+        "Stolen": str(s["stolen"]),
+        "Reclaimed": str(s["reclaimed"]),
+        "Seams": str(s["seams"]),
+        "Calls": str(s["calls"]),
+        "Cost": _tex(s["cost_usd"], 2),
+        "Coverage": _tex(100 * float(book.get("coverage") or 0), 1),
+        "Paragraphs": str(book.get("paragraphs") or 0),
+        "Missing": str(book.get("missing") or 0),
+        "SeamRevised": str(book.get("seam_revised") or 0),
+        "TransportMedian": _tex(max((v["median_s"] for v in lat.values()
+                                     if isinstance(v, dict)), default=0), 1),
+        "TransportH": _tex(float(lat.get("total_rank_h") or 0), 2),
+    }
+    if vs:
+        vals.update({
+            "SevenWall": _tex(float(vs["wall_min"]), 1),
+            "SevenBlockedH": _tex(float(vs["blocked_rank_h"]), 2),
+            "SevenWorkH": _tex(float(vs["work_rank_h"]), 2),
+            "SevenCoordShare": _tex(100 * float(vs["coordination_share"] or 0), 1),
+            "SevenCost": _tex(float(vs["cost_usd"] or 0), 2),
+            "SevenCoverage": _tex(100 * float(vs["coverage"] or 0), 1),
+        })
+    lines = ["% generated by experiments/e8_adaptive_book/analyze.py; do not edit"]
+    lines += [f"\\newcommand{{\\eEight{k}}}{{{v}}}" for k, v in vals.items()]
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap = argparse.ArgumentParser()
     ap.add_argument("name")
     ap.add_argument("--against", default="e7-rawapi-p16")
+    ap.add_argument("--tex", default=None, help="also write the macros here (paper/e8_results.tex)")
     a = ap.parse_args(argv)
     run = RUNS / a.name
     ev = _events(run / "harness.trace.jsonl")
@@ -245,6 +306,13 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     timeline(ranks, min(e["ts"] for e in ev), out)
     md = render(s, vs, ranks)
     (out / "README.md").write_text(md, encoding="utf-8")
+    report = run / "report.json"
+    book = (json.loads(report.read_text(encoding="utf-8")).get("book") or {}) if report.exists() \
+        else {}
+    tex = macros(s, vs, ranks, book)
+    (out / "generated.tex").write_text(tex, encoding="utf-8")
+    if a.tex:
+        Path(a.tex).write_text(tex, encoding="utf-8")
     print(md)
     return s
 

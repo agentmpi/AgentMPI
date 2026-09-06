@@ -1035,8 +1035,9 @@ MUST pass the same seeds to `Pool_create`, as they pass the same group to
 idempotently, so two members proposing the same item make one.
 
 `Pool_next` MUST return an item that is not done, whose dependencies are all
-done, and that no live holder has claimed, choosing by priority, then the
-caller's preferred group, then id; it MUST claim by compare-and-swap so that
+done, and that no live holder has claimed, choosing by ascending priority (as
+`nice`: 0 before 1, so a larger number means "only when nothing better is
+left"), then the caller's preferred group, then id; it MUST claim by compare-and-swap so that
 exactly one caller receives each item. A claim held by a rank the failure
 detector has convicted, or by an earlier epoch of a rank that has since been
 replaced, MUST be reclaimable, and the take-over MUST be traced as a reclaim

@@ -74,7 +74,9 @@ them.
                              analysis/              the trace; trace analysis, figures, viewer
 
 4. The experiments         experiments/             E0 microbenchmarks, E1 and E2 (session
-   and analysis                                     ranks), E5 (machines), E7 (process ranks)
+   and analysis                                     ranks), E5 (machines), E7 (process ranks
+                                                    in phases), E8 (the same book by a work
+                                                    pool, with no phases after the glossary)
                              tools/                 sealing a run, collecting the suite
                            runs/                    committed evidence: launch plans, traces,
                                                     per-rank reports, analyses; no book text
@@ -137,6 +139,16 @@ operator's codomain with a conflict set whose join is a semilattice, so the
 conflicts reaching the root are identical for every tree shape and the root
 arbitrates each exactly once. Verified exhaustively over every binary fold order
 to p=6 and randomly to p=32.
+
+**Work pools.** The one pattern MPI never standardised and every agent system
+rebuilds is a bag of tasks, and every rebuild gets one of four things wrong: two
+workers take the same item, a dead worker keeps its item, an item runs before its
+inputs exist, nobody can say when the job is done. None of the four has anything
+of the application in it, so all four are the runtime's (`ampi/core/pool.py`,
+spec S9.5): claim by compare-and-swap from absence, dependency gating, reclaim
+from a holder the failure detector convicted, and a termination condition. What
+a work item *is* stays with the harness. E8 is what that buys — a population
+that claims its next page instead of waiting at a barrier for the slowest model.
 
 **Context safety.** MPI's advice is to test a program by making every send
 synchronous. Here the buffer a harness implicitly relies on is the receiving
@@ -262,6 +274,35 @@ evidence with what each one found (`runs/e7-rawapi-p128-attempt1` to
 `-attempt5`), and `experiments/e7_rawapi_book/NODES.md` is the operator's
 account.
 
+### A population that never waits for a phase: the work pool
+
+E7 moves the book through phases, and at every boundary the population waits for
+its slowest member: at p=16 that idle time was 68% of rank-time. E8
+(`experiments/e8_adaptive_book/`) translates the same book with the phases after
+the glossary replaced by a **work pool**. Sixteen ranks over two machines each
+own a home block of about six pages; a rank that finishes a page claims the next,
+from its own block first and then from whichever block has the most left; a seam
+between two finished pages becomes work the moment both exist, for whichever rank
+is free; a settled term is published with one atomic union and every later
+translation reads it. The root hands out the glossary with a nonblocking
+broadcast and goes straight to work. The only collective after the glossary is
+the reduction at the end.
+
+```bash
+python -m experiments.e8_adaptive_book.harness run --name e8-stub-p16 --size 16 \
+    --executor stub --launch threads              # a surrogate population, one minute
+bash experiments/e8_adaptive_book/node.sh e8-rawapi-p16 16 2 0   # the real thing, machine 0
+bash experiments/e8_adaptive_book/node.sh e8-rawapi-p16 16 2 1   # machine 1
+python -m experiments.e8_adaptive_book.analyze e8-rawapi-p16 --against e7-rawapi-p16
+```
+
+`experiments/e8_adaptive_book/DESIGN.md` writes down which half of this is
+protocol and which is harness, and why the pool belongs to the runtime. The
+analysis reports, per rank, pages taken from its own block and stolen from
+others, seams, model minutes, minutes waiting for work (`pool.wait` in the
+trace) and minutes blocked in collectives — so the idle time E7 spent at
+barriers is, in E8, either gone or named.
+
 ## Results, including the negative ones
 
 * **E7 across machines.** 16/32/64 raw-API process ranks on one machine
@@ -286,6 +327,16 @@ account.
   machine) is the cost that grows, and it is named with its fixes in
   `experiments/e7_rawapi_book/NODES.md`. `runs/e7-rawapi-p128`,
   `runs/e7-rawapi-p256`, `runs/e7-rawapi-p128-attempt1..5`.
+* **A pool instead of phases (E8).** The same book, 16 ranks over two machines,
+  with every phase after the glossary replaced by a work pool: 98.6% coverage in
+  58 min for $6.72, all 94 seams revised, 15 pages translated by a rank other
+  than their block's owner, pages per rank 3 to 9 against a mean of 5.9. Model
+  work was unchanged (4.8 rank-hours against E7's 4.2 at the same scale) and the
+  idleness collapsed: 27.3% of rank-time against 68.0%. Two thirds of E7's
+  waiting at p=16 was the phase structure rather than the slowest model. The
+  wall times are not comparable — E8 pays a git round trip per operation where
+  E7 at p=16 paid a local write, 1.5 rank-hours of it — so 27.3% is a lower
+  bound on what the pool bought. `runs/e8-rawapi-p16`.
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,
   half-bandwidth point 1521 tokens. β agrees within 2% across all three
   transports, because the per-token cost is serialisation above the waist rather

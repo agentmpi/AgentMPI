@@ -49,8 +49,8 @@ added after creation), `claim/` and `done/`. Members call `pool_create` with the
 same seed list, as they call `comm_create` with the same group; seeds are not
 written. `pool_next` lists the window without bodies, picks the first item
 that is not done, not claimed by a live holder, and whose dependencies are done,
-in (priority, preferred group, id) order, and claims it by compare-and-swap from
-absence; a claim held by a rank the detector has convicted, or by an earlier
+in (ascending priority, preferred group, id) order, and claims it by
+compare-and-swap from absence; a claim held by a rank the detector has convicted, or by an earlier
 epoch of its holder, is taken over by compare-and-swap on the claim record and
 traced as `pool.reclaim`. `pool_done` writes the result cell; `pool_release`
 removes a claim the holder cannot honour. `pool_wait_drained` polls with the

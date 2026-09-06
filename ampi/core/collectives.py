@@ -158,11 +158,14 @@ class CollectiveMixin:
         recovered by the analysis from the timestamps rather than recorded here,
         because no single rank can observe it.
         """
-        waited = None
-        if since is None and rec is not None and rec.get("joined_at") is not None:
+        # A caller that passes ``since`` is timing its own wait --- the completion
+        # of a nonblocking request, which was posted long before and is not a
+        # re-entry.  Everyone else is timed from arrival, and may be a replay.
+        explicit = since is not None
+        if not explicit and rec is not None and rec.get("joined_at") is not None:
             since = float(rec.get("reentered_at") or rec["joined_at"])
         waited = round(max(0.0, self.device.clock() - float(since or self.device.clock())), 4)
-        if since is None and rec is not None and rec.get("reentered_at") is not None:
+        if not explicit and rec is not None and rec.get("reentered_at") is not None:
             # A replay is a re-entry into a collective that had closed before the
             # rank came back, which is the case exactly when every arrival predates
             # the re-entry.  An analysis must not read a restarted rank's instant
