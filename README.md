@@ -53,6 +53,8 @@ them.
                            spec/background/         four dossiers on MPI's history, collective
                                                     algorithms, fault tolerance and the agent
                                                     landscape, with their bibliographies
+                           spec/proposals/          arguments that became normative text, kept
+                                                    with what implementing them changed
 
 2. The reference           ampi/                    the runtime: everything the specification
    implementation            core/                  requires, written over the device waist
@@ -120,7 +122,7 @@ AMPI_RANK=0 .venv/bin/ampi man          # the manual is a command
 AMPI_RANK=0 .venv/bin/ampi doctor       # names the rank that has not arrived
 ```
 
-## The three ideas worth knowing
+## The ideas worth knowing
 
 **The narrow waist.** Six device operations — `append`, `match`, `scan`, `cas`,
 `lease`, `clock` — separate portable semantics from transport, exactly as MPICH's
@@ -149,6 +151,19 @@ spec S9.5): claim by compare-and-swap from absence, dependency gating, reclaim
 from a holder the failure detector convicted, and a termination condition. What
 a work item *is* stays with the harness. E8 is what that buys — a population
 that claims its next page instead of waiting at a barrier for the slowest model.
+
+**Two numbers, not one.** What a rank has consumed and what its next call will
+carry are different questions, and only the second has an answer that may go
+down. So the ledger accounts — cumulative, per-category, reducible only by
+ending the turn — and a *resident set* admits. Eviction reduces the resident
+set and leaves every dropped body at its handle, or at the window key and
+version it came from, so this is not a chat agent's compaction: nothing is
+summarised, a replayed rank sees what the original saw, and a rank that reads an
+evicted body again pays again. Measured: 48,192 tokens of window freed in
+0.19 ms with the ledger unmoved at 48,276, one body recovered in 0.42 ms and
+charged again. Eviction takes
+the tail and never the pinned, because providers cache a prompt prefix and
+freeing the middle costs more than a token counter can see.
 
 **Context safety.** MPI's advice is to test a program by making every send
 synchronous. Here the buffer a harness implicitly relies on is the receiving
@@ -327,16 +342,21 @@ barriers is, in E8, either gone or named.
   machine) is the cost that grows, and it is named with its fixes in
   `experiments/e7_rawapi_book/NODES.md`. `runs/e7-rawapi-p128`,
   `runs/e7-rawapi-p256`, `runs/e7-rawapi-p128-attempt1..5`.
-* **A pool instead of phases (E8).** The same book, 16 ranks over two machines,
-  with every phase after the glossary replaced by a work pool: 98.6% coverage in
-  58 min for $6.72, all 94 seams revised, 15 pages translated by a rank other
-  than their block's owner, pages per rank 3 to 9 against a mean of 5.9. Model
-  work was unchanged (4.8 rank-hours against E7's 4.2 at the same scale) and the
-  idleness collapsed: 27.3% of rank-time against 68.0%. Two thirds of E7's
-  waiting at p=16 was the phase structure rather than the slowest model. The
-  wall times are not comparable — E8 pays a git round trip per operation where
-  E7 at p=16 paid a local write, 1.5 rank-hours of it — so 27.3% is a lower
-  bound on what the pool bought. `runs/e8-rawapi-p16`.
+* **A pool instead of phases (E8), run twice.** The same book, 16 ranks over two
+  machines, with every phase after the glossary replaced by a work pool: 98.6%
+  and 100% coverage, 58 and 74 min, $6.72 and $5.96, all 94 seams revised each
+  time. Model work was unchanged (4.8 and 4.6 rank-hours against E7's 4.2 at the
+  same scale). The idleness has to be split in two before the runs agree. Waiting
+  for work *while work existed* — what the pool exists to remove — was 0.74 and
+  0.41 rank-hours against E7's 9.33 blocked at barriers: gone by an order of
+  magnitude, in both runs. Waiting *for the last item* — what no pool can remove,
+  since it cannot finish before its slowest remaining task — was 0.46 rank-hours
+  in one run and 7.10 in the other, where a single seam's model call ran 1,952 s
+  and returned normally. That call also outlasted its rank's lease, so a peer
+  reclaimed the item and did the seam twice, which is the reclaim rule working
+  and paying for a straggler twice. The wall times are not comparable to E7's
+  either: E8 pays a git round trip per operation where E7 at p=16 paid a local
+  write. `runs/e8-rawapi-p16`, `runs/e8-rawapi-p16-run2`.
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,
   half-bandwidth point 1521 tokens. β agrees within 2% across all three
   transports, because the per-token cost is serialisation above the waist rather

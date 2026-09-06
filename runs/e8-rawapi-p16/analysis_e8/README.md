@@ -8,6 +8,8 @@
 | pages per rank (min / mean / max) | 3 / 5.94 / 9 |
 | pages stolen / items reclaimed / seams | 15 / 0 / 94 |
 | model exchanges / spend | 238 / $6.72 |
+| waiting for work, while work existed / for the last item | 0.74 / 0.46 rank-hours (s088-089, 0.6 min) |
+| slowest single model call | 379.6 s (glm-5.3, translate:p042) |
 | transport per page, by node (median / p90 s from translation done to pool done) | node0: 54.5 / 66.2 (51 pages); node1: 60.0 / 69.9 (44 pages); 1.5 rank-hours in total |
 
 ### Against e7-rawapi-p16

@@ -125,6 +125,53 @@ def device_latency(ev: list[dict[str, Any]], ranks_per_node: int) -> dict[str, A
     return out
 
 
+def tail_wait(ev: list[dict[str, Any]]) -> dict[str, Any]:
+    """Split waiting into what the pool could remove and what it could not.
+
+    A pool cannot finish before its last item, so once one item is left the rest
+    of the population waits however long that item takes --- which in a
+    heavy-tailed population is unbounded.  That is a different quantity from
+    waiting while work exists, which is the idleness the pool was built to
+    remove, and reporting one number for both hides the result in either
+    direction.
+    """
+    # First completion per item: an item reclaimed from a lapsed holder is
+    # completed twice, and counting the duplicate as the last item would put the
+    # cut inside the stall rather than at its start.
+    first: dict[str, float] = {}
+    for e in ev:
+        if e["kind"] == "pool.done":
+            item = str(e.get("item", ""))
+            first.setdefault(item, e["ts"])
+    done = sorted((ts, item) for item, ts in first.items())
+    waits = [e for e in ev if e["kind"] == "pool.wait"]
+    total = sum(float(e.get("waited_s") or 0) for e in waits)
+    if len(done) < 2:
+        return {"total_h": round(total / 3600, 2), "tail_h": 0.0,
+                "while_work_existed_h": round(total / 3600, 2), "tail_item": "", "tail_min": 0.0}
+    # The last stretch in which only one item remained.
+    cut = done[-2][0]
+    tail = sum(float(e.get("waited_s") or 0) for e in waits if e["ts"] > cut)
+    return {
+        "total_h": round(total / 3600, 2),
+        "tail_h": round(tail / 3600, 2),
+        "while_work_existed_h": round((total - tail) / 3600, 2),
+        "tail_item": done[-1][1],
+        "tail_min": round((done[-1][0] - cut) / 60, 1),
+        "tail_ranks": len({e["rank"] for e in waits if e["ts"] > cut}),
+    }
+
+
+def slowest_call(ev: list[dict[str, Any]]) -> dict[str, Any]:
+    calls = [e for e in ev if e["kind"] == "task.call" and e.get("api_seconds")]
+    if not calls:
+        return {}
+    c = max(calls, key=lambda e: float(e["api_seconds"]))
+    return {"label": c.get("label", ""), "model": str(c.get("model", "")).split("/")[-1],
+            "seconds": round(float(c["api_seconds"]), 1),
+            "finish_reason": c.get("finish_reason", "")}
+
+
 def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]]) -> dict[str, Any]:
     t0 = min(e["ts"] for e in ev)
     t1 = max(e["ts"] for e in ev)
@@ -153,6 +200,8 @@ def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]
         "cost_usd": round(sum(r["cost_usd"] for r in ranks.values()), 2),
         "calls": sum(r["calls"] for r in ranks.values()),
         "device_latency": device_latency(ev, max(1, n // 2)),
+        "wait": tail_wait(ev),
+        "slowest_call": slowest_call(ev),
     }
 
 
@@ -213,6 +262,11 @@ def render(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
              f"| pages per rank (min / mean / max) | {s['pages_per_rank']['min']} / {s['pages_per_rank']['mean']} / {s['pages_per_rank']['max']} |",
              f"| pages stolen / items reclaimed / seams | {s['stolen']} / {s['reclaimed']} / {s['seams']} |",
              f"| model exchanges / spend | {s['calls']} / ${s['cost_usd']} |",
+             f"| waiting for work, while work existed / for the last item | "
+             f"{s['wait']['while_work_existed_h']} / {s['wait']['tail_h']} rank-hours "
+             f"({s['wait']['tail_item']}, {s['wait']['tail_min']} min) |",
+             f"| slowest single model call | {s['slowest_call'].get('seconds', 0)} s "
+             f"({s['slowest_call'].get('model', '?')}, {s['slowest_call'].get('label', '?')}) |",
              "| transport per page, by node (median / p90 s from translation done to pool done) | "
              + "; ".join(f"{k}: {v['median_s']} / {v['p90_s']} ({v['pages']} pages)"
                          for k, v in s["device_latency"].items()
@@ -240,7 +294,7 @@ def _tex(x: float, dp: int = 1) -> str:
 
 
 def macros(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[str, Any]],
-           book: dict[str, Any]) -> str:
+           book: dict[str, Any], prefix: str = "eEight") -> str:
     """One macro per quantity, named ``\\eEight<Quantity>``; the paper types none of them."""
     pages = [len(r["pages"]) for r in ranks.values()] or [0]
     lat = s.get("device_latency") or {}
@@ -252,6 +306,11 @@ def macros(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
         "Tail": _tex(s["tail_min"], 1),
         "ModelH": _tex(s["model_rank_h"], 2),
         "WaitH": _tex(s["wait_rank_h"], 2),
+        "WaitWorkH": _tex(float(s["wait"]["while_work_existed_h"]), 2),
+        "WaitTailH": _tex(float(s["wait"]["tail_h"]), 2),
+        "TailMin": _tex(float(s["wait"]["tail_min"]), 1),
+        "SlowestCallS": _tex(float(s["slowest_call"].get("seconds") or 0), 0),
+        "SlowestCallModel": str(s["slowest_call"].get("model") or "?"),
         "BlockedH": _tex(s["blocked_rank_h"], 2),
         "IdleShare": _tex(100 * s["idle_share"], 1),
         "BusyShare": _tex(100 * s["busy_share"], 1),
@@ -281,7 +340,7 @@ def macros(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
             "SevenCoverage": _tex(100 * float(vs["coverage"] or 0), 1),
         })
     lines = ["% generated by experiments/e8_adaptive_book/analyze.py; do not edit"]
-    lines += [f"\\newcommand{{\\eEight{k}}}{{{v}}}" for k, v in vals.items()]
+    lines += [f"\\newcommand{{\\{prefix}{k}}}{{{v}}}" for k, v in vals.items()]
     return "\n".join(lines) + "\n"
 
 
@@ -290,6 +349,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     ap.add_argument("name")
     ap.add_argument("--against", default="e7-rawapi-p16")
     ap.add_argument("--tex", default=None, help="also write the macros here (paper/e8_results.tex)")
+    ap.add_argument("--prefix", default="eEight", help="LaTeX macro prefix")
     a = ap.parse_args(argv)
     run = RUNS / a.name
     ev = _events(run / "harness.trace.jsonl")
@@ -309,7 +369,7 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
     report = run / "report.json"
     book = (json.loads(report.read_text(encoding="utf-8")).get("book") or {}) if report.exists() \
         else {}
-    tex = macros(s, vs, ranks, book)
+    tex = macros(s, vs, ranks, book, a.prefix)
     (out / "generated.tex").write_text(tex, encoding="utf-8")
     if a.tex:
         Path(a.tex).write_text(tex, encoding="utf-8")

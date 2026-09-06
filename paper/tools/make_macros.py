@@ -128,7 +128,8 @@ def e0_macros() -> None:
     d = load(RESULTS / "e0_micro.json")
     if not d:
         for k in ("alphaSqlite", "betaSqlite", "nHalfSqlite", "alphaJournal", "nHalfJournal",
-                  "alphaMemory", "betaSpread", "protoFracOne", "protoFracThirty", "protoMsP"):
+                  "alphaMemory", "betaSpread", "protoFracOne", "protoFracThirty", "protoMsP",
+                  "evictFreed", "evictMs", "evictRecoverMs", "evictBodies", "evictLedger"):
             put(k, None)
         return
     pp = d["pingpong"]
@@ -145,6 +146,13 @@ def e0_macros() -> None:
     put("protoFracOne", round(100 * rows[(128, 1.0)]["protocol_fraction"], 3), fmt=".3f")
     put("protoFracThirty", round(100 * rows[(128, 30.0)]["protocol_fraction"], 4), fmt=".4f")
     put("e0Devices", len(pp))
+    ev = (d.get("eviction") or {}).get("sqlite")
+    if ev:
+        put("evictBodies", ev["evicted_bodies"])
+        put("evictFreed", int(ev["freed_tokens"]))
+        put("evictLedger", int(ev["used_before"]))
+        put("evictMs", round(ev["evict_ms"], 2), fmt=".2f")
+        put("evictRecoverMs", round(ev["recover_ms"], 2), fmt=".2f")
 
 
 # --------------------------------------------------------------------------
