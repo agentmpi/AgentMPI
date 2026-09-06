@@ -124,10 +124,10 @@ AMPI_RANK=0 .venv/bin/ampi doctor       # names the rank that has not arrived
 
 **The narrow waist.** Six device operations — `append`, `match`, `scan`, `cas`,
 `lease`, `clock` — separate portable semantics from transport, exactly as MPICH's
-abstract device interface does. Three transports ship (SQLite, a filesystem
-journal, memory) and share no code below the interface. One conformance suite runs
-against all of them, which is the difference between a specification and a
-library. It found a defect that exists on one transport only: SQLite's type
+abstract device interface does. Five transports ship (SQLite, a filesystem
+journal, memory, a git remote, and a git remote behind a per-machine daemon) and
+share no code below the interface. One conformance suite runs against all of
+them, which is the difference between a specification and a library. It found a defect that exists on one transport only: SQLite's type
 affinity returned integers as strings for four indexed fields, so a wildcard
 receive posted as `-1` read back as `"-1"` and silently stopped matching.
 

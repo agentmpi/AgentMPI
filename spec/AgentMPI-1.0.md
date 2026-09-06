@@ -24,9 +24,11 @@ implementation may store its state anywhere, use any transport, and select any
 algorithm permitted by S7, provided the observable behaviour matches this text.
 
 The reference implementation that accompanies this specification is one such
-implementation and is normative only where this document says so. Three transports
-ship with it; the conformance suite of S14 runs unchanged against all of them, and
-that is the property this document is written to make possible.
+implementation and is normative only where this document says so. Five transports
+ship with it --- SQLite, a filesystem journal, memory, a git remote, and a git
+remote behind a per-machine daemon; the conformance suite of S14 runs unchanged
+against all of them, and that is the property this document is written to make
+possible.
 
 ### S0.2 What AgentMPI is not
 
