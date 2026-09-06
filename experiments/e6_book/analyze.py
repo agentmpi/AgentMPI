@@ -148,7 +148,14 @@ def summarise_run(name: str) -> dict[str, Any] | None:
                 commits += 1
                 commit_kinds[parts[3]] += 1
     identities = [e for e in events if e["kind"] == "rank.identity"]
-    machines = len({e.get("boot_id") for e in identities if e.get("boot_id")})
+    # A machine is a session; a container is a boot.  They differ because a
+    # container that is paused and resumed comes back as a fresh boot under the
+    # same session, so counting boots answers "how many containers did this run
+    # burn through" and counting sessions answers "how many machines ran it at
+    # once".  The paper wants the second and the freeze story wants the first.
+    machines = len({e.get("session") for e in identities if e.get("session")})
+    containers = len({e.get("boot_id") for e in identities if e.get("boot_id")})
+    machines = machines or containers
     lock_waits = [float(e.get("waited_s") or 0) for e in events if e["kind"] == "win.lock"]
     claim_attempts = [e for e in events if e["kind"] == "win.cas"]
 
@@ -157,7 +164,7 @@ def summarise_run(name: str) -> dict[str, Any] | None:
         "name": name, "p": p, "wall_s": round(wall, 1), "wall_h": round(wall / 3600, 2),
         "active_wall_s": round(active_wall, 1), "active_wall_h": round(active_wall / 3600, 2),
         "freezes": freezes, "n_freezes": len(freezes), "frozen_h": round(frozen_s / 3600, 2),
-        "machines": machines,
+        "machines": machines, "containers": containers,
         "ranks_finalised": (report.get("rank_states") or {}).get("finalised", 0),
         "ranks_failed": (report.get("rank_states") or {}).get("failed", 0),
         "convicted": convicted, "executors_lost": len(lost), "pages_stolen": len(stolen),

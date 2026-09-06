@@ -305,7 +305,7 @@ def e5_macros() -> None:
     for p in (2, 32):
         r = load(RUNS / f"e5-cloud-p{p}" / "report.json")
         if not r:
-            for k in ("Machines", "Pushes", "Rejections", "Commits", "WallMedian", "WallMax"):
+            for k in ("Machines", "Containers", "Pushes", "Rejections", "Commits", "WallMedian", "WallMax"):
                 put(f"eFive{k}{p}", None)
             continue
         walls = sorted(float(v) for v in (r.get("wall_s_by_rank") or {}).values())
@@ -349,6 +349,7 @@ def e6_macros() -> None:
         put(f"eSixFreezes{p}", r.get("n_freezes") or 0)
         put(f"eSixActivePar{p}", round(r.get("active_parallelism") or 0, 2), fmt=".2f")
         put(f"eSixMachines{p}", r.get("machines"))
+        put(f"eSixContainers{p}", r.get("containers"))
         put(f"eSixTasks{p}", r.get("tasks"))
         put(f"eSixWork{p}", int(round(r["work_rank_s"])))
         put(f"eSixBlocked{p}", int(round(r["blocked_rank_s"])))

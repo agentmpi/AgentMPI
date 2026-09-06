@@ -231,9 +231,27 @@ paused machine's harness, the rank program re-runs from the top, skips the work
 it already did, and passes back through collectives it already completed. Two
 machines never came back; their ranks were convicted and the survivors stole
 their pages, so the book still assembled complete from fourteen of sixteen
-ranks. The `p=32` and `p=64` runs wait for a window in which the usage limit is
-not the binding constraint; the launcher (a committed `LAUNCH.json`, the hook,
-several ranks per machine) is in place and needs only the sessions.
+ranks. `p=32` (`runs/e6-book-p32/`) finished 60 of 64 pages in 3.8 hours with no
+freeze, but two thirds of its ranks removed themselves: four ranks now shared
+one machine and one executor, and a task waiting behind three siblings' looked
+exactly like a task nobody would ever claim, so those ranks concluded their
+worker had died and killed themselves. The survivors stole 19 pages and nearly
+finished the book — the failure path worked perfectly on a failure that was not
+real. `AMPI_ERR_NO_WORKER` now requires that *no* task on the campaign was
+claimed during the window, so a busy executor is no longer mistaken for a dead
+one.
+
+`p=64` (`runs/e6-book-p64/`) did **not** finish: 14 of 64 pages. Sixty-four
+ranks share one git branch, so every lease renewal is a push racing sixty-three
+others; renewals lost that race for longer than a lease lasts, 44 ranks were
+convicted for silence while they were working, one died after 500 rejected
+compare-and-swaps, and convicted ranks kept running as ghosts whose writes
+landed but whose collectives had closed without them. A rank whose only
+conviction is a lapsed lease now re-admits itself at a new epoch on its next
+runtime call. The run was then stopped outright by the account's seven-day
+usage limit, which rejected all eight machines. The limit at 64 is the
+single-branch transport, not the protocol above it; a device with per-rank
+streams is where that scale should be tried next.
 
 ## Results, including the negative ones
 
