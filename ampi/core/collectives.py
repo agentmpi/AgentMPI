@@ -566,7 +566,8 @@ class CollectiveMixin:
         body = self.get_body(handle)
         if view:
             body = apply_view(body, view)
-        charged, degraded = self.charge(count_tokens(canonical(body)), what="bcast")
+        charged, degraded = self.charge(count_tokens(canonical(body)), what="bcast",
+                                        handle=handle)
         if degraded:
             body = apply_view(body, degraded)
             result["degraded_to"] = degraded

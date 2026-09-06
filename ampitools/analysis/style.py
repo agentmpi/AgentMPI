@@ -181,6 +181,7 @@ STYLE: dict[str, Style] = {
     "comm.agree": _s("recovery", "diamond", "#ddd6fe"),
     "ctx.stall.end": _s("recovery", "tick", "#c4b5fd"),
     "ctx.release": _s("recovery", "tick", "#c4b5fd"),
+    "ctx.evict": _s("recovery", "tick", "#a78bfa"),
 }
 
 UNKNOWN = Style(MUTED, "tick", "lifecycle")

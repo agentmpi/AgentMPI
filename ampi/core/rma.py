@@ -179,7 +179,11 @@ class RmaMixin:
             )
             result.update(saved_to=out, charged=0)
             return result
-        charged, degraded = self.charge(count_tokens(canonical(value)), what=f"win:{win}/{key}")
+        # A window cell's address is its own backing store: evicting it from the
+        # live set costs a re-read of this version, not a lost body.
+        charged, degraded = self.charge(count_tokens(canonical(value)),
+                                        what=f"win:{win}/{key}",
+                                        handle=f"win:{win}/{key}@{cell.version}")
         if degraded:
             value = apply_view(value, degraded)
             result["degraded_to"] = degraded

@@ -159,6 +159,7 @@ class P2PMixin:
             requested=delivery,
             eager_threshold=self.manifest.eager_threshold,
             remaining=dst_ledger.remaining,
+            headroom=dst_ledger.residency().headroom,
         )
 
         if mode == SEND_READY:
@@ -500,7 +501,7 @@ class P2PMixin:
         if budget is not None and tokens > budget:
             body = apply_view(body, f"headtail:{budget}")
             tokens = count_tokens(canonical(body))
-        charged, degraded = self.charge(tokens, what="body")
+        charged, degraded = self.charge(tokens, what="body", handle=rec.get("handle", ""))
         if degraded:
             body = apply_view(body, degraded)
             result["degraded_to"] = degraded

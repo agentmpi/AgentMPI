@@ -34,7 +34,7 @@ receives an error usually cannot.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..constants import (
@@ -46,7 +46,128 @@ from ..constants import (
 )
 from ..errors import err
 
-__all__ = ["Ledger", "choose_delivery", "degrade_spec", "ResidencyModel"]
+__all__ = ["Ledger", "Resident", "ResidentEntry", "choose_delivery", "degrade_spec",
+           "ResidencyModel"]
+
+
+@dataclass
+class ResidentEntry:
+    """One body the next model call would carry, and where to get it again.
+
+    ``handle`` is an address, in one of the two forms the runtime has: a payload
+    handle, which ``get_body`` resolves, or ``win:<window>/<key>@<version>``,
+    which a window read at that version resolves.  Either way an evicted body is
+    recoverable, which is the whole difference between this and compaction.
+    """
+
+    handle: str
+    tokens: int
+    what: str = ""
+    pinned: bool = False
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"handle": self.handle, "tokens": self.tokens, "what": self.what,
+                "pinned": self.pinned}
+
+
+@dataclass
+class Resident:
+    """What is live in this rank's window now --- the reducible half of S6.1.
+
+    The ledger says what a rank has *consumed*; this says what the next call will
+    *carry*.  They are different questions and only the second has an answer that
+    may go down without lying: a rank that drops a body from its window has still
+    read it.
+
+    Eviction here is not a chat agent's compaction.  Every body is content
+    addressed and the handle outlives the eviction, so a rank that drops one can
+    materialise it again or take a view of it (S5).  Nothing is summarised and
+    nothing is lost --- which is why Appendix B's omission of a compaction policy
+    is untouched by this.
+
+    Order matters for a reason no token counter can see.  Providers cache the
+    key-value state of a prompt prefix, so editing a body invalidates the cache
+    from that point on: freeing fifty thousand tokens while forcing a full cache
+    miss on every later call is usually the worse trade.  So entries are held in
+    admission order, eviction takes the *tail* first, and a harness pins the
+    immutable shared material it wants to stay at the front (E7's commission is
+    byte-identical across every rank, which makes it a natural shared prefix).
+    """
+
+    budget: int = DEFAULT_CTX_BUDGET
+    entries: list[ResidentEntry] = field(default_factory=list)
+    evictions: int = 0
+    evicted_tokens: int = 0
+
+    @property
+    def tokens(self) -> int:
+        return sum(e.tokens for e in self.entries)
+
+    @property
+    def headroom(self) -> int:
+        return max(0, self.budget - self.tokens)
+
+    def admit(self, handle: str, tokens: int, *, what: str = "",
+              pinned: bool = False) -> ResidentEntry:
+        """Record a body as live.  An admission never fails: the ledger has
+        already decided whether the delivery is allowed, and a resident set that
+        refused would only hide what the rank is actually carrying."""
+        entry = ResidentEntry(handle=handle, tokens=tokens, what=what, pinned=pinned)
+        self.entries.append(entry)
+        return entry
+
+    def evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = ()
+              ) -> list[ResidentEntry]:
+        """Drop bodies from the tail until at most ``down_to`` tokens are live.
+
+        Pinned entries and those named in ``keep`` are never dropped.  Returns
+        what was dropped, whose handles still resolve.
+        """
+        target = self.budget // 2 if down_to is None else max(0, down_to)
+        dropped: list[ResidentEntry] = []
+        for i in range(len(self.entries) - 1, -1, -1):
+            if self.tokens <= target:
+                break
+            e = self.entries[i]
+            if e.pinned or e.handle in keep:
+                continue
+            dropped.append(self.entries.pop(i))
+        self.evictions += len(dropped)
+        self.evicted_tokens += sum(e.tokens for e in dropped)
+        return dropped
+
+    def clear(self) -> int:
+        """A fresh executor turn carries nothing, pinned material included."""
+        freed = self.tokens
+        self.entries = []
+        return freed
+
+    def by_category(self) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for e in self.entries:
+            out[e.what or "?"] = out.get(e.what or "?", 0) + e.tokens
+        return out
+
+    @classmethod
+    def from_dict(cls, raw: dict[str, Any] | None) -> Resident:
+        raw = raw or {}
+        return cls(
+            budget=int(raw.get("budget", DEFAULT_CTX_BUDGET)),
+            entries=[ResidentEntry(handle=str(e.get("handle", "")),
+                                   tokens=int(e.get("tokens", 0)),
+                                   what=str(e.get("what", "")),
+                                   pinned=bool(e.get("pinned", False)))
+                     for e in raw.get("entries", []) or []],
+            evictions=int(raw.get("evictions", 0)),
+            evicted_tokens=int(raw.get("evicted_tokens", 0)),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"budget": self.budget, "tokens": self.tokens, "headroom": self.headroom,
+                "live": len(self.entries), "evictions": self.evictions,
+                "evicted_tokens": self.evicted_tokens,
+                "by_category": self.by_category(),
+                "entries": [e.to_dict() for e in self.entries]}
 
 
 @dataclass
@@ -59,6 +180,12 @@ class Ledger:
     spent 8000 tokens.  ``release`` exists for harnesses that genuinely start a
     fresh executor turn, and it is traced, because a ledger that can be silently
     zeroed measures nothing.
+
+    ``resident`` is the other number, and it answers the other question (S6.1):
+    what the *next* call will carry.  It is reducible by eviction where ``used``
+    is not, because dropping a body does not unspend the tokens that read it.
+    ``by_what`` keeps the provenance of every charge, which the runtime already
+    computes for its own trace.
     """
 
     budget: int = DEFAULT_CTX_BUDGET
@@ -68,6 +195,8 @@ class Ledger:
     releases: int = 0
     degradations: int = 0
     peak: int = 0
+    by_what: dict[str, int] = field(default_factory=dict)
+    resident: dict[str, Any] = field(default_factory=dict)
 
     @property
     def remaining(self) -> int:
@@ -91,6 +220,18 @@ class Ledger:
             )
         self.used += tokens
         self.peak = max(self.peak, self.used)
+        self.note(tokens, what=what)
+
+    def note(self, tokens: int, *, what: str = "") -> None:
+        """Attribute a charge to the operation that caused it.
+
+        The runtime computed this label already and threw it away on every
+        delivery that succeeded, keeping it only in the degradation trace.  It
+        costs a dictionary entry to keep, and it is the difference between
+        knowing a rank spent its budget and knowing what it spent it on.
+        """
+        key = what or "?"
+        self.by_what[key] = self.by_what.get(key, 0) + tokens
 
     def release(self, tokens: int) -> int:
         """Record that an executor turn ended and its transcript was dropped."""
@@ -119,7 +260,16 @@ class Ledger:
             "unexpected_used": self.unexpected_used,
             "releases": self.releases,
             "degradations": self.degradations,
+            "by_what": dict(self.by_what),
+            "resident": self.resident,
         }
+
+    def residency(self) -> Resident:
+        """The live set, defaulting to this rank's budget."""
+        r = Resident.from_dict(self.resident or None)
+        if not self.resident:
+            r.budget = self.budget
+        return r
 
 
 def choose_delivery(
@@ -128,20 +278,29 @@ def choose_delivery(
     requested: str = "auto",
     eager_threshold: int = EAGER_THRESHOLD_TOKENS,
     remaining: int | None = None,
+    headroom: int | None = None,
 ) -> str:
     """Decide eager versus rendezvous.
 
     The threshold is the primary rule, but a *receiver-driven* correction matters
     too: a payload comfortably under the eager limit should still travel by
-    rendezvous when the receiver has almost no budget left.  MPI has no analogue
+    rendezvous when the receiver has almost no room left.  MPI has no analogue
     because an MPI receiver's buffer pressure is not visible to the sender; here
     it is, because the ledger is shared state.
+
+    Two numbers can say the receiver is short (S6.1).  ``remaining`` is what is
+    left of its budget and ``headroom`` what is left of its live window, and the
+    second is the one MPI's buffer occupancy actually corresponds to: a receiver
+    that has evicted its way back to room can take an eager body whatever its
+    lifetime intake has been.  Where both are known the decision follows the
+    tighter.
     """
     if requested in (DELIVERY_EAGER, DELIVERY_RENDEZVOUS):
         return requested
     if tokens > eager_threshold:
         return DELIVERY_RENDEZVOUS
-    if remaining is not None and tokens > remaining // 4:
+    limits = [x for x in (remaining, headroom) if x is not None]
+    if limits and tokens > min(limits) // 4:
         return DELIVERY_RENDEZVOUS
     return DELIVERY_EAGER
 

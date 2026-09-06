@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import statistics
 import time
 from pathlib import Path
@@ -37,7 +38,8 @@ from typing import Any
 from ampi import Ampi
 from ampi.core.algorithms import CATALOGUE, build_schedule, cost_of
 from ampi.core.context import ResidencyModel
-from ampi.tokens import counter_name
+from ampi.core.payload import canonical
+from ampi.tokens import count_tokens, counter_name
 from ampitools.harness import Harness
 
 HERE = Path(__file__).resolve().parent
@@ -170,6 +172,84 @@ def residency(ps: list[int], n_tokens: int) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------
+# Q0.5 -- what eviction costs, and what it recovers
+# --------------------------------------------------------------------------
+
+
+def eviction(device: str, root: Path, *, bodies: int = 24, body_tokens: int = 2000
+             ) -> dict[str, Any]:
+    """Measure the resident set against the ledger (S6.1).
+
+    A rank reads ``bodies`` documents, evicts back to its pinned prefix, and
+    reads one of the evicted bodies again.  Three numbers come out: what an
+    eviction costs, what re-materialising an evicted body costs, and the fact
+    the mechanism exists to establish --- that ``used`` does not go down when
+    the window does.
+    """
+    job = root / f"evict-{device}"
+    if job.exists():
+        shutil.rmtree(job)
+    Ampi.create(str(job), 1, device=device, allow_volatile=True)
+    amp = Ampi(str(job), rank=0, allow_volatile=True)
+    try:
+        amp.init()
+        amp.win_create("w")
+        text = "word " * body_tokens
+        for i in range(bodies):
+            amp.put("w", f"doc/{i:03d}", {"i": i, "text": text})
+        # A shared prefix every call carries: pinned, so eviction never takes it.
+        amp.put("w", "commission", {"rules": text[:400]})
+        amp.charge(count_tokens(canonical({"rules": text[:400]})), what="commission",
+                   handle="win:w/commission@1", pinned=True)
+        pinned = amp.resident()["tokens"]
+
+        reads = []
+        for i in range(bodies):
+            t0 = time.perf_counter()
+            amp.get("w", f"doc/{i:03d}")
+            reads.append(time.perf_counter() - t0)
+        used_before = amp.ledger().used
+        live_before = amp.resident()["tokens"]
+
+        t0 = time.perf_counter()
+        out = amp.ctx_evict(down_to=pinned)
+        evict_s = time.perf_counter() - t0
+        live_after = amp.resident()["tokens"]
+        used_after_evict = amp.ledger().used
+
+        t0 = time.perf_counter()
+        again = amp.get("w", "doc/000")            # the evicted body still resolves
+        recover_s = time.perf_counter() - t0
+        assert again["present"] and again["value"]["i"] == 0
+
+        return {
+            "device": device,
+            "bodies": bodies,
+            "body_tokens": body_tokens,
+            "pinned_tokens": pinned,
+            "read_median_ms": round(1e3 * statistics.median(reads), 3),
+            "live_before": live_before,
+            "live_after_evict": live_after,
+            "live_after_recover": amp.resident()["tokens"],
+            "freed_tokens": out["freed"],
+            "evicted_bodies": len(out["dropped"]),
+            "evict_ms": round(1e3 * evict_s, 3),
+            "recover_ms": round(1e3 * recover_s, 3),
+            "used_before": used_before,
+            "used_after_evict": used_after_evict,
+            "used_after_recover": amp.ledger().used,
+            # The point of the whole mechanism, as two numbers: the window went
+            # down and the account did not, and reading the body again cost
+            # again --- which is what makes the account honest.
+            "evict_left_the_ledger_alone": used_after_evict == used_before,
+            "recovery_charged_again": amp.ledger().used > used_after_evict,
+            "by_what": amp.ledger().by_what,
+        }
+    finally:
+        amp.close()
+
+
+# --------------------------------------------------------------------------
 # Q0.4 -- protocol cost against an executor turn
 # --------------------------------------------------------------------------
 
@@ -228,6 +308,13 @@ def main() -> None:
 
     ref = out["pingpong"].get("sqlite") or next(iter(out["pingpong"].values()))
     out["residency"] = residency([8, 16, 32, 64, 128], 4000)
+    out["eviction"] = {}
+    for device in devices:
+        print(f"[e0] eviction on {device} ...", flush=True)
+        out["eviction"][device] = eviction(device, root)
+        e = out["eviction"][device]
+        print(f"[e0]   freed {e['freed_tokens']} tokens in {e['evict_ms']:.1f} ms; "
+              f"recovered one in {e['recover_ms']:.1f} ms", flush=True)
     out["relative_cost"] = relative_cost(ref["alpha_s"], ref["beta_s_per_token"], [0.0, 1.0, 30.0])
     out["finished_at"] = time.time()
 

@@ -132,6 +132,12 @@ class RankProfile:
     context_high_water: int = 0
     n_degrade: int = 0
     n_stall: int = 0
+    #: Evictions reduce what the next call carries without unspending it (S6.1),
+    #: so they are counted apart from releases: a run with many of them is one
+    #: whose harness is managing a window rather than starting fresh turns.
+    n_evict: int = 0
+    evicted_tokens: int = 0
+    resident_tokens: int = 0
     executors: set[str] = field(default_factory=set)
     task_latencies: list[float] = field(default_factory=list)
     kinds: Counter = field(default_factory=Counter)
@@ -205,6 +211,9 @@ class RankProfile:
             "context_high_water": self.context_high_water,
             "n_degrade": self.n_degrade,
             "n_stall": self.n_stall,
+            "n_evict": self.n_evict,
+            "evicted_tokens": self.evicted_tokens,
+            "resident_tokens": self.resident_tokens,
             "max_epoch": self.max_epoch,
             "reattachments": self.reattachments,
             "executors": sorted(self.executors),
@@ -1011,6 +1020,10 @@ def analyse(events: list[Event], *, name: str = "", meta: dict[str, Any] | None 
             p.recv += 1
         elif kind == "ctx.degrade":
             p.n_degrade += 1
+        elif kind == "ctx.evict":
+            p.n_evict += 1
+            p.evicted_tokens += int(e.get("freed") or 0)
+            p.resident_tokens = int(e.get("resident") or 0)
         elif kind == "ctx.stall":
             p.n_stall += 1
         elif kind == "broker.publish":

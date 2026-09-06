@@ -428,7 +428,11 @@ class RuntimeBase:
     #: The ledger fields a rank owns.  ``unexpected_used`` is not among them: a
     #: *sender* reserves eager credit in the receiver's row, so the receiver's
     #: pending charges must not overwrite it.
-    _CTX_OWNED = ("budget", "used", "releases", "degradations", "peak")
+    #: The ledger fields a rank writes for itself, and so may overlay from its
+    #: own deferred copy.  ``unexpected_used`` is deliberately absent: a *sender*
+    #: reserves eager credit against a receiver, so overlaying it from a stale
+    #: local copy would discard a peer's reservation.
+    _CTX_OWNED = ("budget", "used", "releases", "degradations", "peak", "by_what", "resident")
     _ctx_pending: dict[str, Any] | None = None  # class default: some paths skip __init__
 
     def _rankview(self, r: int | None = None) -> RankView:
@@ -446,6 +450,19 @@ class RuntimeBase:
         assert self._ctx_pending is not None
         merged.update({k: self._ctx_pending[k] for k in self._CTX_OWNED if k in self._ctx_pending})
         return merged
+
+    def _settle_ctx(self, view: RankView) -> bool:
+        """Write a ledger the caller derived from an overlaid read, authoritatively.
+
+        ``_rankview`` folds the deferred charge into what it returns, so a caller
+        that read, reduced and is writing back has already absorbed it.  Letting
+        ``_write_rank`` overlay again would resurrect exactly what was reduced:
+        before this, a release or an eviction issued straight after a delivery
+        was silently undone, and only survived when some unrelated write had
+        flushed the pending charge first.
+        """
+        self._ctx_pending = None
+        return self._write_rank(view)
 
     def _write_rank(self, view: RankView, *, expect: int | None = None) -> bool:
         own = self._ctx_pending is not None and view.rank == self._rank
@@ -751,13 +768,21 @@ class RuntimeBase:
     def ledger(self, r: int | None = None) -> Ledger:
         return Ledger.from_dict(self._rankview(r).ctx)
 
-    def charge(self, tokens: int, *, what: str = "", degrade_ok: bool = True) -> tuple[int, str]:
+    def charge(self, tokens: int, *, what: str = "", degrade_ok: bool = True,
+               handle: str = "", pinned: bool = False) -> tuple[int, str]:
         """Charge the caller's ledger, degrading to a view rather than failing.
 
         Returns ``(charged, view_spec)`` where an empty ``view_spec`` means the
         full body was delivered.  Degrading is preferred to failing because an
         agent that receives a truncated message can continue while one that
         receives an error usually cannot.
+
+        Two counters move (S6.1).  The ledger's ``used`` records what this rank
+        has consumed and is not reducible except by ending the turn.  When the
+        delivery names a ``handle`` the body also joins the *resident set*: what
+        the next model call will carry, which ``ctx_evict`` can reduce without
+        pretending the tokens were never spent, because the handle still
+        resolves.
         """
         from .context import MIN_DEGRADE_TOKENS, degrade_allowance, degrade_spec
 
@@ -793,6 +818,11 @@ class RuntimeBase:
             self.trace("ctx.degrade", rank=view.rank, spec=spec, what=what)
         ledger.used += tokens
         ledger.peak = max(ledger.peak, ledger.used)
+        ledger.note(tokens, what=what)
+        if handle:
+            resident = ledger.residency()
+            resident.admit(handle, tokens, what=what, pinned=pinned)
+            ledger.resident = resident.to_dict()
         view.ctx = ledger.to_dict()
         # The charge is local until the row is next written for another reason
         # --- a lease renewal, a collective arrival, a release.  Writing it here
@@ -810,10 +840,49 @@ class RuntimeBase:
         view = self._rankview()
         ledger = Ledger.from_dict(view.ctx)
         freed = ledger.release(ledger.used if tokens is None else tokens)
+        # A fresh executor turn carries nothing, so the live set goes with it.
+        resident = ledger.residency()
+        dropped = resident.clear()
+        ledger.resident = resident.to_dict()
         view.ctx = ledger.to_dict()
-        self._write_rank(view)
-        self.trace("ctx.release", rank=view.rank, freed=freed)
+        self._settle_ctx(view)
+        self.trace("ctx.release", rank=view.rank, freed=freed, resident_dropped=dropped)
         return ledger.to_dict()
+
+    def ctx_evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = ()
+                  ) -> dict[str, Any]:
+        """Reduce the live set without unspending what it cost (S6.1).
+
+        This is what a chat agent cannot do.  Its only way to shrink a window is
+        to summarise, which is lossy, costly and unreproducible --- and fatal to
+        replay, since a summary is itself a model call.  Here every body is
+        content addressed, so eviction drops it from the *next prompt* and leaves
+        it addressable: the rank materialises it again with ``get_body``, or
+        takes a bounded view of it, and a replayed rank sees what the original
+        saw.  Nothing is summarised and nothing is lost.
+
+        Written at once, unlike a charge.  A peer deciding how much to send is
+        entitled to see that a receiver has made room, and evictions are rare and
+        deliberate where charges are constant --- which is why the deferred rule
+        of S6.1 stays with the charge and not with this.
+        """
+        view = self._rankview()
+        ledger = Ledger.from_dict(view.ctx)
+        resident = ledger.residency()
+        before = resident.tokens
+        dropped = resident.evict(down_to=down_to, keep=tuple(keep))
+        ledger.resident = resident.to_dict()
+        view.ctx = ledger.to_dict()
+        self._settle_ctx(view)
+        freed = before - resident.tokens
+        self.trace("ctx.evict", rank=view.rank, freed=freed, dropped=len(dropped),
+                   handles=[e.handle for e in dropped][:16], resident=resident.tokens)
+        return {"freed": freed, "dropped": [e.to_dict() for e in dropped],
+                "resident": resident.to_dict()}
+
+    def resident(self, rank: int | None = None) -> dict[str, Any]:
+        """The live set of this rank, or of a peer a sender is sizing up."""
+        return Ledger.from_dict(self._rankview(rank).ctx).residency().to_dict()
 
     # -- object store ------------------------------------------------------
     def put_payload(self, value: Any, *, schema: str = "") -> Payload:

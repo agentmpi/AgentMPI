@@ -1173,3 +1173,101 @@ def test_s9_5_pool_returns_a_rank_its_own_unfinished_claim(job):
     assert ranks[1].pool_next("w")["item"]["id"] != first["item"]["id"]
     ranks[0].pool_done("w", first["item"]["id"])
     assert ranks[0].pool_next("w")["item"] is None       # b is held by rank 1, a is done
+
+
+# S6.1 -- the ledger and the resident set
+# ==========================================================================
+
+
+def test_s6_1_ledger_is_cumulative_while_the_resident_set_is_reducible(job):
+    """S6.1: two numbers, two questions -- what was spent, what the next call carries."""
+    ranks = job(2)
+    ranks[0].win_create("w")
+    body = {"text": "x" * 4000}
+    ranks[0].put("w", "doc", body)
+    got = ranks[1].get("w", "doc")
+    charged = got["charged"]
+    assert charged > 0
+    led = ranks[1].ledger()
+    assert led.used == charged
+    res = ranks[1].resident()
+    assert res["tokens"] == charged and res["live"] == 1
+    assert res["entries"][0]["handle"].startswith("win:w/doc@")
+
+    # Eviction reduces what the next call carries and does not unspend the read.
+    out = ranks[1].ctx_evict(down_to=0)
+    assert out["freed"] == charged and out["resident"]["tokens"] == 0
+    assert ranks[1].ledger().used == charged, "eviction must not rewrite history"
+    # ...and the evicted body is still addressable: this is not compaction.
+    again = ranks[1].get("w", "doc")
+    assert again["value"] == body
+    assert ranks[1].ledger().used == 2 * charged, "reading it twice costs twice"
+
+
+def test_s6_1_a_charge_carries_its_category(job):
+    """S6.1: the runtime computes the provenance of every charge; it keeps it."""
+    ranks = job(2)
+    ranks[0].win_create("w")
+    ranks[0].put("w", "doc", {"text": "y" * 2000})
+    ranks[1].get("w", "doc")
+    parallel(ranks, lambda r: r.bcast("news", payload={"n": "z" * 2000} if r.rank == 0 else None,
+                                      root=0, materialize=True))
+    by_what = ranks[1].ledger().by_what
+    assert by_what.get("win:w/doc", 0) > 0 and by_what.get("bcast", 0) > 0
+    assert sum(by_what.values()) == ranks[1].ledger().used
+
+
+def test_s6_1_eviction_takes_the_tail_and_never_the_pinned(job):
+    """S6.1: a provider caches a prompt prefix, so eviction works from the tail."""
+    from ampi.core.context import Resident
+
+    r = Resident(budget=1000)
+    r.admit("h/commission", 300, what="bcast", pinned=True)
+    r.admit("h/first", 300, what="win:a")
+    r.admit("h/second", 300, what="win:b")
+    dropped = r.evict(down_to=600)
+    assert [d.handle for d in dropped] == ["h/second"]
+    assert [e.handle for e in r.entries] == ["h/commission", "h/first"]
+    # A pinned prefix survives even a demand for room it cannot make.
+    dropped = r.evict(down_to=0)
+    assert [d.handle for d in dropped] == ["h/first"]
+    assert [e.handle for e in r.entries] == ["h/commission"]
+    assert r.evicted_tokens == 600 and r.tokens == 300
+
+
+def test_s6_2_delivery_consults_the_live_window_not_only_the_budget():
+    """S6.2: the receiver's occupancy is what MPI's buffer pressure corresponds to."""
+    from ampi.constants import DELIVERY_EAGER, DELIVERY_RENDEZVOUS
+    from ampi.core.context import choose_delivery
+
+    assert choose_delivery(100, eager_threshold=1000, remaining=100000,
+                           headroom=100000) == DELIVERY_EAGER
+    # Plenty of lifetime budget left, but the window is nearly full.
+    assert choose_delivery(100, eager_threshold=1000, remaining=100000,
+                           headroom=200) == DELIVERY_RENDEZVOUS
+    # And the converse: a rank that evicted its way back to room takes it eagerly.
+    assert choose_delivery(100, eager_threshold=1000, remaining=300,
+                           headroom=100000) == DELIVERY_RENDEZVOUS
+
+
+def test_s6_1_a_fresh_turn_carries_nothing(job):
+    ranks = job(2)
+    ranks[0].win_create("w")
+    ranks[0].put("w", "doc", {"text": "q" * 2000})
+    ranks[1].get("w", "doc")
+    assert ranks[1].resident()["tokens"] > 0
+    ranks[1].ctx_release()
+    assert ranks[1].resident()["tokens"] == 0 and ranks[1].ledger().used == 0
+
+
+def test_s6_1_a_release_straight_after_a_delivery_actually_releases(job):
+    """S6.1: the deferred charge must not resurrect what a release reduced."""
+    ranks = job(2)
+    ranks[0].win_create("w")
+    ranks[0].put("w", "doc", {"text": "r" * 3000})
+    ranks[1].get("w", "doc")                     # charged, and deferred
+    assert ranks[1].ledger().used > 0
+    ranks[1].ctx_release()                        # with no write in between
+    assert ranks[1].ledger().used == 0
+    ranks[1].heartbeat()                          # the next write must not restore it
+    assert ranks[1].ledger().used == 0

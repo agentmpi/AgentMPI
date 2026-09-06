@@ -231,6 +231,17 @@ def build_parser() -> argparse.ArgumentParser:
     _common(p)
     p.add_argument("--tokens", type=int, default=None)
 
+    p = sub.add_parser("ctx-evict", help="drop bodies from what your next call carries")
+    _common(p)
+    p.add_argument("--down-to", type=int, default=None,
+                   help="target live tokens (default: half the budget)")
+    p.add_argument("--keep", default="", help="comma-separated handles to keep")
+
+    p = sub.add_parser("resident", help="what your next call would carry, and from where")
+    _common(p)
+    p.add_argument("--of-rank", type=int, default=None,
+                   help="a peer's live set, for a sender sizing a payload")
+
     p = sub.add_parser("memo", help="record or read your own progress note")
     _common(p)
     p.add_argument("key")
@@ -698,6 +709,11 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return amp.ledger().to_dict(), amp.rank, job
     if cmd == "ctx-release":
         return amp.ctx_release(a.tokens), amp.rank, job
+    if cmd == "ctx-evict":
+        keep = tuple(h for h in a.keep.split(",") if h)
+        return amp.ctx_evict(down_to=a.down_to, keep=keep), amp.rank, job
+    if cmd == "resident":
+        return amp.resident(a.of_rank), amp.rank, job
     if cmd == "memo":
         value = a.value
         if value is not None:

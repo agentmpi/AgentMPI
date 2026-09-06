@@ -1,6 +1,25 @@
 # Context residency: splitting the ledger from the resident set
 
-**Status.** Proposal, non-normative, not implemented. It touches S6 and Appendix B.
+**Status.** Implemented and normative as of S6.1, S6.2 and Appendix A. This note
+is kept as the argument that produced them; where it and the specification differ,
+the specification is authoritative.
+
+One departure was made in implementing it, and it is recorded here rather than
+quietly. The note proposed that the resident figure inherit the degradation's
+"written at once" rule. Taken literally that would publish on every admission,
+which is every delivery --- exactly the write-per-read that cost a 128-rank
+population half an hour between the research fence and the next reduction. What
+was implemented instead: admissions ride the deferred charge, and *evictions* and
+*releases* are written at once, since those are the deliberate, rare events that
+change what a rank can accept. The rule the note was reaching for holds; the
+event it attaches to is the reduction rather than the admission.
+
+Implementing it also found a defect the note did not predict. Because a rank's
+own reads fold in its deferred charge, a release or an eviction issued straight
+after a delivery was silently undone by the next write that carried the charge
+forward; it survived only when an unrelated write had flushed the charge first.
+S6.1 now requires a reduction to be authoritative over a deferred charge, and
+there is a conformance test for it on every transport.
 
 ## The question
 

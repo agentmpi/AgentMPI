@@ -418,11 +418,40 @@ be deterministic and MUST be free of model calls.
 
 ## S6. Flow control, views, and contracts
 
-### S6.1 The context ledger
+### S6.1 The context ledger and the resident set
 
 Every rank has a **context budget** in tokens and a **context used** counter,
 which is cumulative rather than a high-water mark of live data, because that is
 what an executor's window is: a transcript that only grows.
+
+A rank also has a **resident set**: the bodies its next model call will carry.
+The two answer different questions --- what has this rank consumed, and what will
+the next call cost --- and only the second may go down without lying. An
+implementation MUST provide both, MUST record the operation each charge is
+attributed to, and MUST NOT reduce `used` except by an explicit release.
+
+The resident set MUST be reducible by **eviction**, and an eviction MUST leave
+every evicted body addressable: at a payload handle, or at the window key and
+version it was read from. Eviction is therefore not compaction and does not
+contradict Appendix B: nothing is summarised and nothing is lost, and a rank that
+evicted a body may materialise it again --- paying the ledger again, because it
+has read it again. An implementation SHOULD evict from the tail of the set and
+MUST NOT evict a body the harness has pinned.
+
+> **Rationale.** A chat agent shrinks its window by summarising, which is lossy,
+> costly and unreproducible, and fatal to durable replay (S10.7), because a
+> summary is itself a model call and a replayed rank would not see what the
+> original saw. It summarises because it has nowhere to put what it drops. A rank
+> here has somewhere: every body is content addressed. Eviction against a backing
+> store is the mechanism a chat agent cannot have.
+>
+> Tail-first eviction is not an ordering preference, it is a cost model providers
+> impose. A provider caches the key-value state of a prompt prefix, and editing a
+> body invalidates that cache from its position onward, so freeing fifty thousand
+> tokens from the middle while forcing a full cache miss on every later call is
+> usually the worse trade. Pinning exists so a harness can hold the immutable
+> shared material at the front: a commission that is byte-identical across a
+> population is a natural shared prefix.
 
 Delivering a payload body into a rank's context MUST charge the ledger. An
 operation whose delivery would exceed the budget MUST NOT silently succeed. It
@@ -438,7 +467,14 @@ reading forty-eight cells pays forty-eight round trips while the population
 waits. The charged ledger SHOULD travel with the next write of the rank's row that
 happens for another reason — a lease renewal, a collective arrival, a release —
 and a **degradation** SHOULD be written at once, because a peer deciding how much
-to send is entitled to see it.
+to send is entitled to see it. An **eviction** and a **release** follow the
+degradation's rule rather than the charge's: both are deliberate and rare where
+charges are constant, and both change what the rank can accept.
+
+A deferred charge MUST NOT survive the operation that reduced it. An
+implementation that folds the pending charge into a rank's own reads must treat a
+release or an eviction as authoritative, or the reduction is undone by the next
+write that carries the charge forward.
 
 > *Where this comes from.* At 128 ranks over four machines the runtime wrote the
 > rank row on every read; after the research fence the whole population spent
@@ -456,8 +492,11 @@ Let `E` be the implementation's **eager threshold** in tokens.
   explicit materialisation to obtain the body.
 
 A caller MAY override the decision per operation. An implementation MAY also
-choose rendezvous for a payload under the threshold when the receiver's remaining
-budget is small.
+choose rendezvous for a payload under the threshold when the receiver is short of
+room, and SHOULD read that from the receiver's **resident set** as well as its
+remaining budget (S6.1): occupancy is what MPI's buffer pressure corresponds to,
+and a receiver that has evicted its way back to room can take an eager body
+whatever its lifetime intake has been. Where both are known the tighter governs.
 
 > **Rationale.** This is MPI's eager limit, and it exists for the same reason.
 > Below the limit, pushing bytes to the receiver unsolicited is cheaper than an
@@ -1568,6 +1607,7 @@ network round trip.
 | — | **conflict lifting and invariant verification** | no MPI analogue |
 | — | **interface declaration and verification** | no MPI analogue |
 | `MPI_Ibcast` | `AMPI_Ibcast` (S7.4): the root's request completes on return |
+| Unexpected-message buffer *occupancy* | resident set (S6.1): what the next call carries, reducible by eviction against a backing store |
 | Work queue / bag of tasks (no MPI analogue) | `AMPI_Pool_*` (S9.5): claim by compare-and-swap, dependency gating, reclaim from a dead holder, termination |
 
 ## Appendix B. Deliberate omissions in 1.0
