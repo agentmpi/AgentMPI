@@ -31,6 +31,7 @@ from .base import (
 )
 from .gitd import GitdDevice
 from .gitlog import GitDevice
+from .hub import HubDevice
 from .journal import JournalDevice
 from .memory import MemoryDevice
 from .sqlite import SqliteDevice
@@ -42,6 +43,7 @@ __all__ = [
     "GitDevice",
     "GitdDevice",
     "Gt",
+    "HubDevice",
     "In",
     "IsNull",
     "JournalDevice",

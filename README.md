@@ -56,8 +56,8 @@ them.
 
 2. The reference           ampi/                    the runtime: everything the specification
    implementation            core/                  requires, written over the device waist
-                             device/                the waist: 6 operations, 5 transports
-                                                    (sqlite, journal, memory, git, gitd)
+                             device/                the waist: 6 operations, 6 transports
+                                                    (sqlite, journal, memory, git, gitd, hub)
                              cli.py                 the command binding an agent calls
                            conformance/             one suite, run unchanged against every
                                                     transport; the artifact that makes this a
@@ -74,7 +74,8 @@ them.
                              analysis/              the trace; trace analysis, figures, viewer
 
 4. The experiments         experiments/             E0 microbenchmarks, E1 and E2 (session
-   and analysis                                     ranks), E5 (machines), E7 (process ranks)
+   and analysis                                     ranks), E5 (machines), E7 (process ranks),
+                             aws_production/        the fleet: real machines, provisioned
                              tools/                 sealing a run, collecting the suite
                            runs/                    committed evidence: launch plans, traces,
                                                     per-rank reports, analyses; no book text
@@ -251,7 +252,7 @@ ampirun -np 256 --nodes 8 --node 3 --device gitd --root work/job -- ...      # m
 git device's mutations are pure functions of the state, so the daemon can apply
 every write its ranks issue within a window as one commit and one push — the
 intra-node aggregation every production MPI does before it touches the network.
-It passes the same conformance suite as the other four transports. `E7`
+It passes the same conformance suite as the other transports. `E7`
 (`experiments/e7_rawapi_book/`) is the experiment built on all three: the
 production book translation on raw-API ranks: 16, 32 and 64 processes on one
 machine, then 128 and 256 over four machines, all to completion, with
@@ -261,6 +262,58 @@ spread over the population, and a locked amendment ledger. Its runs are under
 evidence with what each one found (`runs/e7-rawapi-p128-attempt1` to
 `-attempt5`), and `experiments/e7_rawapi_book/NODES.md` is the operator's
 account.
+
+### Machines you own: the hub device and an AWS fleet
+
+The git transports exist because a cloud sandbox has no shared filesystem and no
+inbound port, and they have a measured ceiling: eight daemons on one ref land
+about one push in ten, so four machines sit inside it and thirty-two would not
+run a job at all. That ceiling is a property of the constraint, not of the
+protocol — and the constraint is the sandbox's, not the cloud's. Thirty-two EC2
+instances in one VPC have routable private addresses, a firewall the operator
+writes, and a round trip of a few tenths of a millisecond.
+
+`ampi/device/hub.py` is the transport that follows: one process owns the state
+(a SQLite file) and answers the six waist operations over TCP; every rank on
+every node is a client, speaking the wire format `gitd` established. There is no
+push contest because there is one writer and it is a mutex rather than a remote
+ref. It passes the same conformance suite as the other five transports, and
+nothing above the waist changed. Two things fall out of having one authority
+rather than a replicated document: every rank reads the *hub's* clock, carried
+as a periodically-sampled offset, so a fleet whose machines disagree about the
+time no longer convicts the living; and the state is indexed rather than parsed
+whole, so a poll does not cost more as the run gets longer. What it costs is
+stated plainly in the module: the hub is a single point of failure where the git
+host was someone else's problem. Its disk survives, so `rejoin` recovers a job —
+but that is recovery, not availability.
+
+`experiments/aws_production/` is the fleet around it: `fleet.py` provisions,
+drives and tears down the machines (everything tagged `ampi:job=<name>`, and
+`down` acts on exactly that tag), `bootstrap.sh` is cloud-init user-data that
+carries no credential and starts no rank, and `costs.py` prices a plan from a
+dated price table rather than from an assertion.
+
+```bash
+pip install -e '.[aws,tokens]'
+F="python -m experiments.aws_production.fleet"
+$F plan --name e9-aws-p256 --nodes 32 --spot --api-spend 23   # makes no AWS calls
+$F up --name e9-aws-p256 --nodes 32 --spot && $F status --name e9-aws-p256
+$F env --name e9-aws-p256 && $F run --name e9-aws-p256 --size 256
+$F collect --name e9-aws-p256 && $F down --name e9-aws-p256
+```
+
+32 workers and one hub for four hours is $3.84 on demand, $2.44 with the workers
+on spot, against the $23.38 the same book cost in models at p=256: the machines
+are 9-14% of the run. The two lines worth staring at are that 33 public IPv4
+addresses cost more per hour than the hub instance does, and that EBS is billed
+until a volume is deleted rather than until its instance is stopped.
+`experiments/aws_production/AWS.md` is the runbook and the full table.
+
+The device is tested and the fleet tooling is not yet proven against real
+hardware: no run in `runs/` came from it, and `AWS.md` ends with what stays
+unknown until one does — chiefly whether one hub process serves 256 clients
+comfortably, since the load that grew at p=256 on git was the population's own
+polling.
 
 ## Results, including the negative ones
 
