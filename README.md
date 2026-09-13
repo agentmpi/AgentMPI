@@ -153,17 +153,22 @@ a work item *is* stays with the harness. E8 is what that buys — a population
 that claims its next page instead of waiting at a barrier for the slowest model.
 
 **Two numbers, not one.** What a rank has consumed and what its next call will
-carry are different questions, and only the second has an answer that may go
-down. So the ledger accounts — cumulative, per-category, reducible only by
-ending the turn — and a *resident set* admits. Eviction reduces the resident
-set and leaves every dropped body at its handle, or at the window key and
-version it came from, so this is not a chat agent's compaction: nothing is
-summarised, a replayed rank sees what the original saw, and a rank that reads an
-evicted body again pays again. Measured: 48,192 tokens of window freed in
-0.19 ms with the ledger unmoved at 48,276, one body recovered in 0.42 ms and
-charged again. Eviction takes
-the tail and never the pinned, because providers cache a prompt prefix and
-freeing the middle costs more than a token counter can see.
+carry are different questions, and only the second may go down. So the ledger
+accounts — cumulative, per-category, and never decreased by anything, not even a
+release — and a *buffer* admits: what the next call carries, each body at an
+address it can be read back from, with a headroom that is the budget less what
+is carried and less what senders have reserved. The buffer decides whether a
+delivery fits, degrades, or is refused; the ledger only records that it happened.
+That is MPI's unexpected-message buffer with the unit changed — occupancy is the
+flow-control quantity and bytes received is a statistic — and it is what lets a
+rank read four times its budget without a single degradation (`experiments/e0_micro`,
+Q0.6: 24 bodies, a 12,000-token window, a ledger at 4.0× the budget, none
+truncated). Eviction takes the tail and never what the harness pinned, because
+providers cache a prompt prefix and freeing the middle costs more than a token
+counter can see; an evicted body is paged back in with `ctx_materialize` and
+charged again, so this is not a chat agent's compaction and a replayed rank
+sees what the original saw. E8's carry mode routes a prompt's shared material
+through the buffer and holds the provider's billed prompt against it.
 
 **Context safety.** MPI's advice is to test a program by making every send
 synchronous. Here the buffer a harness implicitly relies on is the receiving
@@ -357,6 +362,17 @@ barriers is, in E8, either gone or named.
   and paying for a straggler twice. The wall times are not comparable to E7's
   either: E8 pays a git round trip per operation where E7 at p=16 paid a local
   write. `runs/e8-rawapi-p16`, `runs/e8-rawapi-p16-run2`.
+* **The buffer governs admission; the ledger only counts (E8 carry mode).** The
+  same harness with its prompt material read through the runtime's buffer, a
+  32,000-token window, sixteen ranks on one machine: 207 model calls, 664
+  evictions, no degradation, a ledger of 1.54 million tokens — 48 times the
+  window — and the provider's billed prompt at 0.61 of the buffer at the median
+  with correlation 0.80. The first attempt is kept because the buffer found the
+  harness pinning a 15,000-token glossary no prompt used whole and reading
+  whole segments for seams that used edges: 131 degradations, a billed prompt a
+  fifth of the buffer. The discipline that fixed it is MPI's: the buffer holds
+  what the call carries. `runs/e8-rawapi-p16-carry`, `-attempt1`,
+  `runs/e8-stub-carry`.
 * **Protocol cost.** SQLite transport: α = 0.730 ms, β = 0.480 µs/token,
   half-bandwidth point 1521 tokens. β agrees within 2% across all three
   transports, because the per-token cost is serialisation above the waist rather

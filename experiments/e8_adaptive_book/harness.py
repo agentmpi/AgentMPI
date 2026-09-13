@@ -37,8 +37,9 @@ from typing import Any
 from ampi import Ampi
 from ampi.core.ops import CONFLICT_KEY, value_of
 from ampi.core.ops import arbitrate as default_arbitrate
-from ampi.core.payload import Contract
+from ampi.core.payload import Contract, canonical
 from ampi.errors import AmpiError
+from ampi.tokens import count_tokens
 from ampitools.executor import Task, new_aid
 from ampitools.harness import Harness
 from ampitools.launcher import EXIT_EXECUTOR_DIED
@@ -106,6 +107,13 @@ class Config:
     first_page: int = corpus_mod.FIRST_PROSE_PAGE
     last_page: int | None = None
     steal: bool = True
+    #: Carry mode: the harness reads what a prompt needs *through* the runtime
+    #: --- the commission and glossary pinned at the front, the chapter's
+    #: amendments and the previous page charged and admitted, the page's own
+    #: text put once and read back --- and makes room by eviction rather than by
+    #: ending the turn.  Then the buffer is the prompt's shared material, and the
+    #: provider's prompt-token count can be held against it (S6.1).
+    carry: bool = False
     nodes: int = 1
     remote: str = ""
     branch: str = ""
@@ -230,12 +238,29 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
         except json.JSONDecodeError as exc:
             raise RuntimeError(f"{label}: the delivered body is not JSON ({exc})") from exc
 
-    def read_cell(win: str, key: str) -> Any:
-        """A window body, uncharged: the harness's bookkeeping, not a model's reading."""
+    def read_cell(win: str, key: str, *, prompt: bool = False) -> Any:
+        """A window body.
+
+        Bookkeeping reads are uncharged (``out=``): the harness's, not a model's.
+        A read whose body goes into the next prompt is charged and admitted when
+        the run carries, so the buffer says what the prompt will carry.
+        """
+        if prompt and cfg.carry:
+            got = amp.get(win, key)
+            if not got.get("present"):
+                return None
+            return got.get("value")
         got = amp.get(win, key, out=str(bodies / f"{win}-{key.replace('/', '_')}.json"))
         if not got.get("present"):
             return None
         return take(got, f"{win}/{key}")
+
+    def make_room() -> None:
+        """Before a model call: a fresh turn, or an evicted window with its prefix."""
+        if cfg.carry:
+            amp.ctx_evict(down_to=0)      # everything but the pinned prefix
+        else:
+            amp.ctx_release()
 
     def maybe_die(where: str) -> None:
         if cfg.die_fraction <= 0 or epoch != 1:
@@ -258,6 +283,10 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
             amp.trace("task.replay", rank=rank, label=label)
             return take(saved, label)
         amp.heartbeat(extend=cfg.task_timeout)
+        led = amp.ledger()
+        amp.trace("ctx.carry", rank=rank, label=label, occupancy=led.occupancy,
+                  entries=int((led.resident or {}).get("live", 0)), used=led.used,
+                  prompt_tokens_local=count_tokens(prompt), carry=cfg.carry)
         value: Any = None
         problems: list[str] = []
         for attempt in range(2):
@@ -272,7 +301,8 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
             amp.trace("task.invalid", rank=rank, label=label, attempt=attempt + 1,
                       problems=problems[:5])
         amp.put(MEMO_WIN, key, value)
-        amp.ctx_release()
+        if not cfg.carry:
+            make_room()
         return value
 
     # -- 0. commission and windows --------------------------------------------
@@ -285,13 +315,30 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
                             "translate every paragraph; never summarise",
                             "keep the source's paragraphing"], "model": cfg.model}
     if rank == 0:
-        amp.bcast("commission", payload=commission, root=0, timeout=cfg.phase_timeout)
+        got = amp.bcast("commission", payload=commission, root=0, timeout=cfg.phase_timeout)
+    elif cfg.carry:
+        got = amp.bcast("commission", root=0, timeout=cfg.phase_timeout, materialize=True)
     else:
-        take(amp.bcast("commission", root=0, timeout=cfg.phase_timeout,
-                       out=str(bodies / "commission.json")), "commission")
+        got = amp.bcast("commission", root=0, timeout=cfg.phase_timeout,
+                        out=str(bodies / "commission.json"))
+        take(got, "commission")
+    if cfg.carry:
+        # Byte-identical across the population: a natural shared prefix.
+        if rank == 0:
+            amp.ctx_materialize(got["handle"], pinned=True)
+        else:
+            amp.ctx_pin(got["handle"])
 
     # -- 1. survey the home block -----------------------------------------------
     amp.memo("phase", "survey")
+    if cfg.carry:
+        # The block's pages enter the window like everything else: put once at
+        # an address the runtime can page back in, and read charged.  The
+        # translate step finds them already there.
+        for n in my_block:
+            if not read_cell(BOOK_WIN, f"src/{n:03d}"):
+                amp.put(BOOK_WIN, f"src/{n:03d}", {"page": n, "units": pages[n]["units"]})
+            amp.get(BOOK_WIN, f"src/{n:03d}")
     block_units = [u for n in my_block for u in pages[n]["units"]]
     segment = {"index": rank, "pages": [my_block[0], my_block[-1]] if my_block else [],
                "chapters": sorted({pages[n]["chapter"] for n in my_block}), "units": block_units}
@@ -303,7 +350,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
 
     # -- 2. census, arbitration, and a glossary nobody waits to hand out -----------
     amp.memo("phase", "census")
-    amp.ctx_release()
+    make_room()
     census = amp.allreduce("census", payload={t: terms[t]["proposed"] for t in terms}, op="union",
                            algorithm=cfg.algorithm, quorum=cfg.quorum, timeout=cfg.phase_timeout)
     conflicts = census.get("conflicts") or {}
@@ -341,13 +388,25 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
     # The root publishes the settled glossary and goes straight to the pool: a
     # nonblocking broadcast (S7.4).  In E7 the root of this broadcast waited for
     # its slowest receiver while its own segment sat untranslated.
+    # The census reduction is done with: it leaves the window before the
+    # glossary, which is a body of comparable size, arrives.  The first carry
+    # run did not do this and the buffer degraded the glossary at every rank
+    # rather than overflow --- reported, as S6.1 requires, where a window
+    # without a buffer would have silently carried both.
+    make_room()
+    # The binding glossary is the harness's reference, not a body any prompt
+    # carries whole: each page's prompt gets the terms that page uses, and it is
+    # that projection which is charged, at the glossary's address, when the
+    # page is translated.  The first carry run pinned the whole glossary in
+    # every window and the buffer reported five times what any prompt used.
     if rank == 0:
-        amp.ibcast("glossary", payload=glossary, root=0)
+        req = amp.ibcast("glossary", payload=glossary, root=0)
         amp.put(BOOK_WIN, "glossary", glossary)
     else:
         req = amp.ibcast("glossary", root=0)
         glossary = take(amp.wait(req["request"], timeout=cfg.phase_timeout,
                                  out=str(bodies / "glossary.json")), "glossary")
+    glossary_address = f"win:{BOOK_WIN}/glossary@1"
     if not isinstance(glossary, dict):
         glossary = {}
     report["glossary_terms"] = len(glossary)
@@ -369,17 +428,35 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
 
     def translate_page(n: int) -> None:
         page = pages[n]
-        amp.ctx_release()
+        make_room()
         maybe_die("translate")
         chapter = page["chapter"]
+        if cfg.carry:
+            # The page's own text enters the window like everything else: put
+            # once at an address the runtime can page back in, and read charged.
+            if not amp.get(BOOK_WIN, f"src/{n:03d}").get("present"):
+                amp.put(BOOK_WIN, f"src/{n:03d}", {"page": n, "units": page["units"]})
+            amp.get(BOOK_WIN, f"src/{n:03d}")
         extra = current_amendments(chapter)
         merged_glossary = {**extra, **glossary}   # the binding glossary wins over an amendment
         relevant = _relevant_glossary(merged_glossary, page["units"], set())
+        if cfg.carry and relevant:
+            # What the prompt carries of the glossary: a projection of an
+            # addressed body, admitted at that address.  Evicting it drops it
+            # from the next prompt; materialising the address brings the whole
+            # glossary back, charged.
+            amp.charge(count_tokens(canonical(relevant)), what="glossary",
+                       handle=glossary_address)
         previous = None
         if n - 1 in pages:
-            prev = read_cell(BOOK_WIN, f"seg/{n - 1:03d}")
-            if isinstance(prev, dict) and prev.get("units"):
-                previous = prev["units"][-1]
+            # Only the last paragraph of the page before enters the prompt, so
+            # only its edge is read through the buffer.  The first carry run
+            # read the whole segment here and again, twice, at every seam, and
+            # the buffer degraded the reads rather than carry five times what
+            # the prompt used.  What the prompt carries is what is charged.
+            edge = read_cell(BOOK_WIN, f"edge/{n - 1:03d}", prompt=True)
+            if isinstance(edge, dict) and edge.get("tail_unit"):
+                previous = edge["tail_unit"]
         seg = {"index": n, "pages": [n, n], "chapters": [chapter], "units": page["units"]}
         expected = [u["i"] for u in page["units"]]
         translation = invoke(
@@ -398,6 +475,10 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
                  "new_terms": new_terms, "epoch": epoch, "block": page["block"],
                  "stolen": page["block"] != rank}
         amp.put(BOOK_WIN, f"seg/{n:03d}", draft)
+        amp.put(BOOK_WIN, f"edge/{n:03d}", {"page": n, "rank": rank,
+                                              **_edges_of(units, languages),
+                                              "head_unit": units[0] if units else None,
+                                              "tail_unit": units[-1] if units else None})
         if new_terms:
             # One atomic union, no lock: a term two translators settled differently
             # is lifted as a conflict, which the analysis counts as a clash and the
@@ -413,26 +494,37 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
         # A seam exists the moment both of its pages do; both neighbours may
         # propose it and the pool keeps one.
         for m in (n - 1, n + 1):
-            if m in pages and amp.get(BOOK_WIN, f"seg/{m:03d}").get("present"):
+            # Whether a neighbour exists is bookkeeping: an uncharged read.  A
+            # charged one carried the whole neighbouring segment into the
+            # window for a yes-or-no answer.
+            if m in pages and read_cell(BOOK_WIN, f"edge/{m:03d}") is not None:
                 a, b = min(n, m), max(n, m)
                 amp.pool_add(POOL, {"id": seam_id(a, b), "deps": [page_id(a), page_id(b)],
                                     "priority": 1, "group": f"b{pages[a]['block']}",
                                     "payload": {"pages": [a, b]}})
 
     def revise_seam(a: int, b: int) -> None:
-        amp.ctx_release()
+        make_room()
         maybe_die("seam")
-        left = read_cell(BOOK_WIN, f"seg/{a:03d}")
-        right = read_cell(BOOK_WIN, f"seg/{b:03d}")
-        if not (isinstance(left, dict) and isinstance(right, dict)):
-            amp.pool_done(POOL, seam_id(a, b), result={"skipped": "a page is missing"})
+        # The prompt sees two edges; those are read through the buffer.  The
+        # left segment is read whole only to rewrite its tail, which is the
+        # harness's bookkeeping and is not charged.
+        left_edge = read_cell(BOOK_WIN, f"edge/{a:03d}", prompt=True)
+        right_edge = read_cell(BOOK_WIN, f"edge/{b:03d}", prompt=True)
+        if not (isinstance(left_edge, dict) and isinstance(right_edge, dict)):
+            amp.pool_done(POOL, seam_id(a, b), result={"skipped": "an edge is missing"})
             return
-        my_edges = _edges_of(left["units"], languages)
+        my_edges = {"head": left_edge.get("head") or {}, "tail": left_edge.get("tail") or {}}
         seam = invoke(f"seam:{seam_id(a, b)}",
-                      seam_prompt(rank, my_edges, [{"rank": right["rank"],
-                                                    **_edges_of(right["units"], languages)}],
+                      seam_prompt(rank, my_edges, [{"rank": right_edge.get("rank"),
+                                                    "head": right_edge.get("head") or {},
+                                                    "tail": right_edge.get("tail") or {}}],
                                   languages), SEAM_CONTRACT)
         if isinstance(seam, dict) and seam.get("changed"):
+            left = read_cell(BOOK_WIN, f"seg/{a:03d}")
+            if not isinstance(left, dict):
+                amp.pool_done(POOL, seam_id(a, b), result={"skipped": "a page is missing"})
+                return
             revised = dict(seam)
             revised["revised"] = {"tail": (seam.get("revised") or {}).get("tail") or {}}
             left["units"] = _apply_seam(left["units"], revised, languages)
@@ -477,7 +569,7 @@ def rank_main(amp: Ampi, rank: int, cfg: Config, plan: dict[str, Any], executor:
     amp.memo("phase", "done-pool")
     report["pages_in_order"] = [n for n in order if n in set(report["pages_done"])]
     usage = executor.stats().get("usage", {}) if hasattr(executor, "stats") else {}
-    amp.ctx_release()
+    make_room()
     spend = amp.allreduce("spend", payload=float(usage.get("cost_usd", 0.0)), op="sum",
                           quorum=cfg.quorum, timeout=cfg.phase_timeout)
     report["spend_total_usd"] = round(float(spend.get("value") or 0.0), 4)
@@ -568,7 +660,8 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
         fallback_model=a.fallback_model, device=a.device, task_timeout=a.task_timeout,
         phase_timeout=a.phase_timeout, quorum=a.quorum, algorithm=a.algorithm,
         die_fraction=a.die_fraction, respawn=a.respawn, ctx_budget=a.ctx_budget, lease_s=a.lease,
-        first_page=a.first_page, last_page=a.last_page, steal=not a.no_steal, nodes=a.nodes,
+        first_page=a.first_page, last_page=a.last_page, steal=not a.no_steal, carry=a.carry,
+        nodes=a.nodes,
         remote=a.remote or "", branch=a.branch or "", run_dir=a.run_dir or "",
         work_dir=a.work_dir or "",
     )
@@ -596,6 +689,7 @@ def cmd_run(a: argparse.Namespace) -> dict[str, Any]:
             "model": cfg.model, "model_pool": [m.strip() for m in cfg.model.split(",") if m.strip()],
             "reasoning": cfg.reasoning, "fallback_model": cfg.fallback_model,
             "languages": cfg.languages, "quorum": cfg.quorum, "steal": cfg.steal,
+            "carry": cfg.carry, "ctx_budget": cfg.ctx_budget,
             "die_fraction": cfg.die_fraction, "respawn": cfg.respawn, "job_root": str(job_root),
             "requested_ranks": list(range(cfg.size)), "created_at": time.time(),
             "ranks": plan["meta"]["blocks"]}, indent=2), encoding="utf-8")
@@ -718,6 +812,9 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--first-page", type=int, default=corpus_mod.FIRST_PROSE_PAGE)
     r.add_argument("--last-page", type=int, default=None)
     r.add_argument("--no-steal", action="store_true", help="ranks take only their home block")
+    r.add_argument("--carry", action="store_true",
+                   help="read prompt material through the runtime's buffer and evict "
+                        "rather than release between pages (S6.1)")
     r.add_argument("--source-dir", default=None)
     r.add_argument("--run-dir", default=None)
     r.add_argument("--work-dir", default=None)

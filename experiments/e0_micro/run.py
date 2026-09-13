@@ -39,6 +39,7 @@ from ampi import Ampi
 from ampi.core.algorithms import CATALOGUE, build_schedule, cost_of
 from ampi.core.context import ResidencyModel
 from ampi.core.payload import canonical
+from ampi.errors import AmpiError
 from ampi.tokens import count_tokens, counter_name
 from ampitools.harness import Harness
 
@@ -275,6 +276,78 @@ def relative_cost(alpha_s: float, beta: float, gammas: list[float]) -> dict[str,
 # --------------------------------------------------------------------------
 
 
+# Q0.6 -- the buffer governs admission; the ledger only accounts
+# --------------------------------------------------------------------------
+
+
+def gating(device: str, root: Path, *, budget: int = 12_000, bodies: int = 24,
+           body_tokens: int = 2000) -> dict[str, Any]:
+    """The same reads under the two disciplines S6.1 distinguishes.
+
+    A rank with a ``budget``-token window reads ``bodies`` documents of
+    ``body_tokens`` each, four times its budget in all.  Under *release*, the
+    harness ends the turn only when a read would not fit --- what a harness
+    written against a cumulative counter learned to do.  Under *eviction*, it
+    drops the tail of its window to make exactly the room the next body needs
+    and keeps a pinned prefix.  Both deliver every body whole with no
+    degradation, because the buffer governs admission; both leave a ledger
+    four times the budget, because the ledger only accounts.  The numbers that
+    differ are what the prefix cost to keep and how often the window emptied.
+    """
+    out: dict[str, Any] = {"device": device, "budget": budget, "bodies": bodies,
+                           "body_tokens": body_tokens}
+    for policy in ("release", "evict"):
+        job = root / f"gate-{policy}-{device}"
+        if job.exists():
+            shutil.rmtree(job)
+        Ampi.create(str(job), 1, device=device, allow_volatile=True, ctx_budget=budget)
+        amp = Ampi(str(job), rank=0, allow_volatile=True)
+        try:
+            amp.init(ctx_budget=budget)
+            amp.win_create("w")
+            text = "word " * body_tokens
+            for i in range(bodies):
+                amp.put("w", f"doc/{i:03d}", {"i": i, "text": text})
+            amp.put("w", "commission", {"rules": text[:400]})
+            got = amp.get("w", "commission")
+            amp.ctx_pin(f"win:w/commission@{got['version']}")
+            pinned = amp.ledger().occupancy
+            delivered = degraded = refused = reductions = 0
+            prefix_lost = 0
+            t0 = time.perf_counter()
+            for i in range(bodies):
+                need = body_tokens + 32
+                led = amp.ledger()
+                if led.headroom < need:
+                    reductions += 1
+                    if policy == "release":
+                        amp.ctx_release()
+                        prefix_lost += 1
+                    else:
+                        amp.ctx_evict(down_to=led.budget - need)
+                try:
+                    r = amp.get("w", f"doc/{i:03d}")
+                except AmpiError:
+                    refused += 1
+                    continue
+                delivered += 1
+                degraded += "degraded_to" in r
+            seconds = time.perf_counter() - t0
+            led = amp.ledger()
+            out[policy] = {
+                "delivered": delivered, "degraded": degraded, "refused": refused,
+                "window_reductions": reductions, "prefix_dropped": prefix_lost,
+                "prefix_tokens": pinned, "prefix_still_live": policy == "evict" and any(
+                    e["pinned"] for e in led.resident.get("entries", [])),
+                "used": led.used, "peak_occupancy": led.peak, "occupancy": led.occupancy,
+                "used_over_budget": round(led.used / budget, 2),
+                "seconds": round(seconds, 4),
+            }
+        finally:
+            amp.close()
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="AgentMPI protocol microbenchmarks")
     ap.add_argument("--devices", default="sqlite,journal,memory")
@@ -315,6 +388,14 @@ def main() -> None:
         e = out["eviction"][device]
         print(f"[e0]   freed {e['freed_tokens']} tokens in {e['evict_ms']:.1f} ms; "
               f"recovered one in {e['recover_ms']:.1f} ms", flush=True)
+    out["gating"] = {}
+    for device in devices:
+        print(f"[e0] admission gating on {device} ...", flush=True)
+        out["gating"][device] = gating(device, root)
+        g = out["gating"][device]
+        print(f"[e0]   evict: {g['evict']['delivered']} delivered, {g['evict']['degraded']} degraded, "
+              f"ledger {g['evict']['used_over_budget']}x budget, peak {g['evict']['peak_occupancy']}",
+              flush=True)
     out["relative_cost"] = relative_cost(ref["alpha_s"], ref["beta_s_per_token"], [0.0, 1.0, 30.0])
     out["finished_at"] = time.time()
 

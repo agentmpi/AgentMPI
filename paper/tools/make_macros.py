@@ -129,7 +129,9 @@ def e0_macros() -> None:
     if not d:
         for k in ("alphaSqlite", "betaSqlite", "nHalfSqlite", "alphaJournal", "nHalfJournal",
                   "alphaMemory", "betaSpread", "protoFracOne", "protoFracThirty", "protoMsP",
-                  "evictFreed", "evictMs", "evictRecoverMs", "evictBodies", "evictLedger"):
+                  "evictFreed", "evictMs", "evictRecoverMs", "evictBodies", "evictLedger",
+                  "gateBudget", "gateBodies", "gateDelivered", "gateDegraded", "gateLedgerX",
+                  "gatePeak", "gateReductions", "gateReleaseReductions"):
             put(k, None)
         return
     pp = d["pingpong"]
@@ -153,6 +155,16 @@ def e0_macros() -> None:
         put("evictLedger", int(ev["used_before"]))
         put("evictMs", round(ev["evict_ms"], 2), fmt=".2f")
         put("evictRecoverMs", round(ev["recover_ms"], 2), fmt=".2f")
+    g = (d.get("gating") or {}).get("sqlite")
+    if g:
+        put("gateBudget", int(g["budget"]))
+        put("gateBodies", int(g["bodies"]))
+        put("gateDelivered", int(g["evict"]["delivered"]))
+        put("gateDegraded", int(g["evict"]["degraded"]))
+        put("gateLedgerX", round(g["evict"]["used_over_budget"], 1), fmt=".1f")
+        put("gatePeak", int(g["evict"]["peak_occupancy"]))
+        put("gateReductions", int(g["evict"]["window_reductions"]))
+        put("gateReleaseReductions", int(g["release"]["window_reductions"]))
 
 
 # --------------------------------------------------------------------------

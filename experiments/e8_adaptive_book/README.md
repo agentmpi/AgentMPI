@@ -42,3 +42,24 @@ preferred group, and how long the rank waited for it; a claim taken over from a
 convicted holder is preceded by `pool.reclaim`; a rank with nothing to do
 records `pool.wait`. Those three are the experiment's instrument: the idle time
 E7 spent at barriers is, in E8, either gone or named.
+
+## Carry mode: the prompt through the buffer
+
+`--carry` makes the harness read what a prompt needs *through* the runtime
+(S6.1): the commission and the settled glossary pinned at the front of the
+window, the chapter's amendments and the previous page charged and admitted, the
+page's own text put once and read back. Room is made by eviction rather than by
+ending the turn, so the buffer at each model call is the prompt's shared
+material, and the analysis holds the provider's billed prompt tokens against it.
+
+```bash
+python -m experiments.e8_adaptive_book.harness run --name e8-stub-carry --size 16 \
+    --executor stub --launch threads --carry --ctx-budget 12000     # a 12k window, whole book
+python -m experiments.e8_adaptive_book.harness run --name e8-rawapi-p16-carry --size 16 \
+    --executor model --model ... --carry --ctx-budget 32000
+```
+
+The trace gains `ctx.carry` (what the buffer held at each call), `ctx.evict`,
+`ctx.pin` and `ctx.materialize`; `analysis_e8/README.md` gains a table of the
+buffer against the prompt. `runs/e8-stub-carry` is the surrogate population
+translating the whole book inside a 12,000-token window with no degradation.

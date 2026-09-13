@@ -172,6 +172,68 @@ def slowest_call(ev: list[dict[str, Any]]) -> dict[str, Any]:
             "finish_reason": c.get("finish_reason", "")}
 
 
+def buffer(ev: list[dict[str, Any]]) -> dict[str, Any]:
+    """The buffer against the prompt, per model call (S6.1).
+
+    In carry mode the harness reads a prompt's shared material through the
+    runtime, so at every call the buffer's occupancy is what the runtime thinks
+    the prompt carries.  Two numbers stand against it: the prompt the harness
+    actually composed, counted locally, and --- with a real model --- the
+    prompt tokens the provider billed.  The ratio and its spread say how well
+    the buffer tracks the window; the eviction and degradation counts say
+    whether it ever had to.
+    """
+    carries = [e for e in ev if e["kind"] == "ctx.carry"]
+    calls: dict[tuple[int, str], int] = {}
+    for e in ev:
+        if e["kind"] == "task.call" and e.get("prompt_tokens"):
+            key = (int(e["rank"]), str(e.get("label", "")))
+            calls.setdefault(key, int(e["prompt_tokens"]))   # the first call of the task
+    pairs_local = [(int(e.get("occupancy") or 0), int(e.get("prompt_tokens_local") or 0))
+                   for e in carries if e.get("prompt_tokens_local")]
+    pairs_billed = [(int(e.get("occupancy") or 0), calls[(int(e["rank"]), str(e.get("label")))])
+                    for e in carries if (int(e["rank"]), str(e.get("label"))) in calls]
+
+    def stats(pairs: list[tuple[int, int]]) -> dict[str, Any]:
+        pairs = [(o, q) for o, q in pairs if o > 0 and q > 0]
+        if not pairs:
+            return {"n": 0}
+        ratios = sorted(q / o for o, q in pairs)
+        xs = [o for o, _ in pairs]
+        ys = [q for _, q in pairs]
+        mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
+        cov = sum((x - mx) * (y - my) for x, y in pairs)
+        vx = sum((x - mx) ** 2 for x in xs) ** 0.5
+        vy = sum((y - my) ** 2 for y in ys) ** 0.5
+        return {"n": len(pairs), "ratio_median": round(ratios[len(ratios) // 2], 3),
+                "ratio_p10": round(ratios[int(len(ratios) * 0.1)], 3),
+                "ratio_p90": round(ratios[int(len(ratios) * 0.9)], 3),
+                "correlation": round(cov / (vx * vy), 3) if vx and vy else None,
+                "occupancy_mean": round(mx), "prompt_mean": round(my)}
+
+    fin = [e for e in ev if e["kind"] == "finalize"]
+    by_label: dict[str, Any] = {}
+    for fam in ("survey", "arbitrate", "translate", "seam"):
+        sub = [(int(e.get("occupancy") or 0), calls[(int(e["rank"]), str(e.get("label")))])
+               for e in carries if str(e.get("label", "")).startswith(fam)
+               and (int(e["rank"]), str(e.get("label"))) in calls]
+        if sub:
+            by_label[fam] = stats(sub)
+    return {
+        "by_label_billed": by_label,
+        "carry": bool(carries and carries[0].get("carry")),
+        "calls_seen": len(carries),
+        "vs_local_prompt": stats(pairs_local),
+        "vs_billed_prompt": stats(pairs_billed),
+        "occupancy_max": max((int(e.get("occupancy") or 0) for e in carries), default=0),
+        "evictions": sum(int(e.get("evictions") or 0) for e in fin),
+        "evicted_tokens": sum(int(e.get("evicted_tokens") or 0) for e in fin),
+        "degradations": sum(int(e.get("degradations") or 0) for e in fin),
+        "used_total": sum(int(e.get("used") or 0) for e in fin),
+        "high_water_max": max((int(e.get("high_water") or 0) for e in fin), default=0),
+        "budget": max((int(e.get("budget") or 0) for e in fin), default=0),
+    }
+
 def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]]) -> dict[str, Any]:
     t0 = min(e["ts"] for e in ev)
     t1 = max(e["ts"] for e in ev)
@@ -200,6 +262,7 @@ def summary(name: str, ev: list[dict[str, Any]], ranks: dict[int, dict[str, Any]
         "cost_usd": round(sum(r["cost_usd"] for r in ranks.values()), 2),
         "calls": sum(r["calls"] for r in ranks.values()),
         "device_latency": device_latency(ev, max(1, n // 2)),
+        "buffer": buffer(ev),
         "wait": tail_wait(ev),
         "slowest_call": slowest_call(ev),
     }
@@ -272,6 +335,21 @@ def render(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
                          for k, v in s["device_latency"].items()
                          if isinstance(v, dict))
              + f"; {s['device_latency'].get('total_rank_h', 0)} rank-hours in total |", ""]
+    b = s.get("buffer") or {}
+    if b.get("calls_seen"):
+        vl, vb = b["vs_local_prompt"], b["vs_billed_prompt"]
+        lines += ["### The buffer against the prompt", "",
+                  "| quantity | value |", "|---|---|",
+                  f"| carry mode / window budget | {'yes' if b['carry'] else 'no'} / {b['budget']:,} |",
+                  f"| model calls seen / buffer high-water mark | {b['calls_seen']} / {b['high_water_max']:,} |",
+                  f"| prompt composed / buffer (median, p10-p90, n) | {vl.get('ratio_median')}, {vl.get('ratio_p10')}-{vl.get('ratio_p90')}, {vl.get('n')} |",
+                  f"| prompt billed / buffer (median, p10-p90, n) | {vb.get('ratio_median')}, {vb.get('ratio_p10')}-{vb.get('ratio_p90')}, {vb.get('n')} |",
+                  f"| correlation, buffer vs billed prompt | {vb.get('correlation')} |",
+                  "| billed / buffer by task (median, n) | " + "; ".join(
+                      f"{k}: {v.get('ratio_median')} ({v.get('n')})"
+                      for k, v in (b.get("by_label_billed") or {}).items()) + " |",
+                  f"| evictions / tokens evicted / degradations | {b['evictions']} / {b['evicted_tokens']:,} / {b['degradations']} |",
+                  f"| ledger total, all ranks | {b['used_total']:,} |", ""]
     if vs:
         lines += [f"### Against {vs['name']}", "",
                   "| | E7 (phases) | E8 (pool) |", "|---|---|---|",
@@ -330,6 +408,24 @@ def macros(s: dict[str, Any], vs: dict[str, Any] | None, ranks: dict[int, dict[s
                                      if isinstance(v, dict)), default=0), 1),
         "TransportH": _tex(float(lat.get("total_rank_h") or 0), 2),
     }
+    b = s.get("buffer") or {}
+    if b.get("calls_seen"):
+        vb, vl = b["vs_billed_prompt"], b["vs_local_prompt"]
+        vals.update({
+            "BufferBudget": f"{b['budget']:,}".replace(",", "{,}"),
+            "BufferCalls": str(b["calls_seen"]),
+            "BufferHighWater": f"{b['high_water_max']:,}".replace(",", "{,}"),
+            "BufferEvictions": str(b["evictions"]),
+            "BufferEvictedK": _tex(b["evicted_tokens"] / 1000, 0),
+            "BufferDegradations": str(b["degradations"]),
+            "BufferLedgerM": _tex(b["used_total"] / 1e6, 2),
+            "BufferRatioLocal": _tex(float(vl.get("ratio_median") or 0), 2),
+            "BufferRatioBilled": _tex(float(vb.get("ratio_median") or 0), 2),
+            "BufferRatioBilledLo": _tex(float(vb.get("ratio_p10") or 0), 2),
+            "BufferRatioBilledHi": _tex(float(vb.get("ratio_p90") or 0), 2),
+            "BufferCorrelation": _tex(float(vb.get("correlation") or 0), 2),
+            "BufferPairs": str(vb.get("n") or 0),
+        })
     if vs:
         vals.update({
             "SevenWall": _tex(float(vs["wall_min"]), 1),

@@ -37,7 +37,7 @@ def test_stub_population_drains_the_pool_and_covers_the_book(tmp_path):
         arbiter_model="", reasoning="low", fallback_model="", device="sqlite", launch="threads",
         nodes=1, node=0, rejoin=False, remote=None, branch=None, task_timeout=60.0,
         phase_timeout=120.0, lease=60.0, quorum=1.0, algorithm=None, die_fraction=0.0,
-        respawn=0, ctx_budget=200000, first_page=5, last_page=24, no_steal=False,
+        respawn=0, ctx_budget=200000, first_page=5, last_page=24, no_steal=False, carry=False,
         source_dir=None, run_dir=str(tmp_path / "run"), work_dir=str(tmp_path / "work"),
         quiet=True,
     )
