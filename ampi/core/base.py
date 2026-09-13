@@ -590,6 +590,9 @@ class RuntimeBase:
             used=ledger.used,
             budget=ledger.budget,
             high_water=ledger.peak,
+            occupancy=ledger.occupancy,
+            evictions=int((ledger.resident or {}).get("evictions", 0)),
+            evicted_tokens=int((ledger.resident or {}).get("evicted_tokens", 0)),
             releases=ledger.releases,
             degradations=ledger.degradations,
         )
@@ -769,20 +772,24 @@ class RuntimeBase:
         return Ledger.from_dict(self._rankview(r).ctx)
 
     def charge(self, tokens: int, *, what: str = "", degrade_ok: bool = True,
-               handle: str = "", pinned: bool = False) -> tuple[int, str]:
-        """Charge the caller's ledger, degrading to a view rather than failing.
+               handle: str = "", pinned: bool = False,
+               entries: list[tuple[str, int]] | None = None) -> tuple[int, str]:
+        """Admit a delivery into the caller's buffer, degrading rather than failing.
 
         Returns ``(charged, view_spec)`` where an empty ``view_spec`` means the
         full body was delivered.  Degrading is preferred to failing because an
         agent that receives a truncated message can continue while one that
         receives an error usually cannot.
 
-        Two counters move (S6.1).  The ledger's ``used`` records what this rank
-        has consumed and is not reducible except by ending the turn.  When the
-        delivery names a ``handle`` the body also joins the *resident set*: what
-        the next model call will carry, which ``ctx_evict`` can reduce without
-        pretending the tokens were never spent, because the handle still
-        resolves.
+        Two numbers move (S6.1), and only one of them decides.  The buffer ---
+        what the next model call will carry --- is what the delivery must fit
+        into, and its headroom is what is left of the budget after what is
+        carried and what senders have reserved.  The ledger's ``used`` records
+        that the delivery happened and never goes down.  What is admitted is
+        addressable: at ``handle``, at each of ``entries`` for a delivery of
+        several bodies, or at a ``meta:`` address for a charge that carries no
+        body; ``ctx_evict`` drops it from the next prompt and
+        ``ctx_materialize`` brings it back, charged again.
         """
         from .context import MIN_DEGRADE_TOKENS, degrade_allowance, degrade_spec
 
@@ -790,39 +797,36 @@ class RuntimeBase:
         ledger = Ledger.from_dict(view.ctx)
         spec = ""
         if ledger.would_exceed(tokens):
-            if ledger.remaining < MIN_DEGRADE_TOKENS:
+            if ledger.headroom < MIN_DEGRADE_TOKENS:
                 # Degradation is preferred to failure, but it has a floor: below a
                 # few dozen tokens no projection says anything, and charging a
-                # minimum would break the very budget the ledger exists to keep.
+                # minimum would break the very budget the buffer exists to keep.
                 raise err(
                     "AMPI_ERR_CTX_EXCEEDED",
-                    f"rank {view.rank} has {ledger.remaining} tokens left and cannot "
-                    f"accept a {tokens}-token delivery, even degraded",
-                    hint="Use --out FILE to save the body to disk without charging "
-                    "context, or start a fresh executor turn with 'ampi ctx-release'.",
+                    f"rank {view.rank} has {ledger.headroom} tokens of window free "
+                    f"(carrying {ledger.occupancy}, reserved {ledger.reserved}, budget "
+                    f"{ledger.budget}) and cannot accept a {tokens}-token delivery, even "
+                    "degraded",
+                    hint="Make room with 'ampi ctx-evict' (the dropped bodies stay "
+                    "addressable), end the turn with 'ampi ctx-release', or use --out "
+                    "FILE to save the body to disk without charging context.",
                     tokens=tokens,
                     **ledger.to_dict(),
                 )
             if not degrade_ok:
-                ledger_error = err(
+                raise err(
                     "AMPI_ERR_CTX_EXCEEDED",
-                    f"delivering {tokens} tokens would exceed this rank's budget "
-                    f"({ledger.used}/{ledger.budget} used)",
+                    f"delivering {tokens} tokens would not fit this rank's window "
+                    f"({ledger.headroom} of {ledger.budget} free)",
                     tokens=tokens,
                     **ledger.to_dict(),
                 )
-                raise ledger_error
-            spec = degrade_spec(tokens, ledger.remaining)
-            tokens = min(tokens, degrade_allowance(ledger.remaining))
+            spec = degrade_spec(tokens, ledger.headroom)
+            tokens = min(tokens, degrade_allowance(ledger.headroom))
             ledger.degradations += 1
-            self.trace("ctx.degrade", rank=view.rank, spec=spec, what=what)
-        ledger.used += tokens
-        ledger.peak = max(ledger.peak, ledger.used)
-        ledger.note(tokens, what=what)
-        if handle:
-            resident = ledger.residency()
-            resident.admit(handle, tokens, what=what, pinned=pinned)
-            ledger.resident = resident.to_dict()
+            self.trace("ctx.degrade", rank=view.rank, spec=spec, what=what,
+                       headroom=ledger.headroom, occupancy=ledger.occupancy, used=ledger.used)
+        ledger.charge(tokens, what=what, handle=handle, pinned=pinned, entries=entries)
         view.ctx = ledger.to_dict()
         # The charge is local until the row is next written for another reason
         # --- a lease renewal, a collective arrival, a release.  Writing it here
@@ -837,29 +841,34 @@ class RuntimeBase:
         return tokens, spec
 
     def ctx_release(self, tokens: int | None = None) -> dict[str, Any]:
+        """End the executor's turn: the next call carries nothing (S6.1).
+
+        The ledger does not move.  A release used to subtract from ``used`` and
+        so let a rank hide what it had consumed; now it empties the buffer and
+        counts, and ``used`` says what the rank has read over its life whatever
+        it is carrying now.  With ``tokens`` it drops that much from the tail
+        instead, pinned material included.
+        """
         view = self._rankview()
         ledger = Ledger.from_dict(view.ctx)
-        freed = ledger.release(ledger.used if tokens is None else tokens)
-        # A fresh executor turn carries nothing, so the live set goes with it.
-        resident = ledger.residency()
-        dropped = resident.clear()
-        ledger.resident = resident.to_dict()
+        freed = ledger.release(tokens)
         view.ctx = ledger.to_dict()
         self._settle_ctx(view)
-        self.trace("ctx.release", rank=view.rank, freed=freed, resident_dropped=dropped)
+        self.trace("ctx.release", rank=view.rank, freed=freed, used=ledger.used,
+                   occupancy=ledger.occupancy, partial=tokens is not None)
         return ledger.to_dict()
 
     def ctx_evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = ()
                   ) -> dict[str, Any]:
-        """Reduce the live set without unspending what it cost (S6.1).
+        """Reduce the buffer without unspending what it cost (S6.1).
 
         This is what a chat agent cannot do.  Its only way to shrink a window is
         to summarise, which is lossy, costly and unreproducible --- and fatal to
         replay, since a summary is itself a model call.  Here every body is
-        content addressed, so eviction drops it from the *next prompt* and leaves
-        it addressable: the rank materialises it again with ``get_body``, or
-        takes a bounded view of it, and a replayed rank sees what the original
-        saw.  Nothing is summarised and nothing is lost.
+        addressable, so eviction drops it from the *next prompt* and leaves it
+        where it was: the rank materialises it again with ``ctx_materialize``,
+        or takes a bounded view of it, and a replayed rank sees what the
+        original saw.  Nothing is summarised and nothing is lost.
 
         Written at once, unlike a charge.  A peer deciding how much to send is
         entitled to see that a receiver has made room, and evictions are rare and
@@ -868,17 +877,78 @@ class RuntimeBase:
         """
         view = self._rankview()
         ledger = Ledger.from_dict(view.ctx)
-        resident = ledger.residency()
-        before = resident.tokens
-        dropped = resident.evict(down_to=down_to, keep=tuple(keep))
-        ledger.resident = resident.to_dict()
+        before = ledger.occupancy
+        dropped = ledger.evict(down_to=down_to, keep=tuple(keep))
         view.ctx = ledger.to_dict()
         self._settle_ctx(view)
-        freed = before - resident.tokens
+        freed = before - ledger.occupancy
         self.trace("ctx.evict", rank=view.rank, freed=freed, dropped=len(dropped),
-                   handles=[e.handle for e in dropped][:16], resident=resident.tokens)
+                   handles=[e.handle for e in dropped][:16], resident=ledger.occupancy,
+                   used=ledger.used)
         return {"freed": freed, "dropped": [e.to_dict() for e in dropped],
-                "resident": resident.to_dict()}
+                "resident": ledger.resident, "ledger": ledger.to_dict()}
+
+    def ctx_pin(self, address: str, *, pinned: bool = True) -> dict[str, Any]:
+        """Pin (or unpin) a body in the buffer so eviction leaves it at the front.
+
+        A provider caches the key-value state of a prompt prefix, so the
+        immutable shared material --- a commission every rank carries --- is
+        worth keeping where it is; pinning is how a harness says so after the
+        body has arrived.  Written at once, like an eviction.
+        """
+        view = self._rankview()
+        ledger = Ledger.from_dict(view.ctx)
+        r = ledger.residency()
+        changed = r.pin(address, pinned)
+        ledger.resident = r.to_dict()
+        view.ctx = ledger.to_dict()
+        self._settle_ctx(view)
+        self.trace("ctx.pin", rank=view.rank, address=address, pinned=pinned, changed=changed)
+        return {"address": address, "pinned": pinned, "changed": changed}
+
+    def ctx_materialize(self, address: str, *, view: str = "", pinned: bool = False,
+                        comm: str = "world") -> dict[str, Any]:
+        """Bring an evicted body back into the buffer: the page-in of S6.1.
+
+        An address is one of the three forms an admission records: a payload
+        handle, ``win:<window>/<key>@<version>``, or ``slice:<handle>#<index>``
+        for one member's share of a scattered or all-to-all payload.  A
+        ``meta:`` address names no body and is re-derived by repeating the
+        operation that produced it.  Reading the body again charges the ledger
+        again, which is what keeps the account honest.
+        """
+        from ..tokens import count_tokens
+        from .payload import apply_view, canonical
+
+        self.assert_identity()
+        if address.startswith("meta:"):
+            raise err("AMPI_ERR_ARG", f"{address} names no body: repeat the operation instead",
+                      address=address)
+        if address.startswith("win:"):
+            rest = address[4:]
+            win, _, tail = rest.partition("/")
+            key, _, version = tail.rpartition("@")
+            space = self._require_win(win, comm)  # type: ignore[attr-defined]
+            cell = self.device.read(space, key, version=int(version) if version else None)
+            if cell is None:
+                raise err("AMPI_ERR_ARG", f"nothing at {address}", address=address)
+            body = cell.value
+        elif address.startswith("slice:"):
+            handle, _, index = address[6:].rpartition("#")
+            body = self.get_body(handle)[int(index)]
+        else:
+            body = self.get_body(address)
+        if view:
+            body = apply_view(body, view)
+        charged, degraded = self.charge(count_tokens(canonical(body)), what="materialize",
+                                        handle=address, pinned=pinned)
+        if degraded:
+            body = apply_view(body, degraded)
+        out: dict[str, Any] = {"address": address, "body": body, "charged": charged}
+        if degraded:
+            out["degraded_to"] = degraded
+        self.trace("ctx.materialize", rank=self.rank, address=address, charged=charged)
+        return out
 
     def resident(self, rank: int | None = None) -> dict[str, Any]:
         """The live set of this rank, or of a peer a sender is sizing up."""

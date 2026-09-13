@@ -213,24 +213,45 @@ def test_invariant_concurrent_shrinks_agree(job, seed):
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_invariant_the_ledger_never_exceeds_its_budget(job, seed):
-    """INV7. No sequence of deliveries takes a rank past its budget.
+def test_invariant_the_buffer_never_exceeds_its_budget_and_the_ledger_never_falls(job, seed):
+    """INV7. No sequence of operations takes a rank's window past its budget,
+    and nothing takes its ledger down.
 
-    Degradation is the mechanism, and the invariant is what it exists to keep.
+    The buffer's invariant is what degradation and refusal exist to keep; the
+    ledger's is what makes the coordination numbers in every run report honest.
+    A random program of reads, evictions and releases exercises both, and the
+    reads are sized so that only a program that evicts can deliver them all.
     """
     rng = random.Random(seed)
     budget = 4000
-    ranks = job(3, ctx_budget=budget)
-    for i in range(30):
-        ranks[0].send(1, "word " * rng.randrange(50, 1500), tag=i % 8)
-    for i in range(30):
-        try:
-            ranks[1].recv(0, tag=i % 8, timeout=2, materialize=True)
-        except AmpiError:
-            break
+    ranks = job(2, ctx_budget=budget)
+    ranks[0].win_create("w")
+    for i in range(12):
+        ranks[0].put("w", f"k{i}", "word " * rng.randrange(100, 900))
+    used_before = 0
+    delivered = degraded = 0
+    for _step in range(40):
+        op = rng.choice(["get", "get", "get", "evict", "release"])
+        if op == "get":
+            try:
+                got = ranks[1].get("w", f"k{rng.randrange(12)}")
+            except AmpiError as exc:
+                assert exc.cls_name == "AMPI_ERR_CTX_EXCEEDED"
+            else:
+                delivered += 1
+                degraded += "degraded_to" in got
+        elif op == "evict":
+            ranks[1].ctx_evict(down_to=rng.randrange(0, budget))
+        else:
+            ranks[1].ctx_release()
         led = ranks[1].ledger()
-        assert led.used <= led.budget, f"ledger exceeded its budget: {led.used}/{led.budget}"
-    assert ranks[1].ledger().used <= budget
+        assert led.occupancy <= led.budget, f"window over budget: {led.occupancy}/{led.budget}"
+        assert led.occupancy + led.headroom == led.budget
+        assert led.used >= used_before, "the ledger went down"
+        used_before = led.used
+    led = ranks[1].ledger()
+    assert delivered > 0 and led.used >= sum(e["tokens"] for e in led.resident["entries"])
+    assert led.peak <= budget
 
 
 @pytest.mark.parametrize("device", ["sqlite", "journal", "memory"])

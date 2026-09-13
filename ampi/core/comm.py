@@ -335,7 +335,10 @@ class CommMixin:
         from ..tokens import count_tokens
         from .payload import canonical
 
-        charged, _ = self.charge(count_tokens(canonical(got)), what="neighbor_allgather")
+        entries = [(n["handle"], count_tokens(canonical(n.get("body"))))
+                   for n in got if n.get("handle") and "body" in n]
+        charged, _ = self.charge(count_tokens(canonical(got)), what="neighbor_allgather",
+                                 entries=entries or None)
         self._coll_done(
             "neighbor_allgather", joined, comm=comm, label=label,
             degree=len(got), charged=charged,

@@ -1250,14 +1250,133 @@ def test_s6_2_delivery_consults_the_live_window_not_only_the_budget():
                            headroom=100000) == DELIVERY_RENDEZVOUS
 
 
-def test_s6_1_a_fresh_turn_carries_nothing(job):
+def test_s6_1_a_fresh_turn_carries_nothing_and_the_ledger_does_not_move(job):
+    """S6.1: a release empties the buffer; ``used`` is a life total and stays."""
     ranks = job(2)
     ranks[0].win_create("w")
     ranks[0].put("w", "doc", {"text": "q" * 2000})
-    ranks[1].get("w", "doc")
-    assert ranks[1].resident()["tokens"] > 0
+    charged = ranks[1].get("w", "doc")["charged"]
+    assert ranks[1].resident()["tokens"] == charged
     ranks[1].ctx_release()
-    assert ranks[1].resident()["tokens"] == 0 and ranks[1].ledger().used == 0
+    led = ranks[1].ledger()
+    assert led.occupancy == 0 and led.used == charged and led.releases == 1
+    assert led.headroom == led.budget
+
+
+def test_s6_1_eviction_restores_admission_while_used_exceeds_the_budget(job):
+    """S6.1: the buffer governs admission and the ledger only accounts.
+
+    A rank with a 3,000-token window reads six 1,000-token bodies, evicting
+    as it goes.  Every read is delivered whole, none degrades, and at the end
+    the rank has consumed twice its budget --- which the ledger says and the
+    buffer does not care about.  Before the split, the sixth read would have
+    been refused on the strength of the first three.
+    """
+    ranks = job(2, ctx_budget=3000)
+    ranks[0].win_create("w")
+    body = {"text": "word " * 1100}
+    for i in range(6):
+        ranks[0].put("w", f"doc/{i}", body)
+    one = ranks[1].get("w", "doc/0")["charged"]
+    assert 1000 < one <= 1500, one                     # two fit, three do not
+    for i in range(1, 6):
+        led = ranks[1].ledger()
+        if led.headroom < one:
+            ranks[1].ctx_evict(down_to=led.budget - one)
+        got = ranks[1].get("w", f"doc/{i}")
+        assert "degraded_to" not in got and got["charged"] == one
+    led = ranks[1].ledger()
+    assert led.used == 6 * one > led.budget
+    assert led.occupancy <= led.budget and led.degradations == 0
+    assert led.peak <= led.budget and led.headroom == led.budget - led.occupancy
+    assert int(led.resident["evictions"]) >= 3
+
+
+def test_s6_1_every_delivery_admits_an_addressable_entry(job):
+    """S6.1: whatever the operation, what the next call carries has an address."""
+    ranks = job(3)
+    big = {"text": "b" * 1500}
+    # point-to-point, broadcast, scatter, gather, reduce, exscan, alltoall
+    ranks[0].send(1, big, tag=7)
+    ranks[1].recv(0, tag=7, materialize=True, timeout=20)
+    parallel(ranks, lambda r: r.bcast("b", payload=big if r.rank == 0 else None, root=0,
+                                      materialize=True))
+    parallel(ranks, lambda r: r.scatter("s", payload=[big, big, big] if r.rank == 0 else None,
+                                        root=0, materialize=True))
+    parallel(ranks, lambda r: r.gather("g", payload={"from": r.rank, **big}, root=1,
+                                       materialize=(r.rank == 1)))
+    parallel(ranks, lambda r: r.allreduce("r", payload={f"k{r.rank}": 1}, op="union"))
+    parallel(ranks, lambda r: r.exscan("x", payload=r.rank + 1, op="sum"))
+    parallel(ranks, lambda r: r.alltoall("a", payload=[{"to": t, "from": r.rank} for t in range(3)]))
+    entries = ranks[1].resident()["entries"]
+    addresses = [e["handle"] for e in entries]
+    whats = {e["what"] for e in entries}
+    assert {"body", "bcast", "scatter", "gather", "allreduce", "exscan", "alltoall"} <= whats
+    # Every category carries a body at a real address; a delivery of several
+    # bodies may leave a small residue (the list around them) at a meta address.
+    for what in whats:
+        assert any(e["handle"] and not e["handle"].startswith("meta:")
+                   for e in entries if e["what"] == what), what
+    assert all(e["tokens"] < 120 for e in entries if e["handle"].startswith("meta:"))
+    assert any(a.startswith("slice:") and a.endswith("#1") for a in addresses)   # scatter
+    bodies = [e for e in entries if not e["handle"].startswith("meta:")]
+    assert sum(1 for e in bodies if e["what"] == "gather") == 3            # one per contributor
+    assert sum(1 for e in bodies if e["what"] == "alltoall") == 3
+    led = ranks[1].ledger()
+    assert led.occupancy == sum(e["tokens"] for e in entries) == led.used
+
+
+def test_s6_1_materialize_pages_an_evicted_body_back_in(job):
+    """S6.1: eviction is not compaction --- every form of address resolves again."""
+    ranks = job(2)
+    ranks[0].win_create("w")
+    ranks[0].put("w", "doc", {"text": "m" * 1000})
+    got = ranks[1].get("w", "doc")
+    parallel(ranks, lambda r: r.scatter("s", payload=[{"a": 1}, {"b": "y" * 500}]
+                                        if r.rank == 0 else None, root=0, materialize=True))
+    parallel(ranks, lambda r: r.bcast("b", payload={"c": "z" * 500} if r.rank == 0 else None,
+                                      root=0, materialize=True))
+    before = ranks[1].ledger()
+    addresses = [e["handle"] for e in ranks[1].resident()["entries"]]
+    assert len(addresses) == 3
+    ranks[1].ctx_evict(down_to=0)
+    assert ranks[1].ledger().occupancy == 0
+    for address in addresses:
+        back = ranks[1].ctx_materialize(address)
+        assert back["charged"] > 0
+    assert ranks[1].ctx_materialize(addresses[0])["body"] == got["value"]
+    assert ranks[1].ctx_materialize(addresses[1])["body"] == {"b": "y" * 500}
+    assert ranks[1].ctx_materialize(addresses[2])["body"] == {"c": "z" * 500}
+    led = ranks[1].ledger()
+    assert led.used > before.used, "reading an evicted body again costs again"
+    assert led.occupancy > 0
+
+
+def test_s6_1_pinned_material_survives_eviction_and_release_drops_it(job):
+    ranks = job(2)
+    parallel(ranks, lambda r: r.bcast("commission", payload={"rules": "r" * 800}
+                                      if r.rank == 0 else None, root=0, materialize=True))
+    address = ranks[1].resident()["entries"][0]["handle"]
+    ranks[1].ctx_pin(address)
+    ranks[0].win_create("w")
+    ranks[0].put("w", "doc", {"text": "d" * 800})
+    ranks[1].get("w", "doc")
+    ranks[1].ctx_evict(down_to=0)
+    live = ranks[1].resident()["entries"]
+    assert [e["handle"] for e in live] == [address] and live[0]["pinned"]
+    ranks[1].ctx_release()
+    assert ranks[1].resident()["entries"] == []
+
+
+def test_s6_3_a_reserved_eager_message_counts_against_the_receivers_window(job):
+    """S6.3 with S6.1: reserved credit is buffer space, and headroom says so."""
+    ranks = job(2)
+    led = ranks[1].ledger()
+    ranks[0]._reserve_eager(1, 500)
+    after = ranks[1].ledger()
+    assert after.reserved == 500 and after.headroom == led.headroom - 500
+    ranks[0]._release_eager(1, 500)
+    assert ranks[1].ledger().headroom == led.headroom
 
 
 def test_s6_1_a_release_straight_after_a_delivery_actually_releases(job):
@@ -1265,9 +1384,11 @@ def test_s6_1_a_release_straight_after_a_delivery_actually_releases(job):
     ranks = job(2)
     ranks[0].win_create("w")
     ranks[0].put("w", "doc", {"text": "r" * 3000})
-    ranks[1].get("w", "doc")                     # charged, and deferred
-    assert ranks[1].ledger().used > 0
+    charged = ranks[1].get("w", "doc")["charged"]      # charged, and deferred
+    assert ranks[1].ledger().occupancy == charged
     ranks[1].ctx_release()                        # with no write in between
-    assert ranks[1].ledger().used == 0
+    assert ranks[1].ledger().occupancy == 0 and ranks[1].ledger().used == charged
     ranks[1].heartbeat()                          # the next write must not restore it
-    assert ranks[1].ledger().used == 0
+    led = ranks[1].ledger()
+    assert led.occupancy == 0 and led.used == charged
+    assert ranks[0].ledger(1).occupancy == 0       # and a peer sees the room

@@ -116,12 +116,13 @@ class Resident:
         self.entries.append(entry)
         return entry
 
-    def evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = ()
-              ) -> list[ResidentEntry]:
+    def evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = (),
+              pinned_too: bool = False) -> list[ResidentEntry]:
         """Drop bodies from the tail until at most ``down_to`` tokens are live.
 
-        Pinned entries and those named in ``keep`` are never dropped.  Returns
-        what was dropped, whose handles still resolve.
+        Pinned entries and those named in ``keep`` are never dropped, unless
+        ``pinned_too`` says the window is being rebuilt.  Returns what was
+        dropped, whose addresses still resolve.
         """
         target = self.budget // 2 if down_to is None else max(0, down_to)
         dropped: list[ResidentEntry] = []
@@ -129,12 +130,21 @@ class Resident:
             if self.tokens <= target:
                 break
             e = self.entries[i]
-            if e.pinned or e.handle in keep:
+            if (e.pinned and not pinned_too) or e.handle in keep:
                 continue
             dropped.append(self.entries.pop(i))
         self.evictions += len(dropped)
         self.evicted_tokens += sum(e.tokens for e in dropped)
         return dropped
+
+    def pin(self, handle: str, pinned: bool = True) -> int:
+        """Pin (or unpin) every entry at ``handle``; returns how many changed."""
+        n = 0
+        for e in self.entries:
+            if e.handle == handle and e.pinned != pinned:
+                e.pinned = pinned
+                n += 1
+        return n
 
     def clear(self) -> int:
         """A fresh executor turn carries nothing, pinned material included."""
@@ -172,20 +182,26 @@ class Resident:
 
 @dataclass
 class Ledger:
-    """One rank's context accounting.
+    """One rank's context accounting, and the buffer it admits into.
 
-    ``used`` is cumulative, not a high-water mark of live data, because that is
-    what an executor's window actually is: a transcript that only grows.  A rank
-    that reads a 4000-token document, is told to forget it, and reads it again has
-    spent 8000 tokens.  ``release`` exists for harnesses that genuinely start a
-    fresh executor turn, and it is traced, because a ledger that can be silently
-    zeroed measures nothing.
+    Two numbers, two questions (S6.1).  ``used`` is what this rank has consumed
+    over its life and it only goes up: not a high-water mark of live data, and
+    not reducible by anything, because that is what an executor's window
+    actually is --- a transcript that only grows --- and because a ledger that
+    can be zeroed measures nothing.  A rank that reads a 4000-token document,
+    drops it, and reads it again has spent 8000 tokens and this says so.
 
-    ``resident`` is the other number, and it answers the other question (S6.1):
-    what the *next* call will carry.  It is reducible by eviction where ``used``
-    is not, because dropping a body does not unspend the tokens that read it.
-    ``by_what`` keeps the provenance of every charge, which the runtime already
-    computes for its own trace.
+    ``resident`` is the buffer: what the *next* call will carry.  It is what
+    MPI's unexpected-message buffer is --- a finite space that admits a body,
+    holds it until it is consumed or dropped, and refuses what does not fit ---
+    and it is the number every admission decision reads.  It goes down by
+    eviction, which leaves every body addressable, and by ending the turn.
+    ``unexpected_used`` is space in it a sender has reserved for an eager
+    message not yet received, and counts against the headroom until the
+    receiver takes the message or the sender's claim lapses.
+
+    ``by_what`` keeps the provenance of every charge and ``peak`` the buffer's
+    high-water mark, which is the statistic MPI keeps for its buffer.
     """
 
     budget: int = DEFAULT_CTX_BUDGET
@@ -198,29 +214,92 @@ class Ledger:
     by_what: dict[str, int] = field(default_factory=dict)
     resident: dict[str, Any] = field(default_factory=dict)
 
+    # -- the buffer ---------------------------------------------------------
+    def residency(self) -> Resident:
+        """The live set, sized to this rank's budget."""
+        r = Resident.from_dict(self.resident or None)
+        r.budget = self.budget
+        return r
+
+    @property
+    def occupancy(self) -> int:
+        """Tokens the next call would carry."""
+        return self.residency().tokens
+
+    @property
+    def reserved(self) -> int:
+        """Buffer space promised to eager messages not yet received."""
+        return max(0, self.unexpected_used)
+
+    @property
+    def headroom(self) -> int:
+        """What the buffer can still admit: the flow-control quantity."""
+        return max(0, self.budget - self.occupancy - self.reserved)
+
     @property
     def remaining(self) -> int:
-        return max(0, self.budget - self.used)
+        """An alias of ``headroom`` kept for the command binding's vocabulary.
+
+        Before the buffer existed this was ``budget - used``; a rank that had
+        evicted its way back to room was still refused because a cumulative
+        count never comes back down.  Room is a property of the buffer.
+        """
+        return self.headroom
 
     def would_exceed(self, tokens: int) -> bool:
-        return self.used + tokens > self.budget
+        return tokens > self.headroom
 
-    def charge(self, tokens: int, *, what: str = "") -> None:
+    # -- charging -----------------------------------------------------------
+    def charge(self, tokens: int, *, what: str = "", handle: str = "",
+               pinned: bool = False,
+               entries: list[tuple[str, int]] | None = None) -> None:
+        """Account ``tokens`` and admit what carries them into the buffer.
+
+        Raises when the buffer cannot take them; the runtime's ``charge``
+        decides whether to degrade first.  What is admitted is one entry at
+        ``handle`` (or the ``entries`` given, for a delivery of several bodies),
+        or a metadata entry when the charge names no body --- an envelope, a
+        manifest, a key listing --- which occupies the window like anything
+        else and is re-derivable by repeating the operation.
+        """
         if self.would_exceed(tokens):
             raise err(
                 "AMPI_ERR_CTX_EXCEEDED",
-                f"delivering {tokens} tokens would take this rank to "
-                f"{self.used + tokens} against a budget of {self.budget}",
-                hint="Re-issue with --view head:400 to take a bounded projection, "
-                "or --out FILE to save the body to disk without charging context.",
+                f"delivering {tokens} tokens needs more than the {self.headroom} this "
+                f"rank's window has free (budget {self.budget}, carrying {self.occupancy}, "
+                f"reserved {self.reserved})",
+                hint="Evict with 'ampi ctx-evict', end the turn with 'ampi ctx-release', "
+                "take a bounded projection with --view head:400, or save the body "
+                "with --out FILE without charging context.",
                 tokens=tokens,
-                used=self.used,
+                headroom=self.headroom,
+                occupancy=self.occupancy,
                 budget=self.budget,
                 what=what,
             )
+        self.account(tokens, what=what)
+        self.admit(tokens, what=what, handle=handle, pinned=pinned, entries=entries)
+
+    def account(self, tokens: int, *, what: str = "") -> None:
+        """The monotone half: what was consumed, and by which operation."""
         self.used += tokens
-        self.peak = max(self.peak, self.used)
         self.note(tokens, what=what)
+
+    def admit(self, tokens: int, *, what: str = "", handle: str = "",
+              pinned: bool = False,
+              entries: list[tuple[str, int]] | None = None) -> None:
+        """The buffer half: what the next call now carries, and from where."""
+        r = self.residency()
+        if entries:
+            for address, n in entries:
+                r.admit(address, int(n), what=what, pinned=pinned)
+            rest = tokens - sum(int(n) for _, n in entries)
+            if rest > 0:
+                r.admit(f"meta:{what or '?'}", rest, what=what)
+        else:
+            r.admit(handle or f"meta:{what or '?'}", tokens, what=what, pinned=pinned)
+        self.resident = r.to_dict()
+        self.peak = max(self.peak, r.tokens)
 
     def note(self, tokens: int, *, what: str = "") -> None:
         """Attribute a charge to the operation that caused it.
@@ -233,19 +312,38 @@ class Ledger:
         key = what or "?"
         self.by_what[key] = self.by_what.get(key, 0) + tokens
 
-    def release(self, tokens: int) -> int:
-        """Record that an executor turn ended and its transcript was dropped."""
-        freed = min(tokens, self.used)
-        self.used -= freed
+    # -- reducing the buffer ---------------------------------------------------
+    def release(self, tokens: int | None = None) -> int:
+        """End the turn: the next call carries nothing.  ``used`` does not move.
+
+        With ``tokens`` it drops that much from the tail instead, pinned entries
+        included --- a release is the harness saying the window is being
+        rebuilt, which is stronger than an eviction.  Returns the occupancy
+        freed.
+        """
+        r = self.residency()
+        before = r.tokens
+        if tokens is None or tokens >= before:
+            r.clear()
+        else:
+            r.evict(down_to=before - max(0, tokens), keep=(), pinned_too=True)
+        self.resident = r.to_dict()
         self.releases += 1
-        return freed
+        return before - r.tokens
+
+    def evict(self, *, down_to: int | None = None, keep: tuple[str, ...] = ()
+              ) -> list[ResidentEntry]:
+        r = self.residency()
+        dropped = r.evict(down_to=down_to, keep=keep)
+        self.resident = r.to_dict()
+        return dropped
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any] | None) -> Ledger:
         """Rebuild from a serialised ledger, ignoring derived fields.
 
-        ``to_dict`` reports ``remaining`` because that is the number an executor
-        needs; it is not state, so it must not be fed back in.
+        ``to_dict`` reports the derived numbers because they are what an
+        executor needs; they are not state and must not be fed back in.
         """
         fields = {f for f in cls.__dataclass_fields__}
         return cls(**{k: v for k, v in (raw or {}).items() if k in fields})
@@ -254,6 +352,9 @@ class Ledger:
         return {
             "budget": self.budget,
             "used": self.used,
+            "occupancy": self.occupancy,
+            "reserved": self.reserved,
+            "headroom": self.headroom,
             "remaining": self.remaining,
             "peak": self.peak,
             "unexpected_budget": self.unexpected_budget,
@@ -263,13 +364,6 @@ class Ledger:
             "by_what": dict(self.by_what),
             "resident": self.resident,
         }
-
-    def residency(self) -> Resident:
-        """The live set, defaulting to this rank's budget."""
-        r = Resident.from_dict(self.resident or None)
-        if not self.resident:
-            r.budget = self.budget
-        return r
 
 
 def choose_delivery(
@@ -299,6 +393,8 @@ def choose_delivery(
         return requested
     if tokens > eager_threshold:
         return DELIVERY_RENDEZVOUS
+    # ``remaining`` is the buffer's headroom under another name (S6.1); a caller
+    # still passing both gets the tighter, which is what the name promised.
     limits = [x for x in (remaining, headroom) if x is not None]
     if limits and tokens > min(limits) // 4:
         return DELIVERY_RENDEZVOUS
@@ -311,11 +407,11 @@ MIN_DEGRADE_TOKENS = 64
 
 
 def degrade_allowance(remaining: int) -> int:
-    """How many tokens an over-budget delivery may still be charged.
+    """How many tokens an over-size delivery may still be charged.
 
-    Half the remaining budget rather than all of it, because a rank that spends
-    its last token on one message can do nothing with what it read --- but never
-    more than what is actually left.  An earlier version took
+    ``remaining`` is the buffer's headroom.  Half of it rather than all, because
+    a rank that fills its last token of window with one message can do nothing
+    with what it read --- but never more than what is actually free.  An earlier version took
     ``max(64, remaining // 2)``, and that floor is a bug: with two tokens
     remaining it charges sixty-four, so the mechanism that exists to keep a rank
     inside its budget takes it outside.  A randomised invariant test found it at

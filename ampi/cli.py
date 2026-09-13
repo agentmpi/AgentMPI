@@ -242,6 +242,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--of-rank", type=int, default=None,
                    help="a peer's live set, for a sender sizing a payload")
 
+    p = sub.add_parser("ctx-materialize", help="bring an evicted body back into your window")
+    _common(p)
+    p.add_argument("address", help="a handle, win:<w>/<k>@<v>, or slice:<handle>#<i>")
+    p.add_argument("--view", default="")
+    p.add_argument("--pin", action="store_true")
+
+    p = sub.add_parser("ctx-pin", help="keep a body at the front of your window across evictions")
+    _common(p)
+    p.add_argument("address")
+    p.add_argument("--unpin", action="store_true")
+
     p = sub.add_parser("memo", help="record or read your own progress note")
     _common(p)
     p.add_argument("key")
@@ -714,6 +725,10 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
         return amp.ctx_evict(down_to=a.down_to, keep=keep), amp.rank, job
     if cmd == "resident":
         return amp.resident(a.of_rank), amp.rank, job
+    if cmd == "ctx-materialize":
+        return amp.ctx_materialize(a.address, view=a.view, pinned=a.pin), amp.rank, job
+    if cmd == "ctx-pin":
+        return amp.ctx_pin(a.address, pinned=not a.unpin), amp.rank, job
     if cmd == "memo":
         value = a.value
         if value is not None:
@@ -943,7 +958,8 @@ def _dispatch(a: argparse.Namespace) -> tuple[dict[str, Any], int | None, str]:
                 return {"handle": a.handle, "saved_to": a.out, "charged": 0}, amp.rank, job
             from .core.payload import canonical
             from .tokens import count_tokens
-            charged, degraded = amp.charge(count_tokens(canonical(body)), what="obj.get")
+            charged, degraded = amp.charge(count_tokens(canonical(body)), what="obj.get",
+                                           handle=a.handle)
             out = {"handle": a.handle, "body": body, "charged": charged}
             if degraded:
                 from .core.payload import apply_view

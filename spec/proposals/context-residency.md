@@ -1,8 +1,28 @@
 # Context residency: splitting the ledger from the resident set
 
-**Status.** Implemented and normative as of S6.1, S6.2 and Appendix A. This note
-is kept as the argument that produced them; where it and the specification differ,
-the specification is authoritative.
+**Status.** Implemented and normative as of S6.1, S6.2, S6.3 and Appendix A, in
+two steps. This note is kept as the argument that produced them; where it and the
+specification differ, the specification is authoritative.
+
+The first step (5 September 2026) added the resident set beside the ledger and let
+the eager decision read it. It left the gate where it was: a delivery was still
+refused or degraded on `used`, the cumulative count, so a rank that had evicted
+its way back to room was refused on the strength of what it had read an hour
+before, and `ctx_release` still subtracted from `used`, which is how the harnesses
+had been getting room --- by zeroing the account after every task. The second
+step (13 September) finished the split the note asked for. The buffer decides:
+admission, degradation and refusal read its headroom, which is the budget less
+what is carried and less what senders have reserved, and every delivery admits an
+addressable entry --- a handle, a window key and version, a member's slice of a
+scattered payload, or a metadata address for an envelope or manifest. The ledger
+records: `used` never decreases, not on release, not on eviction; a release
+empties the buffer and counts; `ctx_materialize` pages an evicted body back in
+and charges again. Measured in E0 (Q0.6): a rank with a 12,000-token window
+reads 48,000 tokens of bodies whole, without a degradation, under either
+discipline; under eviction it keeps its pinned prefix through nineteen
+reductions where release lost it four times. E8's carry mode routes a prompt's
+shared material through the buffer and holds the provider's billed prompt
+against the buffer's occupancy at every call.
 
 One departure was made in implementing it, and it is recorded here rather than
 quietly. The note proposed that the resident figure inherit the degradation's

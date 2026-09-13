@@ -129,6 +129,9 @@ class RankProfile:
     max_epoch: int = 1
     context_used: int = 0
     context_budget: int = 0
+    #: The buffer's high-water mark: the most the next call ever stood to carry.
+    #: Where ``context_used`` is a life total, this is the number that says
+    #: whether the window was ever near full --- MPI's buffer statistic.
     context_high_water: int = 0
     n_degrade: int = 0
     n_stall: int = 0
@@ -1006,6 +1009,12 @@ def analyse(events: list[Event], *, name: str = "", meta: dict[str, Any] | None 
             p.context_used = int(e.get("used") or p.context_used)
             p.context_budget = int(e.get("budget") or p.context_budget)
             p.context_high_water = int(e.get("high_water") or p.context_high_water)
+            # The buffer's own counters, final at the one moment they are (S6.1):
+            # how many times the window was reduced and by how much, against a
+            # ledger that only ever went up.
+            p.n_evict = max(p.n_evict, int(e.get("evictions") or 0))
+            p.evicted_tokens = max(p.evicted_tokens, int(e.get("evicted_tokens") or 0))
+            p.resident_tokens = int(e.get("occupancy") or p.resident_tokens)
         elif kind == "memo":
             phase_marks.append((ts - t0, rank, str(e.get("note") or e.get("topic") or "")))
         elif kind == "send":

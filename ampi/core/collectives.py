@@ -530,7 +530,10 @@ class CollectiveMixin:
             self._coll_done("scatter", joined, comm=comm, label=label, root=root, tokens=tokens)
             return out_rec
         if materialize:
-            charged, degraded = self.charge(tokens, what="scatter")
+            # One member's share of the root's payload: addressable as a slice of
+            # the whole, so an evicted slice comes back without the root.
+            charged, degraded = self.charge(tokens, what="scatter",
+                                            handle=f"slice:{rec['handle']}#{me}")
             if degraded:
                 slice_ = apply_view(slice_, degraded)
                 out_rec["degraded_to"] = degraded
@@ -622,6 +625,7 @@ class CollectiveMixin:
         }
         if materialize or view:
             bodies = []
+            entries: list[tuple[str, int]] = []
             for m in manifest:
                 if not m["handle"]:
                     continue
@@ -631,7 +635,11 @@ class CollectiveMixin:
                 if budget is not None:
                     b = apply_view(b, f"headtail:{budget}")
                 bodies.append({"rank": m["rank"], "body": b})
-            charged, degraded = self.charge(count_tokens(canonical(bodies)), what=kind)
+                entries.append((m["handle"], count_tokens(canonical(b))))
+            # Each contribution is admitted at its own handle, so a rank can
+            # drop one contributor's body and keep the others.
+            charged, degraded = self.charge(count_tokens(canonical(bodies)), what=kind,
+                                            entries=entries)
             result.update(bodies=bodies, charged=charged)
             if degraded:
                 result["degraded_to"] = degraded
@@ -677,10 +685,13 @@ class CollectiveMixin:
         )
         me = self.comm_rank(comm)
         received = []
+        entries: list[tuple[str, int]] = []
         for p in arrived:
             block = self.get_body(p["handle"])
             received.append({"from": p["rank"], "item": block[me]})
-        charged, _ = self.charge(count_tokens(canonical(received)), what="alltoall")
+            entries.append((f"slice:{p['handle']}#{me}", count_tokens(canonical(block[me]))))
+        charged, _ = self.charge(count_tokens(canonical(received)), what="alltoall",
+                                 entries=entries)
         self._coll_done(
             "alltoall", joined, comm=comm, label=label,
             received=len(received), dropped=dropped, charged=charged,
@@ -788,7 +799,8 @@ class CollectiveMixin:
             {"handle": handle, "op": op, "algorithm": decision.chosen}, writer=self.rank,
         )
         if materialize:
-            charged, degraded = self.charge(count_tokens(canonical(value)), what="reduce")
+            charged, degraded = self.charge(count_tokens(canonical(value)), what=kind,
+                                            handle=handle)
             result["value"] = apply_view(value, degraded) if degraded else value
             result["charged"] = charged
         self._coll_done(
@@ -856,7 +868,10 @@ class CollectiveMixin:
             if w in by_rank and by_rank[w].get("handle")
         ]
         value = serial_fold(operator, prefix) if prefix else identity_like(operator, payload)
-        charged, _ = self.charge(count_tokens(canonical(value)), what=kind)
+        # A prefix result is computed here and nowhere else; storing it gives the
+        # buffer an address to evict it to.
+        stored = self.put_payload(value).envelope.handle
+        charged, _ = self.charge(count_tokens(canonical(value)), what=kind, handle=stored)
         self._coll_done(
             kind, joined, comm=comm, label=label, op=op,
             prefix=len(prefix), dropped=dropped, charged=charged,
@@ -1008,8 +1023,12 @@ class CollectiveMixin:
             left = apply_view(left, f"head:{operand_budget}")
             right = apply_view(right, f"head:{operand_budget}")
             clipped = True
+        operand_entries = [(step["left"], count_tokens(canonical(left)))]
+        if step["right"]:
+            operand_entries.append((step["right"], count_tokens(canonical(right))))
         charged, _ = self.charge(
-            count_tokens(canonical(left)) + count_tokens(canonical(right)), what="operands"
+            count_tokens(canonical(left)) + count_tokens(canonical(right)), what="operands",
+            entries=operand_entries,
         )
         note = (
             "Both operands are structured, so they are delivered whole regardless of any "

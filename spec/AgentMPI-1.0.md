@@ -418,62 +418,83 @@ be deterministic and MUST be free of model calls.
 
 ## S6. Flow control, views, and contracts
 
-### S6.1 The context ledger and the resident set
+### S6.1 The context ledger and the buffer
 
-Every rank has a **context budget** in tokens and a **context used** counter,
-which is cumulative rather than a high-water mark of live data, because that is
-what an executor's window is: a transcript that only grows.
+Every rank has a **context budget** in tokens, a **ledger**, and a **buffer**.
 
-A rank also has a **resident set**: the bodies its next model call will carry.
-The two answer different questions --- what has this rank consumed, and what will
-the next call cost --- and only the second may go down without lying. An
-implementation MUST provide both, MUST record the operation each charge is
-attributed to, and MUST NOT reduce `used` except by an explicit release.
+The ledger's `used` is what the rank has consumed over its life. It is
+cumulative and it MUST NOT decrease: not on a release, not on an eviction, not on
+anything short of a successor taking the rank with a fresh executor. An
+implementation MUST record the operation each charge is attributed to.
 
-The resident set MUST be reducible by **eviction**, and an eviction MUST leave
-every evicted body addressable: at a payload handle, or at the window key and
-version it was read from. Eviction is therefore not compaction and does not
-contradict Appendix B: nothing is summarised and nothing is lost, and a rank that
-evicted a body may materialise it again --- paying the ledger again, because it
-has read it again. An implementation SHOULD evict from the tail of the set and
-MUST NOT evict a body the harness has pinned.
+The buffer is the set of bodies the rank's next model call will carry, each at an
+**address** from which it can be read again. Its **occupancy** is their token
+total, its **reserved** space is what senders have promised to eager messages
+not yet received (S6.3), and its **headroom** is the budget less both. The
+buffer is what MPI's unexpected-message buffer is, with the unit changed: a
+finite space that admits a body, holds it until it is consumed or dropped, and
+refuses what does not fit.
 
-> **Rationale.** A chat agent shrinks its window by summarising, which is lossy,
-> costly and unreproducible, and fatal to durable replay (S10.7), because a
-> summary is itself a model call and a replayed rank would not see what the
-> original saw. It summarises because it has nowhere to put what it drops. A rank
-> here has somewhere: every body is content addressed. Eviction against a backing
-> store is the mechanism a chat agent cannot have.
+**The buffer decides; the ledger records.** Delivering a payload body MUST admit
+it into the buffer and charge the ledger. A delivery that does not fit the
+headroom MUST NOT silently succeed: it MUST either fail with
+`AMPI_ERR_CTX_EXCEEDED` or **degrade**, delivering a bounded view that fits and
+reporting that it did so. Implementations SHOULD degrade, because an agent that
+receives a truncated message can continue while one that receives an error
+usually cannot. The decision MUST read the buffer's headroom and MUST NOT read
+`used`: a rank that has consumed ten times its budget over its life and is
+carrying nothing has a whole window free.
+
+Every admission MUST be addressable: at a payload handle; at the window key and
+version it was read from; at the member's index into a scattered or all-to-all
+payload; or, for a charge that carries no body --- an envelope, a manifest, a
+listing --- at a metadata address that names the operation which re-derives it.
+The buffer MUST be reducible by **eviction** and by **release**. Eviction drops
+bodies from the tail, never a body the harness has pinned, and leaves each at its
+address; release ends the turn and drops everything. Neither touches `used`. A
+rank MAY **materialise** an evicted body again, and doing so charges the ledger
+again, because the rank has read it again. Eviction is therefore not compaction
+and does not contradict Appendix B: nothing is summarised and nothing is lost.
+
+> **Rationale.** One counter was doing two jobs --- saying what a rank had
+> consumed and deciding what its next call may carry --- and a counter that only
+> goes up cannot do the second: measured on the first runtime, a rank that had
+> evicted its way back to room was still refused on the strength of what it had
+> read an hour before, and the harnesses learned to zero the counter after every
+> task, which made it measure nothing. Splitting the two restores the MPI
+> correspondence rather than departing from it. In MPI, buffer occupancy is the
+> flow-control quantity and bytes received is a statistic; here the buffer's
+> headroom is the flow-control quantity and the ledger is the statistic, and it
+> is the statistic every coordination-cost number in a run report is built on,
+> which is why nothing may lower it.
 >
-> Tail-first eviction is not an ordering preference, it is a cost model providers
-> impose. A provider caches the key-value state of a prompt prefix, and editing a
-> body invalidates that cache from its position onward, so freeing fifty thousand
-> tokens from the middle while forcing a full cache miss on every later call is
-> usually the worse trade. Pinning exists so a harness can hold the immutable
-> shared material at the front: a commission that is byte-identical across a
-> population is a natural shared prefix.
-
-Delivering a payload body into a rank's context MUST charge the ledger. An
-operation whose delivery would exceed the budget MUST NOT silently succeed. It
-MUST either fail with `AMPI_ERR_CTX_EXCEEDED` or **degrade**: deliver a bounded
-view instead of the body and report that it did so. Implementations SHOULD
-degrade, because an agent that receives a truncated message can continue while one
-that receives an error usually cannot.
+> A chat agent shrinks its window by summarising, which is lossy, costly and
+> unreproducible, and fatal to durable replay (S10.7), because a summary is
+> itself a model call and a replayed rank would not see what the original saw.
+> It summarises because it has nowhere to put what it drops. A rank here has
+> somewhere: every body is addressed. Tail-first eviction is not an ordering
+> preference, it is a cost model providers impose: a provider caches the
+> key-value state of a prompt prefix, and editing a body invalidates that cache
+> from its position onward, so freeing fifty thousand tokens from the middle while
+> forcing a full cache miss on every later call is usually the worse trade.
+> Pinning exists so a harness can hold the immutable shared material at the
+> front: a commission that is byte-identical across a population is a natural
+> shared prefix.
 
 The ledger is the rank's own. An implementation MUST charge it on every delivery
 but MUST NOT turn the charge into a device mutation: a read that persists its
 charge is a write, and on a device where a write is a round trip (S15.2) a rank
 reading forty-eight cells pays forty-eight round trips while the population
-waits. The charged ledger SHOULD travel with the next write of the rank's row that
-happens for another reason — a lease renewal, a collective arrival, a release —
-and a **degradation** SHOULD be written at once, because a peer deciding how much
-to send is entitled to see it. An **eviction** and a **release** follow the
-degradation's rule rather than the charge's: both are deliberate and rare where
-charges are constant, and both change what the rank can accept.
+waits. The charged ledger and the admission SHOULD travel with the next write of
+the rank's row that happens for another reason --- a lease renewal, a collective
+arrival, a release --- and a **degradation**, an **eviction**, a **release** and a
+**pin** SHOULD be written at once, because a peer deciding how much to send is
+entitled to see what the receiver can accept, and those are deliberate and rare
+where charges are constant.
 
-A deferred charge MUST NOT survive the operation that reduced it. An
-implementation that folds the pending charge into a rank's own reads must treat a
-release or an eviction as authoritative, or the reduction is undone by the next
+A deferred charge MUST NOT survive the operation that reduced the buffer. An
+implementation that folds the pending charge into a rank's own reads must treat
+a release or an eviction as authoritative, or the reduction is undone by the next
 write that carries the charge forward.
 
 > *Where this comes from.* At 128 ranks over four machines the runtime wrote the
@@ -493,8 +514,7 @@ Let `E` be the implementation's **eager threshold** in tokens.
 
 A caller MAY override the decision per operation. An implementation MAY also
 choose rendezvous for a payload under the threshold when the receiver is short of
-room, and SHOULD read that from the receiver's **resident set** as well as its
-remaining budget (S6.1): occupancy is what MPI's buffer pressure corresponds to,
+room, and MUST read that from the receiver's **buffer** (S6.1): occupancy is what MPI's buffer pressure corresponds to,
 and a receiver that has evicted its way back to room can take an eager body
 whatever its lifetime intake has been. Where both are known the tighter governs.
 
@@ -518,7 +538,10 @@ Every rank publishes an **unexpected-message budget**: a bound, in tokens, on th
 total volume of unmatched eager messages it will accept. A sender whose eager
 message would exceed the destination's budget MUST block, and MUST raise
 `AMPI_ERR_CTX_CREDIT` if it cannot proceed by its deadline. Both the stall and its
-resolution MUST be traced.
+resolution MUST be traced. The credit a sender holds is space in the receiver's
+buffer (S6.1): it counts against the receiver's headroom until the message is
+received or the claim lapses, so a receiver cannot be promised more than it can
+carry.
 
 **Definition (context-safe program).** A program is *context-safe* if it completes
 for every assignment of unexpected-message budgets, however small.
@@ -1607,7 +1630,8 @@ network round trip.
 | — | **conflict lifting and invariant verification** | no MPI analogue |
 | — | **interface declaration and verification** | no MPI analogue |
 | `MPI_Ibcast` | `AMPI_Ibcast` (S7.4): the root's request completes on return |
-| Unexpected-message buffer *occupancy* | resident set (S6.1): what the next call carries, reducible by eviction against a backing store |
+| Unexpected-message buffer *occupancy* | the buffer (S6.1): what the next call carries, reducible by eviction against a backing store; its headroom is the flow-control quantity |
+| bytes received (a statistic) | the ledger's `used` (S6.1): cumulative, never decreasing, attributed by operation |
 | Work queue / bag of tasks (no MPI analogue) | `AMPI_Pool_*` (S9.5): claim by compare-and-swap, dependency gating, reclaim from a dead holder, termination |
 
 ## Appendix B. Deliberate omissions in 1.0

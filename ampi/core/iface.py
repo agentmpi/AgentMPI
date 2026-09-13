@@ -158,7 +158,8 @@ class IfaceMixin:
         decl = cell.value["declaration"]
         if view:
             decl = apply_view(decl, view)
-        charged, degraded = self.charge(count_tokens(canonical(decl)), what="iface.get")
+        charged, degraded = self.charge(count_tokens(canonical(decl)), what="iface.get",
+                                        handle=f"iface:{provider}/{name}@{cell.version}")
         return {
             **{k: v for k, v in cell.value.items() if k != "declaration"},
             "declaration": apply_view(decl, degraded) if degraded else decl,

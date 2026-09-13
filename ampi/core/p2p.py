@@ -154,12 +154,13 @@ class P2PMixin:
             )
 
         dst_ledger = self.ledger(world_dst)
+        # The receiver's buffer, not its lifetime intake, decides whether an
+        # eager body fits: a rank that evicted its way back to room takes it.
         chosen = choose_delivery(
             env.tokens,
             requested=delivery,
             eager_threshold=self.manifest.eager_threshold,
-            remaining=dst_ledger.remaining,
-            headroom=dst_ledger.residency().headroom,
+            headroom=dst_ledger.headroom,
         )
 
         if mode == SEND_READY:
