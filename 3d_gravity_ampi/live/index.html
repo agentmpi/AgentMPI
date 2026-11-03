@@ -131,6 +131,11 @@ svg text{font-family:"IBM Plex Mono",Menlo,monospace;font-size:10.5px;fill:var(-
 .n.active rect{stroke-width:2.6;stroke:var(--accent);filter:drop-shadow(0 0 3px var(--accent))}
 .n.delivered rect{stroke-dasharray:2 2;stroke-width:2}
 .edge{fill:none;stroke:var(--ink-3);stroke-opacity:.55;stroke-width:1.1}
+.dag .band{fill:var(--panel-2,var(--panel));opacity:.55}.dag .band.alt{fill:var(--line-2);opacity:.35}.dag .ch{font-size:11px;fill:var(--ink-2);font-weight:600}.dag .gh{font-size:11px;fill:var(--ink-2);font-weight:600}.dag .dim{fill:var(--ink-3);font-weight:400}
+.dag .edge{fill:none;stroke:var(--ink-3);stroke-width:1.1;opacity:.5}.dag .arr{fill:var(--ink-3);opacity:.6}.dag .xe{fill:none;stroke:var(--accent);stroke-width:1.2;display:none}
+.dag .xb circle{fill:var(--panel);stroke:var(--ink-3);stroke-width:1}.dag .xb text{font-size:9.5px;fill:var(--ink-2);font-weight:600}
+.dag.focus .n:not(.on){opacity:.18}.dag.focus .edge:not(.hi),.dag.focus .arr:not(.hi){opacity:.06}.dag.focus .edge.hi{stroke:var(--accent);stroke-width:2;opacity:1}.dag.focus .arr.hi{fill:var(--accent);opacity:1}.dag.focus .xe.hi{display:block}
+.dag .n{cursor:pointer}.dag .n.on rect{stroke-width:2}
 .legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11.5px;color:var(--ink-2)}.legend i{display:inline-block;width:12px;height:12px;border-radius:3px;vertical-align:-2px;margin-right:4px;border:1px solid}
 .feed{max-height:360px;overflow:auto}.feed td:first-child{white-space:nowrap}
 .digest{max-height:420px;overflow:auto}
@@ -202,37 +207,84 @@ function overview(){
 }
 
 function dag(M){
-  // layered layout: externals (col 0) → ledger nodes by depth → planned goals from the brief (last col)
-  const nodes=M.nodes.slice(), ids=new Set(nodes.map(n=>n.id));
+  // Layered layout. Column 0: predecessors admitted in earlier missions, drawn once as grouped chips with NO edges
+  // (they carried most of the clutter); every ledger node shows how many it uses in a bubble and reveals them on hover.
+  // Columns 1..: ledger nodes by depth, rows ordered by barycenter; edges inside the mission are orthogonal:
+  // adjacent depths go through a lane in the gap, longer spans ride a bus under the rows. Hover/click a node to focus.
+  const nodes=M.nodes.slice(), byId={}; nodes.forEach(n=>byId[n.id]=n);
   const claimed=new Set((M.tasks||[]).filter(t=>t.state==="claimed").map(t=>t.anchor));
   const delivered=new Set((M.tasks||[]).filter(t=>t.state==="done").flatMap(t=>(t.result&&t.result.nodes_worked)||[t.anchor]));
   const verd={}; (M.verdicts||[]).forEach(v=>{ if(!verd[v.node]) verd[v.node]=v; });
-  const ext=(M.externals||[]).slice(0,30);
-  const planned=M.goals.filter(g=>!ids.has(g));
-  const maxd=nodes.length?Math.max(...nodes.map(n=>n.depth)):-1;
-  const EXTCOL=12, nExt=Math.ceil(ext.length/EXTCOL);
-  const colOf=n=>n.depth+nExt;
-  const cols={}; const put=(c,item)=>{(cols[c]=cols[c]||[]).push(item)};
-  ext.forEach((e,i)=>put(Math.floor(i/EXTCOL),{id:e,cls:"external",tip:"predecessor admitted in an earlier mission"}));
-  nodes.sort((a,b)=>a.depth-b.depth||a.id.localeCompare(b.id)).forEach(n=>{
-    let cls=n.status||"planned"; if(claimed.has(n.id)) cls+=" active"; else if(delivered.has(n.id)&&n.status!=="solid") cls+=" delivered";
-    const v=verd[n.id]; put(colOf(n),{id:n.id,cls,tip:`${n.id} · ${n.status} · depth ${n.depth}${n.domain?" · "+n.domain:""}\n${n.summary}\ntrials ${n.trials}${v?`\nlast verdict: ${v.verdict} (wave ${v.wave})${v.reasons?" — "+v.reasons.slice(0,160):""}`:""}${claimed.has(n.id)?"\n● a machine is working this node now":""}`,preds:n.preds});
-  });
-  const pcol=nExt+maxd+1;
-  planned.forEach(g=>{let cls="planned"; if(claimed.has(g)) cls+=" active"; else if(delivered.has(g)) cls+=" delivered"; put(pcol,{id:g,cls,tip:`${g}\nplanned in the mission brief; not yet in the knowledge ledger${claimed.has(g)?"\n● a machine is working this node now":delivered.has(g)?"\n◌ delivered, awaiting ingest/verdict":""}`});});
-  const W=186,H=30,GX=46,GY=10,PAD=14; const ncol=Object.keys(cols).length; if(!ncol) return '<p class="dim small">no nodes yet</p>';
-  const colKeys=Object.keys(cols).map(Number).sort((a,b)=>a-b); const idx={}; colKeys.forEach((c,i)=>idx[c]=i);
-  const pos={}; let maxRows=0;
-  colKeys.forEach(c=>{cols[c].forEach((it,i)=>{pos[it.id]={x:PAD+idx[c]*(W+GX),y:PAD+i*(H+GY)}}); maxRows=Math.max(maxRows,cols[c].length);});
-  const width=PAD*2+ncol*W+(ncol-1)*GX, height=PAD*2+maxRows*(H+GY)-GY+16;
-  let edges="";
-  nodes.forEach(n=>(n.preds||[]).forEach(p=>{ if(!pos[p]||!pos[n.id]) return; const a=pos[p],b=pos[n.id]; const x1=a.x+W,y1=a.y+H/2,x2=b.x,y2=b.y+H/2,mx=(x1+x2)/2; edges+=`<path class="edge" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`;}));
+  const pre=(M.prefix||"")+"::"; const short=id=>id.startsWith(pre)?id.slice(pre.length):id;
+  const planned=M.goals.filter(g=>!byId[g]).map(g=>({id:g,status:"planned",depth:(M.max_depth||0)+1,preds:[],summary:"planned in the mission brief; not yet in the knowledge ledger",trials:0}));
+  const all=nodes.concat(planned); all.forEach(n=>byId[n.id]=n);
+  if(!all.length) return '<p class="dim small">no nodes yet</p>';
+  // external predecessors actually referenced, grouped by their paper prefix
+  const extUse={}; all.forEach(n=>(n.preds||[]).forEach(p=>{ if(!byId[p]) (extUse[p]=extUse[p]||[]).push(n.id); }));
+  const extIds=Object.keys(extUse).sort(); const groups={}; extIds.forEach(e=>{const g=e.split("::")[0]; (groups[g]=groups[g]||[]).push(e);});
+  // columns by depth
+  const depths=[...new Set(all.map(n=>n.depth))].sort((a,b)=>a-b); const cols=depths.map(d=>all.filter(n=>n.depth===d).sort((a,b)=>a.id.localeCompare(b.id)));
+  const succ={}; all.forEach(n=>(n.preds||[]).forEach(p=>{ if(byId[p]) (succ[p]=succ[p]||[]).push(n.id); }));
+  const row={}; const setRows=()=>cols.forEach(c=>c.forEach((n,i)=>row[n.id]=i));
+  setRows();
+  const bary=(n,list)=>{const r=(list||[]).filter(x=>row[x]!=null).map(x=>row[x]); return r.length?r.reduce((a,b)=>a+b,0)/r.length:null;};
+  for(let sweep=0;sweep<4;sweep++){
+    for(let c=1;c<cols.length;c++){ const b={}; cols[c].forEach(n=>{const v=bary(n,(n.preds||[]).filter(p=>byId[p])); b[n.id]=v==null?row[n.id]:v;}); cols[c].sort((x,y)=>b[x.id]-b[y.id]||x.id.localeCompare(y.id)); setRows(); }
+    for(let c=cols.length-2;c>=0;c--){ const b={}; cols[c].forEach(n=>{const v=bary(n,succ[n.id]); b[n.id]=v==null?row[n.id]:v;}); cols[c].sort((x,y)=>b[x.id]-b[y.id]||x.id.localeCompare(y.id)); setRows(); }
+  }
+  // geometry
+  const W=176,H=30,GY=12,PAD=14,HEAD=26,EW=extIds.length?292:0,EGAP=extIds.length?40:0,CW=140,CH=20,CG=5;
+  const colIndex={}; depths.forEach((d,i)=>colIndex[d]=i);
+  // lanes per gap: each node with out-edges owns a lane in the gap right of its column; each node receiving a long edge owns a lane in the gap left of its column
+  const outLane={}, inLane={}, laneCount=[];
+  for(let c=0;c<cols.length;c++){ let k=0; cols[c].forEach(n=>{ if((succ[n.id]||[]).length){outLane[n.id]=k++;} }); if(c+1<cols.length) cols[c+1].forEach(n=>{ if((n.preds||[]).some(p=>byId[p]&&colIndex[byId[p].depth]<c)){inLane[n.id]=k++;} }); laneCount[c]=k; }
+  const gapW=c=>Math.max(44, 14+7*(laneCount[c]||0));
+  const colX=[]; let x=PAD+EW+EGAP; for(let c=0;c<cols.length;c++){ colX[c]=x; x+=W+gapW(c); }
+  const maxRows=Math.max(...cols.map(c=>c.length), extIds.length?Math.ceil(extIds.length/2)+Object.keys(groups).length:0);
+  const top=PAD+HEAD; const pos={}; cols.forEach((c,ci)=>c.forEach((n,i)=>pos[n.id]={x:colX[ci],y:top+i*(H+GY)}));
+  const busBase=top+maxRows*(H+GY)+6; const busOf={}; let nb=0; all.forEach(n=>{ if((succ[n.id]||[]).some(s=>colIndex[byId[s].depth]>colIndex[n.depth]+1)) busOf[n.id]=nb++; });
+  const width=x-gapW(cols.length-1)+PAD, height=busBase+nb*6+PAD+24;
+  const laneX=(c,k)=>colX[c]+W+10+7*k;
+  // edges inside the mission
+  let edges="", arrows="";
+  all.forEach(n=>(n.preds||[]).forEach(p=>{ const a=byId[p]; if(!a||!pos[p]||!pos[n.id]) return;
+    const ca=colIndex[a.depth], cb=colIndex[n.depth]; const A=pos[p], B=pos[n.id]; const y1=A.y+H/2, y2=B.y+H/2, x1=A.x+W, x2=B.x;
+    let d; if(cb===ca+1){ const lx=laneX(ca,outLane[p]); d=`M${x1},${y1} H${lx} V${y2} H${x2-6}`; }
+    else { const lx=laneX(ca,outLane[p]), rx=laneX(cb-1,inLane[n.id]), by=busBase+6*(busOf[p]||0); d=`M${x1},${y1} H${lx} V${by} H${rx} V${y2} H${x2-6}`; }
+    edges+=`<path class="edge" data-s="${esc(p)}" data-d="${esc(n.id)}" d="${d}"/><path class="arr" data-s="${esc(p)}" data-d="${esc(n.id)}" d="M${x2-6},${y2-3.5} L${x2},${y2} L${x2-6},${y2+3.5} Z"/>`; }));
+  // external chips (column 0) and their hidden edges, shown only when a node is focused
+  let chips="", xedges=""; const cpos={};
+  if(extIds.length){ let y=top; const gx=PAD;
+    Object.keys(groups).sort().forEach(g=>{ chips+=`<text class="gh" x="${gx}" y="${y+12}">${esc(g)}:: <tspan class="dim">${groups[g].length} established earlier</tspan></text>`; y+=18;
+      groups[g].forEach((e,i)=>{ const cx=gx+(i%2)*(CW+CG+7), cy=y+Math.floor(i/2)*(CH+CG); cpos[e]={x:cx,y:cy};
+        chips+=`<g class="n external" data-id="${esc(e)}" data-tip="${esc(e)}\nadmitted in an earlier mission · used by ${extUse[e].length} node${extUse[e].length>1?"s":""} here: ${esc(extUse[e].map(short).join(", "))}"><rect x="${cx}" y="${cy}" width="${CW}" height="${CH}" rx="4"/><text x="${cx+6}" y="${cy+14}">${esc(short(e).length>19?short(e).slice(0,18)+"…":short(e))}</text></g>`; });
+      y+=Math.ceil(groups[g].length/2)*(CH+CG)+8; });
+    all.forEach(n=>(n.preds||[]).forEach(p=>{ const c=cpos[p]; if(!c||!pos[n.id]) return; const x1=c.x+CW, y1=c.y+CH/2, x2=pos[n.id].x, y2=pos[n.id].y+H/2, mx=(x1+x2)/2; xedges+=`<path class="xe" data-d="${esc(n.id)}" data-s="${esc(p)}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`; }));
+  }
+  // column bands + headers
+  let bands="", heads=`<text class="ch" x="${PAD}" y="${PAD+14}">established earlier <tspan class="dim">${extIds.length} predecessors · no links drawn, hover a node</tspan></text>`;
+  cols.forEach((c,ci)=>{ const d=depths[ci]; const isPlanned=c.every(n=>n.status==="planned"); bands+=`<rect class="band${ci%2?" alt":""}" x="${colX[ci]-8}" y="${PAD}" width="${W+16}" height="${busBase-PAD-4}" rx="6"/>`; heads+=`<text class="ch" x="${colX[ci]}" y="${PAD+14}">${isPlanned?"planned":"depth "+d} <tspan class="dim">${c.length} node${c.length>1?"s":""}</tspan></text>`; });
+  // node boxes
   let boxes="";
-  colKeys.forEach(c=>cols[c].forEach(it=>{const p=pos[it.id]; const lab=it.id.length>24?it.id.slice(0,23)+"…":it.id; boxes+=`<g class="n ${it.cls}" data-tip="${esc(it.tip)}"><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="5"/><text x="${p.x+8}" y="${p.y+19}">${esc(lab)}</text></g>`;}));
-  const heads=colKeys.map(c=>`<text x="${PAD+idx[c]*(W+GX)}" y="${height-4}" style="fill:var(--ink-3)">${c<nExt?(c===0?"established earlier":""):c===pcol?"planned":"depth "+(c-nExt)}</text>`).join("");
-  return `<div class="dagwrap"><svg width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${edges}${boxes}${heads}</svg></div>
-  <div class="legend"><span><i style="background:var(--ok-soft);border-color:var(--ok)"></i>solid</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>preliminary / hypothesis</span><span><i style="background:var(--bad-soft);border-color:var(--bad)"></i>blocking / rejected</span><span><i style="background:var(--panel);border-color:var(--ink-3);border-style:dashed"></i>planned (brief)</span><span><i style="background:var(--line-2);border-color:var(--line)"></i>established earlier</span><span><i style="border-color:var(--accent);border-width:2px;background:transparent"></i>being worked now</span><span><i style="border-style:dotted;border-color:var(--ink-2);background:transparent"></i>delivered, awaiting verdict</span></div>`;
+  all.forEach(n=>{ const p=pos[n.id]; let cls=n.status||"planned"; if(claimed.has(n.id)) cls+=" active"; else if(delivered.has(n.id)&&n.status!=="solid") cls+=" delivered";
+    const nx=(n.preds||[]).filter(q=>!byId[q]).length; const v=verd[n.id]; const lab=short(n.id); const maxc=nx?19:22;
+    const tip=`${n.id} · ${n.status} · depth ${n.depth}${n.domain?" · "+n.domain:""}\n${n.summary||""}\n${nx?nx+" predecessors from earlier missions · ":""}${(n.preds||[]).filter(q=>byId[q]).length} inside this mission · ${(succ[n.id]||[]).length} dependents\ntrials ${n.trials||0}${v?`\nlast verdict: ${v.verdict} (wave ${v.wave})${v.reasons?" — "+v.reasons.slice(0,160):""}`:""}${claimed.has(n.id)?"\n● a machine is working this node now":delivered.has(n.id)&&n.status!=="solid"?"\n◌ delivered, awaiting ingest/verdict":""}`;
+    boxes+=`<g class="n ${cls}" data-id="${esc(n.id)}" data-tip="${esc(tip)}"><rect x="${p.x}" y="${p.y}" width="${W}" height="${H}" rx="5"/><text x="${p.x+(nx?22:9)}" y="${p.y+19}">${esc(lab.length>maxc?lab.slice(0,maxc-1)+"…":lab)}</text>${nx?`<g class="xb"><circle cx="${p.x+1}" cy="${p.y+H/2}" r="8.5"/><text x="${p.x+1}" y="${p.y+H/2+3.5}" text-anchor="middle">${nx}</text></g>`:""}</g>`; });
+  return `<div class="dagwrap"><svg class="dag" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${bands}${heads}${xedges}${edges}${arrows}${chips}${boxes}</svg></div>
+  <div class="legend"><span><i style="background:var(--ok-soft);border-color:var(--ok)"></i>solid</span><span><i style="background:var(--warn-soft);border-color:var(--warn)"></i>preliminary / hypothesis</span><span><i style="background:var(--bad-soft);border-color:var(--bad)"></i>blocking / rejected</span><span><i style="background:var(--panel);border-color:var(--ink-3);border-style:dashed"></i>planned (brief)</span><span><i style="background:var(--line-2);border-color:var(--line)"></i>established earlier</span><span><i style="border-color:var(--accent);border-width:2px;background:transparent"></i>being worked now</span><span><i style="border-style:dotted;border-color:var(--ink-2);background:transparent"></i>delivered, awaiting verdict</span><span><i style="border-radius:50%;background:var(--line-2);border-color:var(--ink-3)"></i>count of earlier-mission predecessors</span><span class="dim">· arrows run left→right by depth; long spans ride the bus under the rows · hover a node to see only its links, click to pin</span></div>`;
 }
+// focus handling for the DAG: hover shows a node's neighbourhood, click pins it
+let pinned=null;
+function dagFocus(id){
+  const svg=document.querySelector("svg.dag"); if(!svg) return;
+  svg.querySelectorAll(".on,.hi").forEach(e=>e.classList.remove("on","hi"));
+  if(!id){ svg.classList.remove("focus"); return; }
+  svg.classList.add("focus"); const on=new Set([id]);
+  svg.querySelectorAll(`[data-s="${CSS.escape(id)}"],[data-d="${CSS.escape(id)}"]`).forEach(e=>{ e.classList.add("hi"); on.add(e.dataset.s); on.add(e.dataset.d); });
+  on.forEach(n=>svg.querySelectorAll(`.n[data-id="${CSS.escape(n)}"]`).forEach(g=>g.classList.add("on")));
+}
+document.addEventListener("mouseover",e=>{ const g=e.target.closest&&e.target.closest("svg.dag .n"); if(pinned) return; dagFocus(g?g.dataset.id:null); });
+document.addEventListener("click",e=>{ const svg=e.target.closest&&e.target.closest("svg.dag"); if(!svg) return; const g=e.target.closest(".n"); if(g){ pinned=pinned===g.dataset.id?null:g.dataset.id; dagFocus(pinned||g.dataset.id); } else { pinned=null; dagFocus(null); } });
 
 function machines(M){
   const ranks=M.ranks||[]; const byRank={}; (M.pool||[]).forEach(p=>byRank[p.rank]=p);
